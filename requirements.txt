@@ -1,0 +1,49 @@
+# Core
+python>=3.10
+pandas>=2.0
+polars>=0.20
+numpy>=1.24
+
+# ML/DL
+torch>=2.0
+pytorch-lightning>=2.0
+xgboost>=2.0
+lightgbm>=4.0
+
+# Data processing
+ta-lib>=0.4
+pandas-ta>=0.3
+
+# Anti-block crawler
+curl-cffi>=0.6
+browserforge>=1.0
+playwright>=1.40
+
+# Data sources
+akshare>=1.12
+yfinance>=0.2
+efinance>=0.4
+tushare>=1.4
+baostock>=0.8
+
+# NLP (Phase 3)
+transformers>=4.35
+jieba>=0.42
+
+# Config & monitoring
+hydra-core>=1.3
+omegaconf>=2.3
+wandb>=0.16
+
+# Storage
+pyarrow>=14.0
+fastparquet>=2023.10
+
+# Code quality
+pytest>=7.4
+ruff>=0.1
+
+# Utilities
+tqdm>=4.66
+matplotlib>=3.8
+seaborn>=0.13

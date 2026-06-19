@@ -1,0 +1,80 @@
+# Global configuration
+project:
+  name: stoke-ml
+  data_dir: ./data
+  model_dir: ./models/checkpoints
+
+# Market configuration
+markets:
+  a_shares:
+    enabled: true
+    stock_universe: [csi300, csi500]
+    start_date: "2015-01-01"
+  us:
+    enabled: false
+    stock_universe: [sp500]
+    start_date: "2015-01-01"
+
+# Crawler configuration
+crawler:
+  tls_impersonate: "chrome120"
+  browserforge:
+    browser: "chrome"
+    device: "desktop"
+    os: "windows"
+  session_pool:
+    max_sessions: 50
+    max_age_minutes: 30
+    max_usage: 30
+    max_error_score: 3.0
+  proxy:
+    enabled: false
+    tier: "free"
+    validate_on_startup: true
+    max_proxies: 20
+  rate_limit:
+    base_delay_sec: 2.0
+    jitter_factor: 0.5
+    max_backoff_sec: 300
+    circuit_breaker_cooldown_sec: 300
+    daily_quota_per_domain: 10000
+  browser_fallback:
+    enabled: true
+    engine: "playwright"
+    stealth_js: true
+    captcha_solver: "opencv"
+
+# Feature configuration
+features:
+  seq_len: 60
+  technical_indicators: true
+  rule_based_scoring: true
+  temporal_features: true
+  target_horizon: 1
+
+# Model configuration
+model:
+  phase: 1
+  name: "xgboost"
+  params:
+    max_depth: 6
+    learning_rate: 0.1
+    n_estimators: 200
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+# Training configuration
+training:
+  batch_size: 512
+  epochs: 100
+  learning_rate: 0.001
+  early_stopping_patience: 5
+  validation:
+    method: "walk_forward"
+    train_years: 2
+    val_months: 3
+
+# Evaluation
+evaluation:
+  primary_metric: "mcc"
+  financial_metrics: [sharpe, max_drawdown, win_rate, profit_factor]
