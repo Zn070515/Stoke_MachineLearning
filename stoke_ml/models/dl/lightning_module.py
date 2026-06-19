@@ -38,11 +38,17 @@ class StockLightningModule(pl.LightningModule):
         self._val_preds = []
         self._val_targets = []
 
+    def _ensure_criterion_device(self, device):
+        if self._class_weight is not None and self._class_weight.device != device:
+            self._class_weight = self._class_weight.to(device)
+            self._criterion = nn.CrossEntropyLoss(weight=self._class_weight)
+
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
+        self._ensure_criterion_device(x.device)
         logits = self(x)
         loss = self._criterion(logits, y)
         self.log("train_loss", loss, on_step=False, on_epoch=True)
@@ -50,6 +56,7 @@ class StockLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
+        self._ensure_criterion_device(x.device)
         logits = self(x)
         loss = self._criterion(logits, y)
         preds = torch.argmax(logits, dim=-1)

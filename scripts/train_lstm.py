@@ -15,7 +15,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
-from stoke_ml.evaluation.metrics import mcc_score
+from stoke_ml.evaluation.metrics import mcc_score, compute_financial_metrics
 from stoke_ml.models.dl.dataset import StockDataset
 from stoke_ml.models.dl.lstm_model import LSTMModel
 from stoke_ml.models.dl.lightning_module import StockLightningModule
@@ -74,14 +74,17 @@ def main():
     logger.info("CUDA available: %s", torch.cuda.is_available())
 
     output_dir = args.output or cfg.project.model_dir
-    max_epochs = args.epochs or cfg.training.epochs
-    batch_size = args.batch_size or cfg.training.batch_size
+    max_epochs = args.epochs if args.epochs is not None else cfg.training.epochs
+    batch_size = args.batch_size if args.batch_size is not None else cfg.training.batch_size
     os.makedirs(output_dir, exist_ok=True)
 
     pipeline = FeaturePipeline(
         seq_len=cfg.features.seq_len,
         horizon=cfg.features.target_horizon,
         flat_mode=False,
+        use_technical=cfg.features.technical_indicators,
+        use_scoring=cfg.features.rule_based_scoring,
+        use_temporal=cfg.features.temporal_features,
     )
     splitter = WalkForwardSplitter(
         train_years=cfg.training.validation.train_years,
@@ -135,7 +138,10 @@ def main():
             # Class weight for imbalance
             n_neg = (y_train == 0).sum()
             n_pos = (y_train == 1).sum()
-            class_weight = [1.0, n_neg / n_pos] if n_pos > 0 else None
+            if n_pos > 0 and n_neg > 0:
+                class_weight = [1.0, n_neg / n_pos]
+            else:
+                class_weight = None
 
             lit_module = StockLightningModule(
                 input_dim=n_features,
@@ -186,9 +192,17 @@ def main():
                         all_preds.append(preds)
                 val_preds = np.concatenate(all_preds)
                 val_mcc = mcc_score(y_val, val_preds)
+                # financial metrics
+                if len(val_idx) > 1:
+                    close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
+                    fin_metrics = compute_financial_metrics(close_prices, val_preds)
+                else:
+                    fin_metrics = {"sharpe": 0.0, "max_drawdown": 0.0,
+                                   "win_rate": 0.0, "profit_factor": 0.0}
                 all_val_mcc.append(val_mcc)
                 logger.info(
-                    "  %s fold %d | Val MCC=%.4f", code, fold_idx, val_mcc
+                    "  %s fold %d | Val MCC=%.4f Sharpe=%.2f",
+                    code, fold_idx, val_mcc, fin_metrics["sharpe"],
                 )
             else:
                 logger.warning("  %s fold %d | No checkpoint saved", code, fold_idx)
@@ -207,7 +221,10 @@ def main():
             )
             n_neg = (y == 0).sum()
             n_pos = (y == 1).sum()
-            final_class_weight = [1.0, n_neg / n_pos] if n_pos > 0 else None
+            if n_pos > 0 and n_neg > 0:
+                final_class_weight = [1.0, n_neg / n_pos]
+            else:
+                final_class_weight = None
 
             final_module = StockLightningModule(
                 input_dim=n_features,

@@ -20,10 +20,16 @@ class FeaturePipeline:
         seq_len: int = 60,
         horizon: int = 1,
         flat_mode: bool = False,
+        use_technical: bool = True,
+        use_scoring: bool = True,
+        use_temporal: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
         self.flat_mode = flat_mode
+        self.use_technical = use_technical
+        self.use_scoring = use_scoring
+        self.use_temporal = use_temporal
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
 
@@ -36,12 +42,15 @@ class FeaturePipeline:
 
     def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df = self._ti.compute_all(df)
-        df = self._scorer.score(df)
-        cols = self.TARGET_COLS + ["volume_ratio", "atr_14", "rsi_12"]
-        df = add_lag_features(df, cols, self.LAGS)
-        df = add_rolling_features(df, cols, self.ROLLING_WINDOWS)
-        df = add_calendar_features(df)
+        if self.use_technical:
+            df = self._ti.compute_all(df)
+        if self.use_scoring:
+            df = self._scorer.score(df)
+        if self.use_temporal:
+            cols = self.TARGET_COLS + ["volume_ratio", "atr_14", "rsi_12"]
+            df = add_lag_features(df, cols, self.LAGS)
+            df = add_rolling_features(df, cols, self.ROLLING_WINDOWS)
+            df = add_calendar_features(df)
         return df
 
     def _create_sequences(

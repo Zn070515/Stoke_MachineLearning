@@ -21,16 +21,18 @@ class BaostockSource(AShareSourceBase):
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
+        import baostock as bs
+        lg = None
         try:
-            import baostock as bs
             lg = bs.login()
             if lg.error_code != "0":
                 logger.warning("Baostock login failed: %s", lg.error_msg)
                 return pd.DataFrame()
 
-            # Baostock expects code format like sh.600000 or sz.000001
-            if stock_code.startswith("6"):
+            if stock_code.startswith("6") or stock_code.startswith("9"):
                 bs_code = f"sh.{stock_code}"
+            elif stock_code.startswith("8") or stock_code.startswith("4"):
+                bs_code = f"bj.{stock_code}"
             else:
                 bs_code = f"sz.{stock_code}"
 
@@ -50,18 +52,25 @@ class BaostockSource(AShareSourceBase):
             rows = []
             while rs.next():
                 rows.append(rs.get_row_data())
-            bs.logout()
 
             if not rows:
+                bs.logout()
                 return pd.DataFrame()
             df = pd.DataFrame(
                 rows,
                 columns=["date", "open", "high", "low", "close",
                           "volume", "amount", "pct_change"],
             )
-            return self._normalize(df, stock_code)
+            result = self._normalize(df, stock_code)
+            bs.logout()
+            return result
         except Exception as e:
             logger.warning("Baostock fetch failed for %s: %s", stock_code, e)
+            if lg is not None and lg.error_code == "0":
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
             return pd.DataFrame()
 
     def _normalize(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:

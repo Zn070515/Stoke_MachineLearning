@@ -30,7 +30,22 @@ class TushareSource(AShareSourceBase):
             return None
 
     def is_available(self) -> bool:
-        return bool(self._token)
+        if not self._token:
+            return False
+        try:
+            import tushare
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _to_ts_code(stock_code: str) -> str:
+        if stock_code.startswith("6"):
+            return f"{stock_code}.SH"
+        elif stock_code.startswith("8") or stock_code.startswith("4"):
+            return f"{stock_code}.BJ"
+        else:
+            return f"{stock_code}.SZ"
 
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str
@@ -39,8 +54,9 @@ class TushareSource(AShareSourceBase):
             pro = self._get_pro()
             if pro is None:
                 return pd.DataFrame()
+            ts_code = self._to_ts_code(stock_code)
             df = pro.daily(
-                ts_code=stock_code,
+                ts_code=ts_code,
                 start_date=start_date.replace("-", ""),
                 end_date=end_date.replace("-", ""),
             )

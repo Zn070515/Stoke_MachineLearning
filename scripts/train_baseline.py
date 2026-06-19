@@ -72,6 +72,9 @@ def main():
         seq_len=cfg.features.seq_len,
         horizon=cfg.features.target_horizon,
         flat_mode=True,
+        use_technical=cfg.features.technical_indicators,
+        use_scoring=cfg.features.rule_based_scoring,
+        use_temporal=cfg.features.temporal_features,
     )
     splitter = WalkForwardSplitter(
         train_years=cfg.training.validation.train_years,
@@ -115,7 +118,8 @@ def main():
             preds = model.predict(X_val)
             cls_metrics = compute_classification_metrics(y_val, preds)
 
-            close_prices = aligned_close[val_idx]
+            # n_val predictions need n_val+1 close prices for n_val returns
+            close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
             fin_metrics = compute_financial_metrics(close_prices, preds)
 
             mcc = cls_metrics["mcc"]

@@ -34,7 +34,10 @@ class XGBoostBaseline:
         if self._params.get("scale_pos_weight") is None:
             neg = np.sum(y == 0)
             pos = np.sum(y == 1)
-            self._params["scale_pos_weight"] = neg / pos if pos > 0 else 1.0
+            if pos > 0 and neg > 0:
+                self._params["scale_pos_weight"] = neg / pos
+            else:
+                self._params["scale_pos_weight"] = 1.0
         self._model = xgb.XGBClassifier(**self._params)
         self._model.fit(X, y, verbose=False)
 

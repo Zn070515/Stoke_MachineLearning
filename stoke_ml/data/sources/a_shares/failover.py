@@ -31,6 +31,7 @@ class AShareDownloader:
         self._failure_counts: dict[str, int] = {}
         self._circuit_open: dict[str, float] = {}
         self._cooldown_sec = 300
+        self._failure_threshold = 15
 
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str
@@ -57,7 +58,7 @@ class AShareDownloader:
 
     def _record_failure(self, name: str):
         self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
-        if self._failure_counts[name] >= 5:
+        if self._failure_counts[name] >= self._failure_threshold:
             self._circuit_open[name] = time.time()
 
     def _record_success(self, name: str):

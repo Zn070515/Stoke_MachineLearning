@@ -57,22 +57,26 @@ class CrawlerClient:
         if not self._rate_limiter.can_request(domain):
             raise RuntimeError(f"Rate limit or circuit breaker: {domain}")
 
-        session = self._session_pool.get_session()
         headers = self._fingerprint.generate()
         if "headers" in kwargs:
             headers.update(kwargs.pop("headers"))
 
-        proxy = self._proxy_pool.get_proxy()
+        try:
+            proxy = self._proxy_pool.get_proxy()
+        except RuntimeError:
+            proxy = None
         if proxy:
             kwargs["proxies"] = {"http": proxy.url, "https": proxy.url}
 
         self._rate_limiter.wait()
+        session = self._session_pool.get_session()
 
         try:
             resp = session.http.request(
                 method, url, headers=headers, **kwargs
             )
             session.mark_used()
+            self._rate_limiter.record_request(domain)
 
             if resp.status_code >= 400:
                 session.mark_bad()
@@ -85,7 +89,6 @@ class CrawlerClient:
 
             session.mark_good()
             self._rate_limiter.report_success()
-            self._rate_limiter.record_request(domain)
             self._rate_limiter.record_success(domain)
             if proxy:
                 self._proxy_pool.mark_current_good()
