@@ -99,7 +99,7 @@ def main():
             logger.warning("No data for %s, skipping", code)
             continue
 
-        X, y = pipeline.build_features(df)
+        X, y, aligned_close = pipeline.build_features(df)
         if len(X) == 0:
             logger.warning("Not enough features for %s, skipping", code)
             continue
@@ -109,14 +109,14 @@ def main():
             "  Data: X=%s y=%s n_features=%d", X.shape, y.shape, n_features
         )
 
-        # Walk-forward folds
-        dates = pd.to_datetime(df["date"].values)
-        folds = list(splitter.split(dates))
+        n_samples = len(X)
+        pseudo_dates = pd.date_range("2000-01-01", periods=n_samples, freq="B")
+        folds = list(splitter.split(pseudo_dates))
 
         all_val_mcc = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
-            if train_idx[-1] >= len(X) or val_idx[-1] >= len(X):
+            if train_idx[-1] >= n_samples or val_idx[-1] >= n_samples:
                 break
 
             X_train, y_train = X[train_idx], y[train_idx]
@@ -216,6 +216,7 @@ def main():
                 dropout=0.3,
                 learning_rate=cfg.training.learning_rate,
                 class_weight=final_class_weight,
+                use_scheduler=False,
             )
             final_trainer = pl.Trainer(
                 max_epochs=max_epochs,

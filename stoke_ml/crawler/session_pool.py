@@ -110,7 +110,15 @@ class SessionPool:
         return random.choice(usable)
 
     def replenish(self):
-        self._sessions = [s for s in self._sessions if s.is_usable()]
+        kept, retired = [], []
+        for s in self._sessions:
+            if s.is_usable():
+                kept.append(s)
+            else:
+                retired.append(s)
+        for s in retired:
+            s.close()
+        self._sessions = kept
         while len(self._sessions) < self._max_sessions:
             self._sessions.append(Session(**self._session_params))
 

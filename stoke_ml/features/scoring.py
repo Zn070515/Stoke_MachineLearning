@@ -80,13 +80,13 @@ class TrendScorer:
             elif trend >= 4:
                 score += 1
 
-            bias = df.get("bias_ma5", pd.Series(0)).iloc[i]
+            bias = df["bias_ma5"].iloc[i] if "bias_ma5" in df.columns else 0.0
             if abs(bias) > self.BIAS_THRESHOLD:
                 score += 1 if bias > 0 else -1
 
-            if df.get("volume_shrink", pd.Series(False)).iloc[i]:
+            if "volume_shrink" in df.columns and df["volume_shrink"].iloc[i]:
                 score += 1
-            if df.get("volume_heavy", pd.Series(False)).iloc[i]:
+            if "volume_heavy" in df.columns and df["volume_heavy"].iloc[i]:
                 score -= 1
 
             if score <= -3:

@@ -19,6 +19,7 @@ class StockLightningModule(pl.LightningModule):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         class_weight: list[float] | None = None,
+        use_scheduler: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -32,6 +33,7 @@ class StockLightningModule(pl.LightningModule):
             self._class_weight = torch.tensor(class_weight, dtype=torch.float)
         else:
             self._class_weight = None
+        self._use_scheduler = use_scheduler
         self._criterion = nn.CrossEntropyLoss(weight=self._class_weight)
         self._val_preds = []
         self._val_targets = []
@@ -71,6 +73,8 @@ class StockLightningModule(pl.LightningModule):
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay,
         )
+        if not self._use_scheduler:
+            return optimizer
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=3
         )

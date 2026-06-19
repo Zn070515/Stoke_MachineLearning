@@ -93,16 +93,17 @@ def main():
             logger.warning("No data for %s, skipping", code)
             continue
 
-        X, y = pipeline.build_features(df)
+        X, y, aligned_close = pipeline.build_features(df)
         if len(X) == 0:
             logger.warning("Not enough features for %s, skipping", code)
             continue
 
-        dates = pd.to_datetime(df["date"].values)
-        folds = list(splitter.split(dates))
+        n_samples = len(X)
+        pseudo_dates = pd.date_range("2000-01-01", periods=n_samples, freq="B")
+        folds = list(splitter.split(pseudo_dates))
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
-            if train_idx[-1] >= len(X) or val_idx[-1] >= len(X):
+            if train_idx[-1] >= n_samples or val_idx[-1] >= n_samples:
                 break
 
             X_train, y_train = X[train_idx], y[train_idx]
@@ -114,7 +115,7 @@ def main():
             preds = model.predict(X_val)
             cls_metrics = compute_classification_metrics(y_val, preds)
 
-            close_prices = df["close"].values[val_idx]
+            close_prices = aligned_close[val_idx]
             fin_metrics = compute_financial_metrics(close_prices, preds)
 
             mcc = cls_metrics["mcc"]

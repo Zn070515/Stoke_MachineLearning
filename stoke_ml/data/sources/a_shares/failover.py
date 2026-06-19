@@ -12,6 +12,8 @@ import pandas as pd
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 from stoke_ml.data.sources.a_shares.efinance_source import EfinanceSource
 from stoke_ml.data.sources.a_shares.akshare_source import AKShareSource
+from stoke_ml.data.sources.a_shares.tushare_source import TushareSource
+from stoke_ml.data.sources.a_shares.baostock_source import BaostockSource
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,8 @@ class AShareDownloader:
         self._sources: list[AShareSourceBase] = [
             EfinanceSource(),
             AKShareSource(),
+            TushareSource(),
+            BaostockSource(),
         ]
         self._failure_counts: dict[str, int] = {}
         self._circuit_open: dict[str, float] = {}

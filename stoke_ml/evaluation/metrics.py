@@ -40,8 +40,10 @@ def compute_classification_metrics(
 def compute_financial_metrics(
     prices: np.ndarray, predictions: np.ndarray
 ) -> dict:
+    n_returns = len(prices) - 1
     price_returns = np.diff(prices) / prices[:-1]
-    strategy_returns = price_returns * (2 * predictions - 1)
+    preds_aligned = predictions[:n_returns]
+    strategy_returns = price_returns * (2 * preds_aligned - 1)
 
     mean_ret = float(np.mean(strategy_returns))
     std_ret = float(np.std(strategy_returns))

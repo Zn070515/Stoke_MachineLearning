@@ -73,6 +73,16 @@ class CrawlerClient:
                 method, url, headers=headers, **kwargs
             )
             session.mark_used()
+
+            if resp.status_code >= 400:
+                session.mark_bad()
+                self._rate_limiter.record_failure(domain)
+                if proxy:
+                    self._proxy_pool.mark_current_bad(domain)
+                if resp.status_code == 429:
+                    self._rate_limiter.report_429()
+                return resp
+
             session.mark_good()
             self._rate_limiter.report_success()
             self._rate_limiter.record_request(domain)

@@ -19,7 +19,11 @@ class EfinanceSource(AShareSourceBase):
             if df is None or len(df) == 0:
                 return pd.DataFrame()
             return self._normalize(df, stock_code)
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Efinance fetch failed for %s: %s", stock_code, e
+            )
             return pd.DataFrame()
 
     def _normalize(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
