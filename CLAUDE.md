@@ -114,3 +114,17 @@ Key settings: `features.seq_len=60`, `features.target_horizon=1`, `training.vali
 - **FeaturePipeline graceful degradation**: `sentiment_df=None` → trains on technical features only
 - **Data partitioned by year/month/stock**: Enables loading date ranges without scanning all files
 - **`PYTHONPATH=.` mandatory**: All scripts import from `stoke_ml` package relative to project root
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub Issues in `Zn070515/Stoke_MachineLearning` — use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context repo: one `CONTEXT.md` + `docs/adr/` at root. See `docs/agents/domain.md`.
