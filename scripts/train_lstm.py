@@ -196,7 +196,9 @@ def main():
             # Evaluate best checkpoint
             best_path = checkpoint_cb.best_model_path
             if best_path:
-                best_module = StockLightningModule.load_from_checkpoint(best_path)
+                best_module = StockLightningModule.load_from_checkpoint(
+                    best_path, weights_only=False,
+                )
                 best_module.eval()
                 best_module.to("cuda" if torch.cuda.is_available() else "cpu")
 
