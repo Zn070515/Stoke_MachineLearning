@@ -1,0 +1,47 @@
+"""AKShare data source for A-shares (fallback)."""
+import pandas as pd
+from stoke_ml.data.sources.a_shares.base import AShareSourceBase
+
+
+class AKShareSource(AShareSourceBase):
+    """Comprehensive A-share data source via AKShare scraping wrapper."""
+
+    SOURCE_NAME = "akshare"
+
+    def fetch_daily(
+        self, stock_code: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        try:
+            import akshare as ak
+            df = ak.stock_zh_a_hist(
+                symbol=stock_code, period="daily",
+                start_date=start_date.replace("-", ""),
+                end_date=end_date.replace("-", ""),
+                adjust="qfq",
+            )
+            if df is None or len(df) == 0:
+                return pd.DataFrame()
+            return self._normalize(df, stock_code)
+        except Exception:
+            return pd.DataFrame()
+
+    def _normalize(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        col_map = {
+            "日期": "date", "开盘": "open", "最高": "high",
+            "最低": "low", "收盘": "close", "成交量": "volume",
+            "成交额": "amount", "涨跌幅": "pct_change",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        cols = ["date", "open", "high", "low", "close", "volume", "amount", "pct_change"]
+        available = [c for c in cols if c in df.columns]
+        df = df[available].copy()
+        df["stock_code"] = stock_code
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
+    def is_available(self) -> bool:
+        try:
+            import akshare
+            return True
+        except ImportError:
+            return False
