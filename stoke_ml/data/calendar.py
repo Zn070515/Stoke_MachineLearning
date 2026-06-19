@@ -128,6 +128,26 @@ class TradingCalendar:
         dt.date(2026, 9, 28),
         dt.date(2026, 10, 1), dt.date(2026, 10, 2), dt.date(2026, 10, 5),
         dt.date(2026, 10, 6), dt.date(2026, 10, 7),
+        # 2027
+        dt.date(2027, 1, 1),
+        dt.date(2027, 2, 8), dt.date(2027, 2, 9), dt.date(2027, 2, 10),
+        dt.date(2027, 2, 11), dt.date(2027, 2, 12),
+        dt.date(2027, 4, 5),
+        dt.date(2027, 5, 3), dt.date(2027, 5, 4), dt.date(2027, 5, 5),
+        dt.date(2027, 6, 10), dt.date(2027, 6, 11),
+        dt.date(2027, 9, 24), dt.date(2027, 9, 27),
+        dt.date(2027, 10, 1), dt.date(2027, 10, 4), dt.date(2027, 10, 5),
+        dt.date(2027, 10, 6), dt.date(2027, 10, 7),
+        # 2028
+        dt.date(2028, 1, 3),
+        dt.date(2028, 1, 26), dt.date(2028, 1, 27), dt.date(2028, 1, 28),
+        dt.date(2028, 1, 31),
+        dt.date(2028, 4, 4), dt.date(2028, 4, 5),
+        dt.date(2028, 5, 1), dt.date(2028, 5, 2),
+        dt.date(2028, 6, 19),
+        dt.date(2028, 9, 18),
+        dt.date(2028, 10, 2), dt.date(2028, 10, 3), dt.date(2028, 10, 4),
+        dt.date(2028, 10, 5), dt.date(2028, 10, 6),
     }
 
     US_HOLIDAYS_2024 = {

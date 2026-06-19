@@ -50,6 +50,7 @@ features:
   technical_indicators: true
   rule_based_scoring: true
   temporal_features: true
+  use_sentiment: true
   target_horizon: 1
 
 # Model configuration

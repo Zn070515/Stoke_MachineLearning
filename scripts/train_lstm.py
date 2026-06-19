@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
+from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
 from stoke_ml.evaluation.metrics import mcc_score, compute_financial_metrics
@@ -64,6 +65,7 @@ def main():
     cfg = load_config(args.config)
 
     storage = DataStorage(cfg.project.data_dir)
+    news_storage = NewsStorage(cfg.project.data_dir)
     codes = [args.stock] if args.stock else available_stocks(storage)
 
     if not codes:
@@ -85,6 +87,7 @@ def main():
         use_technical=cfg.features.technical_indicators,
         use_scoring=cfg.features.rule_based_scoring,
         use_temporal=cfg.features.temporal_features,
+        use_sentiment=cfg.features.get("use_sentiment", True),
     )
     splitter = WalkForwardSplitter(
         train_years=cfg.training.validation.train_years,
@@ -102,7 +105,21 @@ def main():
             logger.warning("No data for %s, skipping", code)
             continue
 
-        X, y, aligned_close = pipeline.build_features(df)
+        # Load daily sentiment if available
+        sentiment_df = news_storage.load_daily_sentiment(
+            code,
+            start_date=cfg.markets.a_shares.start_date,
+            end_date=datetime.now().strftime("%Y-%m-%d"),
+        )
+        if not sentiment_df.empty:
+            logger.info(
+                "  %s: loaded %d sentiment days (%d with news)",
+                code, len(sentiment_df), sentiment_df["has_news"].sum(),
+            )
+
+        X, y, aligned_close = pipeline.build_features(
+            df, sentiment_df=sentiment_df if not sentiment_df.empty else None,
+        )
         if len(X) == 0:
             logger.warning("Not enough features for %s, skipping", code)
             continue

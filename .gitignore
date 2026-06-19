@@ -27,5 +27,8 @@ data/processed/
 # Jupyter
 .ipynb_checkpoints/
 
+# Models (trained artifacts)
+models/checkpoints/
+
 # wandb
 wandb/

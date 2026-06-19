@@ -1,20 +1,29 @@
-"""AKShare data source for A-shares (fallback)."""
+"""AKShare data source using Sina finance API (not EastMoney)."""
+import logging
 import pandas as pd
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
+logger = logging.getLogger(__name__)
+
 
 class AKShareSource(AShareSourceBase):
-    """Comprehensive A-share data source via AKShare scraping wrapper."""
+    """A-share data via AKShare's Sina finance wrapper."""
 
     SOURCE_NAME = "akshare"
+
+    @staticmethod
+    def _to_sina_symbol(stock_code: str) -> str:
+        prefix = "sh" if stock_code.startswith("6") else "sz"
+        return f"{prefix}{stock_code}"
 
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
         try:
             import akshare as ak
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code, period="daily",
+            symbol = self._to_sina_symbol(stock_code)
+            df = ak.stock_zh_a_daily(
+                symbol=symbol,
                 start_date=start_date.replace("-", ""),
                 end_date=end_date.replace("-", ""),
                 adjust="qfq",
@@ -23,29 +32,35 @@ class AKShareSource(AShareSourceBase):
                 return pd.DataFrame()
             return self._normalize(df, stock_code)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "AKShare fetch failed for %s: %s", stock_code, e
-            )
+            logger.warning("AKShare fetch failed for %s: %s", stock_code, e)
             return pd.DataFrame()
 
+    CN_COL_MAP = {
+        "日期": "date", "开盘": "open", "最高": "high",
+        "最低": "low", "收盘": "close", "成交量": "volume",
+        "成交额": "amount", "涨跌幅": "pct_change",
+    }
+
     def _normalize(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        col_map = {
-            "日期": "date", "开盘": "open", "最高": "high",
-            "最低": "low", "收盘": "close", "成交量": "volume",
-            "成交额": "amount", "涨跌幅": "pct_change",
-        }
-        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        cols = ["date", "open", "high", "low", "close", "volume", "amount", "pct_change"]
-        available = [c for c in cols if c in df.columns]
-        df = df[available].copy()
+        # Try Chinese column names first (older AKShare), then English
+        if any(c in df.columns for c in self.CN_COL_MAP):
+            df = df.rename(columns={
+                k: v for k, v in self.CN_COL_MAP.items() if k in df.columns
+            })
+        cols = ["date", "open", "high", "low", "close", "volume", "amount"]
+        keep = [c for c in cols if c in df.columns]
+        df = df[keep].copy()
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["pct_change"] = 0.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
     def is_available(self) -> bool:
         try:
-            import akshare
+            import akshare  # noqa: F401
             return True
         except ImportError:
             return False

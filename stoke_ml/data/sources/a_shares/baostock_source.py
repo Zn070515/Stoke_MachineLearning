@@ -25,6 +25,9 @@ class BaostockSource(AShareSourceBase):
         lg = None
         try:
             lg = bs.login()
+            if lg is None:
+                logger.warning("Baostock login returned None")
+                return pd.DataFrame()
             if lg.error_code != "0":
                 logger.warning("Baostock login failed: %s", lg.error_msg)
                 return pd.DataFrame()
@@ -44,7 +47,7 @@ class BaostockSource(AShareSourceBase):
                 frequency="d",
                 adjustflag="2",
             )
-            if rs.error_code != "0":
+            if rs is None or rs.error_code != "0":
                 logger.warning("Baostock query failed: %s", rs.error_msg)
                 bs.logout()
                 return pd.DataFrame()
