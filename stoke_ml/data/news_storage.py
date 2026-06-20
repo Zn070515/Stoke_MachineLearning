@@ -44,14 +44,26 @@ class NewsStorage:
     # ── Bronze: raw news ───────────────────────────────────────────
 
     def save_raw_news(self, stock_code: str, df: pd.DataFrame) -> None:
-        """Save raw news for a stock. Appends if file already exists."""
+        """Save raw news for a stock. Appends if file already exists.
+
+        Deduplication prefers rows with body text and known source.
+        """
         if df.empty:
             return
         path = os.path.join(self._raw_dir(), f"{stock_code}.parquet")
         existing = self.load_raw_news(stock_code)
         combined = pd.concat([existing, df], ignore_index=True)
         combined["date"] = pd.to_datetime(combined["date"])
+
+        score = 0
+        if "body" in combined.columns:
+            score += combined["body"].str.len().fillna(0).clip(upper=1)
+        if "source" in combined.columns:
+            score += combined["source"].notna().astype(int)
+        combined["_dedup_score"] = score
+        combined = combined.sort_values("_dedup_score", ascending=False)
         combined = combined.drop_duplicates(subset=["title", "date"])
+        combined = combined.drop(columns=["_dedup_score"])
         combined = combined.sort_values("date", ascending=False)
         combined.to_parquet(path, index=False)
 

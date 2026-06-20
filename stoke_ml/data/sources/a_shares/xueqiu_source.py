@@ -35,10 +35,11 @@ _API_URL = (
     "&sort=time&page={page}&q=&type=11"
 )
 
-# Singleton browser state
-_browser = None
-_context = None
-_pw_instance = None  # saved for .stop() on reconnect
+# Thread-local browser state — Playwright sync API is greenlet-bound,
+# so each thread needs its own browser/context instance.
+_tls = threading.local()
+# Guard browser creation within a single thread (CDP is not thread-safe
+# even within the same greenlet).
 _lock = threading.Lock()
 
 
@@ -53,49 +54,47 @@ def _build_symbol(stock_code: str) -> str:
 
 
 def _get_page() -> "Page":
-    """Return a page from the singleton browser context.
+    """Return a page from the thread-local browser context.
 
-    Reinitializes the browser if it was closed (e.g., process restart).
-    Fully serialized under a lock because Playwright's sync API is not
-    thread-safe — concurrent calls to new_page() on the same context can
-    corrupt the CDP WebSocket connection.
+    Each OS thread gets its own Playwright instance because the sync
+    greenlet is thread-affine.
     """
-    global _browser, _context, _pw_instance
     from playwright.sync_api import sync_playwright
 
-    with _lock:
-        if _browser is None or not _browser.is_connected():
-            if _pw_instance is not None:
-                try:
-                    _pw_instance.stop()
-                except Exception:
-                    pass
-            pw = sync_playwright().start()
-            _pw_instance = pw
-            _browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            _context = _browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1920, "height": 1080},
-                locale="zh-CN",
-            )
-            _context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
-                window.chrome = {runtime: {}};
-            """)
-        return _context.new_page()
+    if getattr(_tls, "browser", None) is None or not _tls.browser.is_connected():
+        with _lock:
+            if getattr(_tls, "browser", None) is None or not _tls.browser.is_connected():
+                if getattr(_tls, "pw_instance", None) is not None:
+                    try:
+                        _tls.pw_instance.stop()
+                    except Exception:
+                        pass
+                pw = sync_playwright().start()
+                _tls.pw_instance = pw
+                _tls.browser = pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                _tls.context = _tls.browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1920, "height": 1080},
+                    locale="zh-CN",
+                )
+                _tls.context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+                    window.chrome = {runtime: {}};
+                """)
+    return _tls.context.new_page()
 
 
 _HTML_RE = re.compile(r"<[^>]+>")
@@ -203,7 +202,9 @@ class XueqiuNewsSource:
                         break
 
                     text = item.get("text", "") or item.get("title", "") or ""
-                    title = _strip_html(text)[:300]
+                    full_text = _strip_html(text)
+                    title = full_text[:200]
+                    body = full_text[:2000] if len(full_text) > 200 else full_text[200:]
                     if not title:
                         continue
 
@@ -216,7 +217,7 @@ class XueqiuNewsSource:
                     else:
                         url = ""
 
-                    collected.append({"date": dt, "title": title, "url": url})
+                    collected.append({"date": dt, "title": title, "body": body, "url": url})
                     page_collected += 1
 
                 # Stop if this page had zero items in range (all older
@@ -225,7 +226,7 @@ class XueqiuNewsSource:
                     break
 
             if not collected:
-                return pd.DataFrame(columns=["date", "title", "url"])
+                return pd.DataFrame(columns=["date", "title", "body", "url"])
 
             df = pd.DataFrame(collected)
             df["date"] = pd.to_datetime(df["date"])
@@ -235,11 +236,11 @@ class XueqiuNewsSource:
             df = df.drop_duplicates(subset=["title", "date"])
             df = df.sort_values("date", ascending=False)
 
-            return df[["date", "title", "url"]].reset_index(drop=True)
+            return df[["date", "title", "body", "url"]].reset_index(drop=True)
 
         except Exception as e:
             logger.debug("Xueqiu fetch for %s failed: %s", stock_code, e)
-            return pd.DataFrame(columns=["date", "title", "url"])
+            return pd.DataFrame(columns=["date", "title", "body", "url"])
         finally:
             if page is not None:
                 try:

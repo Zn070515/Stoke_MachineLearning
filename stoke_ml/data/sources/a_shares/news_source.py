@@ -77,6 +77,7 @@ class SinaNewsSource:
                                     all_items.append({
                                         "date": current_date,
                                         "title": title,
+                                        "body": "",
                                         "url": href,
                                     })
                 if not found:
@@ -86,7 +87,7 @@ class SinaNewsSource:
                 break
 
         if not all_items:
-            return pd.DataFrame(columns=["date", "title", "url"])
+            return pd.DataFrame(columns=["date", "title", "body", "url"])
 
         df = pd.DataFrame(all_items)
         df["date"] = pd.to_datetime(df["date"])

@@ -53,8 +53,8 @@ def main():
                         help="Comma-separated stock codes (default: all on disk)")
     parser.add_argument("--source", type=str, default="all",
                         help="News source(s): sina, xueqiu, ths, all (default: all)")
-    parser.add_argument("--max-pages", type=int, default=3,
-                        help="Pages per stock per source (default: 3)")
+    parser.add_argument("--max-pages", type=int, default=20,
+                        help="Pages per stock per source (default: 20)")
     parser.add_argument("--sleep", type=float, default=None,
                         help="Seconds between stocks (default: from config)")
     parser.add_argument("--skip-sentiment", action="store_true",

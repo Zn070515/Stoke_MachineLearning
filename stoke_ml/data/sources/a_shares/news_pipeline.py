@@ -64,13 +64,20 @@ class NewsPipeline:
                 logger.debug("  %s: source %s failed: %s", stock_code, source_name, e)
 
         if not all_frames:
-            return pd.DataFrame(columns=["date", "title", "url", "source"])
+            return pd.DataFrame(columns=["date", "title", "body", "url", "source"])
 
         combined = pd.concat(all_frames, ignore_index=True)
         combined["date"] = pd.to_datetime(combined["date"])
 
-        # Deduplicate across sources: keep first occurrence
-        combined = combined.drop_duplicates(subset=["title", "date"])
+        # Deduplicate across sources: prefer rows with body text
+        if "body" in combined.columns:
+            combined["_body_len"] = combined["body"].str.len().fillna(0)
+            combined = combined.sort_values("_body_len", ascending=False)
+            combined = combined.drop_duplicates(subset=["title", "date"])
+            combined = combined.drop(columns=["_body_len"])
+        else:
+            combined = combined.drop_duplicates(subset=["title", "date"])
+
         combined = combined.sort_values("date", ascending=False)
 
         return combined.reset_index(drop=True)
