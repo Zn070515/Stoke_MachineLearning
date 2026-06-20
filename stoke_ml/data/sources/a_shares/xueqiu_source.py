@@ -56,14 +56,15 @@ def _get_page() -> "Page":
     """Return a page from the singleton browser context.
 
     Reinitializes the browser if it was closed (e.g., process restart).
-    Thread-safe: uses a lock to prevent race conditions on singleton state.
+    Fully serialized under a lock because Playwright's sync API is not
+    thread-safe — concurrent calls to new_page() on the same context can
+    corrupt the CDP WebSocket connection.
     """
     global _browser, _context, _pw_instance
     from playwright.sync_api import sync_playwright
 
     with _lock:
         if _browser is None or not _browser.is_connected():
-            # Stop old Playwright instance before creating a new one
             if _pw_instance is not None:
                 try:
                     _pw_instance.stop()
@@ -94,7 +95,7 @@ def _get_page() -> "Page":
                 Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
                 window.chrome = {runtime: {}};
             """)
-    return _context.new_page()
+        return _context.new_page()
 
 
 _HTML_RE = re.compile(r"<[^>]+>")

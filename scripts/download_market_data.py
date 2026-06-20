@@ -118,7 +118,7 @@ def main():
                         stock_list,
                         lambda c: source.fetch_by_stock(c, args.start, args.end),
                     )
-                    frames = [d for d in results.values() if not d.empty]
+                    frames = [d for d in results.values() if d is not None and not d.empty]
                 else:
                     frames = []
                     for code in stock_list:

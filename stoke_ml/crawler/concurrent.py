@@ -26,7 +26,7 @@ class ConcurrentDownloader:
         stock_codes: list[str],
         fetch_fn,
         sleep_between: float = 0.5,
-    ) -> dict[str, pd.DataFrame]:
+    ) -> dict[str, pd.DataFrame | None]:
         """Download data for all stocks concurrently.
 
         Args:
@@ -35,9 +35,9 @@ class ConcurrentDownloader:
             sleep_between: Min seconds between HTTP calls (enforced via rate limiter).
 
         Returns:
-            Dict mapping stock_code -> DataFrame (empty DF on failure).
+            Dict mapping stock_code -> DataFrame, or None on failure.
         """
-        results: dict[str, pd.DataFrame] = {}
+        results: dict[str, pd.DataFrame | None] = {}
         failures: dict[str, str] = {}
 
         def _worker(code: str) -> tuple[str, pd.DataFrame | None, str | None]:
@@ -55,11 +55,9 @@ class ConcurrentDownloader:
                 code, df, err = future.result()
                 if err:
                     failures[code] = err
-                    results[code] = pd.DataFrame()
-                elif df is None:
-                    results[code] = pd.DataFrame()
+                    results[code] = None
                 else:
-                    results[code] = df
+                    results[code] = df if df is not None else pd.DataFrame()
 
         if failures:
             logger.warning(

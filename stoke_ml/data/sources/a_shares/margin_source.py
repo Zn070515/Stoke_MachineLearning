@@ -118,7 +118,7 @@ class MarginTradingSource:
             df["stock_code"] = df["stock_code"].astype(str).str.replace(".0", "").str.zfill(6)
 
         # Ensure numeric columns
-        for col in ["margin_buy", "margin_repay", "short_sell_vol"]:
+        for col in ["margin_buy", "margin_repay", "short_sell_vol", "short_repay_vol"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
