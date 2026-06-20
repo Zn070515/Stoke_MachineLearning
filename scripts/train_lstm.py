@@ -2,6 +2,7 @@
 import argparse
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime
 
@@ -167,6 +168,7 @@ def main():
                 dropout=0.3,
                 learning_rate=cfg.training.learning_rate,
                 class_weight=class_weight,
+                use_scheduler=False,
             )
 
             checkpoint_cb = pl.callbacks.ModelCheckpoint(
@@ -292,7 +294,6 @@ def main():
 
             best_path = final_checkpoint_cb.best_model_path
             if best_path:
-                import shutil
                 model_path = os.path.join(output_dir, f"lstm_{code}_final.ckpt")
                 shutil.copy2(best_path, model_path)
                 logger.info("  Final model saved to %s", model_path)

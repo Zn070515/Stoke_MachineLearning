@@ -179,8 +179,8 @@ def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> 
         "mcc_std": float(np.std(all_val_mcc)),
         "mcc_max": float(np.max(all_val_mcc)),
         "mcc_min": float(np.min(all_val_mcc)),
-        "sharpe_mean": float(np.mean(all_val_sharpe)),
-        "sharpe_std": float(np.std(all_val_sharpe)),
+        "sharpe_mean": float(np.mean(all_val_sharpe)) if all_val_sharpe else 0.0,
+        "sharpe_std": float(np.std(all_val_sharpe)) if all_val_sharpe else 0.0,
     }
 
 
