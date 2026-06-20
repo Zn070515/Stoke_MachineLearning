@@ -233,13 +233,27 @@ def main():
             )
 
             # Retrain on all data for final model
-            logger.info("  Retraining on full dataset for %s", code)
-            full_ds = StockDataset(X, y)
-            full_loader = DataLoader(
-                full_ds, batch_size=batch_size, shuffle=True, num_workers=0,
+            # Keep last 20% as validation for early stopping,
+            # preserve temporal order (no shuffle in time series)
+            n_total = len(X)
+            n_val = max(int(n_total * 0.2), 1)
+            X_final_train, X_final_val = X[:-n_val], X[-n_val:]
+            y_final_train, y_final_val = y[:-n_val], y[-n_val:]
+
+            logger.info("  Retraining final model for %s (%d train / %d val)",
+                        code, len(X_final_train), len(X_final_val))
+
+            train_ds = StockDataset(X_final_train, y_final_train)
+            val_ds = StockDataset(X_final_val, y_final_val)
+            final_train_loader = DataLoader(
+                train_ds, batch_size=batch_size, shuffle=False, num_workers=0,
             )
-            n_neg = (y == 0).sum()
-            n_pos = (y == 1).sum()
+            final_val_loader = DataLoader(
+                val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
+            )
+
+            n_neg = (y_final_train == 0).sum()
+            n_pos = (y_final_train == 1).sum()
             if n_pos > 0 and n_neg > 0:
                 final_class_weight = [1.0, n_neg / n_pos]
             else:
@@ -252,16 +266,28 @@ def main():
                 dropout=0.3,
                 learning_rate=cfg.training.learning_rate,
                 class_weight=final_class_weight,
-                use_scheduler=False,
+            )
+            final_checkpoint_cb = pl.callbacks.ModelCheckpoint(
+                dirpath=os.path.join(output_dir, "lstm_checkpoints"),
+                filename=f"{code}_final",
+                monitor="val_loss",
+                mode="min",
+                save_top_k=1,
+            )
+            final_early_stop_cb = pl.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=cfg.training.early_stopping_patience,
+                mode="min",
             )
             final_trainer = pl.Trainer(
                 max_epochs=max_epochs,
                 accelerator="auto",
                 devices=1,
+                callbacks=[final_checkpoint_cb, final_early_stop_cb],
                 enable_progress_bar=True,
                 log_every_n_steps=10,
             )
-            final_trainer.fit(final_module, full_loader)
+            final_trainer.fit(final_module, final_train_loader, final_val_loader)
 
             model_path = os.path.join(output_dir, f"lstm_{code}_final.ckpt")
             final_trainer.save_checkpoint(model_path)

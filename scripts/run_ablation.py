@@ -34,10 +34,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_STOCKS = ["600519", "000858", "601318", "000001", "600036"]
 
 
-def run_xgboost(X, y, aligned_close, folds, output_dir, code, tag):
+def run_xgboost(X, y, aligned_close, folds, model_params, output_dir, code, tag):
     """Run XGBoost on given features."""
-    model_params = {"n_estimators": 200, "max_depth": 6, "learning_rate": 0.1,
-                    "subsample": 0.8, "colsample_bytree": 0.8}
     n_samples = len(X)
     results = []
 
@@ -58,7 +56,7 @@ def run_xgboost(X, y, aligned_close, folds, output_dir, code, tag):
     return results
 
 
-def run_lstm(X, y, folds, n_features, cfg, output_dir, code, tag):
+def run_lstm(X, y, aligned_close, folds, n_features, cfg, output_dir, code, tag):
     """Run LSTM on given features."""
     import torch
     import pytorch_lightning as pl
@@ -121,7 +119,10 @@ def run_lstm(X, y, folds, n_features, cfg, output_dir, code, tag):
                     all_preds.append(preds)
             val_preds = np.concatenate(all_preds)
             val_mcc = mcc_score(y_val, val_preds)
-            results.append({"fold": fold_idx, "mcc": val_mcc})
+            close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
+            fin_m = compute_financial_metrics(close_prices, val_preds)
+            results.append({"fold": fold_idx, "mcc": val_mcc,
+                           "sharpe": fin_m["sharpe"]})
 
     return results
 
@@ -190,13 +191,16 @@ def main():
                     pseudo_dates = pd.date_range("2000-01-01", periods=len(X), freq="B")
                     folds = list(splitter.split(pseudo_dates))
                     t0 = time.time()
-                    xgb_results = run_xgboost(X, y, ac, folds, output_dir, code, label)
+                    model_params = dict(cfg.model.params)
+                    xgb_results = run_xgboost(X, y, ac, folds, model_params, output_dir, code, label)
                     mccs = [r["mcc"] for r in xgb_results]
                     logger.info("  XGBoost %s | MCC=%.4f ± %.4f [%d folds] %.1fs",
                                 label, np.mean(mccs), np.std(mccs), len(mccs), time.time() - t0)
                     for r in xgb_results:
                         all_results.append({"stock": code, "model": "XGBoost",
                                             "sentiment": use_sent, **r})
+                else:
+                    logger.warning("  XGBoost %s | No features generated, skipping", label)
 
             # LSTM (sequence mode)
             if args.model in ("lstm", "both"):
@@ -215,7 +219,7 @@ def main():
                     pseudo_dates = pd.date_range("2000-01-01", periods=len(X), freq="B")
                     folds = list(splitter.split(pseudo_dates))
                     t0 = time.time()
-                    lstm_results = run_lstm(X, y, folds, n_features, cfg, output_dir, code, label)
+                    lstm_results = run_lstm(X, y, ac, folds, n_features, cfg, output_dir, code, label)
                     if lstm_results:
                         mccs = [r["mcc"] for r in lstm_results]
                         logger.info("  LSTM %s    | MCC=%.4f ± %.4f [%d folds] %.1fs",
@@ -223,6 +227,8 @@ def main():
                         for r in lstm_results:
                             all_results.append({"stock": code, "model": "LSTM",
                                                 "sentiment": use_sent, **r})
+                else:
+                    logger.warning("  LSTM %s | No features generated, skipping", label)
 
     # Summary
     if all_results:

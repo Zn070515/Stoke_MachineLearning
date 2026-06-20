@@ -130,7 +130,7 @@
 | 术语 | 含义 |
 |------|------|
 | **MCC** (Matthews Correlation Coefficient) | **主要评估指标**，适用于不平衡二分类 |
-| Walk-Forward 验证 | 扩展窗口滚动验证，严格时序拆分，**绝不打乱** |
+| Walk-Forward 验证 | 固定窗口滑动验证（2年训练/3月验证/3月步长），严格时序拆分，**绝不打乱** |
 | Sharpe Ratio | 年化夏普比率 = (日均收益/日收益标准差) × sqrt(252) |
 | Max Drawdown | 最大回撤 |
 | Win Rate | 胜率 = 正收益交易占比 |

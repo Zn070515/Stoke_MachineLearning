@@ -91,7 +91,7 @@ Each source implements `AShareSourceBase` and has a `SOURCE_NAME` string. The do
 
 ### Evaluation (`stoke_ml/evaluation/`)
 
-- `WalkForwardSplitter`: Expanding window with chronological splits only (NO shuffle). Default: 2yr train / 3mo validation / 3mo step.
+- `WalkForwardSplitter`: Fixed-size sliding window with chronological splits only (NO shuffle). Default: 2yr train / 3mo validation / 3mo step.
 - `compute_classification_metrics(y_true, y_pred)`: MCC (primary), accuracy, precision, recall, F1
 - `compute_financial_metrics(close_prices, predictions)`: Sharpe, max drawdown, win rate, profit factor
 - `aligned_close` in pipeline output has `n_samples+1` elements to produce `n_samples` returns matching `n_samples` predictions

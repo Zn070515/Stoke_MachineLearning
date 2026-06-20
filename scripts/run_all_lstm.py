@@ -18,26 +18,25 @@ import pandas as pd
 from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
-from stoke_ml.evaluation.metrics import mcc_score
-from stoke_ml.models.baseline.xgboost_model import XGBoostBaseline
+from stoke_ml.evaluation.metrics import mcc_score, compute_financial_metrics
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("run_all_lstm.log"),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
 
-def get_stocks_ranked(data_dir: str, top_n: int | None = None) -> list[str]:
-    """Get stocks ranked by news coverage (most news first)."""
+def get_stocks_ranked(data_dir: str, top_n: int | None = None) -> tuple[list[str], dict[str, int]]:
+    """Get stocks ranked by news coverage (most news first).
+
+    Returns (ordered_stocks, counts_dict) to avoid reloading raw news later.
+    """
     news = NewsStorage(data_dir)
     stocks = news.list_stocks_with_raw_news()
     if not stocks:
-        return []
+        return [], {}
 
     counts = {}
     for code in stocks:
@@ -47,14 +46,13 @@ def get_stocks_ranked(data_dir: str, top_n: int | None = None) -> list[str]:
     ranked = sorted(counts.items(), key=lambda x: -x[1])
     if top_n:
         ranked = ranked[:top_n]
-    return [code for code, _ in ranked]
+    return [code for code, _ in ranked], counts
 
 
 def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> dict:
     """Run LSTM on a single stock, return summary dict."""
     from stoke_ml.features.pipeline import FeaturePipeline
     from stoke_ml.evaluation.splitter import WalkForwardSplitter
-    from stoke_ml.evaluation.metrics import compute_financial_metrics
     from stoke_ml.models.dl.dataset import StockDataset
     from stoke_ml.models.dl.lightning_module import StockLightningModule
 
@@ -105,6 +103,7 @@ def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> 
     batch_size = cfg.training.batch_size
     max_epochs = cfg.training.epochs
     all_val_mcc = []
+    all_val_sharpe = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         if train_idx[-1] >= n_samples or val_idx[-1] >= n_samples:
@@ -161,6 +160,10 @@ def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> 
             val_preds = np.concatenate(all_preds)
             val_mcc = mcc_score(y_val, val_preds)
             all_val_mcc.append(val_mcc)
+            # Financial metrics per fold
+            close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
+            fin_m = compute_financial_metrics(close_prices, val_preds)
+            all_val_sharpe.append(fin_m["sharpe"])
 
     if not all_val_mcc:
         return {"stock": code, "status": "no_folds"}
@@ -176,6 +179,8 @@ def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> 
         "mcc_std": float(np.std(all_val_mcc)),
         "mcc_max": float(np.max(all_val_mcc)),
         "mcc_min": float(np.min(all_val_mcc)),
+        "sharpe_mean": float(np.mean(all_val_sharpe)),
+        "sharpe_std": float(np.std(all_val_sharpe)),
     }
 
 
@@ -189,21 +194,27 @@ def main():
                         help="Resume from this stock code")
     args = parser.parse_args()
 
+    # Add file logging inside main() so import-time failures don't crash
+    try:
+        file_handler = logging.FileHandler("run_all_lstm.log")
+        logging.getLogger().addHandler(file_handler)
+    except (PermissionError, OSError) as e:
+        logger.warning("Cannot write log file: %s — logging to console only", e)
+
     cfg = load_config()
     storage = DataStorage(cfg.project.data_dir)
     news_storage = NewsStorage(cfg.project.data_dir)
     output_dir = cfg.project.model_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    stocks = get_stocks_ranked(cfg.project.data_dir, args.top)
+    stocks, counts = get_stocks_ranked(cfg.project.data_dir, args.top)
     if not stocks:
         logger.error("No stocks found.")
         sys.exit(1)
 
     logger.info("Stocks to process: %d", len(stocks))
     for i, code in enumerate(stocks):
-        raw = news_storage.load_raw_news(code)
-        logger.info("  %3d. %s — %d articles", i + 1, code, len(raw))
+        logger.info("  %3d. %s — %d articles", i + 1, code, counts.get(code, 0))
 
     if args.dry_run:
         return
