@@ -24,14 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TYPE_MAP = {
-    "margin": ("dragon_tiger", None),  # placeholder, handled separately below
-    "dragon_tiger": ("dragon_tiger", DragonTigerSource),
-    "northbound": ("northbound", NorthboundSource),
-    "all": None,
-}
-
-
 def main():
     parser = argparse.ArgumentParser(description="Download A-share market data")
     parser.add_argument("--type", type=str, default="all",
@@ -43,8 +35,8 @@ def main():
                         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--stocks", type=str, default=None,
                         help="Comma-separated stock codes (default: all)")
-    parser.add_argument("--sleep", type=float, default=0.5,
-                        help="Seconds between API calls (default: 0.5)")
+    parser.add_argument("--sleep", type=float, default=None,
+                        help="Seconds between API calls (default: from config)")
     parser.add_argument("--concurrent", action="store_true",
                         help="Use concurrent downloader")
     args = parser.parse_args()
@@ -56,15 +48,18 @@ def main():
     cfg = load_config()
     data_dir = cfg.project.data_dir
 
+    if args.sleep is None:
+        args.sleep = float(cfg.crawler.rate_limit.base_delay_sec)
+
     to_download = []
     if args.type == "all":
         to_download = [
-            ("margin", MarginTradingSource, "margin_trading"),
+            ("margin", MarginTradingSource, "margin"),
             ("dragon_tiger", DragonTigerSource, "dragon_tiger"),
             ("northbound", NorthboundSource, "northbound"),
         ]
     elif args.type == "margin":
-        to_download = [("margin", MarginTradingSource, "margin_trading")]
+        to_download = [("margin", MarginTradingSource, "margin")]
     elif args.type == "dragon_tiger":
         to_download = [("dragon_tiger", DragonTigerSource, "dragon_tiger")]
     elif args.type == "northbound":
@@ -83,20 +78,99 @@ def main():
         storage = MarketWideStorage(data_dir, storage_type)
 
         if label == "margin":
-            df = source.fetch_daily(args.start, args.end)
+            # Fetch year-by-year with incremental saves to survive interruptions
+            start_dt = pd.Timestamp(args.start).date()
+            end_dt = pd.Timestamp(args.end).date()
+            all_frames = []
+            for year in range(start_dt.year, end_dt.year + 1):
+                y_start = f"{year}-01-01"
+                y_end = f"{min(year, end_dt.year)}-12-31"
+                if year == start_dt.year:
+                    y_start = args.start
+                if year == end_dt.year:
+                    y_end = args.end
+                logger.info("  margin: downloading %s to %s", y_start, y_end)
+                y_df = source.fetch_daily(y_start, y_end)
+                if y_df is not None and not y_df.empty:
+                    storage.save(y_df)
+                    all_frames.append(y_df)
+                    logger.info("  margin saved %d rows for year %d", len(y_df), year)
+                else:
+                    logger.warning("  margin: no data for year %d", year)
+            df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
         elif label == "dragon_tiger":
             if args.stocks:
-                frames = []
-                for code in [c.strip() for c in args.stocks.split(",")]:
-                    sdf = source.fetch_by_stock(code, args.start, args.end)
-                    if not sdf.empty:
-                        frames.append(sdf)
-                    time.sleep(args.sleep)
+                stock_list = [c.strip() for c in args.stocks.split(",")]
+                if args.concurrent:
+                    from stoke_ml.crawler.rate_limiter import RateLimiter
+                    from stoke_ml.crawler.concurrent import ConcurrentDownloader
+
+                    rate_limiter = RateLimiter(
+                        base_delay_sec=args.sleep,
+                        daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
+                    )
+                    downloader = ConcurrentDownloader(
+                        rate_limiter=rate_limiter, max_workers=4,
+                    )
+                    results = downloader.download_all(
+                        stock_list,
+                        lambda c: source.fetch_by_stock(c, args.start, args.end),
+                    )
+                    frames = [d for d in results.values() if not d.empty]
+                else:
+                    frames = []
+                    for code in stock_list:
+                        sdf = source.fetch_by_stock(code, args.start, args.end)
+                        if not sdf.empty:
+                            frames.append(sdf)
+                        time.sleep(args.sleep)
                 df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             else:
                 df = source.fetch_daily(args.start, args.end)
         elif label == "northbound":
-            df = source.fetch_individual(args.start, args.end)
+            stock_codes = None
+            if args.stocks:
+                stock_codes = [c.strip() for c in args.stocks.split(",")]
+            if stock_codes and args.concurrent:
+                from stoke_ml.crawler.rate_limiter import RateLimiter
+                from stoke_ml.crawler.concurrent import ConcurrentDownloader
+
+                rate_limiter = RateLimiter(
+                    base_delay_sec=args.sleep,
+                    daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
+                )
+                downloader = ConcurrentDownloader(
+                    rate_limiter=rate_limiter, max_workers=4,
+                )
+                results = downloader.download_all(
+                    stock_codes,
+                    lambda c: source.fetch_individual(
+                        args.start, args.end, stock_codes=[c],
+                    ),
+                )
+                frames = [d for d in results.values() if not d.empty]
+                df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            elif stock_codes:
+                # Save incrementally in batches of 50 to avoid timeout
+                batch_size = 50
+                all_frames = []
+                for i in range(0, len(stock_codes), batch_size):
+                    batch = stock_codes[i:i + batch_size]
+                    batch_df = source.fetch_individual(
+                        args.start, args.end, stock_codes=batch,
+                    )
+                    if batch_df is not None and not batch_df.empty:
+                        all_frames.append(batch_df)
+                        storage.save(batch_df)
+                        logger.info("  saved batch %d/%d: %d rows",
+                                    i // batch_size + 1,
+                                    (len(stock_codes) + batch_size - 1) // batch_size,
+                                    len(batch_df))
+                df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+                logger.info("  northbound: %d rows total (%d batches)",
+                            len(df), len(all_frames))
+            else:
+                df = source.fetch_individual(args.start, args.end, stock_codes=stock_codes)
         else:
             df = pd.DataFrame()
 

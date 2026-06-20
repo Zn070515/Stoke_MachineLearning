@@ -36,7 +36,11 @@ class THSNewsSource:
             return pd.DataFrame(columns=["date", "title", "url"])
 
         try:
-            df = ak.stock_news_em(stock=stock_code)
+            # Work around pandas pyarrow backend incompatibility in AKShare
+            old_backend = pd.options.mode.string_storage
+            pd.options.mode.string_storage = "python"
+            df = ak.stock_news_em(symbol=stock_code)
+            pd.options.mode.string_storage = old_backend
         except Exception as e:
             logger.debug("THS/AKShare news failed for %s: %s", stock_code, e)
             return pd.DataFrame(columns=["date", "title", "url"])
@@ -91,5 +95,9 @@ class THSNewsSource:
             df = df[df["date"] >= pd.Timestamp(start_date)]
         if end_date:
             df = df[df["date"] <= pd.Timestamp(end_date)]
+
+        # Respect max_pages (approximate: ~20 items per page)
+        if max_pages and len(df) > max_pages * 20:
+            df = df.head(max_pages * 20)
 
         return df[["date", "title", "url"]].reset_index(drop=True)

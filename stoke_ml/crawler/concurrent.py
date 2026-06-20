@@ -56,8 +56,10 @@ class ConcurrentDownloader:
                 if err:
                     failures[code] = err
                     results[code] = pd.DataFrame()
+                elif df is None:
+                    results[code] = pd.DataFrame()
                 else:
-                    results[code] = df or pd.DataFrame()
+                    results[code] = df
 
         if failures:
             logger.warning(

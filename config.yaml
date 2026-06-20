@@ -50,7 +50,8 @@ crawler:
 
 # Feature configuration
 features:
-  seq_len: 60
+  seq_len: 60          # 序列长度 (LSTM用)
+  flat_seq_len: 5      # XGBoost flat模式序列长度 (小值防维度爆炸)
   technical_indicators: true
   rule_based_scoring: true
   temporal_features: true

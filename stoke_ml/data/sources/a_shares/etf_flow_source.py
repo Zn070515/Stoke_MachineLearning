@@ -1,4 +1,4 @@
-"""Sector ETF fund flow data via EastMoney API."""
+"""Sector ETF fund flow data via AKShare (Sina source)."""
 import logging
 import os
 
@@ -6,30 +6,20 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from curl_cffi import requests
-
 logger = logging.getLogger(__name__)
 
-ETF_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-
-ETF_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://quote.eastmoney.com/",
-}
-
-# Mapping file relative to project root
 DEFAULT_MAPPING_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))),
     "config", "sector_etf_mapping.yaml",
 )
 
 
 class SectorETFFlowSource:
-    """Fetch sector-level ETF fund flows and attribute to stocks."""
+    """Fetch sector-level ETF fund flows and attribute to stocks.
+
+    Uses AKShare fund_etf_hist_sina (Sina-based, accessible globally)
+    for daily OHLCV data, then computes flow from volume × price changes.
+    """
 
     def __init__(self, mapping_path: str | None = None):
         self._mapping_path = mapping_path or DEFAULT_MAPPING_PATH
@@ -48,70 +38,57 @@ class SectorETFFlowSource:
             return {}
 
     def get_etf_codes(self) -> list[str]:
-        """Get all ETF codes from the mapping."""
         codes = []
         for sector_info in self._sector_map.values():
             codes.extend(sector_info.get("etf_codes", []))
         return list(set(codes))
 
+    @staticmethod
+    def _to_sina_symbol(etf_code: str) -> str:
+        """Convert 6-digit code to Sina symbol (shXXXXXX or szXXXXXX)."""
+        code = str(etf_code).zfill(6)
+        if code.startswith(("5", "6", "9")):
+            return f"sh{code}"
+        return f"sz{code}"
+
     def fetch_etf_daily(
         self, etf_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """Fetch daily K-line (includes volume/amount) for a single ETF.
-
-        Uses volume and amount as proxies for fund flow.
-        """
-        secid = self._to_eastmoney_secid(etf_code)
-        params = {
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57",
-            "klt": "101",
-            "fqt": "1",
-            "secid": secid,
-            "beg": start_date.replace("-", ""),
-            "end": end_date.replace("-", ""),
-            "rtntype": "6",
-        }
-
+        """Fetch daily K-line for a single ETF via AKShare (Sina source)."""
         try:
-            resp = requests.get(
-                ETF_KLINE_URL, params=params, headers=ETF_HEADERS,
-                impersonate="chrome120", timeout=15,
-            )
-            if resp.status_code != 200:
-                logger.debug("ETF %s fetch failed: HTTP %d", etf_code, resp.status_code)
-                return pd.DataFrame()
-
-            data = resp.json()
-            if data.get("data") is None or data["data"].get("klines") is None:
-                return pd.DataFrame()
-
-            klines = data["data"]["klines"]
-            if not klines:
-                return pd.DataFrame()
-
-            rows = [line.split(",") for line in klines]
-            df = pd.DataFrame(rows, columns=[
-                "date", "open", "close", "high", "low",
-                "volume", "amount",
-            ])
-            df["date"] = pd.to_datetime(df["date"])
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-            df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-            df["pct_change"] = pd.to_numeric(df["close"], errors="coerce").pct_change()
-            df["etf_code"] = etf_code
-            df["etf_flow"] = df["amount"] * np.sign(df["pct_change"])
-            return df[["date", "etf_code", "volume", "amount", "pct_change", "etf_flow"]]
-
-        except Exception as e:
-            logger.debug("ETF %s fetch error: %s", etf_code, e)
+            import akshare as ak
+        except ImportError:
+            logger.warning("AKShare not available for ETF flow data")
             return pd.DataFrame()
 
-    @staticmethod
-    def _to_eastmoney_secid(etf_code: str) -> str:
-        if etf_code.startswith(("5", "6", "9")):
-            return f"1.{etf_code}"
-        return f"0.{etf_code}"
+        symbol = self._to_sina_symbol(etf_code)
+        try:
+            raw = ak.fund_etf_hist_sina(symbol=symbol)
+        except Exception as e:
+            logger.debug("ETF %s (%s) fetch failed: %s", etf_code, symbol, e)
+            return pd.DataFrame()
+
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+
+        df = raw.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+
+        # Filter date range
+        start_dt = pd.Timestamp(start_date)
+        end_dt = pd.Timestamp(end_date)
+        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)]
+
+        if df.empty:
+            return pd.DataFrame()
+
+        df["etf_code"] = etf_code
+        df["pct_change"] = df["close"].pct_change()
+        df["etf_flow"] = df["amount"] * np.sign(df["pct_change"])
+        return df[["date", "etf_code", "volume", "amount", "pct_change", "etf_flow"]]
 
     def fetch_sector_flow(
         self, sector_name: str, start_date: str, end_date: str

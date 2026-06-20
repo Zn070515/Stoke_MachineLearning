@@ -1,5 +1,6 @@
 """North-bound capital / Stock Connect (北向资金) data via AKShare."""
 import logging
+import time
 
 import pandas as pd
 
@@ -18,11 +19,15 @@ class NorthboundSource:
     SOURCE_NAME = "akshare_hsgt"
 
     def fetch_individual(
-        self, start_date: str, end_date: str
+        self,
+        start_date: str,
+        end_date: str,
+        stock_codes: list[str] | None = None,
+        sleep: float = 0.5,
     ) -> pd.DataFrame:
         """Fetch individual stock northbound holdings and flows.
 
-        Returns per-stock daily data: holdings, value, net buy.
+        Uses stock_hsgt_individual_em per-stock (returns full history, date-filtered after).
         """
         try:
             import akshare as ak
@@ -30,36 +35,24 @@ class NorthboundSource:
             logger.warning("AKShare not available for northbound data")
             return pd.DataFrame()
 
-        frames = []
+        if not stock_codes:
+            logger.warning("No northbound stock codes specified")
+            return pd.DataFrame()
 
-        # Try SSE (沪股通)
-        for market, func in [
-            ("north", ak.stock_hsgt_individual_em),
-        ]:
+        frames = []
+        for code in stock_codes:
             try:
-                # AKShare stock_hsgt_individual_em returns latest data
-                # For historical, use stock_hsgt_hist_em
-                df = func(
-                    start_date=start_date.replace("-", ""),
-                    end_date=end_date.replace("-", ""),
-                )
+                df = ak.stock_hsgt_individual_em(symbol=code)
                 if df is not None and not df.empty:
                     df = self._normalize(df)
-                    frames.append(df)
-            except Exception as e:
-                logger.debug("Northbound individual fetch failed: %s", e)
-                break
-
-        # Also try historical net flow
-        try:
-            import akshare as ak
-            hist = ak.stock_hsgt_hist_em(symbol="北向资金")
-            if hist is not None and not hist.empty:
-                hist["stock_code"] = "999999"  # market aggregate
-                hist = self._normalize(hist)
-                frames.append(hist)
-        except Exception:
-            pass
+                    df["stock_code"] = str(code).replace(".0", "").zfill(6)
+                    if "date" in df.columns:
+                        df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+                    if not df.empty:
+                        frames.append(df)
+            except Exception:
+                pass
+            time.sleep(sleep)
 
         if not frames:
             return pd.DataFrame()
@@ -92,22 +85,18 @@ class NorthboundSource:
 
         col_map = {}
         for col in df.columns:
-            if "日期" in col or "date" in col.lower():
+            if col in ("持股日期",) or "date" in col.lower():
                 col_map[col] = "date"
             elif "代码" in col or "code" in col.lower():
                 col_map[col] = "stock_code"
-            elif "持股数" in col or "hold_shares" in col.lower():
+            elif col in ("持股数量",) or "hold_shares" in col.lower():
                 col_map[col] = "north_hold_shares"
-            elif "持股市值" in col or "hold_value" in col.lower():
+            elif col in ("持股市值",) or "hold_value" in col.lower():
                 col_map[col] = "north_hold_value"
-            elif "持股比例" in col or "hold_pct" in col.lower():
+            elif "持股比例" in col or "百分比" in col or "hold_pct" in col.lower():
                 col_map[col] = "north_hold_pct"
-            elif "净买入" in col or "net_buy" in col.lower():
+            elif col in ("今日增持资金",) or "net_buy" in col.lower():
                 col_map[col] = "north_net_buy"
-            elif "买入金额" in col or "buy_amount" in col.lower():
-                col_map[col] = "north_buy_amount"
-            elif "卖出金额" in col or "sell_amount" in col.lower():
-                col_map[col] = "north_sell_amount"
 
         if col_map:
             df = df.rename(columns=col_map)
@@ -116,7 +105,7 @@ class NorthboundSource:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
         if "stock_code" in df.columns:
-            df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+            df["stock_code"] = df["stock_code"].astype(str).str.replace(".0", "").str.zfill(6)
 
         for col in ["north_hold_pct", "north_net_buy"]:
             if col in df.columns:

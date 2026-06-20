@@ -55,8 +55,8 @@ def main():
                         help="News source(s): sina, xueqiu, ths, all (default: all)")
     parser.add_argument("--max-pages", type=int, default=3,
                         help="Pages per stock per source (default: 3)")
-    parser.add_argument("--sleep", type=float, default=1.0,
-                        help="Seconds between stocks (default: 1.0)")
+    parser.add_argument("--sleep", type=float, default=None,
+                        help="Seconds between stocks (default: from config)")
     parser.add_argument("--skip-sentiment", action="store_true",
                         help="Skip sentiment computation (raw only)")
     parser.add_argument("--concurrent", action="store_true",
@@ -71,6 +71,9 @@ def main():
 
     cfg = load_config(args.config)
     data_dir = cfg.project.data_dir
+
+    if args.sleep is None:
+        args.sleep = float(cfg.crawler.rate_limit.base_delay_sec)
 
     if args.stocks:
         codes = [c.strip() for c in args.stocks.split(",")]
@@ -102,53 +105,108 @@ def main():
     total_articles = 0
     success, fail, empty = 0, 0, 0
 
-    for i, code in enumerate(codes):
-        if i > 0:
-            time.sleep(args.sleep)
+    if args.concurrent:
+        from stoke_ml.crawler.rate_limiter import RateLimiter
+        from stoke_ml.crawler.concurrent import ConcurrentDownloader
 
-        logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
+        rate_limiter = RateLimiter(
+            base_delay_sec=args.sleep,
+            daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
+        )
+        downloader = ConcurrentDownloader(
+            rate_limiter=rate_limiter, max_workers=args.workers,
+        )
 
-        try:
+        def _fetch_one(code: str):
             df = news_pipeline.fetch_all_news(
                 code,
                 start_date=args.start,
                 end_date=args.end,
                 max_pages=args.max_pages,
             )
-        except Exception as e:
-            logger.error("  %s: fetch failed: %s", code, e)
-            fail += 1
-            continue
+            if not args.skip_sentiment and not df.empty:
+                df = compute_raw_sentiment(df, analyzer)
+            return df
 
-        if df.empty:
-            logger.info("  %s: no news found", code)
-            empty += 1
-            continue
+        results = downloader.download_all(codes, _fetch_one)
 
-        # Compute sentiment on titles
-        if not args.skip_sentiment:
-            df = compute_raw_sentiment(df, analyzer)
+        for i, code in enumerate(codes):
+            logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
+            df = results.get(code, pd.DataFrame())
 
-        # Save raw (Bronze)
-        news_storage.save_raw_news(code, df)
-        logger.info("  %s: %d articles saved (raw)", code, len(df))
-        total_articles += len(df)
+            if df.empty:
+                logger.info("  %s: no news found", code)
+                empty += 1
+                continue
 
-        # PIT-align -> Silver
-        silver = news_storage.bronze_to_silver(code)
-        if not silver.empty:
-            news_storage.save_silver_news(code, silver)
+            # Save raw (Bronze)
+            news_storage.save_raw_news(code, df)
+            logger.info("  %s: %d articles saved (raw)", code, len(df))
+            total_articles += len(df)
 
-        # Daily aggregation -> Gold
-        if not args.skip_sentiment:
-            gold = news_storage.silver_to_gold(code, analyzer)
-            if not gold.empty:
-                news_storage.save_daily_sentiment(gold)
-                news_days = gold["has_news"].sum()
-                logger.info("  %s: %d sentiment days (%d with news)",
-                            code, len(gold), news_days)
+            # PIT-align -> Silver
+            silver = news_storage.bronze_to_silver(code)
+            if not silver.empty:
+                news_storage.save_silver_news(code, silver)
 
-        success += 1
+            # Daily aggregation -> Gold
+            if not args.skip_sentiment:
+                gold = news_storage.silver_to_gold(code, analyzer)
+                if not gold.empty:
+                    news_storage.save_daily_sentiment(gold)
+                    news_days = gold["has_news"].sum()
+                    logger.info("  %s: %d sentiment days (%d with news)",
+                                code, len(gold), news_days)
+
+            success += 1
+    else:
+        for i, code in enumerate(codes):
+            if i > 0:
+                time.sleep(args.sleep)
+
+            logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
+
+            try:
+                df = news_pipeline.fetch_all_news(
+                    code,
+                    start_date=args.start,
+                    end_date=args.end,
+                    max_pages=args.max_pages,
+                )
+            except Exception as e:
+                logger.error("  %s: fetch failed: %s", code, e)
+                fail += 1
+                continue
+
+            if df.empty:
+                logger.info("  %s: no news found", code)
+                empty += 1
+                continue
+
+            # Compute sentiment on titles
+            if not args.skip_sentiment:
+                df = compute_raw_sentiment(df, analyzer)
+
+            # Save raw (Bronze)
+            news_storage.save_raw_news(code, df)
+            logger.info("  %s: %d articles saved (raw)", code, len(df))
+            total_articles += len(df)
+
+            # PIT-align -> Silver
+            silver = news_storage.bronze_to_silver(code)
+            if not silver.empty:
+                news_storage.save_silver_news(code, silver)
+
+            # Daily aggregation -> Gold
+            if not args.skip_sentiment:
+                gold = news_storage.silver_to_gold(code, analyzer)
+                if not gold.empty:
+                    news_storage.save_daily_sentiment(gold)
+                    news_days = gold["has_news"].sum()
+                    logger.info("  %s: %d sentiment days (%d with news)",
+                                code, len(gold), news_days)
+
+            success += 1
 
     logger.info("Done: %d success, %d fail, %d empty, %d total articles",
                 success, fail, empty, total_articles)

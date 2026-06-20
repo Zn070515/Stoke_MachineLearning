@@ -52,7 +52,11 @@ class MarketWideStorage:
     def load(
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """Load market data for a single stock in a date range."""
+        """Load market data for a single stock in a date range.
+
+        Uses direct path lookup by year/month partition instead of
+        os.walk to avoid scanning hundreds of thousands of files.
+        """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
         base = self._base_dir()
@@ -61,13 +65,25 @@ class MarketWideStorage:
             return pd.DataFrame()
 
         frames = []
-        for root, _dirs, files in os.walk(base):
-            for f in files:
-                if f == f"{stock_code}.parquet":
-                    df = pd.read_parquet(os.path.join(root, f))
-                    df["date"] = pd.to_datetime(df["date"])
-                    mask = (df["date"] >= start) & (df["date"] <= end)
-                    frames.append(df[mask])
+        # Walk year/month partitions in the date range only
+        for year in range(start.year, end.year + 1):
+            year_dir = os.path.join(base, str(year))
+            if not os.path.isdir(year_dir):
+                continue
+            for month in range(1, 13):
+                if year == start.year and month < start.month:
+                    continue
+                if year == end.year and month > end.month:
+                    continue
+                file_path = os.path.join(
+                    year_dir, f"{month:02d}", f"{stock_code}.parquet",
+                )
+                if not os.path.exists(file_path):
+                    continue
+                df = pd.read_parquet(file_path)
+                df["date"] = pd.to_datetime(df["date"])
+                mask = (df["date"] >= start) & (df["date"] <= end)
+                frames.append(df[mask])
 
         if not frames:
             return pd.DataFrame()

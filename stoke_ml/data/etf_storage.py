@@ -43,7 +43,7 @@ class ETFStorage:
     def load_sector_flow(
         self, sector_name: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """Load sector flow data for a date range."""
+        """Load sector flow data for a date range (direct path lookup)."""
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
         base = self._base_dir()
@@ -51,16 +51,25 @@ class ETFStorage:
         if not os.path.exists(base):
             return pd.DataFrame()
 
-        frames = []
         target = f"sector_{sector_name}.parquet"
-        for root, _dirs, files in os.walk(base):
-            for f in files:
-                if f == target:
-                    df = pd.read_parquet(os.path.join(root, f))
-                    if "date" in df.columns:
-                        df["date"] = pd.to_datetime(df["date"])
-                        mask = (df["date"] >= start) & (df["date"] <= end)
-                        frames.append(df[mask])
+        frames = []
+        for year in range(start.year, end.year + 1):
+            year_dir = os.path.join(base, str(year))
+            if not os.path.isdir(year_dir):
+                continue
+            for month in range(1, 13):
+                if year == start.year and month < start.month:
+                    continue
+                if year == end.year and month > end.month:
+                    continue
+                file_path = os.path.join(year_dir, f"{month:02d}", target)
+                if not os.path.exists(file_path):
+                    continue
+                df = pd.read_parquet(file_path)
+                if "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"])
+                    mask = (df["date"] >= start) & (df["date"] <= end)
+                    frames.append(df[mask])
 
         if not frames:
             return pd.DataFrame()

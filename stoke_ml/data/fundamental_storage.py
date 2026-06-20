@@ -49,7 +49,8 @@ class FundamentalStorage:
     ) -> pd.DataFrame:
         """Load fundamental data for a stock in a date range.
 
-        Returns raw quarterly data (no forward-fill).
+        Returns raw quarterly data (no forward-fill). Uses direct
+        path lookup by year/quarter partition.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -59,21 +60,27 @@ class FundamentalStorage:
             return pd.DataFrame()
 
         frames = []
-        for root, _dirs, files in os.walk(base):
-            for f in files:
-                if f == f"{stock_code}.parquet":
-                    df = pd.read_parquet(os.path.join(root, f))
-                    if "report_date" not in df.columns:
-                        continue
-                    df["report_date"] = pd.to_datetime(df["report_date"])
-                    if "disclose_date" in df.columns:
-                        df["disclose_date"] = pd.to_datetime(df["disclose_date"])
-                    mask = (df["report_date"] >= start) & (df["report_date"] <= end)
-                    frames.append(df[mask])
+        quarters = ["Q1", "Q2", "Q3", "Q4"]
+        for year in range(start.year, end.year + 1):
+            for q in quarters:
+                file_path = os.path.join(base, str(year), q,
+                                         f"{stock_code}.parquet")
+                if not os.path.exists(file_path):
+                    continue
+                df = pd.read_parquet(file_path)
+                if "report_date" not in df.columns:
+                    continue
+                df["report_date"] = pd.to_datetime(df["report_date"])
+                if "disclose_date" in df.columns:
+                    df["disclose_date"] = pd.to_datetime(df["disclose_date"])
+                mask = (df["report_date"] >= start) & (df["report_date"] <= end)
+                frames.append(df[mask])
 
         if not frames:
             return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True).sort_values("report_date").reset_index(drop=True)
+        return pd.concat(frames, ignore_index=True).sort_values(
+            "report_date"
+        ).reset_index(drop=True)
 
     def forward_fill_to_daily(
         self, stock_code: str, start_date: str, end_date: str,
@@ -117,10 +124,8 @@ class FundamentalStorage:
                 mask = result["date"] >= fill_date
                 # Cap staleness: set to NaN if too far from fill date
                 if max_gap_days > 0:
-                    stale_mask = (
-                        (result["date"] - fill_date).dt.days > max_gap_days
-                    ) & mask
-                    # Don't overwrite newer data
+                    stale = (result["date"] - fill_date).dt.days > max_gap_days
+                    mask = mask & ~stale
                 result.loc[mask, col] = val
 
             result[col] = result[col].ffill()
