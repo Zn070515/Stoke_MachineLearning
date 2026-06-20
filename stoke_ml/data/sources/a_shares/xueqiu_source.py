@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -37,6 +38,8 @@ _API_URL = (
 # Singleton browser state
 _browser = None
 _context = None
+_pw_instance = None  # saved for .stop() on reconnect
+_lock = threading.Lock()
 
 
 def _build_symbol(stock_code: str) -> str:
@@ -53,35 +56,44 @@ def _get_page() -> "Page":
     """Return a page from the singleton browser context.
 
     Reinitializes the browser if it was closed (e.g., process restart).
+    Thread-safe: uses a lock to prevent race conditions on singleton state.
     """
-    global _browser, _context
+    global _browser, _context, _pw_instance
     from playwright.sync_api import sync_playwright
 
-    if _browser is None or not _browser.is_connected():
-        pw = sync_playwright().start()
-        _browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        _context = _browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-        )
-        _context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
-            window.chrome = {runtime: {}};
-        """)
+    with _lock:
+        if _browser is None or not _browser.is_connected():
+            # Stop old Playwright instance before creating a new one
+            if _pw_instance is not None:
+                try:
+                    _pw_instance.stop()
+                except Exception:
+                    pass
+            pw = sync_playwright().start()
+            _pw_instance = pw
+            _browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            _context = _browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+            )
+            _context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+                window.chrome = {runtime: {}};
+            """)
     return _context.new_page()
 
 

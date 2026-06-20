@@ -92,8 +92,10 @@ class MarginTradingSource:
             "证券代码": "stock_code",
             "融资余额": "margin_balance",
             "融资买入额": "margin_buy",
+            "融资偿还额": "margin_repay",
             "融券余量": "short_balance",
             "融券卖出量": "short_sell_vol",
+            "融券偿还量": "short_repay_vol",
         }
 
         # Determine which mapping to use based on available columns

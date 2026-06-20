@@ -60,7 +60,7 @@ class DragonTigerSource:
             date_str = d.strftime("%Y%m%d")
             try:
                 df = ak.stock_lhb_stock_detail_em(
-                    symbol=stock_code, date=date_str, flag="买入",
+                    symbol=stock_code, date=date_str,
                 )
                 if df is not None and not df.empty:
                     df = df.copy()

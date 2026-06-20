@@ -250,6 +250,8 @@ class FeaturePipeline:
             fd = fd.drop_duplicates(subset="date", keep="last")
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_etf_flow(self, df: pd.DataFrame,

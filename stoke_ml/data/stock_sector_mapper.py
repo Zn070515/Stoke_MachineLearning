@@ -7,7 +7,6 @@ import logging
 import os
 
 import pandas as pd
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,7 @@ INDUSTRY_TO_SECTOR = {
     "军工": "军工", "国防": "军工", "航天": "军工", "航空": "军工",
     "科技": "科技", "计算机": "科技", "软件": "科技",
     "通信": "科技", "电子": "科技", "5G": "科技",
-    "房地产": "房地产", "地产": "房地产", "开发": "房地产",
+    "房地产开发": "房地产", "房地产": "房地产", "地产": "房地产",
     "汽车": "汽车", "汽车零部件": "汽车", "整车": "汽车",
     "有色": "有色", "有色金属": "有色", "稀土": "有色",
     "黄金": "有色", "铜": "有色", "铝": "有色",
@@ -58,6 +57,7 @@ class StockSectorMapper:
         cache_path: str | None = None,
     ):
         self._mapping: dict[str, str] = {}
+        self._mapping_path = mapping_path
         self._cache_path = cache_path or os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             "data", "a_shares", "stock_sector_cache.csv",
@@ -72,16 +72,31 @@ class StockSectorMapper:
 
     def _load_cache(self) -> None:
         """Load stock→sector mapping from cache or build from AKShare."""
-        if os.path.exists(self._cache_path):
+        # Prefer user-provided mapping_path, then cache, then API
+        load_path = self._mapping_path or self._cache_path
+        if os.path.exists(load_path):
             try:
-                df = pd.read_csv(self._cache_path, dtype=str)
+                df = pd.read_csv(load_path, dtype=str)
                 self._mapping = dict(zip(df["stock_code"], df["sector"]))
                 self._loaded = True
-                logger.debug("Loaded %d stock→sector mappings from cache",
-                             len(self._mapping))
+                logger.debug("Loaded %d stock→sector mappings from %s",
+                             len(self._mapping), load_path)
                 return
             except Exception:
-                pass
+                if self._mapping_path:
+                    logger.warning("Failed to load mapping_path %s, falling back",
+                                   self._mapping_path)
+
+        if self._mapping_path:
+            # mapping_path was provided but failed — try cache before API
+            if os.path.exists(self._cache_path):
+                try:
+                    df = pd.read_csv(self._cache_path, dtype=str)
+                    self._mapping = dict(zip(df["stock_code"], df["sector"]))
+                    self._loaded = True
+                    return
+                except Exception:
+                    pass
 
         self._build_from_akshare()
 

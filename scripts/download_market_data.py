@@ -39,6 +39,8 @@ def main():
                         help="Seconds between API calls (default: from config)")
     parser.add_argument("--concurrent", action="store_true",
                         help="Use concurrent downloader")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Concurrent workers (default: 4)")
     args = parser.parse_args()
 
     if args.end is None:
@@ -110,7 +112,7 @@ def main():
                         daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
                     )
                     downloader = ConcurrentDownloader(
-                        rate_limiter=rate_limiter, max_workers=4,
+                        rate_limiter=rate_limiter, max_workers=args.workers,
                     )
                     results = downloader.download_all(
                         stock_list,
@@ -140,7 +142,7 @@ def main():
                     daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
                 )
                 downloader = ConcurrentDownloader(
-                    rate_limiter=rate_limiter, max_workers=4,
+                    rate_limiter=rate_limiter, max_workers=args.workers,
                 )
                 results = downloader.download_all(
                     stock_codes,

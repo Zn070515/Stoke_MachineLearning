@@ -38,9 +38,11 @@ class THSNewsSource:
         try:
             # Work around pandas pyarrow backend incompatibility in AKShare
             old_backend = pd.options.mode.string_storage
-            pd.options.mode.string_storage = "python"
-            df = ak.stock_news_em(symbol=stock_code)
-            pd.options.mode.string_storage = old_backend
+            try:
+                pd.options.mode.string_storage = "python"
+                df = ak.stock_news_em(symbol=stock_code)
+            finally:
+                pd.options.mode.string_storage = old_backend
         except Exception as e:
             logger.debug("THS/AKShare news failed for %s: %s", stock_code, e)
             return pd.DataFrame(columns=["date", "title", "url"])

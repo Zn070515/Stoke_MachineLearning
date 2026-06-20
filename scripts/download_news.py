@@ -132,7 +132,11 @@ def main():
 
         for i, code in enumerate(codes):
             logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
-            df = results.get(code, pd.DataFrame())
+            df = results.get(code)
+            if df is None:
+                logger.error("  %s: fetch failed (exception in worker)", code)
+                fail += 1
+                continue
 
             if df.empty:
                 logger.info("  %s: no news found", code)
