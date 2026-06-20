@@ -1,8 +1,7 @@
 """News sentiment analysis for Chinese financial text.
 
-L1: SnowNLP (general Chinese NLP, offline).
-L2: Financial lexicon + SnowNLP hybrid (domain-aware, offline).
-L3: FinBERT Chinese (planned — needs accessible model mirror).
+L3: FinBERT Chinese (yiyanghkust/finbert-tone-chinese) with GPU batching.
+    Fallback: financial lexicon for CPU-only environments.
 
 Pipeline:
   raw news → compute_sentiment() → raw news with scores
@@ -12,18 +11,17 @@ Pipeline:
 """
 
 import logging
-import re
+import os
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# A-share market close time (CST)
-MARKET_CLOSE_HOUR = 15
+_FINBERT_MODEL = "yiyanghkust/finbert-tone-chinese"
+_BATCH_SIZE = 64  # GPU batch size for sentiment inference
 
-# Chinese financial sentiment lexicon — domain-specific positive/negative
-# terms that carry strong signal in A-share news context.
+# Chinese financial sentiment lexicon — fallback when FinBERT unavailable
 _FIN_POSITIVE = frozenset([
     "利好", "大涨", "暴涨", "飙升", "涨停", "突破", "新高",
     "增长", "增速", "提速", "回暖", "复苏", "反弹", "走强",
@@ -47,38 +45,65 @@ _FIN_NEGATIVE = frozenset([
     "政策利空", "监管", "整顿", "去杠杆", "收紧",
 ])
 
+# Label mapping for yiyanghkust/finbert-tone-chinese
+_LABEL_TO_SCORE = {
+    "Positive": 1.0,
+    "Negative": -1.0,
+    "Neutral": 0.0,
+}
+
 
 class NewsSentimentAnalyzer:
-    """Chinese financial news sentiment (SnowNLP + financial lexicon hybrid).
+    """Chinese financial news sentiment with FinBERT (GPU) + lexicon fallback.
 
-    Uses SnowNLP as base signal, blended with financial lexicon ratio
-    for domain-aware scoring.
+    Uses yiyanghkust/finbert-tone-chinese on GPU for high-quality
+    financial sentiment. Falls back to financial lexicon on CPU.
     """
 
     def __init__(self):
         self._loaded = False
-        self._model = None
-        self._has_snownlp = False
+        self._model_name = "lexicon"
+        self._pipe = None
+        self._device = "cpu"
 
     def _ensure_loaded(self):
         if self._loaded:
             return
         self._loaded = True
-        self._has_snownlp = self._try_snownlp()
 
-        if self._has_snownlp:
-            self._model = "hybrid"
-            logger.info("Sentiment: hybrid (SnowNLP + financial lexicon)")
+        if self._try_finbert():
+            self._model_name = "finbert"
+            logger.info("Sentiment: FinBERT Chinese (GPU batch)")
         else:
-            self._model = "lexicon"
-            logger.info("Sentiment: financial lexicon only (no SnowNLP)")
+            self._model_name = "lexicon"
+            logger.info("Sentiment: financial lexicon (CPU fallback)")
 
-    @staticmethod
-    def _try_snownlp() -> bool:
+    def _try_finbert(self) -> bool:
+        """Load FinBERT model to GPU. Returns True on success."""
         try:
-            from snownlp import SnowNLP  # noqa: F401
+            import torch
+            from transformers import pipeline
+
+            if not torch.cuda.is_available():
+                logger.info("FinBERT: no GPU available, using lexicon fallback")
+                return False
+
+            self._device = "cuda"
+            self._pipe = pipeline(
+                "sentiment-analysis",
+                model=_FINBERT_MODEL,
+                device=0,  # first GPU
+                batch_size=_BATCH_SIZE,
+            )
+            # Warm-up: run a single text to prime CUDA context
+            _ = self._pipe("测试")
+            logger.info("FinBERT loaded on %s", torch.cuda.get_device_name(0))
             return True
         except ImportError:
+            logger.info("FinBERT: transformers/torch not installed")
+            return False
+        except Exception as e:
+            logger.info("FinBERT: failed to load (%s), using lexicon", e)
             return False
 
     def analyze(self, texts: list[str]) -> np.ndarray:
@@ -87,40 +112,41 @@ class NewsSentimentAnalyzer:
             return np.array([], dtype=np.float32)
         self._ensure_loaded()
 
-        lex_scores = np.array(
-            [self._lexicon_score(t) for t in texts], dtype=np.float32
-        )
+        if self._model_name == "finbert":
+            return self._finbert_sentiment(texts)
 
-        if self._has_snownlp:
-            snow_scores = self._snownlp_sentiment(texts)
-            # Blend: lexicon is more domain-precise, SnowNLP provides nuance
-            return (0.55 * lex_scores + 0.45 * snow_scores).astype(np.float32)
+        return self._lexicon_batch(texts)
 
-        return lex_scores
+    def _finbert_sentiment(self, texts: list[str]) -> np.ndarray:
+        """Run FinBERT inference with GPU batching.
+
+        Text is truncated to ~300 chars (safe for 512 BERT tokens even
+        with multi-byte Chinese characters) and the tokenizer applies
+        explicit truncation as a second safety layer.
+        """
+        truncated = [t[:300] for t in texts]
+        results = self._pipe(truncated, truncation=True, max_length=512)
+        scores = np.zeros(len(texts), dtype=np.float32)
+        for i, r in enumerate(results):
+            label = r["label"]
+            score = r["score"]
+            base = _LABEL_TO_SCORE.get(label, 0.0)
+            scores[i] = base * score
+        return scores
 
     @staticmethod
-    def _lexicon_score(text: str) -> float:
-        """Score a single text using financial lexicon ratio [-1, 1]."""
-        if not text or not isinstance(text, str):
-            return 0.0
-        pos = sum(1 for w in _FIN_POSITIVE if w in text)
-        neg = sum(1 for w in _FIN_NEGATIVE if w in text)
-        total = pos + neg
-        if total == 0:
-            return 0.0
-        return (pos - neg) / total
-
-    @staticmethod
-    def _snownlp_sentiment(texts: list[str]) -> np.ndarray:
-        try:
-            from snownlp import SnowNLP
-            scores = []
-            for t in texts:
-                s = SnowNLP(t)
-                scores.append(s.sentiments * 2 - 1)
-            return np.array(scores, dtype=np.float32)
-        except ImportError:
-            return np.zeros(len(texts), dtype=np.float32)
+    def _lexicon_batch(texts: list[str]) -> np.ndarray:
+        """Score texts with financial lexicon ratio."""
+        scores = np.zeros(len(texts), dtype=np.float32)
+        for i, text in enumerate(texts):
+            if not text or not isinstance(text, str):
+                continue
+            pos = sum(1 for w in _FIN_POSITIVE if w in text)
+            neg = sum(1 for w in _FIN_NEGATIVE if w in text)
+            total = pos + neg
+            if total > 0:
+                scores[i] = (pos - neg) / total
+        return scores
 
 
 def compute_raw_sentiment(
