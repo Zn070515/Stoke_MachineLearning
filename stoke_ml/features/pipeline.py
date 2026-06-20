@@ -166,6 +166,19 @@ class FeaturePipeline:
                 df[col] = df[col].fillna(0).astype("int16")
             else:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
+
+        # Lag sentiment by 1 trading day to prevent look-ahead bias.
+        # Without timestamps, day-t news may include post-15:00 releases
+        # the market hasn't absorbed yet. Using sentiment[t-1] with
+        # price[t] ensures all news was fully priced before prediction.
+        for col in SENTIMENT_COLS:
+            df[col] = df[col].shift(1)
+        df["has_news"] = df["has_news"].fillna(False).astype(bool)
+        df["news_count"] = df["news_count"].fillna(0).astype("int16")
+        for col in ["sentiment_mean", "sentiment_std",
+                     "positive_ratio", "negative_ratio"]:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+
         return df
 
     def _merge_margin(self, df: pd.DataFrame,
