@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_STOCKS = ["600519", "000858", "601318", "000001", "600036"]
 
 
-def run_xgboost(X, y, aligned_close, folds, model_params, output_dir, code, tag):
+def run_xgboost(X, y, aligned_close, folds, model_params):
     """Run XGBoost on given features."""
     n_samples = len(X)
     results = []
@@ -49,8 +49,11 @@ def run_xgboost(X, y, aligned_close, folds, model_params, output_dir, code, tag)
         model.fit(X_train, y_train)
         preds = model.predict(X_val)
         cls_m = compute_classification_metrics(y_val, preds)
-        close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
-        fin_m = compute_financial_metrics(close_prices, preds)
+        if len(val_idx) > 1:
+            close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
+            fin_m = compute_financial_metrics(close_prices, preds)
+        else:
+            fin_m = {"sharpe": 0.0}
         results.append({"fold": fold_idx, "mcc": cls_m["mcc"],
                         "accuracy": cls_m["accuracy"], "sharpe": fin_m["sharpe"]})
     return results
@@ -119,8 +122,11 @@ def run_lstm(X, y, aligned_close, folds, n_features, cfg, output_dir, code, tag)
                     all_preds.append(preds)
             val_preds = np.concatenate(all_preds)
             val_mcc = mcc_score(y_val, val_preds)
-            close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
-            fin_m = compute_financial_metrics(close_prices, val_preds)
+            if len(val_idx) > 1:
+                close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
+                fin_m = compute_financial_metrics(close_prices, val_preds)
+            else:
+                fin_m = {"sharpe": 0.0}
             results.append({"fold": fold_idx, "mcc": val_mcc,
                            "sharpe": fin_m["sharpe"]})
 
@@ -137,6 +143,9 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config()
+    # Ablation results depend on current config (seq_len, train_years, val_months,
+    # model params). For reproducible comparisons, pin config.yaml or record its git
+    # hash alongside results.
     storage = DataStorage(cfg.project.data_dir)
     news_storage = NewsStorage(cfg.project.data_dir)
     output_dir = cfg.project.model_dir
@@ -192,7 +201,7 @@ def main():
                     folds = list(splitter.split(pseudo_dates))
                     t0 = time.time()
                     model_params = dict(cfg.model.params)
-                    xgb_results = run_xgboost(X, y, ac, folds, model_params, output_dir, code, label)
+                    xgb_results = run_xgboost(X, y, ac, folds, model_params)
                     mccs = [r["mcc"] for r in xgb_results]
                     logger.info("  XGBoost %s | MCC=%.4f ± %.4f [%d folds] %.1fs",
                                 label, np.mean(mccs), np.std(mccs), len(mccs), time.time() - t0)

@@ -160,10 +160,10 @@ def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> 
             val_preds = np.concatenate(all_preds)
             val_mcc = mcc_score(y_val, val_preds)
             all_val_mcc.append(val_mcc)
-            # Financial metrics per fold
-            close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
-            fin_m = compute_financial_metrics(close_prices, val_preds)
-            all_val_sharpe.append(fin_m["sharpe"])
+            if len(val_idx) > 1:
+                close_prices = aligned_close[val_idx[0]:val_idx[-1] + 2]
+                fin_m = compute_financial_metrics(close_prices, val_preds)
+                all_val_sharpe.append(fin_m["sharpe"])
 
     if not all_val_mcc:
         return {"stock": code, "status": "no_folds"}

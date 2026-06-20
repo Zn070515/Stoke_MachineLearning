@@ -1,8 +1,8 @@
-"""Walk-forward (expanding window) data splitter.
+"""Walk-forward (fixed-size sliding window) data splitter.
 
 Time series data cannot be randomly shuffled. Walk-forward validation
-trains on expanding historical windows and validates on subsequent
-periods, preventing lookahead bias.
+trains on fixed-size historical windows and validates on subsequent
+periods, stepping forward to prevent lookahead bias.
 """
 import numpy as np
 import pandas as pd

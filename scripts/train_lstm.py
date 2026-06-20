@@ -232,9 +232,9 @@ def main():
                 code, np.mean(all_val_mcc), np.std(all_val_mcc),
             )
 
-            # Retrain on all data for final model
-            # Keep last 20% as validation for early stopping,
-            # preserve temporal order (no shuffle in time series)
+            # Retrain on all data for final model.
+            # Reserve last 20% for early-stopping validation, save best-epoch
+            # weights (not last-epoch). shuffle=False preserves temporal order.
             n_total = len(X)
             n_val = max(int(n_total * 0.2), 1)
             X_final_train, X_final_val = X[:-n_val], X[-n_val:]
@@ -252,8 +252,8 @@ def main():
                 val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
             )
 
-            n_neg = (y_final_train == 0).sum()
-            n_pos = (y_final_train == 1).sum()
+            n_neg = (y == 0).sum()
+            n_pos = (y == 1).sum()
             if n_pos > 0 and n_neg > 0:
                 final_class_weight = [1.0, n_neg / n_pos]
             else:
@@ -266,12 +266,13 @@ def main():
                 dropout=0.3,
                 learning_rate=cfg.training.learning_rate,
                 class_weight=final_class_weight,
+                use_scheduler=False,
             )
             final_checkpoint_cb = pl.callbacks.ModelCheckpoint(
                 dirpath=os.path.join(output_dir, "lstm_checkpoints"),
                 filename=f"{code}_final",
-                monitor="val_loss",
-                mode="min",
+                monitor="val_mcc",
+                mode="max",
                 save_top_k=1,
             )
             final_early_stop_cb = pl.callbacks.EarlyStopping(
@@ -289,9 +290,14 @@ def main():
             )
             final_trainer.fit(final_module, final_train_loader, final_val_loader)
 
-            model_path = os.path.join(output_dir, f"lstm_{code}_final.ckpt")
-            final_trainer.save_checkpoint(model_path)
-            logger.info("  Final model saved to %s", model_path)
+            best_path = final_checkpoint_cb.best_model_path
+            if best_path:
+                import shutil
+                model_path = os.path.join(output_dir, f"lstm_{code}_final.ckpt")
+                shutil.copy2(best_path, model_path)
+                logger.info("  Final model saved to %s", model_path)
+            else:
+                logger.warning("  No best checkpoint for final model")
 
 
 if __name__ == "__main__":
