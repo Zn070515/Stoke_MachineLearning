@@ -1,10 +1,13 @@
-"""Download news for A-share stocks, compute sentiment, store in 3-layer format.
+"""Download news for A-share stocks from multiple sources, compute sentiment.
 
 Usage:
-  python scripts/download_news.py                          # all stocks on disk
-  python scripts/download_news.py --stocks 000001,600519   # specific stocks
-  python scripts/download_news.py --max-pages 5 --sleep 2  # deeper, slower
-  python scripts/download_news.py --skip-sentiment          # raw only
+  python scripts/download_news.py                              # all stocks, all sources
+  python scripts/download_news.py --stocks 000001,600519       # specific stocks
+  python scripts/download_news.py --source sina                # single source
+  python scripts/download_news.py --source xueqiu,ths,sina     # selected sources
+  python scripts/download_news.py --max-pages 5 --sleep 1      # deeper, faster
+  python scripts/download_news.py --concurrent                 # parallel download
+  python scripts/download_news.py --skip-sentiment             # raw only
 """
 import argparse
 import logging
@@ -18,7 +21,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.sources.a_shares.news_source import SinaNewsSource
+from stoke_ml.data.sources.a_shares.news_pipeline import NewsPipeline
 from stoke_ml.features.news_nlp import (
     NewsSentimentAnalyzer,
     compute_raw_sentiment,
@@ -48,12 +51,18 @@ def main():
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--stocks", type=str, default=None,
                         help="Comma-separated stock codes (default: all on disk)")
+    parser.add_argument("--source", type=str, default="all",
+                        help="News source(s): sina, xueqiu, ths, all (default: all)")
     parser.add_argument("--max-pages", type=int, default=3,
-                        help="Pages per stock (default: 3)")
-    parser.add_argument("--sleep", type=float, default=2.0,
-                        help="Seconds between stocks (default: 2.0)")
+                        help="Pages per stock per source (default: 3)")
+    parser.add_argument("--sleep", type=float, default=1.0,
+                        help="Seconds between stocks (default: 1.0)")
     parser.add_argument("--skip-sentiment", action="store_true",
                         help="Skip sentiment computation (raw only)")
+    parser.add_argument("--concurrent", action="store_true",
+                        help="Use concurrent downloader")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Concurrent workers (default: 4)")
     parser.add_argument("--start", type=str, default=None,
                         help="Start date filter YYYY-MM-DD")
     parser.add_argument("--end", type=str, default=None,
@@ -72,13 +81,23 @@ def main():
         logger.error("No stock codes found. Run download_data.py first.")
         sys.exit(1)
 
+    # Select sources
+    if args.source == "all":
+        active_sources = None  # pipeline uses all available
+    else:
+        active_sources = [s.strip() for s in args.source.split(",")]
+
     calendar = TradingCalendar("a_shares")
     news_storage = NewsStorage(data_dir, calendar)
-    news_source = SinaNewsSource()
+    news_pipeline = NewsPipeline(active_sources=active_sources)
     analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer()
 
-    logger.info("Downloading news for %d stocks (max_pages=%d, sleep=%.1fs)",
-                len(codes), args.max_pages, args.sleep)
+    source_label = args.source if args.source != "all" else "sina+xueqiu+ths"
+    mode_label = "concurrent" if args.concurrent else "sequential"
+    logger.info(
+        "Downloading news for %d stocks (sources=%s, max_pages=%d, sleep=%.1fs, %s)",
+        len(codes), source_label, args.max_pages, args.sleep, mode_label,
+    )
 
     total_articles = 0
     success, fail, empty = 0, 0, 0
@@ -90,7 +109,7 @@ def main():
         logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
 
         try:
-            df = news_source.fetch_news(
+            df = news_pipeline.fetch_all_news(
                 code,
                 start_date=args.start,
                 end_date=args.end,
@@ -115,12 +134,12 @@ def main():
         logger.info("  %s: %d articles saved (raw)", code, len(df))
         total_articles += len(df)
 
-        # PIT-align → Silver
+        # PIT-align -> Silver
         silver = news_storage.bronze_to_silver(code)
         if not silver.empty:
             news_storage.save_silver_news(code, silver)
 
-        # Daily aggregation → Gold
+        # Daily aggregation -> Gold
         if not args.skip_sentiment:
             gold = news_storage.silver_to_gold(code, analyzer)
             if not gold.empty:

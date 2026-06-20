@@ -1,0 +1,85 @@
+# Industry sector to representative ETF code mapping
+# ETF codes are standard A-share 6-digit codes
+# eastmoney_secid uses "1." prefix for Shanghai, "0." for Shenzhen
+
+sectors:
+  券商:
+    name_en: broker
+    etf_codes: ["512880", "159848"]
+    eastmoney_secid: ["1.512880"]
+  半导体:
+    name_en: semiconductor
+    etf_codes: ["512480", "159995"]
+    eastmoney_secid: ["1.512480"]
+  医药:
+    name_en: healthcare
+    etf_codes: ["512010", "159938"]
+    eastmoney_secid: ["1.512010"]
+  消费:
+    name_en: consumer
+    etf_codes: ["159928", "512600"]
+    eastmoney_secid: ["0.159928"]
+  白酒:
+    name_en: liquor
+    etf_codes: ["512690", "161725"]
+    eastmoney_secid: ["1.512690"]
+  新能源:
+    name_en: new_energy
+    etf_codes: ["516160", "159875"]
+    eastmoney_secid: ["1.516160"]
+  银行:
+    name_en: banking
+    etf_codes: ["512800", "159887"]
+    eastmoney_secid: ["1.512800"]
+  军工:
+    name_en: defense
+    etf_codes: ["512660", "512670"]
+    eastmoney_secid: ["1.512660"]
+  科技:
+    name_en: tech
+    etf_codes: ["515000", "159807"]
+    eastmoney_secid: ["1.515000"]
+  房地产:
+    name_en: real_estate
+    etf_codes: ["512200", "159768"]
+    eastmoney_secid: ["1.512200"]
+  汽车:
+    name_en: auto
+    etf_codes: ["516110", "159889"]
+    eastmoney_secid: ["1.516110"]
+  有色:
+    name_en: metals
+    etf_codes: ["512400", "159871"]
+    eastmoney_secid: ["1.512400"]
+  煤炭:
+    name_en: coal
+    etf_codes: ["515220", "159945"]
+    eastmoney_secid: ["1.515220"]
+  钢铁:
+    name_en: steel
+    etf_codes: ["515210", "159766"]
+    eastmoney_secid: ["1.515210"]
+  电力:
+    name_en: power
+    etf_codes: ["159611", "561560"]
+    eastmoney_secid: ["0.159611"]
+  农业:
+    name_en: agriculture
+    etf_codes: ["159865", "516550"]
+    eastmoney_secid: ["0.159865"]
+  传媒:
+    name_en: media
+    etf_codes: ["512980", "159805"]
+    eastmoney_secid: ["1.512980"]
+  通信:
+    name_en: telecom
+    etf_codes: ["515880", "159811"]
+    eastmoney_secid: ["1.515880"]
+  计算机:
+    name_en: computer
+    etf_codes: ["512720", "159998"]
+    eastmoney_secid: ["1.512720"]
+  基建:
+    name_en: infrastructure
+    etf_codes: ["516950", "159619"]
+    eastmoney_secid: ["1.516950"]

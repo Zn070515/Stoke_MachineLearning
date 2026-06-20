@@ -33,11 +33,15 @@ crawler:
     validate_on_startup: true
     max_proxies: 20
   rate_limit:
-    base_delay_sec: 2.0
+    base_delay_sec: 1.0
     jitter_factor: 0.5
     max_backoff_sec: 300
     circuit_breaker_cooldown_sec: 300
+    circuit_breaker_fail_threshold: 10
     daily_quota_per_domain: 10000
+  concurrency:
+    enabled: false
+    max_workers: 4
   browser_fallback:
     enabled: true
     engine: "playwright"
@@ -79,3 +83,22 @@ training:
 evaluation:
   primary_metric: "mcc"
   financial_metrics: [sharpe, max_drawdown, win_rate, profit_factor]
+
+# News source configuration
+news_sources:
+  sina: true
+  xueqiu: true
+  ths: true
+
+# Market data types to download
+market_data:
+  dragon_tiger: true
+  margin_trading: true
+  northbound: true
+  etf_flow: true
+
+# Fundamental data
+fundamental:
+  enabled: true
+  max_stale_days: 90
+  data_types: [roe, roa, pe, pb, eps, revenue_yoy, profit_yoy, debt_ratio, gross_margin, net_margin]
