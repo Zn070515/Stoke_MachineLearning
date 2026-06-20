@@ -1,7 +1,8 @@
 """News sentiment analysis for Chinese financial text.
 
-L1: SnowNLP (offline, fast, good Chinese support).
-L2: FinBERT Chinese (planned — needs HuggingFace access or local mirror).
+L1: SnowNLP (general Chinese NLP, offline).
+L2: Financial lexicon + SnowNLP hybrid (domain-aware, offline).
+L3: FinBERT Chinese (planned — needs accessible model mirror).
 
 Pipeline:
   raw news → compute_sentiment() → raw news with scores
@@ -11,6 +12,7 @@ Pipeline:
 """
 
 import logging
+import re
 
 import numpy as np
 import pandas as pd
@@ -20,26 +22,56 @@ logger = logging.getLogger(__name__)
 # A-share market close time (CST)
 MARKET_CLOSE_HOUR = 15
 
+# Chinese financial sentiment lexicon — domain-specific positive/negative
+# terms that carry strong signal in A-share news context.
+_FIN_POSITIVE = frozenset([
+    "利好", "大涨", "暴涨", "飙升", "涨停", "突破", "新高",
+    "增长", "增速", "提速", "回暖", "复苏", "反弹", "走强",
+    "买入", "增持", "看好", "超预期", "优于预期", "业绩预增",
+    "分红", "回购", "高送转", "派息", "股息",
+    "盈利", "扭亏", "净利润增长", "营收增长", "毛利率提升",
+    "中标", "签约", "订单", "扩产", "投产",
+    "创新高", "历史新高", "领涨", "龙头", "标杆",
+    "政策利好", "扶持", "补贴", "减税", "降准",
+    "资金流入", "北向增持", "机构调研", "主力加仓",
+])
+
+_FIN_NEGATIVE = frozenset([
+    "利空", "大跌", "暴跌", "跳水", "跌停", "破位", "新低",
+    "下滑", "萎缩", "衰退", "低迷", "疲软", "走弱", "承压",
+    "卖出", "减持", "清仓", "看空", "低于预期", "业绩预亏",
+    "亏损", "净亏损", "净利润下滑", "营收下降", "毛利率下降",
+    "违约", "处罚", "调查", "诉讼", "退市", "ST",
+    "质押", "爆仓", "平仓", "强制平仓", "追加保证金",
+    "资金流出", "北向减持", "主力出逃", "机构减仓",
+    "政策利空", "监管", "整顿", "去杠杆", "收紧",
+])
+
 
 class NewsSentimentAnalyzer:
-    """Chinese financial news sentiment using SnowNLP (L1)."""
+    """Chinese financial news sentiment (SnowNLP + financial lexicon hybrid).
+
+    Uses SnowNLP as base signal, blended with financial lexicon ratio
+    for domain-aware scoring.
+    """
 
     def __init__(self):
         self._loaded = False
         self._model = None
+        self._has_snownlp = False
 
     def _ensure_loaded(self):
         if self._loaded:
             return
         self._loaded = True
+        self._has_snownlp = self._try_snownlp()
 
-        if self._try_snownlp():
-            logger.info("Sentiment: using SnowNLP (offline Chinese NLP)")
-            self._model = "snownlp"
-            return
-
-        logger.warning("No sentiment model available; scores will be 0")
-        self._model = None
+        if self._has_snownlp:
+            self._model = "hybrid"
+            logger.info("Sentiment: hybrid (SnowNLP + financial lexicon)")
+        else:
+            self._model = "lexicon"
+            logger.info("Sentiment: financial lexicon only (no SnowNLP)")
 
     @staticmethod
     def _try_snownlp() -> bool:
@@ -54,9 +86,29 @@ class NewsSentimentAnalyzer:
         if not texts:
             return np.array([], dtype=np.float32)
         self._ensure_loaded()
-        if self._model == "snownlp":
-            return self._snownlp_sentiment(texts)
-        return np.zeros(len(texts), dtype=np.float32)
+
+        lex_scores = np.array(
+            [self._lexicon_score(t) for t in texts], dtype=np.float32
+        )
+
+        if self._has_snownlp:
+            snow_scores = self._snownlp_sentiment(texts)
+            # Blend: lexicon is more domain-precise, SnowNLP provides nuance
+            return (0.55 * lex_scores + 0.45 * snow_scores).astype(np.float32)
+
+        return lex_scores
+
+    @staticmethod
+    def _lexicon_score(text: str) -> float:
+        """Score a single text using financial lexicon ratio [-1, 1]."""
+        if not text or not isinstance(text, str):
+            return 0.0
+        pos = sum(1 for w in _FIN_POSITIVE if w in text)
+        neg = sum(1 for w in _FIN_NEGATIVE if w in text)
+        total = pos + neg
+        if total == 0:
+            return 0.0
+        return (pos - neg) / total
 
     @staticmethod
     def _snownlp_sentiment(texts: list[str]) -> np.ndarray:
@@ -68,7 +120,6 @@ class NewsSentimentAnalyzer:
                 scores.append(s.sentiments * 2 - 1)
             return np.array(scores, dtype=np.float32)
         except ImportError:
-            logger.warning("SnowNLP not installed, returning zeros")
             return np.zeros(len(texts), dtype=np.float32)
 
 

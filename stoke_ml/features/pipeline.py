@@ -128,6 +128,8 @@ class FeaturePipeline:
         if self.use_scoring:
             df = self._scorer.score(df)
 
+        df = self._add_microstructure(df)
+
         if self.use_temporal:
             temporal_cols = list(TEMPORAL_BASE_COLS)
             temporal_cols += _active_cols(df, [
@@ -268,6 +270,56 @@ class FeaturePipeline:
         df = df.merge(ef[["date"] + available], on="date", how="left")
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
+
+    # ------------------------------------------------------------------
+    # Microstructure features
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _add_microstructure(df: pd.DataFrame) -> pd.DataFrame:
+        """Add market microstructure features from OHLCV data.
+
+        Adds: limit_up, limit_down, gap_up_pct, gap_down_pct,
+        volume_ratio_20, turnover_anomaly.
+        """
+        df = df.copy()
+        close = df.get("close")
+        _open = df.get("open")
+        volume = df.get("volume")
+        if close is None:
+            return df
+
+        prev_close = close.shift(1)
+
+        # Limit up/down (A-share: 10% daily limit)
+        pct = (close - prev_close) / prev_close.replace(0, np.nan)
+        df["is_limit_up"] = (pct >= 0.098).astype(np.float32)
+        df["is_limit_down"] = (pct <= -0.098).astype(np.float32)
+
+        # Gap open
+        if _open is not None:
+            gap = (_open - prev_close) / prev_close.replace(0, np.nan)
+            df["gap_up_pct"] = gap.clip(lower=0).fillna(0).astype(np.float32)
+            df["gap_down_pct"] = (-gap).clip(lower=0).fillna(0).astype(np.float32)
+
+        # Volume anomaly: ratio of current volume to 20-day median
+        if volume is not None:
+            vol_med = volume.rolling(20, min_periods=5).median()
+            df["volume_ratio_20"] = (volume / vol_med.replace(0, np.nan)).clip(0, 20)
+            df["volume_ratio_20"] = df["volume_ratio_20"].fillna(1.0).astype(np.float32)
+
+            # Turnover anomaly flag: volume > 3x 20-day median
+            df["volume_anomaly"] = (df["volume_ratio_20"] > 3.0).astype(np.float32)
+
+        # Consecutive limit-up streak
+        df["limit_up_streak"] = (
+            df["is_limit_up"]
+            .groupby((df["is_limit_up"] == 0).cumsum())
+            .cumsum()
+            .astype(np.float32)
+        )
+
         return df
 
     # ------------------------------------------------------------------

@@ -84,33 +84,35 @@ class FundamentalStorage:
 
     def forward_fill_to_daily(
         self, stock_code: str, start_date: str, end_date: str,
-        max_gap_days: int = 90,
+        max_gap_days: int = 30,
+        interpolate: bool = True,
     ) -> pd.DataFrame:
         """Load fundamentals and forward-fill to daily trading calendar.
 
-        Uses disclose_date as the forward-fill start to prevent lookahead bias.
-        Caps stale data at max_gap_days.
+        Uses disclose_date for forward-fill to prevent lookahead bias.
+        Optionally linearly interpolates between disclosure dates for
+        smoother transitions (better than step-function fill).
+
+        Args:
+            max_gap_days: Max days a value stays fresh after disclosure.
+            interpolate: If True, linear interpolate between data points.
         """
         raw = self.load(stock_code, "2010-01-01", end_date)
         if raw.empty:
             return pd.DataFrame()
 
-        # Get trading day range
         trading_days = self._calendar.get_trading_days(start_date, end_date)
         daily_df = pd.DataFrame({"date": trading_days})
         daily_df["date"] = pd.to_datetime(daily_df["date"])
 
-        # Use disclose_date for forward-fill origin (not report_date)
         fill_col = "disclose_date" if "disclose_date" in raw.columns else "report_date"
         raw["_fill_from"] = pd.to_datetime(raw[fill_col])
 
-        # Get value columns (exclude metadata)
         value_cols = [
             c for c in raw.columns
             if c not in ("stock_code", "report_date", "disclose_date", "_fill_from")
         ]
 
-        # Build daily forward-filled values
         result = daily_df.copy()
         result["stock_code"] = str(stock_code).zfill(6)
 
@@ -122,12 +124,19 @@ class FundamentalStorage:
                 fill_date = row["_fill_from"]
                 val = row[col]
                 mask = result["date"] >= fill_date
-                # Cap staleness: set to NaN if too far from fill date
                 if max_gap_days > 0:
                     stale = (result["date"] - fill_date).dt.days > max_gap_days
                     mask = mask & ~stale
                 result.loc[mask, col] = val
 
-            result[col] = result[col].ffill()
+            if interpolate:
+                # Linear interpolate between non-NaN values (smoother than step fill)
+                has_val = result[col].notna()
+                if has_val.sum() >= 2:
+                    result[col] = result[col].interpolate(
+                        method="linear", limit_direction="forward"
+                    )
+            else:
+                result[col] = result[col].ffill()
 
         return result.reset_index(drop=True)

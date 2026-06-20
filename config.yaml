@@ -101,5 +101,6 @@ market_data:
 # Fundamental data
 fundamental:
   enabled: true
-  max_stale_days: 90
+  max_stale_days: 30  # how long quarterly data stays fresh before NaN
+  interpolate: true    # linear interp between disclosure dates (smoother than step fill)
   data_types: [roe, roa, pe, pb, eps, revenue_yoy, profit_yoy, debt_ratio, gross_margin, net_margin]
