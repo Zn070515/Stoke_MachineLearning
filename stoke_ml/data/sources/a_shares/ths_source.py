@@ -1,104 +1,107 @@
-"""THS / 10jqka (同花顺) news source via AKShare EastMoney backend."""
+"""THS / EastMoney news source with deep-pagination support.
+
+Uses EastMoney's search API directly (bypassing AKShare's thin wrapper)
+to fetch up to 500 articles per stock via pagination (100/page × 5 pages).
+"""
+import json
 import logging
+import time
 
 import pandas as pd
+from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
-THS_HEADERS = {
+EM_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
+EM_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/142.0.0.0 Safari/537.36"
     ),
+    "Referer": "https://so.eastmoney.com/news/s",
 }
 
 
 class THSNewsSource:
-    """Fetch stock news via AKShare EastMoney news (same underlying data as THS)."""
+    """Fetch stock news from EastMoney search API with deep pagination."""
+
+    @staticmethod
+    def _fetch_em_page(stock_code: str, page: int, page_size: int = 100) -> list[dict]:
+        """Fetch one page of EastMoney search results."""
+        inner = {
+            "uid": "",
+            "keyword": stock_code,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {
+                "cmsArticleWebOld": {
+                    "searchScope": "default",
+                    "sort": "default",
+                    "pageIndex": page,
+                    "pageSize": page_size,
+                    "preTag": "<em>",
+                    "postTag": "</em>",
+                }
+            },
+        }
+        params = {
+            "cb": "jQuery",
+            "param": json.dumps(inner, ensure_ascii=False),
+            "_": str(int(time.time() * 1000)),
+        }
+        try:
+            resp = requests.get(
+                EM_SEARCH_URL, params=params, headers=EM_HEADERS,
+                impersonate="chrome120", timeout=15,
+            )
+            text = resp.text
+            if text.startswith("jQuery"):
+                data = json.loads(text[text.find("(") + 1 : -1])
+                return data.get("result", {}).get("cmsArticleWebOld", [])
+        except Exception:
+            pass
+        return []
 
     def fetch_news(
         self,
         stock_code: str,
         start_date: str | None = None,
         end_date: str | None = None,
-        max_pages: int = 3,
+        max_pages: int = 5,
     ) -> pd.DataFrame:
-        """Fetch news from EastMoney news via AKShare.
+        """Fetch stock news from EastMoney search with deep pagination.
 
-        AKShare's stock_news_em uses EastMoney's API which covers
-        the same news pool that 同花顺 draws from.
+        Each page returns up to 100 articles. The API typically allows
+        ~5 pages before returning empty, yielding up to ~500 articles
+        spanning ~6-12 months of history.
         """
-        try:
-            import akshare as ak
-        except ImportError:
-            logger.warning("AKShare not available for THS news")
-            return pd.DataFrame(columns=["date", "title", "url"])
+        all_rows = []
+        for page in range(1, max_pages + 1):
+            items = self._fetch_em_page(stock_code, page, page_size=100)
+            if not items:
+                break
+            for it in items:
+                title = (it.get("title") or "").replace("<em>", "").replace("</em>", "")
+                content = (it.get("content") or "").replace("<em>", "").replace("</em>", "")
+                date_str = (it.get("date") or "")[:10]
+                code = it.get("code", "")
+                url = f"https://finance.eastmoney.com/a/{code}.html" if code else ""
+                if title and date_str:
+                    all_rows.append({
+                        "date": date_str,
+                        "title": title,
+                        "body": content if len(content) > 20 else "",
+                        "url": url,
+                    })
 
-        try:
-            # Work around pandas pyarrow backend incompatibility in AKShare
-            old_backend = pd.options.mode.string_storage
-            try:
-                pd.options.mode.string_storage = "python"
-                df = ak.stock_news_em(symbol=stock_code)
-            finally:
-                pd.options.mode.string_storage = old_backend
-        except Exception as e:
-            logger.debug("THS/AKShare news failed for %s: %s", stock_code, e)
-            return pd.DataFrame(columns=["date", "title", "url"])
+        if not all_rows:
+            return pd.DataFrame(columns=["date", "title", "body", "url"])
 
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["date", "title", "url"])
-
-        # AKShare returns: 关键词, 新闻标题, 新闻内容, 发布时间, 文章来源, 新闻链接
-        # Map to standard format — keep body text when available
-        col_map = {}
-        body_col = None
-        for col in df.columns:
-            if "时间" in col or "发布时间" in col:
-                col_map[col] = "date"
-            elif "标题" in col:
-                col_map[col] = "title"
-            elif "内容" in col:
-                body_col = col
-            elif "链接" in col:
-                col_map[col] = "url"
-
-        if col_map:
-            df = df.rename(columns=col_map)
-            keep_cols = [c for c in ["date", "title", "url"] if c in df.columns]
-            if body_col and body_col not in col_map:
-                df["body"] = df[body_col].astype(str)
-            elif body_col and body_col in col_map:
-                pass  # already renamed
-            else:
-                df["body"] = ""
-            df = df[keep_cols + ["body"]]
-        else:
-            cols = list(df.columns)
-            if len(cols) >= 1:
-                df["title"] = df[cols[0]].astype(str)
-            df["date"] = pd.Timestamp.now().strftime("%Y-%m-%d")
-            df["url"] = ""
-            df["body"] = ""
-
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"])
-        else:
-            df["date"] = pd.Timestamp.now()
-
-        if "title" not in df.columns:
-            return pd.DataFrame(columns=["date", "title", "url", "body"])
-
-        df["title"] = df["title"].astype(str).str[:300]
-        df["body"] = df.get("body", "")
-        if df["body"].dtype != object:
-            df["body"] = df["body"].astype(str)
-        df["body"] = df["body"].str[:2000]
-        if "url" not in df.columns:
-            df["url"] = ""
-
+        df = pd.DataFrame(all_rows)
+        df["date"] = pd.to_datetime(df["date"])
         df = df.drop_duplicates(subset=["title", "date"])
         df = df.sort_values("date", ascending=False)
 
@@ -107,7 +110,4 @@ class THSNewsSource:
         if end_date:
             df = df[df["date"] <= pd.Timestamp(end_date)]
 
-        if max_pages and len(df) > max_pages * 20:
-            df = df.head(max_pages * 20)
-
-        return df[["date", "title", "url", "body"]].reset_index(drop=True)
+        return df.reset_index(drop=True)
