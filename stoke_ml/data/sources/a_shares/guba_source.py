@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -343,24 +344,31 @@ class GubaSource:
             df = df.sort_values("_date_sort", ascending=False)
             df = df.drop(columns=["_date_sort"])
 
-        # Fetch bodies for posts that don't already have them
+        # Fetch bodies concurrently (5 threads, ~5x speedup)
         if fetch_bodies and not df.empty:
             needs_body = df["body"].str.strip().eq("")
             need_count = needs_body.sum()
             if need_count > 0:
                 logger.info(
                     "Fetching bodies for %d/%d posts for %s",
-                    need_count,
-                    len(df),
-                    stock_code,
+                    need_count, len(df), stock_code,
                 )
-                for i, idx in enumerate(df[needs_body].index):
-                    post_id = df.at[idx, "post_id"]
-                    body = self._fetch_post_body(stock_code, str(post_id))
-                    if body:
-                        df.at[idx, "body"] = body
-                    # Polite delay between detail page requests
-                    if i < need_count - 1:
-                        time.sleep(0.2)
+                indices = df[needs_body].index.tolist()
+                post_ids = [str(df.at[i, "post_id"]) for i in indices]
+                bodies_result = [""] * len(indices)
+                with ThreadPoolExecutor(max_workers=5) as pool:
+                    futures = {
+                        pool.submit(self._fetch_post_body, stock_code, pid): j
+                        for j, pid in enumerate(post_ids)
+                    }
+                    for fut in as_completed(futures):
+                        j = futures[fut]
+                        try:
+                            bodies_result[j] = fut.result() or ""
+                        except Exception:
+                            bodies_result[j] = ""
+                for j, idx in enumerate(indices):
+                    if bodies_result[j]:
+                        df.at[idx, "body"] = bodies_result[j]
 
         return df.reset_index(drop=True)
