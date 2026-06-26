@@ -37,6 +37,11 @@ ETF_FLOW_COLS = [
     "sector_etf_flow", "sector_etf_amount",
 ]
 
+GUBA_COLS = [
+    "guba_sentiment_mean", "guba_sentiment_std", "guba_post_count",
+    "guba_positive_ratio", "guba_negative_ratio", "has_guba_post",
+]
+
 FUNDAMENTAL_COLS = [
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
@@ -65,6 +70,7 @@ class FeaturePipeline:
         use_temporal: bool = True,
         use_sentiment: bool = True,
         use_announcements: bool = True,
+        use_guba: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -74,6 +80,7 @@ class FeaturePipeline:
         self.use_temporal = use_temporal
         self.use_sentiment = use_sentiment
         self.use_announcements = use_announcements
+        self.use_guba = use_guba
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
 
@@ -92,18 +99,20 @@ class FeaturePipeline:
         fundamental_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
+        guba_df: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build features and return (X, y, aligned_close).
 
         All auxiliary DataFrames must have a 'date' column and be
         pre-filtered to the stock's date range.  Market data are merged
         by date; fundamentals should already be forward-filled to daily;
-        ETF flow is merged by date after mapping stock to sector.
+        ETF flow is merged by date after mapping stock to sector;
+        guba_df provides Guba forum sentiment aggregated to daily.
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, etf_flow_df,
-            announcement_df,
+            announcement_df, guba_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
         return X, y, aligned_close
@@ -122,6 +131,7 @@ class FeaturePipeline:
         fundamental_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
+        guba_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
@@ -133,6 +143,7 @@ class FeaturePipeline:
         df = self._merge_dragon_tiger(df, dragon_tiger_df)
         df = self._merge_fundamental(df, fundamental_df)
         df = self._merge_etf_flow(df, etf_flow_df)
+        df = self._merge_guba(df, guba_df)
 
         if self.use_technical:
             df = self._ti.compute_all(df)
@@ -156,6 +167,7 @@ class FeaturePipeline:
             ))
             temporal_cols += _active_cols(df, FUNDAMENTAL_COLS)
             temporal_cols += _active_cols(df, ETF_FLOW_COLS)
+            temporal_cols += _active_cols(df, GUBA_COLS)
             df = add_lag_features(df, temporal_cols, self.LAGS)
             df = add_rolling_features(df, temporal_cols, self.ROLLING_WINDOWS)
             df = add_calendar_features(df)
@@ -338,6 +350,35 @@ class FeaturePipeline:
         df = df.merge(ef[["date"] + available], on="date", how="left")
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
+
+    def _merge_guba(self, df: pd.DataFrame,
+                    guba_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_guba and guba_df is not None
+                and not guba_df.empty):
+            return df
+        g = guba_df.copy()
+        g["date"] = pd.to_datetime(g["date"])
+        available = [c for c in GUBA_COLS if c in g.columns]
+        if not available:
+            return df
+        df = df.merge(g[["date"] + available], on="date", how="left")
+        for col in available:
+            if col == "has_guba_post":
+                df[col] = df[col].fillna(False).astype(bool)
+            elif col == "guba_post_count":
+                df[col] = df[col].fillna(0).astype("int16")
+            else:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: guba sentiment[t-1] paired with price[t]
+        for col in available:
+            df[col] = df[col].shift(1)
+        df["has_guba_post"] = df["has_guba_post"].fillna(False).astype(bool)
+        df["guba_post_count"] = df["guba_post_count"].fillna(0).astype("int16")
+        for col in ["guba_sentiment_mean", "guba_sentiment_std",
+                     "guba_positive_ratio", "guba_negative_ratio"]:
+            if col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     # ------------------------------------------------------------------
