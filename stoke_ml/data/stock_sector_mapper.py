@@ -110,10 +110,9 @@ class StockSectorMapper:
             return
 
         try:
-            # Get all industry boards
             industries = ak.stock_board_industry_name_em()
         except Exception as e:
-            logger.warning("Failed to fetch industry names: %s", e)
+            logger.warning("Failed to fetch industry names (%s), ETF data will be unavailable", e)
             self._loaded = True
             return
 
