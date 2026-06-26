@@ -15,6 +15,10 @@ from torch.utils.data import DataLoader
 from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
+from stoke_ml.data.market_wide_storage import MarketWideStorage
+from stoke_ml.data.fundamental_storage import FundamentalStorage
+from stoke_ml.data.etf_storage import ETFStorage
+from stoke_ml.data.stock_sector_mapper import StockSectorMapper
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
 from stoke_ml.evaluation.metrics import mcc_score, compute_financial_metrics
@@ -67,6 +71,12 @@ def main():
 
     storage = DataStorage(cfg.project.data_dir)
     news_storage = NewsStorage(cfg.project.data_dir)
+    margin_storage = MarketWideStorage(cfg.project.data_dir, "margin")
+    nb_storage = MarketWideStorage(cfg.project.data_dir, "northbound")
+    dt_storage = MarketWideStorage(cfg.project.data_dir, "dragon_tiger")
+    fund_storage = FundamentalStorage(cfg.project.data_dir)
+    etf_storage = ETFStorage(cfg.project.data_dir)
+    sector_mapper = StockSectorMapper()
     codes = [args.stock] if args.stock else available_stocks(storage)
 
     if not codes:
@@ -106,20 +116,52 @@ def main():
             logger.warning("No data for %s, skipping", code)
             continue
 
-        # Load daily sentiment if available
-        sentiment_df = news_storage.load_daily_sentiment(
-            code,
-            start_date=cfg.markets.a_shares.start_date,
-            end_date=datetime.now().strftime("%Y-%m-%d"),
-        )
+        date_start = cfg.markets.a_shares.start_date
+        date_end = datetime.now().strftime("%Y-%m-%d")
+
+        # Load daily sentiment
+        sentiment_df = news_storage.load_daily_sentiment(code, date_start, date_end)
         if not sentiment_df.empty:
             logger.info(
                 "  %s: loaded %d sentiment days (%d with news)",
                 code, len(sentiment_df), sentiment_df["has_news"].sum(),
             )
 
+        # Load market-wide data
+        margin_df = margin_storage.load(code, date_start, date_end)
+        nb_df = nb_storage.load(code, date_start, date_end)
+        dt_df = dt_storage.load(code, date_start, date_end)
+
+        # Load fundamentals (forward-filled to daily)
+        fundamental_df = fund_storage.forward_fill_to_daily(code, date_start, date_end)
+
+        # Load ETF flow for this stock's sector
+        etf_df = pd.DataFrame()
+        sector = sector_mapper.get_sector(code)
+        if sector:
+            etf_df = etf_storage.load_sector_flow(sector, date_start, date_end)
+
+        loaded = [f"K={len(df)}"]
+        if not sentiment_df.empty:
+            loaded.append(f"S={len(sentiment_df)}")
+        if not margin_df.empty:
+            loaded.append(f"M={len(margin_df)}")
+        if not nb_df.empty:
+            loaded.append(f"N={len(nb_df)}")
+        if not fundamental_df.empty:
+            loaded.append(f"F={len(fundamental_df)}")
+        if not etf_df.empty:
+            loaded.append(f"ETF={len(etf_df)}")
+        logger.info("  %s: %s", code, " ".join(loaded))
+
         X, y, aligned_close = pipeline.build_features(
-            df, sentiment_df=sentiment_df if not sentiment_df.empty else None,
+            df,
+            sentiment_df=sentiment_df if not sentiment_df.empty else None,
+            margin_df=margin_df if not margin_df.empty else None,
+            northbound_df=nb_df if not nb_df.empty else None,
+            dragon_tiger_df=dt_df if not dt_df.empty else None,
+            fundamental_df=fundamental_df if not fundamental_df.empty else None,
+            etf_flow_df=etf_df if not etf_df.empty else None,
         )
         if len(X) == 0:
             logger.warning("Not enough features for %s, skipping", code)
