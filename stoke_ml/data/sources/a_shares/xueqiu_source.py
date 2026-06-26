@@ -42,6 +42,13 @@ _tls = threading.local()
 # even within the same greenlet).
 _lock = threading.Lock()
 
+# Per-page API call timeout in ms (injected into JS fetch via AbortController)
+_API_TIMEOUT_MS = 30000
+# Per-stock total timeout in seconds — a threading.Timer will force-close
+# the browser if the stock fetch exceeds this, causing the hung evaluate()
+# to throw and the next stock to auto-create a fresh browser.
+_BROWSER_TIMEOUT_SEC = 120
+
 
 def _build_symbol(stock_code: str) -> str:
     """Build Xueqiu symbol from 6-digit A-share code."""
@@ -97,6 +104,23 @@ def _get_page() -> "Page":
     return _tls.context.new_page()
 
 
+def _kill_chromes() -> None:
+    """Kill all Chromium processes owned by this user.  Called by a
+    threading.Timer when a stock fetch exceeds the per-stock timeout.
+    This is more reliable than browser.close() which requires a working
+    DevTools connection (which is exactly what hangs).
+    """
+    import subprocess
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chrome-headless-shell.exe"],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 _HTML_RE = re.compile(r"<[^>]+>")
 
 
@@ -112,6 +136,9 @@ class XueqiuNewsSource:
     Cloudflare WAF is bypassed by loading the stock page in headless
     Chromium (which auto-solves the JS challenge), then calling the
     internal status API through the authenticated session.
+
+    Each API call has a JS-level 30s timeout via AbortController so
+    a hung request cannot stall the pipeline indefinitely.
     """
 
     def fetch_news(
@@ -130,100 +157,142 @@ class XueqiuNewsSource:
             max_pages: Pages to fetch (20 items/page, max 50).
 
         Returns:
-            DataFrame with columns: date, title, url.
+            DataFrame with columns: date, title, body, url.
         """
         symbol = _build_symbol(stock_code)
         end_dt = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
         start_dt = pd.Timestamp(start_date) if start_date else end_dt - pd.Timedelta(days=30)
 
         page = None
+        timer = None
         try:
             page = _get_page()
         except Exception as e:
             logger.warning("Playwright not available for Xueqiu: %s", e)
-            return pd.DataFrame(columns=["date", "title", "url"])
+            return pd.DataFrame(columns=["date", "title", "body", "url"])
 
         try:
-            # Navigate to stock page to get WAF-cleared cookies for this page
-            page.goto(
-                f"{_BASE_URL}/S/{symbol}",
-                timeout=60000,
-                wait_until="domcontentloaded",
+            timer = threading.Timer(
+                _BROWSER_TIMEOUT_SEC, lambda: _kill_chromes(),
             )
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-            time.sleep(1)
-            # Dismiss any modal overlay
-            page.evaluate(
-                '() => { const m = document.querySelector(".modals.dimmer");'
-                " if(m) m.remove(); }"
-            )
-            time.sleep(0.3)
+            timer.start()
 
-            # Fetch pages via the internal API
             collected: list[dict] = []
             max_pages = min(max_pages, 50)
 
-            for page_num in range(1, max_pages + 1):
-                api_url = _API_URL.format(symbol=symbol, page=page_num)
-                js = (
-                    "async () => {"
-                    f"  const resp = await fetch('{api_url}',"
-                    "   {credentials: 'include'});"
-                    "  return JSON.stringify(await resp.json());"
-                    "}"
+            for waf_attempt in range(3):
+                # Navigate to stock page for WAF cookies
+                page.goto(
+                    f"{_BASE_URL}/S/{symbol}",
+                    timeout=60000, wait_until="domcontentloaded",
                 )
                 try:
-                    raw = page.evaluate(js)
-                    data = json.loads(raw)
-                except Exception as e:
-                    logger.warning(
-                        "Xueqiu API page %d failed for %s: %s",
-                        page_num, stock_code, e,
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                time.sleep(1.5)
+                page.evaluate(
+                    '() => { const m = document.querySelector(".modals.dimmer");'
+                    " if(m) m.remove(); }"
+                )
+                time.sleep(0.3)
+
+                waf_ok = True
+                page_items: list[dict] = []
+                for page_num in range(1, max_pages + 1):
+                    api_url = _API_URL.format(symbol=symbol, page=page_num)
+                    js = (
+                        "async () => {"
+                        f"  const ctrl = new AbortController();"
+                        f"  const timer = setTimeout(() => ctrl.abort(), {_API_TIMEOUT_MS});"
+                        "  try {"
+                        f"    const resp = await fetch('{api_url}',"
+                        "      {credentials: 'include', signal: ctrl.signal});"
+                        "    const text = await resp.text();"
+                        "    return JSON.stringify({ok: resp.ok, text: text});"
+                        "  } finally {"
+                        "    clearTimeout(timer);"
+                        "  }"
+                        "}"
                     )
-                    break
-
-                items = data.get("list", [])
-                if not items:
-                    break
-
-                page_collected = 0
-                for item in items:
-                    created_at = item.get("created_at")
-                    if not created_at:
-                        continue
-                    dt = datetime.fromtimestamp(created_at / 1000.0)
-
-                    # Items are newest-first; stop processing this page
-                    # once we reach items older than start_date
-                    if dt < start_dt:
+                    try:
+                        raw = page.evaluate(js)
+                        wrapper = json.loads(raw)
+                    except Exception:
+                        logger.debug(
+                            "Xueqiu evaluate failed page %d for %s",
+                            page_num, stock_code,
+                        )
                         break
 
-                    text = item.get("text", "") or item.get("title", "") or ""
-                    full_text = _strip_html(text)
-                    title = full_text[:200]
-                    body = full_text[:2000] if len(full_text) > 200 else full_text[200:]
-                    if not title:
-                        continue
+                    if not wrapper.get("ok"):
+                        # HTTP error (429, 403, etc.) — stop, WAF may need refresh
+                        logger.debug(
+                            "Xueqiu HTTP %s on page %d for %s",
+                            "error" if not wrapper.get("ok") else "ok",
+                            page_num, stock_code,
+                        )
+                        if page_num == 1:
+                            waf_ok = False
+                        break
 
-                    post_id = item.get("id")
-                    user_id = item.get("user_id") or ""
-                    if post_id and user_id:
-                        url = f"{_BASE_URL}/{user_id}/{post_id}"
-                    elif post_id:
-                        url = f"{_BASE_URL}/u/{post_id}"
-                    else:
-                        url = ""
+                    text = wrapper.get("text", "")
+                    if not text or text.strip().startswith("<"):
+                        if page_num == 1:
+                            waf_ok = False
+                        break
 
-                    collected.append({"date": dt, "title": title, "body": body, "url": url})
-                    page_collected += 1
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        if page_num == 1:
+                            waf_ok = False
+                        break
 
-                # Stop if this page had zero items in range (all older
-                # than start_date, so subsequent pages will be older too)
-                if page_collected == 0:
-                    break
+                    items = data.get("list", [])
+                    if not items:
+                        break
+
+                    page_count = 0
+                    for item in items:
+                        created_at = item.get("created_at")
+                        if not created_at:
+                            continue
+                        dt = datetime.fromtimestamp(created_at / 1000.0)
+                        if dt < start_dt:
+                            break
+
+                        content = item.get("text", "") or item.get("title", "") or ""
+                        clean = _strip_html(content)
+                        title = clean[:200]
+                        body = clean[:2000] if len(clean) > 200 else ""
+                        if not title:
+                            continue
+
+                        post_id = item.get("id")
+                        user_id = item.get("user_id") or ""
+                        if post_id and user_id:
+                            url = f"{_BASE_URL}/{user_id}/{post_id}"
+                        elif post_id:
+                            url = f"{_BASE_URL}/u/{post_id}"
+                        else:
+                            url = ""
+
+                        page_items.append({
+                            "date": dt, "title": title, "body": body, "url": url,
+                        })
+                        page_count += 1
+
+                    if page_count == 0:
+                        break
+
+                if not waf_ok:
+                    page_items.clear()
+                    continue
+
+                collected = page_items
+                if collected:
+                    break  # success — got data
 
             if not collected:
                 return pd.DataFrame(columns=["date", "title", "body", "url"])
@@ -239,9 +308,18 @@ class XueqiuNewsSource:
             return df[["date", "title", "body", "url"]].reset_index(drop=True)
 
         except Exception as e:
-            logger.debug("Xueqiu fetch for %s failed: %s", stock_code, e)
+            msg = str(e)
+            if "closed" in msg.lower() or "connection" in msg.lower():
+                logger.warning(
+                    "Xueqiu browser closed (likely timeout) for %s, will restart browser",
+                    stock_code,
+                )
+            else:
+                logger.debug("Xueqiu fetch for %s failed: %s", stock_code, e)
             return pd.DataFrame(columns=["date", "title", "body", "url"])
         finally:
+            if timer is not None:
+                timer.cancel()
             if page is not None:
                 try:
                     page.close()

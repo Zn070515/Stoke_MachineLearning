@@ -1,19 +1,25 @@
-"""Multi-source news pipeline aggregating Sina, Xueqiu, and THS news."""
+"""Multi-source news pipeline aggregating Sina and THS news.
+
+Xueqiu is currently blocked by Cloudflare WAF and skipped by default.
+"""
 import logging
 
 import pandas as pd
 
 from stoke_ml.data.sources.a_shares.news_source import SinaNewsSource
-from stoke_ml.data.sources.a_shares.xueqiu_source import XueqiuNewsSource
 from stoke_ml.data.sources.a_shares.ths_source import THSNewsSource
 
 logger = logging.getLogger(__name__)
 
+# Xueqiu removed from defaults — Cloudflare WAF blocks both Playwright
+# and curl_cffi impersonation as of 2026-06.
 SOURCE_MAP = {
     "sina": SinaNewsSource,
-    "xueqiu": XueqiuNewsSource,
     "ths": THSNewsSource,
 }
+
+# Sources that support the fetch_bodies parameter
+_BODY_SOURCES = {"sina"}
 
 
 class NewsPipeline:
@@ -43,17 +49,21 @@ class NewsPipeline:
         """Fetch news from all active sources, deduplicate by (title, date).
 
         Returns DataFrame with columns: date, title, url, source.
+        Sources that support body fetching (Sina) will include full article text.
         """
         all_frames = []
 
         for source_name, source in self._sources.items():
             try:
-                df = source.fetch_news(
-                    stock_code,
+                kwargs = dict(
+                    stock_code=stock_code,
                     start_date=start_date,
                     end_date=end_date,
                     max_pages=max_pages,
                 )
+                if source_name in _BODY_SOURCES:
+                    kwargs["fetch_bodies"] = True
+                df = source.fetch_news(**kwargs)
                 if not df.empty:
                     df["source"] = source_name
                     all_frames.append(df)

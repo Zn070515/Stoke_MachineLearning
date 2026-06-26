@@ -1,6 +1,7 @@
 """Sina Finance news crawler for A-share stocks."""
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -36,8 +37,17 @@ class SinaNewsSource:
         start_date: str | None = None,
         end_date: str | None = None,
         max_pages: int = 3,
+        fetch_bodies: bool = False,
     ) -> pd.DataFrame:
-        """Fetch news headlines for a stock. Returns DataFrame with date/title/url."""
+        """Fetch news headlines for a stock. Returns DataFrame with date/title/url.
+
+        Args:
+            stock_code: 6-digit A-share code.
+            start_date: YYYY-MM-DD filter (inclusive).
+            end_date: YYYY-MM-DD filter (inclusive).
+            max_pages: Pages to fetch (~25 items/page).
+            fetch_bodies: If True, fetch full article body for each article.
+        """
         prefix = self._to_sina_prefix(stock_code)
         all_items = []
 
@@ -98,6 +108,20 @@ class SinaNewsSource:
             df = df[df["date"] >= pd.Timestamp(start_date)]
         if end_date:
             df = df[df["date"] <= pd.Timestamp(end_date)]
+
+        # Fetch article bodies concurrently (5 threads, ~3x speedup)
+        if fetch_bodies and not df.empty:
+            urls = df["url"].tolist()
+            bodies = [""] * len(urls)
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = {pool.submit(self.fetch_article_body, u): i for i, u in enumerate(urls)}
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    try:
+                        bodies[i] = fut.result() or ""
+                    except Exception:
+                        bodies[i] = ""
+            df["body"] = bodies
 
         return df.reset_index(drop=True)
 
