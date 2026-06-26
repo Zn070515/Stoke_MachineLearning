@@ -54,8 +54,7 @@ class MarketWideStorage:
     ) -> pd.DataFrame:
         """Load market data for a single stock in a date range.
 
-        Uses direct path lookup by year/month partition instead of
-        os.walk to avoid scanning hundreds of thousands of files.
+        Prefers consolidated flat file; falls back to year/month partitions.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -64,8 +63,16 @@ class MarketWideStorage:
         if not os.path.exists(base):
             return pd.DataFrame()
 
+        # Prefer consolidated flat file: {type}/{code}.parquet
+        flat_path = os.path.join(base, f"{stock_code}.parquet")
+        if os.path.isfile(flat_path):
+            df = pd.read_parquet(flat_path)
+            df["date"] = pd.to_datetime(df["date"])
+            mask = (df["date"] >= start) & (df["date"] <= end)
+            return df[mask].sort_values("date").reset_index(drop=True)
+
+        # Fallback: partitioned {type}/{year}/{month}/{code}.parquet
         frames = []
-        # Walk year/month partitions in the date range only
         for year in range(start.year, end.year + 1):
             year_dir = os.path.join(base, str(year))
             if not os.path.isdir(year_dir):

@@ -36,6 +36,15 @@ class DataStorage:
         if not os.path.exists(base):
             return pd.DataFrame()
 
+        # Prefer consolidated flat file: daily/{code}.parquet
+        flat_path = os.path.join(base, f"{stock_code}.parquet")
+        if os.path.isfile(flat_path):
+            df = pd.read_parquet(flat_path)
+            df["date"] = pd.to_datetime(df["date"])
+            mask = (df["date"] >= start) & (df["date"] <= end)
+            return df[mask].sort_values("date").reset_index(drop=True)
+
+        # Fallback: partitioned daily/{year}/{month}/{code}.parquet
         all_data = []
         for root, _dirs, files in os.walk(base):
             for f in files:

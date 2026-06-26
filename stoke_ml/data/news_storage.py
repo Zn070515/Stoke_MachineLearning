@@ -168,7 +168,10 @@ class NewsStorage:
     def load_daily_sentiment(
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """Load daily sentiment for a stock in a date range."""
+        """Load daily sentiment for a stock in a date range.
+
+        Prefers consolidated flat file; falls back to year/month partitions.
+        """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
 
@@ -176,6 +179,15 @@ class NewsStorage:
         if not os.path.exists(base):
             return pd.DataFrame()
 
+        # Prefer consolidated flat file: sentiment/{code}.parquet
+        flat_path = os.path.join(base, f"{stock_code}.parquet")
+        if os.path.isfile(flat_path):
+            df = pd.read_parquet(flat_path)
+            df["date"] = pd.to_datetime(df["date"])
+            mask = (df["date"] >= start) & (df["date"] <= end)
+            return df[mask].sort_values("date").reset_index(drop=True)
+
+        # Fallback: partitioned sentiment/{year}/{month}/{code}.parquet
         frames = []
         for root, _dirs, files in os.walk(base):
             for f in files:

@@ -49,8 +49,8 @@ class FundamentalStorage:
     ) -> pd.DataFrame:
         """Load fundamental data for a stock in a date range.
 
-        Returns raw quarterly data (no forward-fill). Uses direct
-        path lookup by year/quarter partition.
+        Returns raw quarterly data (no forward-fill). Prefers consolidated
+        flat file; falls back to year/quarter partitions.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -59,6 +59,19 @@ class FundamentalStorage:
         if not os.path.exists(base):
             return pd.DataFrame()
 
+        # Prefer consolidated flat file: fundamentals/{code}.parquet
+        flat_path = os.path.join(base, f"{stock_code}.parquet")
+        if os.path.isfile(flat_path):
+            df = pd.read_parquet(flat_path)
+            if "report_date" not in df.columns:
+                return pd.DataFrame()
+            df["report_date"] = pd.to_datetime(df["report_date"])
+            if "disclose_date" in df.columns:
+                df["disclose_date"] = pd.to_datetime(df["disclose_date"])
+            mask = (df["report_date"] >= start) & (df["report_date"] <= end)
+            return df[mask].sort_values("report_date").reset_index(drop=True)
+
+        # Fallback: partitioned fundamentals/{year}/{quarter}/{code}.parquet
         frames = []
         quarters = ["Q1", "Q2", "Q3", "Q4"]
         for year in range(start.year, end.year + 1):

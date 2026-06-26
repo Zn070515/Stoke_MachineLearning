@@ -43,7 +43,10 @@ class ETFStorage:
     def load_sector_flow(
         self, sector_name: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """Load sector flow data for a date range (direct path lookup)."""
+        """Load sector flow data for a date range.
+
+        Prefers consolidated flat file; falls back to year/month partitions.
+        """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
         base = self._base_dir()
@@ -51,6 +54,17 @@ class ETFStorage:
         if not os.path.exists(base):
             return pd.DataFrame()
 
+        # Prefer consolidated flat file: etf_flow/sector_{name}.parquet
+        flat_path = os.path.join(base, f"sector_{sector_name}.parquet")
+        if os.path.isfile(flat_path):
+            df = pd.read_parquet(flat_path)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                mask = (df["date"] >= start) & (df["date"] <= end)
+                return df[mask].sort_values("date").reset_index(drop=True)
+            return df
+
+        # Fallback: partitioned etf_flow/{year}/{month}/sector_{name}.parquet
         target = f"sector_{sector_name}.parquet"
         frames = []
         for year in range(start.year, end.year + 1):
