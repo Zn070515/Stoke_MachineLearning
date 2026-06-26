@@ -42,6 +42,11 @@ GUBA_COLS = [
     "guba_positive_ratio", "guba_negative_ratio", "has_guba_post",
 ]
 
+COMMENT_COLS = [
+    "comment_score", "comment_attention", "comment_institution",
+    "comment_trend", "has_comment",
+]
+
 FUNDAMENTAL_COLS = [
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
@@ -71,6 +76,7 @@ class FeaturePipeline:
         use_sentiment: bool = True,
         use_announcements: bool = True,
         use_guba: bool = True,
+        use_comment: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -81,6 +87,7 @@ class FeaturePipeline:
         self.use_sentiment = use_sentiment
         self.use_announcements = use_announcements
         self.use_guba = use_guba
+        self.use_comment = use_comment
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
 
@@ -100,6 +107,7 @@ class FeaturePipeline:
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
+        comment_df: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build features and return (X, y, aligned_close).
 
@@ -107,12 +115,13 @@ class FeaturePipeline:
         pre-filtered to the stock's date range.  Market data are merged
         by date; fundamentals should already be forward-filled to daily;
         ETF flow is merged by date after mapping stock to sector;
-        guba_df provides Guba forum sentiment aggregated to daily.
+        guba_df provides Guba forum sentiment aggregated to daily;
+        comment_df provides AKShare market comment scores (daily).
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, etf_flow_df,
-            announcement_df, guba_df,
+            announcement_df, guba_df, comment_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
         return X, y, aligned_close
@@ -132,6 +141,7 @@ class FeaturePipeline:
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
+        comment_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
@@ -144,6 +154,7 @@ class FeaturePipeline:
         df = self._merge_fundamental(df, fundamental_df)
         df = self._merge_etf_flow(df, etf_flow_df)
         df = self._merge_guba(df, guba_df)
+        df = self._merge_comment(df, comment_df)
 
         if self.use_technical:
             df = self._ti.compute_all(df)
@@ -168,6 +179,7 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, FUNDAMENTAL_COLS)
             temporal_cols += _active_cols(df, ETF_FLOW_COLS)
             temporal_cols += _active_cols(df, GUBA_COLS)
+            temporal_cols += _active_cols(df, COMMENT_COLS)
             df = add_lag_features(df, temporal_cols, self.LAGS)
             df = add_rolling_features(df, temporal_cols, self.ROLLING_WINDOWS)
             df = add_calendar_features(df)
@@ -378,6 +390,31 @@ class FeaturePipeline:
         for col in ["guba_sentiment_mean", "guba_sentiment_std",
                      "guba_positive_ratio", "guba_negative_ratio"]:
             if col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
+
+    def _merge_comment(self, df: pd.DataFrame,
+                       comment_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_comment and comment_df is not None
+                and not comment_df.empty):
+            return df
+        c = comment_df.copy()
+        c["date"] = pd.to_datetime(c["date"])
+        available = [col for col in COMMENT_COLS if col in c.columns]
+        if not available:
+            return df
+        df = df.merge(c[["date"] + available], on="date", how="left")
+        for col in available:
+            if col == "has_comment":
+                df[col] = df[col].fillna(False).astype(bool)
+            else:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: comment data[t-1] paired with price[t]
+        for col in available:
+            df[col] = df[col].shift(1)
+        df["has_comment"] = df["has_comment"].fillna(False).astype(bool)
+        for col in COMMENT_COLS:
+            if col != "has_comment" and col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
