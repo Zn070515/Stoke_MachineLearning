@@ -58,15 +58,23 @@ class GubaStorage:
             return
         path = os.path.join(self._raw_dir(), f"{stock_code}.parquet")
         existing = self.load_raw(stock_code)
-        combined = pd.concat([existing, df], ignore_index=True)
+        # New data first + prefer rows with sentiment when body lengths tie.
+        combined = pd.concat([df, existing], ignore_index=True)
         combined["date"] = pd.to_datetime(combined["date"])
 
-        # Deduplicate by post_id — keep the row with the longest body
+        # Deduplicate by post_id — keep the row with the longest body,
+        # breaking ties in favour of rows that have sentiment data.
         if "body" in combined.columns:
+            sort_keys = ["_body_len"]
             combined["_body_len"] = combined["body"].str.len().fillna(0)
-            combined = combined.sort_values("_body_len", ascending=False)
+            if "sentiment_title" in combined.columns:
+                combined["_has_sent"] = combined["sentiment_title"].notna().astype(int)
+                sort_keys.append("_has_sent")
+            combined = combined.sort_values(sort_keys, ascending=False)
             combined = combined.drop_duplicates(subset=["post_id"])
-            combined = combined.drop(columns=["_body_len"])
+            combined = combined.drop(
+                columns=[c for c in ["_body_len", "_has_sent"] if c in combined.columns]
+            )
         else:
             combined = combined.drop_duplicates(subset=["post_id"])
 
@@ -96,10 +104,19 @@ class GubaStorage:
             return
         path = os.path.join(self._silver_dir(), f"{stock_code}.parquet")
         existing = self.load_silver(stock_code)
-        combined = pd.concat([existing, df], ignore_index=True)
+        # New data first: drop_duplicates keeps first occurrence, so
+        # new rows with updated sentiment win over stale existing rows.
+        combined = pd.concat([df, existing], ignore_index=True)
         combined["aligned_date"] = pd.to_datetime(combined["aligned_date"])
         combined["date"] = pd.to_datetime(combined["date"])
-        combined = combined.drop_duplicates(subset=["post_id"])
+        # Prefer rows with sentiment data (non-NaN sentiment_title)
+        if "sentiment_title" in combined.columns:
+            combined["_has_sent"] = combined["sentiment_title"].notna().astype(int)
+            combined = combined.sort_values("_has_sent", ascending=False)
+            combined = combined.drop_duplicates(subset=["post_id"])
+            combined = combined.drop(columns=["_has_sent"])
+        else:
+            combined = combined.drop_duplicates(subset=["post_id"])
         combined = combined.sort_values("aligned_date", ascending=False)
         combined.to_parquet(path, index=False)
 
