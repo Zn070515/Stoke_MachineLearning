@@ -11,7 +11,6 @@ from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
-GUBA_LIST_URL = "https://guba.eastmoney.com/list,{code}.html"
 GUBA_PAGE_URL = "https://guba.eastmoney.com/list,{code}_{page}.html"
 GUBA_DETAIL_URL = "https://guba.eastmoney.com/news,{code},{post_id}.html"
 
@@ -90,15 +89,19 @@ def _extract_article_list(html: str) -> dict | None:
         )
     if not match:
         return None
+
+    raw = match.group(1)
+
+    # Pattern 1 captures content between braces → add braces back
     try:
-        return json.loads("{" + match.group(1) + "}")
+        return json.loads("{" + raw + "}")
     except (json.JSONDecodeError, KeyError):
-        # Try the alternative match group
-        if match.lastindex and match.lastindex >= 1:
-            try:
-                return json.loads(match.group(1))
-            except (json.JSONDecodeError, KeyError):
-                pass
+        pass
+
+    # Pattern 2 captures content WITH braces → parse directly
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, KeyError):
         return None
 
 
@@ -282,6 +285,10 @@ class GubaSource:
                 # Later pages empty means end of pagination
                 break
 
+            # Capture raw page size before any date filtering so the
+            # pagination-termination check is not fooled by filtered-out rows.
+            raw_page_size = len(df_page)
+
             # Filter by date range before adding to keep memory low
             if not df_page["date"].str.strip().eq("").all():
                 df_page["date_parsed"] = pd.to_datetime(
@@ -312,8 +319,10 @@ class GubaSource:
             if not df_page.empty:
                 all_pages.append(df_page)
 
-            # If we got fewer posts than expected (not a full page), stop
-            if len(df_page) < 40 and page > 1:
+            # Stop pagination when the raw (unfiltered) page is sparse —
+            # this means we've exhausted the available posts regardless of
+            # how many rows the date filter kept.
+            if raw_page_size < 40 and page > 1:
                 break
 
             # Polite delay between page requests
