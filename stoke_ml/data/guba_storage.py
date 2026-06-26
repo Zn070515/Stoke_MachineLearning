@@ -123,24 +123,30 @@ class GubaStorage:
         df = raw.copy()
         df["date"] = pd.to_datetime(df["date"])
 
-        # Build datetime from date + time columns
-        df["datetime_str"] = (
-            df["date"].dt.strftime("%Y-%m-%d") + " " + df["time"].astype(str)
-        )
-        df["datetime"] = pd.to_datetime(df["datetime_str"], errors="coerce")
-
-        cutoff = pd.Timestamp("15:00:00").time()
-        df["aligned_date"] = df["date"]  # default: same day
-
-        post_close = df["datetime"].dt.time > cutoff
-        for idx in df[post_close].index:
-            d = df.at[idx, "date"].date()
-            df.at[idx, "aligned_date"] = pd.Timestamp(
-                self._calendar.next_trading_day(d)
+        if "time" in df.columns:
+            # Build datetime from date + time columns
+            df["datetime_str"] = (
+                df["date"].dt.strftime("%Y-%m-%d") + " " + df["time"].astype(str)
             )
+            df["datetime"] = pd.to_datetime(df["datetime_str"], errors="coerce")
 
-        df["aligned_date"] = pd.to_datetime(df["aligned_date"])
-        return df.drop(columns=["datetime_str", "datetime"])
+            cutoff = pd.Timestamp("15:00:00").time()
+            df["aligned_date"] = df["date"]  # default: same day
+
+            post_close = df["datetime"].dt.time > cutoff
+            for idx in df[post_close].index:
+                d = df.at[idx, "date"].date()
+                df.at[idx, "aligned_date"] = pd.Timestamp(
+                    self._calendar.next_trading_day(d)
+                )
+
+            df["aligned_date"] = pd.to_datetime(df["aligned_date"])
+            return df.drop(columns=["datetime_str", "datetime"])
+        else:
+            # No time column — fall back to same-day alignment
+            df["aligned_date"] = df["date"]
+            df["aligned_date"] = pd.to_datetime(df["aligned_date"])
+            return df
 
     # ── Gold: daily sentiment ──────────────────────────────────────
 

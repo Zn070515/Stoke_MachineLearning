@@ -13,7 +13,7 @@ class TestGubaStorage:
     @staticmethod
     def _sample_posts():
         return pd.DataFrame({
-            "date": ["2026-06-22", "2026-06-22", "2026-06-23"],
+            "date": ["2026-06-25", "2026-06-25", "2026-06-23"],
             "time": ["10:30:00", "16:00:00", "14:00:00"],
             "title": ["大涨了", "明天要跌", "稳住了"],
             "body": ["利好！", "利空消息", "没什么"],
@@ -41,16 +41,16 @@ class TestGubaStorage:
 
             silver = storage.bronze_to_silver("600519")
 
-            # Post 123 at 10:30 — same day
+            # Post 123 at 10:30 on Thursday — same day
             post_123 = silver[silver["post_id"] == "123"].iloc[0]
             assert pd.to_datetime(post_123["aligned_date"]).date() == pd.Timestamp(
-                "2026-06-22"
+                "2026-06-25"
             ).date()
 
-            # Post 456 at 16:00 — should move forward (next trading day)
+            # Post 456 at 16:00 on Thursday → aligned to Friday
             post_456 = silver[silver["post_id"] == "456"].iloc[0]
-            assert pd.to_datetime(post_456["aligned_date"]).date() > pd.Timestamp(
-                "2026-06-22"
+            assert pd.to_datetime(post_456["aligned_date"]).date() == pd.Timestamp(
+                "2026-06-26"
             ).date()
 
             # Post 789 at 14:00 on 2026-06-23 — same day
