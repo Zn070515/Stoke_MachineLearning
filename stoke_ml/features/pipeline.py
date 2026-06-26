@@ -16,6 +16,11 @@ SENTIMENT_COLS = [
     "positive_ratio", "negative_ratio", "has_news",
 ]
 
+ANNOUNCEMENT_COLS = [
+    "ann_sentiment_mean", "ann_sentiment_std", "ann_count",
+    "ann_positive_ratio", "ann_negative_ratio", "has_announce",
+]
+
 MARGIN_COLS = [
     "margin_balance", "margin_buy", "short_balance", "margin_net",
 ]
@@ -59,6 +64,7 @@ class FeaturePipeline:
         use_scoring: bool = True,
         use_temporal: bool = True,
         use_sentiment: bool = True,
+        use_announcements: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -67,6 +73,7 @@ class FeaturePipeline:
         self.use_scoring = use_scoring
         self.use_temporal = use_temporal
         self.use_sentiment = use_sentiment
+        self.use_announcements = use_announcements
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
 
@@ -84,6 +91,7 @@ class FeaturePipeline:
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
+        announcement_df: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build features and return (X, y, aligned_close).
 
@@ -95,6 +103,7 @@ class FeaturePipeline:
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, etf_flow_df,
+            announcement_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
         return X, y, aligned_close
@@ -112,11 +121,13 @@ class FeaturePipeline:
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
+        announcement_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
 
         df = self._merge_sentiment(df, sentiment_df)
+        df = self._merge_announcements(df, announcement_df)
         df = self._merge_margin(df, margin_df)
         df = self._merge_northbound(df, northbound_df)
         df = self._merge_dragon_tiger(df, dragon_tiger_df)
@@ -135,6 +146,10 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, [
                 "sentiment_mean", "sentiment_std",
                 "positive_ratio", "negative_ratio",
+            ])
+            temporal_cols += _active_cols(df, [
+                "ann_sentiment_mean", "ann_sentiment_std",
+                "ann_positive_ratio", "ann_negative_ratio",
             ])
             temporal_cols += _active_cols(df, (
                 MARGIN_COLS + NORTHBOUND_COLS + DRAGON_TIGER_COLS
@@ -179,6 +194,46 @@ class FeaturePipeline:
                      "positive_ratio", "negative_ratio"]:
             df[col] = df[col].fillna(0.0).astype(np.float32)
 
+        return df
+
+    def _merge_announcements(self, df: pd.DataFrame,
+                             announcement_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_announcements and announcement_df is not None
+                and not announcement_df.empty):
+            return df
+        a = announcement_df.copy()
+        a["date"] = pd.to_datetime(a["date"])
+        # Map storage column names to prefixed feature column names
+        col_map = {
+            "sentiment_mean": "ann_sentiment_mean",
+            "sentiment_std": "ann_sentiment_std",
+            "announce_count": "ann_count",
+            "positive_ratio": "ann_positive_ratio",
+            "negative_ratio": "ann_negative_ratio",
+            "has_announce": "has_announce",
+        }
+        available = {k: v for k, v in col_map.items() if k in a.columns}
+        if not available:
+            return df
+        rename = {k: v for k, v in available.items()}
+        a_renamed = a[["date"] + list(available.keys())].rename(columns=rename)
+        df = df.merge(a_renamed, on="date", how="left")
+        for _, target_col in available.items():
+            if target_col == "has_announce":
+                df[target_col] = df[target_col].fillna(False).astype(bool)
+            elif "count" in target_col:
+                df[target_col] = df[target_col].fillna(0).astype("int16")
+            else:
+                df[target_col] = df[target_col].fillna(0.0).astype(np.float32)
+        # Same PIT lag as news sentiment
+        for _, target_col in available.items():
+            df[target_col] = df[target_col].shift(1)
+        df["has_announce"] = df["has_announce"].fillna(False).astype(bool)
+        df["ann_count"] = df["ann_count"].fillna(0).astype("int16")
+        for col in ["ann_sentiment_mean", "ann_sentiment_std",
+                     "ann_positive_ratio", "ann_negative_ratio"]:
+            if col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_margin(self, df: pd.DataFrame,

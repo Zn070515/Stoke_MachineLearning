@@ -120,18 +120,22 @@ class NewsSentimentAnalyzer:
     def _finbert_sentiment(self, texts: list[str]) -> np.ndarray:
         """Run FinBERT inference with GPU batching.
 
+        Uses P(positive) - P(negative) for nuanced scoring instead of
+        argmax, since financial text is often neutral-dominant but
+        carries weak directional signal in the probability margins.
+
         Text is truncated to ~300 chars (safe for 512 BERT tokens even
-        with multi-byte Chinese characters) and the tokenizer applies
-        explicit truncation as a second safety layer.
+        with multi-byte Chinese characters).
         """
         truncated = [t[:300] for t in texts]
-        results = self._pipe(truncated, truncation=True, max_length=512)
+        results = self._pipe(truncated, truncation=True, max_length=512,
+                             top_k=None)
         scores = np.zeros(len(texts), dtype=np.float32)
         for i, r in enumerate(results):
-            label = r["label"]
-            score = r["score"]
-            base = _LABEL_TO_SCORE.get(label, 0.0)
-            scores[i] = base * score
+            probs = {item["label"]: item["score"] for item in r}
+            pos = probs.get("Positive", 0.0)
+            neg = probs.get("Negative", 0.0)
+            scores[i] = pos - neg
         return scores
 
     @staticmethod
