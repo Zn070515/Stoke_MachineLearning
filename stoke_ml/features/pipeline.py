@@ -412,7 +412,11 @@ class FeaturePipeline:
         # PIT lag: comment data[t-1] paired with price[t]
         for col in available:
             df[col] = df[col].shift(1)
-        df["has_comment"] = df["has_comment"].fillna(False).astype(bool)
+        if "has_comment" in df.columns:
+            df["has_comment"] = df["has_comment"].fillna(False).astype(bool)
+        else:
+            # derive from comment_score when not in input (e.g. load_daily vs build_features)
+            df["has_comment"] = df.get("comment_score", pd.Series(dtype=float)).notna()
         for col in COMMENT_COLS:
             if col != "has_comment" and col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
