@@ -1,17 +1,20 @@
-"""PyTorch Lightning module wrapping LSTM training loop."""
+"""PyTorch Lightning module wrapping stock prediction training loop.
+
+Model-agnostic: accepts any nn.Module via the `model` argument.
+"""
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import numpy as np
-from stoke_ml.models.dl.lstm_model import LSTMModel
 from stoke_ml.evaluation.metrics import mcc_score
 
 
 class StockLightningModule(pl.LightningModule):
-    """Lightning wrapper for stock prediction models."""
+    """Lightning wrapper for stock prediction models (LSTM, Transformer, etc.)."""
 
     def __init__(
         self,
+        model: nn.Module | None = None,
         input_dim: int = 50,
         hidden_dim: int = 128,
         num_layers: int = 2,
@@ -20,15 +23,39 @@ class StockLightningModule(pl.LightningModule):
         weight_decay: float = 1e-4,
         class_weight: list[float] | None = None,
         use_scheduler: bool = True,
+        model_type: str = "lstm",
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = LSTMModel(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
+
+        if model is not None:
+            self.model = model
+        elif model_type == "transformer":
+            from stoke_ml.models.dl.transformer_model import TransformerModel
+            self.model = TransformerModel(
+                input_dim=input_dim,
+                d_model=hidden_dim,
+                nhead=8,
+                num_layers=num_layers,
+                dropout=dropout,
+            )
+        elif model_type == "attention":
+            from stoke_ml.models.dl.attention_model import SimpleAttentionModel
+            self.model = SimpleAttentionModel(
+                input_dim=input_dim,
+                d_model=hidden_dim,
+                nhead=4,
+                dropout=dropout,
+            )
+        else:
+            from stoke_ml.models.dl.lstm_model import LSTMModel
+            self.model = LSTMModel(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                dropout=dropout,
+            )
+
         if class_weight is not None:
             self._class_weight = torch.tensor(class_weight, dtype=torch.float)
         else:
