@@ -12,8 +12,8 @@ from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
-GUBA_PAGE_URL = "https://guba.eastmoney.com/list,{code}_{page}.html"
-GUBA_DETAIL_URL = "https://guba.eastmoney.com/news,{code},{post_id}.html"
+GUBA_PAGE_URL = "https://guba.eastmoney.com/topic,{code}_{page}.html"
+GUBA_DETAIL_URL = "https://guba.eastmoney.com/topic,{code},{post_id}.html"
 
 HEADERS = {
     "User-Agent": (
@@ -47,7 +47,7 @@ def _fetch_with_retry(url: str, timeout: int = 20) -> requests.Response | None:
             resp = requests.get(
                 url,
                 headers=HEADERS,
-                impersonate="chrome120",
+                impersonate="chrome146",
                 timeout=timeout,
             )
             if resp.status_code == 200:
@@ -149,10 +149,11 @@ class GubaSource:
     def _build_list_url(stock_code: str, page: int = 1) -> str:
         """Build the list page URL.
 
-        Page 1 can use either list,{code}.html or list,{code}_1.html.
-        Pages >= 2 use list,{code}_{N}.html.
-        We always use the _N form for consistency.
+        Page 1: topic,{code}.html (no _1 suffix).
+        Pages >= 2: topic,{code}_{N}.html.
         """
+        if page == 1:
+            return f"https://guba.eastmoney.com/topic,{stock_code}.html"
         return GUBA_PAGE_URL.format(code=stock_code, page=page)
 
     def _fetch_list_page(self, stock_code: str, page: int = 1) -> pd.DataFrame:
