@@ -22,7 +22,7 @@ from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
 from stoke_ml.evaluation.metrics import compute_classification_metrics
-from stoke_ml.models.baseline.xgboost_model import XGBoostBaseline
+from stoke_ml.models.baseline import XGBoostBaseline, LGBMBaseline
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 N_ESTIMATORS = 50
 MAX_DEPTH = 4
 LEARNING_RATE = 0.1
+FEATURE_FRACTION = 0.7  # LightGBM EFB regularization
 MAX_WINDOWS = 2
 N_BOOTSTRAP = 1000
 SEED = 42
@@ -56,7 +57,19 @@ def load_stock_data(code, ds, ns, as_, gs, cs, start, end):
     return result
 
 
-def train_and_eval(pipe, data, splitter):
+def _make_model(model_type):
+    if model_type == "lgbm":
+        return LGBMBaseline(
+            n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH,
+            learning_rate=LEARNING_RATE, feature_fraction=FEATURE_FRACTION,
+        )
+    return XGBoostBaseline(
+        n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH,
+        learning_rate=LEARNING_RATE,
+    )
+
+
+def train_and_eval(pipe, data, splitter, model_type="xgb"):
     X, y, _ = pipe.build_features(
         data["kl"],
         sentiment_df=data.get("sentiment"),
@@ -76,10 +89,7 @@ def train_and_eval(pipe, data, splitter):
         y_train, y_val = y[train_idx], y[val_idx]
         if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
             continue
-        model = XGBoostBaseline(
-            n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH,
-            learning_rate=LEARNING_RATE,
-        )
+        model = _make_model(model_type)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_val)
         metrics_list.append(compute_classification_metrics(y_val, y_pred))
@@ -130,6 +140,9 @@ def main():
     parser.add_argument("--start", type=str, default="2024-01-01")
     parser.add_argument("--end", type=str, default="2026-06-27")
     parser.add_argument("--n-stocks", type=int, default=35)
+    parser.add_argument("--model", type=str, default="xgb",
+                        choices=["xgb", "lgbm", "all"],
+                        help="Model type: xgb (XGBoost), lgbm (LightGBM+EFB), all (both)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -182,102 +195,104 @@ def main():
                      use_guba=True, use_comment=True)),
     ]
 
-    # --- Evaluate each config ---
+    # --- Determine model types to evaluate ---
+    model_types = ["xgb", "lgbm"] if args.model == "all" else [args.model]
     codes_list = list(all_data.keys())
-    all_results = {}  # config_name -> list of per-stock MCCs
 
-    for label, kwargs in configurations:
+    for mtype in model_types:
         logger.info("=" * 60)
-        logger.info("CONFIG: %s", label)
-        pipe = FeaturePipeline(
-            seq_len=cfg.features.seq_len,
-            use_technical=True, use_scoring=True, use_temporal=True,
-            **kwargs,
-        )
-        per_stock_mccs = []
-        for i, code in enumerate(codes_list):
-            t0 = time.time()
-            metrics = train_and_eval(pipe, all_data[code], splitter)
-            dt = time.time() - t0
-            mcc = metrics["mcc"] if metrics else None
-            if mcc is not None:
-                per_stock_mccs.append(mcc)
-                logger.info("  [%d/%d] %s: MCC=%.4f (%.1fs)",
-                            i + 1, len(codes_list), code, mcc, dt)
+        logger.info("MODEL: %s", mtype.upper())
+        all_results = {}  # config_name -> list of per-stock MCCs
+
+        for label, kwargs in configurations:
+            logger.info("CONFIG: %s", label)
+            pipe = FeaturePipeline(
+                seq_len=cfg.features.seq_len,
+                use_technical=True, use_scoring=True, use_temporal=True,
+                **kwargs,
+            )
+            per_stock_mccs = []
+            for i, code in enumerate(codes_list):
+                t0 = time.time()
+                metrics = train_and_eval(pipe, all_data[code], splitter, model_type=mtype)
+                dt = time.time() - t0
+                mcc = metrics["mcc"] if metrics else None
+                if mcc is not None:
+                    per_stock_mccs.append(mcc)
+                    logger.info("  [%d/%d] %s: MCC=%.4f (%.1fs)",
+                                i + 1, len(codes_list), code, mcc, dt)
+                else:
+                    logger.info("  [%d/%d] %s: no result (%.1fs)",
+                                i + 1, len(codes_list), code, dt)
+            all_results[label] = per_stock_mccs
+            mean, lo, hi = bootstrap_ci(per_stock_mccs)
+            logger.info("  => MCC=%.4f [%.4f, %.4f] (n=%d stocks)",
+                        mean, lo, hi, len(per_stock_mccs))
+
+        # --- Baseline for deltas ---
+        baseline_mccs = all_results.get("technical", [])
+        if not baseline_mccs:
+            logger.error("No baseline results for %s — skipping", mtype)
+            continue
+
+        # --- Summary with bootstrap CIs ---
+        print("\n" + "=" * 80)
+        print(f"{mtype.upper()} ABLATION SUMMARY — 95% BOOTSTRAP CI")
+        print(f"({len(codes_list)} stocks, {MAX_WINDOWS} windows, {N_BOOTSTRAP} bootstrap samples)")
+        print("=" * 80)
+        print(f"{'Configuration':<20} {'MCC':>8} {'95% CI':>22} {'Δ MCC':>8} {'Δ 95% CI':>22}")
+        print("-" * 86)
+
+        base_mean, base_lo, base_hi = bootstrap_ci(baseline_mccs)
+        for label in ["technical", "+ sentiment", "+ guba", "+ comment", "ALL"]:
+            mccs = all_results.get(label, [])
+            if not mccs:
+                continue
+            mean, lo, hi = bootstrap_ci(mccs)
+            if label == "technical":
+                delta_str = "—"
+                delta_ci_str = "—"
             else:
-                logger.info("  [%d/%d] %s: no result (%.1fs)",
-                            i + 1, len(codes_list), code, dt)
-        all_results[label] = per_stock_mccs
-        mean, lo, hi = bootstrap_ci(per_stock_mccs)
-        logger.info("  => MCC=%.4f [%.4f, %.4f] (n=%d stocks)",
-                    mean, lo, hi, len(per_stock_mccs))
+                delta_mean, delta_lo, delta_hi = bootstrap_delta_ci(baseline_mccs, mccs)
+                delta_str = f"{delta_mean:+.4f}"
+                delta_ci_str = f"[{delta_lo:+.4f}, {delta_hi:+.4f}]"
+            print(f"{label:<20} {mean:8.4f} [{lo:.4f}, {hi:.4f}]   {delta_str:>8} {delta_ci_str:>22}")
 
-    # --- Baseline for deltas ---
-    baseline_mccs = all_results.get("technical", [])
-    if not baseline_mccs:
-        logger.error("No baseline results — aborting summary")
-        return
-
-    # --- Summary with bootstrap CIs ---
-    print("\n" + "=" * 80)
-    print("ABLATION SUMMARY WITH 95% BOOTSTRAP CONFIDENCE INTERVALS")
-    print(f"({len(codes_list)} stocks, {MAX_WINDOWS} windows, {N_BOOTSTRAP} bootstrap samples)")
-    print("=" * 80)
-    print(f"{'Configuration':<20} {'MCC':>8} {'95% CI':>22} {'Δ MCC':>8} {'Δ 95% CI':>22} {'Acc':>8}")
-    print("-" * 88)
-
-    base_mean, base_lo, base_hi = bootstrap_ci(baseline_mccs)
-    for label in ["technical", "+ sentiment", "+ guba", "+ comment", "ALL"]:
-        mccs = all_results.get(label, [])
-        if not mccs:
-            continue
-        mean, lo, hi = bootstrap_ci(mccs)
-        if label == "technical":
-            delta_str = "—"
-            delta_ci_str = "—"
-            acc_str = "—"
-        else:
+        # --- Significance summary ---
+        print("\n--- Statistical Significance ---")
+        for label in ["+ sentiment", "+ guba", "+ comment", "ALL"]:
+            mccs = all_results.get(label, [])
+            if not mccs:
+                continue
             delta_mean, delta_lo, delta_hi = bootstrap_delta_ci(baseline_mccs, mccs)
-            delta_str = f"{delta_mean:+.4f}"
-            delta_ci_str = f"[{delta_lo:+.4f}, {delta_hi:+.4f}]"
-            acc_str = "—"
-        print(f"{label:<20} {mean:8.4f} [{lo:.4f}, {hi:.4f}]   {delta_str:>8} {delta_ci_str:>22}")
+            sig = "SIGNIFICANT" if delta_lo > 0 else ("NEGATIVE" if delta_hi < 0 else "not significant")
+            print(f"  {label:<20}: Δ={delta_mean:+.4f} 95% CI [{delta_lo:+.4f}, {delta_hi:+.4f}] — {sig}")
 
-    # --- Significance summary ---
-    print("\n--- Statistical Significance ---")
-    for label in ["+ sentiment", "+ guba", "+ comment", "ALL"]:
-        mccs = all_results.get(label, [])
-        if not mccs:
-            continue
-        delta_mean, delta_lo, delta_hi = bootstrap_delta_ci(baseline_mccs, mccs)
-        sig = "SIGNIFICANT" if delta_lo > 0 else ("NEGATIVE" if delta_hi < 0 else "not significant")
-        print(f"  {label:<20}: Δ={delta_mean:+.4f} 95% CI [{delta_lo:+.4f}, {delta_hi:+.4f}] — {sig}")
+        # --- Per-stock best config ---
+        print("\n--- Best Config Per Stock ---")
+        config_names = list(all_results.keys())
+        best_counts = {k: 0 for k in config_names}
+        for i, code in enumerate(codes_list):
+            stock_results = {}
+            for name, mccs in all_results.items():
+                if i < len(mccs):
+                    stock_results[name] = mccs[i]
+            if stock_results:
+                best = max(stock_results, key=stock_results.get)
+                best_counts[best] += 1
+        for name in config_names:
+            print(f"  {name}: {best_counts[name]} stocks")
 
-    # --- Per-stock best config ---
-    print("\n--- Best Config Per Stock ---")
-    config_names = list(all_results.keys())
-    best_counts = {k: 0 for k in config_names}
-    for i, code in enumerate(codes_list):
-        stock_results = {}
-        for name, mccs in all_results.items():
-            if i < len(mccs):
-                stock_results[name] = mccs[i]
-        if stock_results:
-            best = max(stock_results, key=stock_results.get)
-            best_counts[best] += 1
-    for name in config_names:
-        print(f"  {name}: {best_counts[name]} stocks")
-
-    # --- Per-stock deltas for guba ---
-    print("\n--- Per-Stock Guba Delta vs Baseline ---")
-    guba_mccs = all_results.get("+ guba", [])
-    for i, code in enumerate(codes_list):
-        bl = baseline_mccs[i] if i < len(baseline_mccs) else None
-        gb = guba_mccs[i] if i < len(guba_mccs) else None
-        if bl is not None and gb is not None:
-            delta = gb - bl
-            bar = "+" if delta > 0 else "-"
-            print(f"  {code}: {bl:.4f} → {gb:.4f} (Δ{delta:+.4f}) {bar * max(1, int(abs(delta)*50))}")
+        # --- Per-stock deltas for guba ---
+        print("\n--- Per-Stock Guba Delta vs Baseline ---")
+        guba_mccs = all_results.get("+ guba", [])
+        for i, code in enumerate(codes_list):
+            bl = baseline_mccs[i] if i < len(baseline_mccs) else None
+            gb = guba_mccs[i] if i < len(guba_mccs) else None
+            if bl is not None and gb is not None:
+                delta = gb - bl
+                bar = "+" if delta > 0 else "-"
+                print(f"  {code}: {bl:.4f} → {gb:.4f} (Δ{delta:+.4f}) {bar * max(1, int(abs(delta)*50))}")
 
 
 if __name__ == "__main__":
