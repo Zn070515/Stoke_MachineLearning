@@ -13,7 +13,7 @@ from curl_cffi import requests
 logger = logging.getLogger(__name__)
 
 GUBA_PAGE_URL = "https://guba.eastmoney.com/topic,{code}_{page}.html"
-GUBA_DETAIL_URL = "https://guba.eastmoney.com/topic,{code},{post_id}.html"
+GUBA_DETAIL_URL = "https://guba.eastmoney.com/news,{code},{post_id}.html"
 
 HEADERS = {
     "User-Agent": (
@@ -357,7 +357,7 @@ class GubaSource:
                 indices = df[needs_body].index.tolist()
                 post_ids = [str(df.at[i, "post_id"]) for i in indices]
                 bodies_result = [""] * len(indices)
-                with ThreadPoolExecutor(max_workers=5) as pool:
+                with ThreadPoolExecutor(max_workers=10) as pool:
                     futures = {
                         pool.submit(self._fetch_post_body, stock_code, pid): j
                         for j, pid in enumerate(post_ids)
