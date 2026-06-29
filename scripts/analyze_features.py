@@ -204,31 +204,33 @@ def main():
     splitter = WalkForwardSplitter(train_years=1, val_months=3, step_months=3)
 
     # --- Define configurations ---
+    _off = dict(use_dragon_tiger=False, use_fundamental=False,
+                use_etf_flow=False)
     configurations = [
         ("technical", dict(use_sentiment=False, use_announcements=False,
                            use_guba=False, use_comment=False,
-                           use_margin=False, use_northbound=False)),
+                           use_margin=False, use_northbound=False, **_off)),
         ("+ sentiment", dict(use_sentiment=True, use_announcements=False,
                              use_guba=False, use_comment=False,
-                             use_margin=False, use_northbound=False)),
+                             use_margin=False, use_northbound=False, **_off)),
         ("+ guba", dict(use_sentiment=False, use_announcements=False,
                         use_guba=True, use_comment=False,
-                        use_margin=False, use_northbound=False)),
+                        use_margin=False, use_northbound=False, **_off)),
         ("+ comment", dict(use_sentiment=False, use_announcements=False,
                            use_guba=False, use_comment=True,
-                           use_margin=False, use_northbound=False)),
+                           use_margin=False, use_northbound=False, **_off)),
         ("+ margin", dict(use_sentiment=False, use_announcements=False,
                           use_guba=False, use_comment=False,
-                          use_margin=True, use_northbound=False)),
+                          use_margin=True, use_northbound=False, **_off)),
         ("+ northbound", dict(use_sentiment=False, use_announcements=False,
                               use_guba=False, use_comment=False,
-                              use_margin=False, use_northbound=True)),
+                              use_margin=False, use_northbound=True, **_off)),
         ("+ margin+nb", dict(use_sentiment=False, use_announcements=False,
                              use_guba=False, use_comment=False,
-                             use_margin=True, use_northbound=True)),
+                             use_margin=True, use_northbound=True, **_off)),
         ("ALL", dict(use_sentiment=True, use_announcements=True,
                      use_guba=True, use_comment=True,
-                     use_margin=True, use_northbound=True)),
+                     use_margin=True, use_northbound=True, **_off)),
     ]
 
     # --- Determine model types to evaluate ---

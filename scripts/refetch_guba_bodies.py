@@ -69,14 +69,14 @@ def fetch_body(stock_code: str, post_id: str) -> str:
     url = GUBA_DETAIL_URL.format(code=stock_code, post_id=post_id)
     try:
         resp = requests.get(url, headers=HEADERS, impersonate="chrome146", timeout=15)
-        with _rate_lock:
-            _last_request = time.time()
         if resp.status_code != 200:
             return ""
         return _extract_body_from_html(resp.text)
     except Exception:
-        pass
-    return ""
+        return ""
+    finally:
+        with _rate_lock:
+            _last_request = time.time()
 
 
 def fetch_body_playwright(page, stock_code: str, post_id: str) -> str:
