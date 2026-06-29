@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GUBA_DETAIL_URL = "https://guba.eastmoney.com/news,{code},{post_id}.html"
+GUBA_DETAIL_URL = "https://guba.eastmoney.com/topic,{code},{post_id}.html"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -65,7 +65,11 @@ def fetch_body(stock_code: str, post_id: str) -> str:
     with _rate_lock:
         elapsed = time.time() - _last_request
         if elapsed < _MIN_INTERVAL:
-            time.sleep(_MIN_INTERVAL - elapsed + random.random() * 0.5)
+            _wait_time = _MIN_INTERVAL - elapsed + random.random() * 0.5
+        else:
+            _wait_time = 0
+    if _wait_time > 0:
+        time.sleep(_wait_time)
     url = GUBA_DETAIL_URL.format(code=stock_code, post_id=post_id)
     try:
         resp = requests.get(url, headers=HEADERS, impersonate="chrome146", timeout=15)
@@ -174,17 +178,14 @@ def process_stock(code, raw_dir, guba_storage, analyzer, min_coverage):
     post_ids = [str(df.at[i, "post_id"]) for i in indices]
     bodies_result = [""] * len(indices)
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {
-            pool.submit(fetch_body, code, pid): j
-            for j, pid in enumerate(post_ids)
-        }
-        for fut in as_completed(futures):
-            j = futures[fut]
-            try:
-                bodies_result[j] = fut.result() or ""
-            except Exception:
-                bodies_result[j] = ""
+    for j, pid in enumerate(post_ids):
+        try:
+            bodies_result[j] = fetch_body(code, pid) or ""
+        except Exception:
+            bodies_result[j] = ""
+        if (j + 1) % 50 == 0:
+            fetched_so_far = sum(1 for b in bodies_result[:j+1] if b)
+            logger.info("  %s: %d/%d fetched so far", code, fetched_so_far, j + 1)
 
     fetched = 0
     for j, idx in enumerate(indices):

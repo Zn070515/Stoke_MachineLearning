@@ -47,6 +47,11 @@ COMMENT_COLS = [
     "comment_trend", "has_comment",
 ]
 
+XUEQIU_COLS = [
+    "xueqiu_sentiment_mean", "xueqiu_sentiment_std", "xueqiu_post_count",
+    "xueqiu_positive_ratio", "xueqiu_negative_ratio", "has_xueqiu_post",
+]
+
 FUNDAMENTAL_COLS = [
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
@@ -82,6 +87,7 @@ class FeaturePipeline:
         use_dragon_tiger: bool = True,
         use_fundamental: bool = True,
         use_etf_flow: bool = True,
+        use_xueqiu: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -98,6 +104,7 @@ class FeaturePipeline:
         self.use_dragon_tiger = use_dragon_tiger
         self.use_fundamental = use_fundamental
         self.use_etf_flow = use_etf_flow
+        self.use_xueqiu = use_xueqiu
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
 
@@ -118,6 +125,7 @@ class FeaturePipeline:
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
+        xueqiu_df: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build features and return (X, y, aligned_close).
 
@@ -126,12 +134,13 @@ class FeaturePipeline:
         by date; fundamentals should already be forward-filled to daily;
         ETF flow is merged by date after mapping stock to sector;
         guba_df provides Guba forum sentiment aggregated to daily;
-        comment_df provides AKShare market comment scores (daily).
+        comment_df provides AKShare market comment scores (daily);
+        xueqiu_df provides Xueqiu forum sentiment aggregated to daily.
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, etf_flow_df,
-            announcement_df, guba_df, comment_df,
+            announcement_df, guba_df, comment_df, xueqiu_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
         return X, y, aligned_close
@@ -152,6 +161,7 @@ class FeaturePipeline:
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
+        xueqiu_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
@@ -165,6 +175,7 @@ class FeaturePipeline:
         df = self._merge_etf_flow(df, etf_flow_df)
         df = self._merge_guba(df, guba_df)
         df = self._merge_comment(df, comment_df)
+        df = self._merge_xueqiu(df, xueqiu_df)
 
         if self.use_technical:
             df = self._ti.compute_all(df)
@@ -190,6 +201,7 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, ETF_FLOW_COLS)
             temporal_cols += _active_cols(df, GUBA_COLS)
             temporal_cols += _active_cols(df, COMMENT_COLS)
+            temporal_cols += _active_cols(df, XUEQIU_COLS)
             df = add_lag_features(df, temporal_cols, self.LAGS)
             df = add_rolling_features(df, temporal_cols, self.ROLLING_WINDOWS)
             df = add_calendar_features(df)
@@ -434,6 +446,35 @@ class FeaturePipeline:
             df["has_comment"] = df.get("comment_score", pd.Series(dtype=float)).notna()
         for col in COMMENT_COLS:
             if col != "has_comment" and col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
+
+    def _merge_xueqiu(self, df: pd.DataFrame,
+                      xueqiu_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_xueqiu and xueqiu_df is not None
+                and not xueqiu_df.empty):
+            return df
+        x = xueqiu_df.copy()
+        x["date"] = pd.to_datetime(x["date"])
+        available = [c for c in XUEQIU_COLS if c in x.columns]
+        if not available:
+            return df
+        df = df.merge(x[["date"] + available], on="date", how="left")
+        for col in available:
+            if col == "has_xueqiu_post":
+                df[col] = df[col].fillna(False).astype(bool)
+            elif col == "xueqiu_post_count":
+                df[col] = df[col].fillna(0).astype("int16")
+            else:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: xueqiu sentiment[t-1] paired with price[t]
+        for col in available:
+            df[col] = df[col].shift(1)
+        df["has_xueqiu_post"] = df["has_xueqiu_post"].fillna(False).astype(bool)
+        df["xueqiu_post_count"] = df["xueqiu_post_count"].fillna(0).astype("int16")
+        for col in ["xueqiu_sentiment_mean", "xueqiu_sentiment_std",
+                     "xueqiu_positive_ratio", "xueqiu_negative_ratio"]:
+            if col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
