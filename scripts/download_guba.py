@@ -95,67 +95,86 @@ def main():
     )
 
     total_posts = 0
-    success, fail, empty = 0, 0, 0
+    success, fail, empty, skipped = 0, 0, 0, 0
+
+    # Resume: skip stocks already on disk
+    pending = []
+    for code in codes:
+        raw_path = os.path.join(data_dir, "a_shares", "guba_raw", f"{code}.parquet")
+        if os.path.exists(raw_path):
+            skipped += 1
+        else:
+            pending.append(code)
+    if skipped:
+        logger.info("Skipping %d stocks already on disk, %d remaining", skipped, len(pending))
+    codes = pending
+
+    # Shared save function used by both paths
+    def _save_stock(code: str, df: pd.DataFrame) -> int:
+        """Save one stock through the full medallion pipeline. Returns post count."""
+        guba_storage.save_raw(code, df)
+        post_count = len(df)
+        silver = guba_storage.bronze_to_silver(code)
+        if not silver.empty:
+            guba_storage.save_silver(code, silver)
+        if not args.skip_sentiment:
+            gold = guba_storage.silver_to_gold(code, analyzer)
+            if not gold.empty:
+                guba_storage.save_daily_sentiment(gold)
+                post_days = gold["has_guba_post"].sum()
+                logger.info("  %s: %d posts saved, %d sentiment days (%d with posts)",
+                            code, post_count, len(gold), post_days)
+        else:
+            logger.info("  %s: %d posts saved (raw)", code, post_count)
+        return post_count
 
     if args.concurrent:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from stoke_ml.crawler.rate_limiter import RateLimiter
-        from stoke_ml.crawler.concurrent import ConcurrentDownloader
 
         rate_limiter = RateLimiter(
-            base_delay_sec=args.sleep,
+            base_delay_sec=0,
             daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
         )
-        downloader = ConcurrentDownloader(
-            rate_limiter=rate_limiter, max_workers=args.workers,
-        )
+        lock = threading.Lock()
+        completed = 0
 
-        def _fetch_one(code: str):
-            df = guba_source.fetch_posts(
-                code,
-                start_date=args.start,
-                end_date=args.end,
-                max_pages=args.max_pages,
-                fetch_bodies=True,
-            )
-            if not args.skip_sentiment and not df.empty:
-                df = compute_raw_sentiment(df, analyzer)
-            return df
+        def _fetch_one(code: str) -> tuple[str, pd.DataFrame | None, str | None]:
+            try:
+                df = guba_source.fetch_posts(
+                    code,
+                    start_date=args.start,
+                    end_date=args.end,
+                    max_pages=args.max_pages,
+                    fetch_bodies=True,
+                )
+                if not args.skip_sentiment and not df.empty:
+                    df = compute_raw_sentiment(df, analyzer)
+                return code, df, None
+            except Exception as e:
+                return code, None, str(e)
 
-        results = downloader.download_all(codes, _fetch_one)
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_fetch_one, code): code for code in codes}
+            for future in as_completed(futures):
+                code, df, err = future.result()
+                with lock:
+                    completed += 1
+                    logger.info("[%d/%d] %s ...", completed, len(codes) + skipped, code)
 
-        for i, code in enumerate(codes):
-            logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
-            df = results.get(code)
-            if df is None:
-                logger.error("  %s: fetch failed (exception in worker)", code)
-                fail += 1
-                continue
+                if err:
+                    logger.error("  %s: fetch failed: %s", code, err)
+                    fail += 1
+                    continue
 
-            if df.empty:
-                logger.info("  %s: no posts found", code)
-                empty += 1
-                continue
+                if df is None or df.empty:
+                    logger.info("  %s: no posts found", code)
+                    empty += 1
+                    continue
 
-            # Save raw (Bronze)
-            guba_storage.save_raw(code, df)
-            logger.info("  %s: %d posts saved (raw)", code, len(df))
-            total_posts += len(df)
-
-            # PIT-align -> Silver
-            silver = guba_storage.bronze_to_silver(code)
-            if not silver.empty:
-                guba_storage.save_silver(code, silver)
-
-            # Daily aggregation -> Gold
-            if not args.skip_sentiment:
-                gold = guba_storage.silver_to_gold(code, analyzer)
-                if not gold.empty:
-                    guba_storage.save_daily_sentiment(gold)
-                    post_days = gold["has_guba_post"].sum()
-                    logger.info("  %s: %d sentiment days (%d with posts)",
-                                code, len(gold), post_days)
-
-            success += 1
+                total_posts += _save_stock(code, df)
+                success += 1
     else:
         for i, code in enumerate(codes):
             if i > 0:
@@ -206,8 +225,8 @@ def main():
 
             success += 1
 
-    logger.info("Done: %d success, %d fail, %d empty, %d total posts",
-                success, fail, empty, total_posts)
+    logger.info("Done: %d success, %d fail, %d empty, %d skipped, %d total posts",
+                success, fail, empty, skipped, total_posts)
 
 
 if __name__ == "__main__":
