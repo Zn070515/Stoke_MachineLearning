@@ -19,6 +19,10 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _FINBERT_MODEL = "yiyanghkust/finbert-tone-chinese"
+_FINBERT_MODELS = [
+    "yiyanghkust/finbert-tone-chinese",     # 0.88 accuracy, analyst reports
+    "bardsai/finance-sentiment-zh-base",    # 0.973 accuracy, financial phrase bank
+]
 _BATCH_SIZE = 64  # GPU batch size for sentiment inference
 
 # Chinese financial sentiment lexicon — fallback when FinBERT unavailable
@@ -56,8 +60,10 @@ _LABEL_TO_SCORE = {
 class NewsSentimentAnalyzer:
     """Chinese financial news sentiment with FinBERT (GPU) + lexicon fallback.
 
-    Uses yiyanghkust/finbert-tone-chinese on GPU for high-quality
-    financial sentiment. Falls back to financial lexicon on CPU.
+    Tries models in order:
+    1. yiyanghkust/finbert-tone-chinese (0.88 acc, analyst reports)
+    2. bardsai/finance-sentiment-zh-base (0.973 acc, financial phrase bank)
+    3. Financial lexicon fallback (CPU)
     """
 
     def __init__(self):
@@ -72,16 +78,16 @@ class NewsSentimentAnalyzer:
         self._loaded = True
 
         if self._try_finbert():
-            self._model_name = "finbert"
-            logger.info("Sentiment: FinBERT Chinese (GPU batch)")
+            logger.info("Sentiment: %s (%s)", self._model_name, self._device)
         else:
             self._model_name = "lexicon"
             logger.info("Sentiment: financial lexicon (CPU fallback)")
 
     def _try_finbert(self) -> bool:
-        """Load FinBERT model. Tries GPU then CPU, mirror then offline.
+        """Load best available FinBERT model.
 
-        Returns True on success, False to fall back to lexicon.
+        Tries models in _FINBERT_MODELS order, each with mirror → direct
+        → offline cache fallback. Returns True on first success.
         """
         try:
             import torch
@@ -98,21 +104,28 @@ class NewsSentimentAnalyzer:
             self._device = "cpu"
             device = -1
 
-        # Try loading with network access (mirror then direct)
+        for model_name in _FINBERT_MODELS:
+            loaded = self._try_load_model(model_name, device, pipeline)
+            if loaded:
+                return True
+        return False
+
+    def _try_load_model(self, model_name: str, device, pipeline) -> bool:
+        """Try loading a specific model with mirror/direct/offline fallback."""
+        # Try with network access (mirror then direct)
         for attempt in range(2):
             try:
                 if attempt == 0:
-                    # Use HuggingFace mirror accessible from mainland China
                     import os as _os
                     _os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
                 self._pipe = pipeline(
                     "sentiment-analysis",
-                    model=_FINBERT_MODEL,
+                    model=model_name,
                     device=device,
                 )
                 _ = self._pipe("测试")  # warm-up
-                logger.info("FinBERT loaded on %s", self._device)
+                self._model_name = model_name
+                logger.info("%s loaded on %s", model_name, self._device)
                 return True
             except Exception:
                 pass
@@ -121,16 +134,18 @@ class NewsSentimentAnalyzer:
         try:
             self._pipe = pipeline(
                 "sentiment-analysis",
-                model=_FINBERT_MODEL,
+                model=model_name,
                 device=device,
                 local_files_only=True,
             )
             _ = self._pipe("测试")
-            logger.info("FinBERT loaded from cache on %s", self._device)
+            self._model_name = model_name
+            logger.info("%s loaded from cache on %s", model_name, self._device)
             return True
-        except Exception as e:
-            logger.info("FinBERT: failed to load (%s), using lexicon", e)
-            return False
+        except Exception:
+            pass
+
+        return False
 
     def analyze(self, texts: list[str]) -> np.ndarray:
         """Return sentiment scores [-1, 1] for each text."""
