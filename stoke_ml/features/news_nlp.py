@@ -71,6 +71,7 @@ class NewsSentimentAnalyzer:
         self._model_name = "lexicon"
         self._pipe = None
         self._device = "cpu"
+        self._use_finbert = False
 
     def _ensure_loaded(self):
         if self._loaded:
@@ -81,6 +82,7 @@ class NewsSentimentAnalyzer:
             logger.info("Sentiment: %s (%s)", self._model_name, self._device)
         else:
             self._model_name = "lexicon"
+            self._use_finbert = False
             logger.info("Sentiment: financial lexicon (CPU fallback)")
 
     def _try_finbert(self) -> bool:
@@ -95,6 +97,7 @@ class NewsSentimentAnalyzer:
         except ImportError:
             logger.info("FinBERT: transformers/torch not installed")
             return False
+        self._use_finbert = True  # optimistic; reset on failure if all models fail
 
         # Resolve device
         if torch.cuda.is_available():
@@ -153,7 +156,7 @@ class NewsSentimentAnalyzer:
             return np.array([], dtype=np.float32)
         self._ensure_loaded()
 
-        if self._model_name == "finbert":
+        if self._use_finbert:
             return self._finbert_sentiment(texts)
 
         return self._lexicon_batch(texts)

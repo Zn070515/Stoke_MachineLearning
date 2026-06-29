@@ -247,7 +247,7 @@ class TechnicalIndicators:
                 slope_val = (d * (x * y).sum() - sx * y.sum()) / denom if denom != 0 else 0
                 intercept = (y.sum() - slope_val * sx) / d
                 pred = slope_val * x + intercept
-                return (y[-1] - pred[-1]) / close.iloc[win.index[-1]]
+                return (y[-1] - pred[-1]) / y[-1] if y[-1] != 0 else 0.0
 
             df[f"resi_{d}d"] = close.rolling(d).apply(_resi_std, raw=False)
 

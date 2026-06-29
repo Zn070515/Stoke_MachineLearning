@@ -77,6 +77,11 @@ class FeaturePipeline:
         use_announcements: bool = True,
         use_guba: bool = True,
         use_comment: bool = True,
+        use_margin: bool = True,
+        use_northbound: bool = True,
+        use_dragon_tiger: bool = True,
+        use_fundamental: bool = True,
+        use_etf_flow: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -88,6 +93,11 @@ class FeaturePipeline:
         self.use_announcements = use_announcements
         self.use_guba = use_guba
         self.use_comment = use_comment
+        self.use_margin = use_margin
+        self.use_northbound = use_northbound
+        self.use_dragon_tiger = use_dragon_tiger
+        self.use_fundamental = use_fundamental
+        self.use_etf_flow = use_etf_flow
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
 
@@ -262,7 +272,8 @@ class FeaturePipeline:
 
     def _merge_margin(self, df: pd.DataFrame,
                       margin_df: pd.DataFrame | None) -> pd.DataFrame:
-        if margin_df is None or margin_df.empty:
+        if not (self.use_margin and margin_df is not None
+                and not margin_df.empty):
             return df
         m = margin_df.copy()
         m["date"] = pd.to_datetime(m["date"])
@@ -278,7 +289,8 @@ class FeaturePipeline:
 
     def _merge_northbound(self, df: pd.DataFrame,
                           northbound_df: pd.DataFrame | None) -> pd.DataFrame:
-        if northbound_df is None or northbound_df.empty:
+        if not (self.use_northbound and northbound_df is not None
+                and not northbound_df.empty):
             return df
         nb = northbound_df.copy()
         nb["date"] = pd.to_datetime(nb["date"])
@@ -294,7 +306,8 @@ class FeaturePipeline:
 
     def _merge_dragon_tiger(self, df: pd.DataFrame,
                             dt_df: pd.DataFrame | None) -> pd.DataFrame:
-        if dt_df is None or dt_df.empty:
+        if not (self.use_dragon_tiger and dt_df is not None
+                and not dt_df.empty):
             return df
         dt = dt_df.copy()
         dt["date"] = pd.to_datetime(dt["date"])
@@ -322,7 +335,8 @@ class FeaturePipeline:
 
     def _merge_fundamental(self, df: pd.DataFrame,
                            fundamental_df: pd.DataFrame | None) -> pd.DataFrame:
-        if fundamental_df is None or fundamental_df.empty:
+        if not (self.use_fundamental and fundamental_df is not None
+                and not fundamental_df.empty):
             return df
         fd = fundamental_df.copy()
         # Drop metadata columns
@@ -350,7 +364,8 @@ class FeaturePipeline:
 
     def _merge_etf_flow(self, df: pd.DataFrame,
                         etf_flow_df: pd.DataFrame | None) -> pd.DataFrame:
-        if etf_flow_df is None or etf_flow_df.empty:
+        if not (self.use_etf_flow and etf_flow_df is not None
+                and not etf_flow_df.empty):
             return df
         ef = etf_flow_df.copy()
         ef["date"] = pd.to_datetime(ef["date"])

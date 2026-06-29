@@ -16,10 +16,12 @@ Usage:
 import argparse
 import logging
 import os
+import random
 import re
 import html as html_mod
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -59,9 +61,16 @@ def _ts_print(*args, **kwargs):
 
 def fetch_body(stock_code: str, post_id: str) -> str:
     """Fetch post body from Guba detail page using curl-cffi."""
+    global _last_request
+    with _rate_lock:
+        elapsed = time.time() - _last_request
+        if elapsed < _MIN_INTERVAL:
+            time.sleep(_MIN_INTERVAL - elapsed + random.random() * 0.5)
     url = GUBA_DETAIL_URL.format(code=stock_code, post_id=post_id)
     try:
         resp = requests.get(url, headers=HEADERS, impersonate="chrome146", timeout=15)
+        with _rate_lock:
+            _last_request = time.time()
         if resp.status_code != 200:
             return ""
         return _extract_body_from_html(resp.text)
@@ -131,7 +140,6 @@ def _create_stealth_context(browser):
     """)
     return ctx
 
-import time as _time_mod
 _rate_lock = threading.Lock()
 _last_request = 0.0
 _MIN_INTERVAL = 0.5  # minimum seconds between requests to avoid WAF
@@ -156,8 +164,6 @@ def process_stock(code, raw_dir, guba_storage, analyzer, min_coverage):
         return code, 0
 
     coverage = 1 - need_count / len(df)
-    if need_count == 0:
-        return code, 0
     if min_coverage > 0 and coverage >= min_coverage:
         return code, 0
 

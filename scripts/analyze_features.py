@@ -104,8 +104,9 @@ def train_and_eval(pipe, data, splitter, model_type="xgb", selector=None):
             try:
                 X_train = selector.fit_transform(X_train, y_train)
                 X_val = selector.transform(X_val)
-            except Exception:
-                pass  # fall through with full features on selection failure
+            except Exception as e:
+                logger.warning("Feature selection failed for this window, "
+                               "using full features: %s", e)
         model = _make_model(model_type)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_val)
