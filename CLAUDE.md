@@ -17,8 +17,20 @@ PYTHONPATH=. ./.venv/Scripts/python <script>
 # Download K-line for all CSI 300+500 stocks (798 stocks, 2015–2026)
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_data.py
 
-# Download news + sentiment for all stocks on disk
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --max-pages 5 --sleep 2
+# Download news + sentiment (multi-source: EastMoney THS + Sina)
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --source all --max-pages 5
+
+# Download Guba forum posts + sentiment (802 stocks)
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_guba.py --max-pages 10
+
+# Download AKShare comment sentiment (5184 stocks)
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_comment.py
+
+# Download market data (margin/northbound/dragon_tiger)
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_market_data.py --type all
+
+# Download fundamental data (quarterly financials)
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_fundamentals.py
 
 # Single stock test
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --stocks 600519 --max-pages 3
@@ -50,44 +62,79 @@ Phase 1: Data Acquisition → Phase 2: Feature Engineering → Phase 3: Model Tr
 ### Data Layer (`stoke_ml/data/`)
 
 **4-source failover chain** for A-share K-line data (`failover.py` → `AShareDownloader`):
-1. Efinance (EastMoney direct HTTP, curl-cffi Chrome 120 impersonation)
+1. Efinance (EastMoney direct HTTP, curl-cffi Chrome 146 impersonation)
 2. AKShare (Sina Finance wrapper)
 3. Tushare (needs token)
 4. Baostock (free, last resort)
 
-Each source implements `AShareSourceBase` and has a `SOURCE_NAME` string. The downloader tracks failure counts and opens a circuit breaker (5 min cooldown) after 15 consecutive failures for a source.
+Each source implements `AShareSourceBase` and has a `SOURCE_NAME` string. Circuit breaker: 10 consecutive failures → 300s cooldown.
 
-**3-layer news medallion** (`news_storage.py` → `NewsStorage`):
-- Bronze: `news_raw/{stock}.parquet` — raw as-fetched, append-only
-- Silver: `news_silver/{stock}.parquet` — PIT-aligned (post-15:00 CST news → next trading day)
-- Gold: `sentiment/{year}/{month}/{stock}.parquet` — daily aggregation, same partition as K-line
+**3-layer medallion architecture** — all text data sources follow this pattern:
+- Bronze: `*_raw/{stock}.parquet` — raw as-fetched, append-only
+- Silver: `*_silver/{stock}.parquet` — PIT-aligned (post-15:00 CST → next trading day)
+- Gold: `*_sentiment/{year}/{month}/{stock}.parquet` — daily aggregation
 
-**K-line storage** (`storage.py` → `DataStorage`): Parquet partitioned `daily/{year}/{month}/{stock}.parquet`.
+**Storage classes and their data:**
+- `DataStorage` — K-line, `daily/{year}/{month}/{stock}.parquet` (also flat `daily/{code}.parquet`)
+- `NewsStorage` — news articles (3-source aggregation via `NewsPipeline`)
+- `GubaStorage` — forum posts, dedup by `post_id`, columns: `guba_sentiment_mean/std/count/positive_ratio/negative_ratio/has_guba_post`
+- `CommentStorage` — AKShare comment ratings, `build_features()` returns daily ZI-filled features
+- `AnnouncementStorage` — company announcements + sentiment
+- `MarketWideStorage` — dragon_tiger/margin/northbound, partitioned `{type}/{year}/{month}/{stock}.parquet`
+- `FundamentalStorage` — quarterly financials, forward-filled to daily
+- `ETFStorage` — sector ETF flows, `etf_flow/{year}/{month}/sector_{name}.parquet`
 
 **Trading calendar** (`calendar.py` → `TradingCalendar`): Hardcoded A-share holidays 2015–2028. `get_trading_days()`, `is_trading_day()`, `next_trading_day()`.
 
 ### Feature Layer (`stoke_ml/features/`)
 
-`FeaturePipeline.build_features(df, sentiment_df=None)` returns `(X, y, aligned_close)`:
+`FeaturePipeline.build_features(df, **aux_dfs)` returns `(X, y, aligned_close)`:
 
-1. Merge sentiment columns (if `sentiment_df` provided and `use_sentiment=True`) — ZI method: missing days get zeros + `has_news=False`
-2. Technical indicators (`technical.py`): MA, MACD, RSI, Bollinger, ATR, OBV, volume ratios
-3. Trend scoring (`scoring.py`): Rule-based trend labels
-4. Temporal features (`temporal.py`): lags (1/2/3/5/10/20), rolling stats (5/10/20/60), calendar features
-5. Sequence creation: `seq_len=60` trading-day windows → `(n_samples, seq_len, n_features)` or flat `(n_samples, n_features*seq_len)` for XGBoost
+**CRITICAL: All `use_*` flags default to `True`** in FeaturePipeline constructor. When running ablation, you MUST explicitly set unused dimensions to `False`:
+```python
+FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
+                use_guba=False, use_comment=False)
+```
 
-`SENTIMENT_COLS = ["sentiment_mean", "sentiment_std", "news_count", "positive_ratio", "negative_ratio", "has_news"]`
+**9 auxiliary dimensions** (all lagged 1 day to prevent leakage, merged via left-join ZI):
+| Dimension | switch | Columns | Data density |
+|---|---|---|---|
+| sentiment (news) | `use_sentiment` | 6 | medium |
+| guba (forum) | `use_guba` | 6 | high (posts), low (body) |
+| comment (ratings) | `use_comment` | 5 | medium |
+| announcement | `use_announcements` | 6 | low |
+| margin trading | `use_margin` | 4 | high |
+| northbound | `use_northbound` | 2 | medium |
+| dragon tiger | `use_dragon_tiger` | 3 | low |
+| fundamental | `use_fundamental` | 8 | low (quarterly) |
+| ETF flow | `use_etf_flow` | 2 | high (sector-level) |
 
-**News NLP** (`news_nlp.py`):
-- L1: SnowNLP — offline Chinese sentiment, maps [0,1]→[-1,1]
-- `compute_raw_sentiment(df, analyzer)` scores titles + bodies → adds `sentiment_title`, `sentiment_body` columns
+Pipeline steps:
+1. Merge all auxiliary DataFrames (ZI fill for missing days/lags)
+2. Technical indicators (`technical.py`): MA(5/10/20/60/120), EMA(12/26), MACD, RSI(6/12/24), KDJ(9/14), Bollinger %b, ATR(14), ROC, Williams %R, CCI, OBV, volume ratios
+3. Trend scoring (`scoring.py`): trend_level (0-6), bias indicators, buy_signal (0-5)
+4. Microstructure: is_limit_up/down, gap_up/down_pct, volume_anomaly, limit_up_streak
+5. Temporal features (`temporal.py`): lags (1/2/3/5/10/20), rolling stats (5/10/20/60), calendar features
+6. Sequence creation: `seq_len=60` windows → `(n, seq_len, n_features)` or flat `(n, n_features*seq_len)` for XGBoost
+7. ALL config dimensionality: ~405 features × 60 seq_len = 24,300 flat dimensions
+
+**News NLP** (`news_nlp.py`) — 3-tier sentiment:
+- L1: FinBERT Chinese (`yiyanghkust/finbert-tone-chinese`) via HF mirror (`hf-mirror.com`) or local cache
+- L2: FinBERT offline (`local_files_only=True`)
+- L3: Financial lexicon fallback (39 positive + 35 negative Chinese financial terms)
+- CPU inference: ~38ms/text; GPU: ~2ms/text with batching
+- `compute_raw_sentiment(df, analyzer)` adds `sentiment_title` + `sentiment_body` columns
 - `aggregate_daily_sentiment(titles)` returns dict of daily stats
-- L2 upgrade path: FinBERT Chinese (model download blocked in mainland China)
 
 ### Model Layer (`stoke_ml/models/`)
 
-- `XGBoostBaseline`: Flat mode classifier, sklearn-compatible `fit/predict/save`
-- `LSTMModel` + `StockLightningModule`: PyTorch Lightning sequence model, class-weighted for imbalance
+- `XGBoostBaseline` (`models/baseline/`): Flat mode classifier, sklearn-compatible `fit/predict/save`
+- `LSTMModel` (`models/dl/`): 2-layer LSTM, hidden_dim=128, dropout=0.3
+- `TransformerModel` (`models/dl/`): 3-layer Transformer encoder, d_model=128, nhead=8
+- `SimpleAttentionModel` (`models/dl/`): Single self-attention + learnable query pooling, d_model=64
+- `StockLightningModule`: PyTorch Lightning wrapper, class-weighted CrossEntropyLoss, ReduceLROnPlateau, records val_mcc
+
+Existing checkpoints: `lstm_000001_final.ckpt`, `lstm_601318_final.ckpt`, `xgboost_000001_best.json`, `xgboost_600519_best.json`
 
 ### Evaluation (`stoke_ml/evaluation/`)
 
@@ -110,10 +157,39 @@ Key settings: `features.seq_len=60`, `features.target_horizon=1`, `training.vali
 
 - **No shuffle in time series**: Walk-forward splits only, chronological order preserved
 - **PIT anti-leakage**: Post-close news (15:00 CST) assigned to next trading day via `TradingCalendar.next_trading_day()`
-- **ZI method**: Days without news get zero-filled sentiment + `has_news=False` flag
-- **FeaturePipeline graceful degradation**: `sentiment_df=None` → trains on technical features only
+- **ZI method**: Days without data get zero-filled values + `has_*=False` flag
+- **Sentiment lag**: All text sentiment columns lagged 1 trading day to prevent same-day information leakage
+- **FeaturePipeline defaults**: ALL `use_*` flags default to `True` — must explicitly disable for ablation
 - **Data partitioned by year/month/stock**: Enables loading date ranges without scanning all files
 - **`PYTHONPATH=.` mandatory**: All scripts import from `stoke_ml` package relative to project root
+- **Flat parquet fallback**: Storage classes check flat `{code}.parquet` before partitioned path
+
+## Known Issues
+
+| Issue | Status |
+|---|---|
+| Guba post bodies unavailable (detail page WAF-blocked) | No workaround |
+| Xueqiu news source blocked (Cloudflare WAF) | Disabled in NewsPipeline |
+| ALL config dimension explosion (24,300 features) | Use +sentiment instead |
+| FinBERT first load needs network or pre-cached model | Use `HF_ENDPOINT=https://hf-mirror.com` |
+| Ablation Δ CIs cross zero (need >100 stocks or stronger signal) | Active research |
+
+## Ablation Results (95 stocks, 1000 bootstrap samples)
+
+| Config | MCC | 95% CI | Δ vs technical |
+|---|---|---|---|
+| technical | 0.0136 | [-0.0035, 0.0312] | — |
+| + sentiment | 0.0279 | [0.0095, 0.0464] | +0.0143 |
+| + guba | 0.0219 | [0.0032, 0.0384] | +0.0084 |
+| + comment | 0.0224 | [0.0045, 0.0408] | +0.0089 |
+| ALL | 0.0261 | [0.0104, 0.0426] | +0.0125 |
+
+- All text dimensions improve MCC vs technical-only (all CIs > 0)
+- News sentiment has largest effect (+104% MCC)
+- ALL config underperforms +sentiment alone (dimension explosion)
+- Δ CIs all cross zero — need more data or stronger signal for significance
+
+Full analysis: `docs/project-analysis-2026-06-29.md`
 
 ## Agent skills
 
