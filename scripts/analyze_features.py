@@ -19,6 +19,7 @@ from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.announcement_storage import AnnouncementStorage
 from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.data.guba_storage import GubaStorage
+from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
 from stoke_ml.evaluation.metrics import compute_classification_metrics
@@ -40,7 +41,7 @@ SEED = 42
 rng = np.random.default_rng(SEED)
 
 
-def load_stock_data(code, ds, ns, as_, gs, cs, start, end):
+def load_stock_data(code, ds, ns, as_, gs, cs, ms, nbs, start, end):
     result = {"kl": ds.load_daily(code, start, end)}
     sentiment = ns.load_daily_sentiment(code, start, end)
     if not sentiment.empty:
@@ -54,6 +55,12 @@ def load_stock_data(code, ds, ns, as_, gs, cs, start, end):
     comment = cs.build_features(code, start, end)
     if not comment.empty:
         result["comment"] = comment
+    margin = ms.load(code, start, end)
+    if not margin.empty:
+        result["margin"] = margin
+    northbound = nbs.load(code, start, end)
+    if not northbound.empty:
+        result["northbound"] = northbound
     return result
 
 
@@ -76,6 +83,8 @@ def train_and_eval(pipe, data, splitter, model_type="xgb"):
         announcement_df=data.get("announcement"),
         guba_df=data.get("guba"),
         comment_df=data.get("comment"),
+        margin_df=data.get("margin"),
+        northbound_df=data.get("northbound"),
     )
     if len(X) < 50:
         return None
@@ -153,6 +162,8 @@ def main():
     as_ = AnnouncementStorage(data_dir)
     gs = GubaStorage(data_dir)
     cs = CommentStorage(data_dir)
+    ms = MarketWideStorage(data_dir, "margin")
+    nbs = MarketWideStorage(data_dir, "northbound")
 
     # Pick stocks
     if args.stocks:
@@ -174,7 +185,7 @@ def main():
     logger.info("Loading data for %d stocks...", len(codes))
     all_data = {}
     for code in codes:
-        data = load_stock_data(code, ds, ns, as_, gs, cs, args.start, args.end)
+        data = load_stock_data(code, ds, ns, as_, gs, cs, ms, nbs, args.start, args.end)
         if data.get("kl") is not None and len(data["kl"]) >= 300:
             all_data[code] = data
     logger.info("Loaded %d stocks with sufficient data", len(all_data))
@@ -184,15 +195,29 @@ def main():
     # --- Define configurations ---
     configurations = [
         ("technical", dict(use_sentiment=False, use_announcements=False,
-                           use_guba=False, use_comment=False)),
+                           use_guba=False, use_comment=False,
+                           use_margin=False, use_northbound=False)),
         ("+ sentiment", dict(use_sentiment=True, use_announcements=False,
-                             use_guba=False, use_comment=False)),
+                             use_guba=False, use_comment=False,
+                             use_margin=False, use_northbound=False)),
         ("+ guba", dict(use_sentiment=False, use_announcements=False,
-                        use_guba=True, use_comment=False)),
+                        use_guba=True, use_comment=False,
+                        use_margin=False, use_northbound=False)),
         ("+ comment", dict(use_sentiment=False, use_announcements=False,
-                           use_guba=False, use_comment=True)),
+                           use_guba=False, use_comment=True,
+                           use_margin=False, use_northbound=False)),
+        ("+ margin", dict(use_sentiment=False, use_announcements=False,
+                          use_guba=False, use_comment=False,
+                          use_margin=True, use_northbound=False)),
+        ("+ northbound", dict(use_sentiment=False, use_announcements=False,
+                              use_guba=False, use_comment=False,
+                              use_margin=False, use_northbound=True)),
+        ("+ margin+nb", dict(use_sentiment=False, use_announcements=False,
+                             use_guba=False, use_comment=False,
+                             use_margin=True, use_northbound=True)),
         ("ALL", dict(use_sentiment=True, use_announcements=True,
-                     use_guba=True, use_comment=True)),
+                     use_guba=True, use_comment=True,
+                     use_margin=True, use_northbound=True)),
     ]
 
     # --- Determine model types to evaluate ---
@@ -244,7 +269,9 @@ def main():
         print("-" * 86)
 
         base_mean, base_lo, base_hi = bootstrap_ci(baseline_mccs)
-        for label in ["technical", "+ sentiment", "+ guba", "+ comment", "ALL"]:
+        config_order = ["technical", "+ sentiment", "+ guba", "+ comment",
+                        "+ margin", "+ northbound", "+ margin+nb", "ALL"]
+        for label in config_order:
             mccs = all_results.get(label, [])
             if not mccs:
                 continue
@@ -260,7 +287,8 @@ def main():
 
         # --- Significance summary ---
         print("\n--- Statistical Significance ---")
-        for label in ["+ sentiment", "+ guba", "+ comment", "ALL"]:
+        for label in ["+ sentiment", "+ guba", "+ comment",
+                       "+ margin", "+ northbound", "+ margin+nb", "ALL"]:
             mccs = all_results.get(label, [])
             if not mccs:
                 continue
