@@ -79,29 +79,55 @@ class NewsSentimentAnalyzer:
             logger.info("Sentiment: financial lexicon (CPU fallback)")
 
     def _try_finbert(self) -> bool:
-        """Load FinBERT model to GPU. Returns True on success."""
+        """Load FinBERT model. Tries GPU then CPU, mirror then offline.
+
+        Returns True on success, False to fall back to lexicon.
+        """
         try:
             import torch
             from transformers import pipeline
-
-            if not torch.cuda.is_available():
-                logger.info("FinBERT: no GPU available, using lexicon fallback")
-                return False
-
-            self._device = "cuda"
-            self._pipe = pipeline(
-                "sentiment-analysis",
-                model=_FINBERT_MODEL,
-                device=0,  # first GPU
-                batch_size=_BATCH_SIZE,
-            )
-            # Warm-up: run a single text to prime CUDA context
-            _ = self._pipe("测试")
-            logger.info("FinBERT loaded on %s", torch.cuda.get_device_name(0))
-            return True
         except ImportError:
             logger.info("FinBERT: transformers/torch not installed")
             return False
+
+        # Resolve device
+        if torch.cuda.is_available():
+            self._device = "cuda"
+            device = 0
+        else:
+            self._device = "cpu"
+            device = -1
+
+        # Try loading with network access (mirror then direct)
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    # Use HuggingFace mirror accessible from mainland China
+                    import os as _os
+                    _os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+                self._pipe = pipeline(
+                    "sentiment-analysis",
+                    model=_FINBERT_MODEL,
+                    device=device,
+                )
+                _ = self._pipe("测试")  # warm-up
+                logger.info("FinBERT loaded on %s", self._device)
+                return True
+            except Exception:
+                pass
+
+        # Final attempt: load from local cache only
+        try:
+            self._pipe = pipeline(
+                "sentiment-analysis",
+                model=_FINBERT_MODEL,
+                device=device,
+                local_files_only=True,
+            )
+            _ = self._pipe("测试")
+            logger.info("FinBERT loaded from cache on %s", self._device)
+            return True
         except Exception as e:
             logger.info("FinBERT: failed to load (%s), using lexicon", e)
             return False
