@@ -24,6 +24,7 @@ from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
 from stoke_ml.evaluation.metrics import compute_classification_metrics
 from stoke_ml.models.baseline import XGBoostBaseline, LGBMBaseline
+from stoke_ml.features.selection import FeatureSelector
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -76,7 +77,7 @@ def _make_model(model_type):
     )
 
 
-def train_and_eval(pipe, data, splitter, model_type="xgb"):
+def train_and_eval(pipe, data, splitter, model_type="xgb", selector=None):
     X, y, _ = pipe.build_features(
         data["kl"],
         sentiment_df=data.get("sentiment"),
@@ -98,6 +99,13 @@ def train_and_eval(pipe, data, splitter, model_type="xgb"):
         y_train, y_val = y[train_idx], y[val_idx]
         if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
             continue
+        # Apply feature selection on training data only
+        if selector is not None:
+            try:
+                X_train = selector.fit_transform(X_train, y_train)
+                X_val = selector.transform(X_val)
+            except Exception:
+                pass  # fall through with full features on selection failure
         model = _make_model(model_type)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_val)
@@ -152,6 +160,8 @@ def main():
     parser.add_argument("--model", type=str, default="xgb",
                         choices=["xgb", "lgbm", "all"],
                         help="Model type: xgb (XGBoost), lgbm (LightGBM+EFB), all (both)")
+    parser.add_argument("--feature-select", action="store_true",
+                        help="Apply MI(200) + SFS(50) feature selection per window")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -224,9 +234,11 @@ def main():
     model_types = ["xgb", "lgbm"] if args.model == "all" else [args.model]
     codes_list = list(all_data.keys())
 
+    selector = FeatureSelector(mi_k=200, sfs_k=50, model_type="lgbm") if args.feature_select else None
+
     for mtype in model_types:
         logger.info("=" * 60)
-        logger.info("MODEL: %s", mtype.upper())
+        logger.info("MODEL: %s (feature_select=%s)", mtype.upper(), args.feature_select)
         all_results = {}  # config_name -> list of per-stock MCCs
 
         for label, kwargs in configurations:
@@ -239,7 +251,7 @@ def main():
             per_stock_mccs = []
             for i, code in enumerate(codes_list):
                 t0 = time.time()
-                metrics = train_and_eval(pipe, all_data[code], splitter, model_type=mtype)
+                metrics = train_and_eval(pipe, all_data[code], splitter, model_type=mtype, selector=selector)
                 dt = time.time() - t0
                 mcc = metrics["mcc"] if metrics else None
                 if mcc is not None:
