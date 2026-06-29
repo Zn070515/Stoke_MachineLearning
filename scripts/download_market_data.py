@@ -8,6 +8,7 @@ Usage:
 """
 import argparse
 import logging
+import os
 import sys
 import time
 
@@ -23,6 +24,20 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def get_stocks_from_disk(data_dir: str) -> list[str]:
+    """Discover stock codes from existing K-line data on disk."""
+    daily_dir = os.path.join(data_dir, "a_shares", "daily")
+    if not os.path.exists(daily_dir):
+        return []
+    codes = set()
+    for root, _dirs, files in os.walk(daily_dir):
+        for f in files:
+            if f.endswith(".parquet"):
+                codes.add(f.replace(".parquet", ""))
+    return sorted(codes)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Download A-share market data")
@@ -133,6 +148,12 @@ def main():
             stock_codes = None
             if args.stocks:
                 stock_codes = [c.strip() for c in args.stocks.split(",")]
+            else:
+                stock_codes = get_stocks_from_disk(data_dir)
+                if not stock_codes:
+                    logger.error("No stock codes found. Run download_data.py first.")
+                    sys.exit(1)
+                logger.info("  northbound: loaded %d stock codes from disk", len(stock_codes))
             if stock_codes and args.concurrent:
                 from stoke_ml.crawler.rate_limiter import RateLimiter
                 from stoke_ml.crawler.concurrent import ConcurrentDownloader
