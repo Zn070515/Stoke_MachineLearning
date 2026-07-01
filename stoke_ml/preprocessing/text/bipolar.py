@@ -50,11 +50,17 @@ class BipolarClassifier(PreprocessingStep):
         for col in available:
             suffix = _col_suffix(col)
             values = df[col].values
-            df[f"is_bull_{suffix}"] = (values > self.pos_threshold).astype("int8")
-            df[f"is_bear_{suffix}"] = (values < self.neg_threshold).astype("int8")
-            df[f"is_neutral_{suffix}"] = (
-                (values >= self.neg_threshold) & (values <= self.pos_threshold)
-            ).astype("int8")
+            nan_mask = np.isnan(values)
+            df[f"is_bull_{suffix}"] = np.where(
+                nan_mask, np.nan, (values > self.pos_threshold).astype("int8"),
+            )
+            df[f"is_bear_{suffix}"] = np.where(
+                nan_mask, np.nan, (values < self.neg_threshold).astype("int8"),
+            )
+            df[f"is_neutral_{suffix}"] = np.where(
+                nan_mask, np.nan,
+                ((values >= self.neg_threshold) & (values <= self.pos_threshold)).astype("int8"),
+            )
 
         return df
 

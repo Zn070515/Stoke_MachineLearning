@@ -58,3 +58,14 @@ class TestBipolarClassifier:
         assert "is_bear_title" in result.columns
         assert "is_bull_body" in result.columns
         assert "is_bear_body" in result.columns
+
+    def test_nan_sentiment_propagates_nan(self):
+        bc = BipolarClassifier()
+        df = pd.DataFrame({"sentiment_title": [0.5, np.nan, -0.5]})
+        result = bc.fit_transform(df)
+        # NaN sentiment should propagate NaN in all three flags
+        assert result["is_bull_title"].iloc[0] == 1
+        assert np.isnan(result["is_bull_title"].iloc[1])
+        assert np.isnan(result["is_bear_title"].iloc[1])
+        assert np.isnan(result["is_neutral_title"].iloc[1])
+        assert result["is_bear_title"].iloc[2] == 1

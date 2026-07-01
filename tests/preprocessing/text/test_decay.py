@@ -57,7 +57,7 @@ class TestTimeDecayWeighter:
         })
         result = td.fit_transform(df)
         assert "weighted_sent" in result.columns
-        w = result["decay_weight"].values
-        s = result["sentiment_title"].values
-        expected = np.average(s, weights=w)
-        assert abs(result["weighted_sent"].iloc[-1] - expected) < 0.001
+        # weighted_sent = sentiment_title * decay_weight (per-row)
+        for i in range(len(df)):
+            expected = result["sentiment_title"].iloc[i] * result["decay_weight"].iloc[i]
+            assert abs(result["weighted_sent"].iloc[i] - expected) < 0.001

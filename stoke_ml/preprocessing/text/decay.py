@@ -45,9 +45,8 @@ class TimeDecayWeighter(PreprocessingStep):
         df["decay_weight"] = weights.astype(np.float32)
 
         if "sentiment_title" in df.columns:
-            w_sum = weights.sum() or 1.0
             df["weighted_sent"] = (
-                (df["sentiment_title"].fillna(0.0) * weights).sum() / w_sum
+                df["sentiment_title"].fillna(0.0) * weights
             ).astype(np.float32)
 
         return df
