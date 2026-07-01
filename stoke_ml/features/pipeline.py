@@ -88,6 +88,8 @@ class FeaturePipeline:
         use_fundamental: bool = True,
         use_etf_flow: bool = True,
         use_xueqiu: bool = True,
+        use_new_preprocessing: bool = False,
+        preprocessing_config: dict | str | None = None,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -105,8 +107,37 @@ class FeaturePipeline:
         self.use_fundamental = use_fundamental
         self.use_etf_flow = use_etf_flow
         self.use_xueqiu = use_xueqiu
+        self.use_new_preprocessing = use_new_preprocessing
+        self._preprocessing_config = preprocessing_config
+        self._preprocessing = None
+        if use_new_preprocessing and preprocessing_config:
+            self._preprocessing = self._build_preprocessing()
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
+
+    # ------------------------------------------------------------------
+    # Preprocessing integration
+    # ------------------------------------------------------------------
+
+    def _build_preprocessing(self):
+        """Lazily build PreprocessingPipeline from stored config."""
+        from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
+        cfg = self._preprocessing_config
+        if isinstance(cfg, str):
+            from stoke_ml.config import load_config as _load_cfg
+            cfg = _load_cfg(cfg)
+        if cfg is not None and hasattr(cfg, "get"):
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+            return PreprocessingPipeline.from_config(cfg.get("preprocessing", cfg))
+        return None
+
+    @property
+    def preprocessing(self):
+        """Return the PreprocessingPipeline, building it lazily if needed."""
+        if self._preprocessing is None and self._preprocessing_config:
+            self._preprocessing = self._build_preprocessing()
+        return self._preprocessing
 
     # ------------------------------------------------------------------
     # Public API

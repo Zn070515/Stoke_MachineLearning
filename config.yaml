@@ -104,3 +104,62 @@ fundamental:
   max_stale_days: 30  # how long quarterly data stays fresh before NaN
   interpolate: true    # linear interp between disclosure dates (smoother than step fill)
   data_types: [roe, roa, pe, pb, eps, revenue_yoy, profit_yoy, debt_ratio, gross_margin, net_margin]
+
+# Preprocessing pipeline configuration
+preprocessing:
+  enabled: true
+  output_dir: "data/preprocessed"
+  registry_path: "models/features/feature_registry.json"
+
+  text:
+    quality_filter:
+      min_text_length: 5
+      max_duplicate_similarity: 0.9
+      remove_html: true
+    bipolar:
+      threshold_positive: 0.2
+      threshold_negative: -0.2
+    time_decay:
+      method: "ema"
+      halflife_days: 7
+    topic_model:
+      enabled: false
+      n_topics: "auto"
+      min_topic_size: 50
+      model_cache_dir: "models/bertopic"
+      embedding_model: "finbert"
+    aggregation:
+      windows: [3, 5, 10, 20]
+      use_body_sentiment: true
+
+  numeric:
+    outlier:
+      method: "mad"
+      threshold: 5.0
+      clip: true
+    missing:
+      short_gap_method: "linear"
+      short_gap_max: 2
+      medium_gap_method: "kalman"
+      medium_gap_max: 10
+    cross_section:
+      enabled: true
+      stages: ["sector", "size", "adaptive"]
+    scaling:
+      method: "robust"
+      window_days: 252
+      winsorize_sigma: 3.0
+    higher_order:
+      enabled: true
+
+  monitor:
+    enabled: true
+    log_dir: "logs/quality"
+    missing_warn_threshold: 0.2
+    missing_error_threshold: 0.5
+    constant_warn_threshold: 0.99
+    drift_sigma_threshold: 3.0
+
+  registry:
+    enabled: true
+    baseline_update_freq: "monthly"
