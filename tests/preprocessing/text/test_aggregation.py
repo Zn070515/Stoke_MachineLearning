@@ -35,7 +35,9 @@ class TestDailyAggregator:
             "sentiment_title": [0.8, 0.7, 0.9, 0.6, 0.8],
         })
         result = agg.fit_transform(df)
-        assert result["agreement"].iloc[0] > 0.8
+        # std of [0.8, 0.7, 0.9, 0.6, 0.8] ≈ 0.114
+        # agreement = 1.0 - std ≈ 0.886
+        assert 0.88 < result["agreement"].iloc[0] < 0.90
 
     def test_computes_attention(self):
         agg = DailyAggregator()
@@ -65,6 +67,8 @@ class TestDailyAggregator:
         })
         result = agg.fit_transform(df)
         assert "bipolar_sent" in result.columns
+        assert "weighted_sent" not in result.columns
+        assert "body_sent_weighted" not in result.columns
 
     def test_single_post_per_day(self):
         agg = DailyAggregator()
@@ -94,3 +98,59 @@ class TestDailyAggregator:
         assert "bipolar_sent_3d_mean" in result.columns
         assert "bipolar_sent_5d_mean" in result.columns
         assert "attention_3d_mean" in result.columns
+
+    def test_missing_sentiment_title_returns_nan_stats(self):
+        agg = DailyAggregator()
+        df = pd.DataFrame({
+            "aligned_date": pd.to_datetime(["2024-01-02"]),
+            "other_col": [1.0],
+        })
+        result = agg.fit_transform(df)
+        assert np.isnan(result["bipolar_sent"].iloc[0])
+        assert np.isnan(result["bull_ratio"].iloc[0])
+        assert result["post_count"].iloc[0] == 0
+
+    def test_all_neutral_posts_bipolar_zero(self):
+        agg = DailyAggregator()
+        df = pd.DataFrame({
+            "aligned_date": pd.to_datetime(["2024-01-02"] * 3),
+            "sentiment_title": [0.1, -0.1, 0.0],
+        })
+        result = agg.fit_transform(df)
+        assert result["bipolar_sent"].iloc[0] == 0.0
+        assert result["neutral_ratio"].iloc[0] == 1.0
+        assert result["bull_ratio"].iloc[0] == 0.0
+        assert result["bear_ratio"].iloc[0] == 0.0
+
+    def test_weighted_sent_from_raw_when_decay_present(self):
+        agg = DailyAggregator()
+        df = pd.DataFrame({
+            "aligned_date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+            "sentiment_title": [0.5, -0.3],
+            "decay_weight": [0.5, 1.0],
+        })
+        result = agg.fit_transform(df)
+        # (0.5*0.5 + (-0.3)*1.0) / (0.5+1.0) = (0.25-0.3)/1.5 = -0.0333
+        assert "weighted_sent" in result.columns
+        assert abs(result["weighted_sent"].iloc[0] - (-0.0333)) < 0.01
+
+    def test_produces_neutral_ratio(self):
+        agg = DailyAggregator()
+        df = pd.DataFrame({
+            "aligned_date": pd.to_datetime(["2024-01-02"] * 4),
+            "sentiment_title": [0.5, -0.5, 0.1, 0.15],
+        })
+        result = agg.fit_transform(df)
+        assert "neutral_ratio" in result.columns
+        # 1 bull, 1 bear, 2 neutral → neutral_ratio = 2/4 = 0.5
+        assert abs(result["neutral_ratio"].iloc[0] - 0.5) < 0.01
+
+    def test_handles_date_column_fallback(self):
+        agg = DailyAggregator()
+        df = pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02"]),
+            "sentiment_title": [0.5],
+        })
+        result = agg.fit_transform(df)
+        assert "date" in result.columns
+        assert result["bipolar_sent"].iloc[0] > 0
