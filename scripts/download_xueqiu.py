@@ -1,23 +1,20 @@
-"""Download Xueqiu forum posts for A-share stocks, compute FinBERT sentiment.
+"""Download Xueqiu forum posts for A-share stocks with FinBERT sentiment.
 
-Xueqiu is a social investing platform with user discussions similar to Guba.
-Each stock returns up to 1000 posts (20 items/page × 50 pages) via the
-internal status API.
-
-Uses Playwright for WAF bypass (aliyun_waf_oo JS challenge).
+Uses the existing XueqiuNewsSource (Playwright browser per stock, handles WAF).
+Auto-skips already-downloaded stocks so interrupted runs can resume.
 
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py
   PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py --stocks 000001,600519
   PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py --max-pages 50
-  PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py --workers 2
 """
 import argparse
 import logging
 import os
+import signal
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 
 import pandas as pd
 
@@ -30,8 +27,11 @@ from stoke_ml.features.news_nlp import (
 )
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
 )
+logging.getLogger().handlers[0].setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -47,53 +47,16 @@ def get_stocks_from_disk(data_dir: str) -> list[str]:
     return sorted(codes)
 
 
-def process_stock(code, start_date, end_date, max_pages, storage, analyzer):
-    """Fetch Xueqiu posts for one stock, compute sentiment, save bronze/silver/gold.
-
-    Returns (code, post_count).
-    """
-    source = XueqiuNewsSource()
-    try:
-        df = source.fetch_news(code, start_date, end_date, max_pages)
-    except Exception as e:
-        logger.error("%s: fetch failed — %s", code, e)
-        return code, 0
-
-    if df.empty:
-        return code, 0
-
-    df = compute_raw_sentiment(df, analyzer)
-    storage.save_raw(code, df)
-
-    silver = storage.bronze_to_silver(code)
-    if not silver.empty:
-        storage.save_silver(code, silver)
-
-    gold = storage.silver_to_gold(code, analyzer)
-    if not gold.empty:
-        storage.save_daily_sentiment(gold)
-        post_days = gold["has_xueqiu_post"].sum()
-        logger.info(
-            "%s: %d posts, %d sentiment days (%d with posts)",
-            code, len(df), len(gold), post_days,
-        )
-
-    return code, len(df)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Download A-share Xueqiu forum posts")
+    parser = argparse.ArgumentParser(description="Download Xueqiu forum posts")
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--stocks", type=str, default=None,
-                        help="Comma-separated stock codes (default: all on disk)")
+    parser.add_argument("--stocks", type=str, default=None)
     parser.add_argument("--start", type=str, default="2015-01-01")
     parser.add_argument("--end", type=str, default=None)
-    parser.add_argument("--max-pages", type=int, default=20,
-                        help="Pages per stock, 20 posts/page, max 50 (default: 20)")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel stocks (default: 1, Playwright is thread-bound)")
-    parser.add_argument("--sleep", type=float, default=2.0,
-                        help="Seconds between stocks (default: 2.0)")
+    parser.add_argument("--max-pages", type=int, default=10,
+                        help="Pages per stock, 20 posts/page (default: 10)")
+    parser.add_argument("--sleep", type=float, default=1.0,
+                        help="Seconds between stocks (default: 1.0)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -104,32 +67,95 @@ def main():
     else:
         codes = get_stocks_from_disk(data_dir)
 
+    # Skip already-downloaded stocks
+    xueqiu_dir = os.path.join(data_dir, "a_shares", "xueqiu_raw")
+    if os.path.exists(xueqiu_dir):
+        done = {f.replace(".parquet", "") for f in os.listdir(xueqiu_dir)
+                if f.endswith(".parquet")}
+        remaining = [c for c in codes if c not in done]
+        skipped = len(codes) - len(remaining)
+        if skipped:
+            logger.info("Skip %d already-downloaded, %d remaining", skipped, len(remaining))
+    else:
+        remaining = codes
+
+    if not remaining:
+        logger.info("All %d stocks already downloaded", len(codes))
+        return
+
     end_date = args.end or pd.Timestamp.now().strftime("%Y-%m-%d")
     max_pages = min(args.max_pages, 50)
 
     storage = XueqiuStorage(data_dir)
     analyzer = NewsSentimentAnalyzer()
-
-    logger.info(
-        "Downloading Xueqiu posts for %d stocks (%s to %s, %d pages/stock)",
-        len(codes), args.start, end_date, max_pages,
-    )
+    source = XueqiuNewsSource()
 
     total_posts = 0
-    for i, code in enumerate(codes):
-        logger.info("[%d/%d] Processing %s", i + 1, len(codes), code)
-        try:
-            _, count = process_stock(
-                code, args.start, end_date, max_pages, storage, analyzer,
-            )
-            total_posts += count
-        except Exception as e:
-            logger.error("%s: failed — %s", code, e)
+    total_errors = 0
+    start_time = time.time()
 
-        if args.sleep > 0 and i < len(codes) - 1:
+    for i, code in enumerate(remaining):
+        sys.stdout.flush()
+        t0 = time.time()
+
+        try:
+            df = source.fetch_news(code, args.start, end_date, max_pages)
+        except Exception as e:
+            total_errors += 1
+            logger.error("[%d/%d] %s: fetch crashed — %s",
+                         i + 1, len(remaining), code, e)
+            if total_errors > 5:
+                logger.error("Too many errors (%d), stopping", total_errors)
+                break
+            time.sleep(args.sleep * 2)
+            source = XueqiuNewsSource()  # fresh source after error
+            continue
+
+        elapsed = time.time() - t0
+
+        if df.empty:
+            if (i + 1) % 20 == 0:
+                logger.info("[%d/%d] %s: 0 posts (%.1fs)",
+                            i + 1, len(remaining), code, elapsed)
+            continue
+
+        try:
+            df = compute_raw_sentiment(df, analyzer)
+            storage.save_raw(code, df)
+
+            silver = storage.bronze_to_silver(code)
+            if not silver.empty:
+                storage.save_silver(code, silver)
+
+            gold = storage.silver_to_gold(code, analyzer)
+            post_days = gold["has_xueqiu_post"].sum() if not gold.empty else 0
+            if not gold.empty:
+                storage.save_daily_sentiment(gold)
+        except Exception as e:
+            total_errors += 1
+            logger.error("[%d/%d] %s: save failed — %s",
+                         i + 1, len(remaining), code, e)
+            continue
+
+        total_posts += len(df)
+
+        if (i + 1) % 10 == 0 or elapsed > 30:
+            eta = (time.time() - start_time) / (i + 1) * (len(remaining) - i - 1)
+            logger.info(
+                "[%d/%d] %s: %d posts, %d sent days (%.1fs, ETA %.0f min)",
+                i + 1, len(remaining), code, len(df), post_days,
+                elapsed, eta / 60,
+            )
+
+        if args.sleep > 0 and i < len(remaining) - 1:
             time.sleep(args.sleep)
 
-    logger.info("Done: %d total posts across %d stocks", total_posts, len(codes))
+    elapsed = time.time() - start_time
+    logger.info(
+        "Done: %d posts across %d stocks in %.1f min (%.1f sec/stock, %d errors)",
+        total_posts, len(remaining), elapsed / 60,
+        elapsed / len(remaining) if remaining else 0, total_errors,
+    )
 
 
 if __name__ == "__main__":

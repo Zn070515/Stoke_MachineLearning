@@ -124,11 +124,14 @@ class NewsSentimentAnalyzer:
                     "sentiment-analysis",
                     model=model_name,
                     device=device,
+                    batch_size=32 if device != -1 else 8,
                 )
                 _ = self._pipe("测试")  # warm-up
                 self._model_name = model_name
                 self._use_finbert = True
-                logger.info("%s loaded on %s", model_name, self._device)
+                logger.info("%s loaded on %s (batch=%d)",
+                             model_name, self._device,
+                             32 if device != -1 else 8)
                 return True
             except Exception:
                 pass
@@ -139,6 +142,7 @@ class NewsSentimentAnalyzer:
                 "sentiment-analysis",
                 model=model_name,
                 device=device,
+                batch_size=32 if device != -1 else 8,
                 local_files_only=True,
             )
             _ = self._pipe("测试")

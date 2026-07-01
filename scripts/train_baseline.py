@@ -15,6 +15,9 @@ from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.fundamental_storage import FundamentalStorage
 from stoke_ml.data.etf_storage import ETFStorage
 from stoke_ml.data.stock_sector_mapper import StockSectorMapper
+from stoke_ml.data.xueqiu_storage import XueqiuStorage
+from stoke_ml.data.guba_storage import GubaStorage
+from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
 from stoke_ml.evaluation.metrics import (
@@ -27,6 +30,126 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _run_ablation(
+    codes, cfg, output_dir, storage, news_storage, margin_storage,
+    nb_storage, dt_storage, fund_storage, etf_storage,
+    xueqiu_storage, guba_storage, comment_storage, sector_mapper,
+    args,
+):
+    """Compare XGBoost with vs without Xueqiu on the same stocks."""
+    results = []
+    splitter = WalkForwardSplitter(
+        train_years=cfg.training.validation.train_years,
+        val_months=cfg.training.validation.val_months,
+    )
+    model_params = dict(cfg.model.params)
+
+    for use_xq_label, use_xq in [("with_xueqiu", True), ("no_xueqiu", False)]:
+        pipeline = FeaturePipeline(
+            seq_len=cfg.features.get("flat_seq_len", cfg.features.seq_len),
+            horizon=cfg.features.target_horizon,
+            flat_mode=True,
+            use_technical=cfg.features.technical_indicators,
+            use_scoring=cfg.features.rule_based_scoring,
+            use_temporal=cfg.features.temporal_features,
+            use_sentiment=cfg.features.get("use_sentiment", True),
+            use_xueqiu=use_xq,
+            use_guba=not args.no_guba,
+            use_comment=not args.no_comment,
+        )
+
+        for code in codes:
+            df = storage.load_daily(
+                code,
+                start_date=cfg.markets.a_shares.start_date,
+                end_date=datetime.now().strftime("%Y-%m-%d"),
+            )
+            if df.empty:
+                continue
+
+            date_start = cfg.markets.a_shares.start_date
+            date_end = datetime.now().strftime("%Y-%m-%d")
+
+            sentiment_df = news_storage.load_daily_sentiment(code, date_start, date_end)
+            margin_df = margin_storage.load(code, date_start, date_end)
+            nb_df = nb_storage.load(code, date_start, date_end)
+            dt_df = dt_storage.load(code, date_start, date_end)
+            fundamental_df = fund_storage.forward_fill_to_daily(code, date_start, date_end)
+            etf_df = pd.DataFrame()
+            sector = sector_mapper.get_sector(code)
+            if sector:
+                etf_df = etf_storage.load_sector_flow(sector, date_start, date_end)
+            xueqiu_df = xueqiu_storage.load_daily_sentiment(code, date_start, date_end)
+            guba_df = guba_storage.load_daily_sentiment(code, date_start, date_end)
+            comment_df = comment_storage.build_features(code, date_start, date_end)
+
+            X, y, aligned_close = pipeline.build_features(
+                df,
+                sentiment_df=sentiment_df if not sentiment_df.empty else None,
+                margin_df=margin_df if not margin_df.empty else None,
+                northbound_df=nb_df if not nb_df.empty else None,
+                dragon_tiger_df=dt_df if not dt_df.empty else None,
+                fundamental_df=fundamental_df if not fundamental_df.empty else None,
+                etf_flow_df=etf_df if not etf_df.empty else None,
+                xueqiu_df=xueqiu_df if not xueqiu_df.empty else None,
+                guba_df=guba_df if not guba_df.empty else None,
+                comment_df=comment_df if not comment_df.empty else None,
+            )
+            if len(X) == 0:
+                continue
+
+            n_samples = len(X)
+            pseudo_dates = pd.date_range("2000-01-01", periods=n_samples, freq="B")
+            folds = list(splitter.split(pseudo_dates))
+
+            for fold_idx, (train_idx, val_idx) in enumerate(folds):
+                if train_idx[-1] >= n_samples or val_idx[-1] >= n_samples:
+                    break
+
+                X_train, y_train = X[train_idx], y[train_idx]
+                X_val, y_val = X[val_idx], y[val_idx]
+
+                model = XGBoostBaseline(**model_params)
+                model.fit(X_train, y_train)
+                preds = model.predict(X_val)
+                cls_metrics = compute_classification_metrics(y_val, preds)
+                results.append({
+                    "stock": code, "fold": fold_idx, "config": use_xq_label,
+                    "mcc": cls_metrics["mcc"], "accuracy": cls_metrics["accuracy"],
+                    "f1": cls_metrics["f1"],
+                })
+
+    if not results:
+        logger.error("No results")
+        return
+
+    results_df = pd.DataFrame(results)
+    summary = results_df.groupby("config")["mcc"].agg(["mean", "std", "count"])
+    logger.info("\n=== Xueqiu Ablation Results ===\n%s", summary.to_string())
+
+    # Per-stock delta
+    pivot = results_df.pivot_table(
+        index="stock", columns="config", values="mcc", aggfunc="mean"
+    )
+    if "with_xueqiu" in pivot.columns and "no_xueqiu" in pivot.columns:
+        pivot["delta"] = pivot["with_xueqiu"] - pivot["no_xueqiu"]
+        pivot = pivot.sort_values("delta", ascending=False)
+        logger.info("\nPer-stock MCC delta (with - without):")
+        for stock, row in pivot.iterrows():
+            logger.info(
+                "  %s: with=%.4f  without=%.4f  delta=%+.4f",
+                stock, row["with_xueqiu"], row["no_xueqiu"], row["delta"],
+            )
+        logger.info(
+            "\nMean delta: %+.4f (std=%.4f, n=%d)",
+            pivot["delta"].mean(), pivot["delta"].std(), len(pivot),
+        )
+
+    out_path = os.path.join(output_dir, "xueqiu_ablation.csv")
+    results_df.to_csv(out_path, index=False)
+    logger.info("Saved to %s", out_path)
 
 
 def available_stocks(storage: DataStorage, market: str = "a_shares") -> list[str]:
@@ -54,6 +177,22 @@ def main():
         "--output", type=str, default=None,
         help="Model output directory (default: config model_dir)"
     )
+    parser.add_argument(
+        "--no-xueqiu", action="store_true",
+        help="Exclude Xueqiu forum sentiment"
+    )
+    parser.add_argument(
+        "--no-guba", action="store_true",
+        help="Exclude Guba forum sentiment"
+    )
+    parser.add_argument(
+        "--no-comment", action="store_true",
+        help="Exclude AKShare comment sentiment"
+    )
+    parser.add_argument(
+        "--xueqiu-only", action="store_true",
+        help="Run ablation: xueqiu vs no-xueqiu on same stocks"
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -66,6 +205,9 @@ def main():
     dt_storage = MarketWideStorage(data_dir, "dragon_tiger")
     fund_storage = FundamentalStorage(data_dir)
     etf_storage = ETFStorage(data_dir)
+    xueqiu_storage = XueqiuStorage(data_dir)
+    guba_storage = GubaStorage(data_dir)
+    comment_storage = CommentStorage(data_dir)
     sector_mapper = StockSectorMapper()
     codes = [args.stock] if args.stock else available_stocks(storage)
 
@@ -81,6 +223,10 @@ def main():
     output_dir = args.output or cfg.project.model_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    use_xq = not args.no_xueqiu
+    use_gb = not args.no_guba
+    use_cm = not args.no_comment
+
     pipeline = FeaturePipeline(
         seq_len=cfg.features.get("flat_seq_len", cfg.features.seq_len),
         horizon=cfg.features.target_horizon,
@@ -89,6 +235,9 @@ def main():
         use_scoring=cfg.features.rule_based_scoring,
         use_temporal=cfg.features.temporal_features,
         use_sentiment=cfg.features.get("use_sentiment", True),
+        use_xueqiu=use_xq,
+        use_guba=use_gb,
+        use_comment=use_cm,
     )
     splitter = WalkForwardSplitter(
         train_years=cfg.training.validation.train_years,
@@ -98,6 +247,16 @@ def main():
     all_fold_scores = []
     best_mcc = -1.0
     best_model_path = ""
+
+    if args.xueqiu_only:
+        logger.info("=== Xueqiu Ablation: with vs without ===")
+        _run_ablation(
+            codes, cfg, output_dir, storage, news_storage, margin_storage,
+            nb_storage, dt_storage, fund_storage, etf_storage,
+            xueqiu_storage, guba_storage, comment_storage, sector_mapper,
+            args,
+        )
+        return
 
     for code in codes:
         logger.info("=== Processing %s ===", code)
@@ -135,6 +294,15 @@ def main():
         if sector:
             etf_df = etf_storage.load_sector_flow(sector, date_start, date_end)
 
+        # Load Xueqiu forum sentiment
+        xueqiu_df = xueqiu_storage.load_daily_sentiment(code, date_start, date_end)
+
+        # Load Guba forum sentiment
+        guba_df = guba_storage.load_daily_sentiment(code, date_start, date_end)
+
+        # Load AKShare comment sentiment
+        comment_df = comment_storage.build_features(code, date_start, date_end)
+
         loaded = [f"K={len(df)}"]
         if not sentiment_df.empty:
             loaded.append(f"S={len(sentiment_df)}")
@@ -146,6 +314,12 @@ def main():
             loaded.append(f"F={len(fundamental_df)}")
         if not etf_df.empty:
             loaded.append(f"ETF={len(etf_df)}")
+        if not xueqiu_df.empty:
+            loaded.append(f"XQ={len(xueqiu_df)}")
+        if not guba_df.empty:
+            loaded.append(f"GB={len(guba_df)}")
+        if not comment_df.empty:
+            loaded.append(f"CM={len(comment_df)}")
         logger.info("  %s: %s", code, " ".join(loaded))
 
         X, y, aligned_close = pipeline.build_features(
@@ -156,6 +330,9 @@ def main():
             dragon_tiger_df=dt_df if not dt_df.empty else None,
             fundamental_df=fundamental_df if not fundamental_df.empty else None,
             etf_flow_df=etf_df if not etf_df.empty else None,
+            xueqiu_df=xueqiu_df if not xueqiu_df.empty else None,
+            guba_df=guba_df if not guba_df.empty else None,
+            comment_df=comment_df if not comment_df.empty else None,
         )
         if len(X) == 0:
             logger.warning("Not enough features for %s, skipping", code)

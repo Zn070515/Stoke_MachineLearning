@@ -1,30 +1,31 @@
 """Xueqiu (雪球) news source for A-share stocks.
 
-Uses Playwright headless Chromium to bypass Cloudflare WAF, then calls
-Xueqiu's internal status API through the authenticated browser session.
+Uses Playwright headless Chromium to bypass aliyun WAF.
 
-Architecture:
-  1. Launch Playwright once (singleton browser per process)
-  2. Load any stock page to get WAF-cleared cookies
-  3. Call /query/v1/symbol/search/status.json directly via fetch()
-  4. Parse JSON responses → DataFrame[date, title, url]
-
-The API returns up to 1000 items per stock (20 items/page × 50 pages).
+Architecture (single-threaded, no Timers — avoids cross-thread greenlet bugs):
+  1. Browser context reused across stocks (fresh page per stock)
+  2. First stock: goto stock page to solve WAF
+  3. Subsequent stocks: goto xueqiu.com/ (fast, WAF cookies in context)
+  4. Resource blocking for faster loads
+  5. storage_state persisted for cross-process WAF cookie reuse
+  6. JS-level AbortController (10s) prevents per-page hangs
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from stoke_ml.config import get_project_root
+
 if TYPE_CHECKING:
-    from playwright.sync_api import Page
+    from playwright.sync_api import BrowserContext, Page
 
 logger = logging.getLogger(__name__)
 
@@ -34,24 +35,29 @@ _API_URL = (
     "?count=20&comment=0&symbol={symbol}&hl=0&source=all"
     "&sort=time&page={page}&q=&type=11"
 )
+_STATE_FILE = str(
+    get_project_root() / "data" / "a_shares" / ".xueqiu_browser_state.json"
+)
 
-# Thread-local browser state — Playwright sync API is greenlet-bound,
-# so each thread needs its own browser/context instance.
-_tls = threading.local()
-# Guard browser creation within a single thread (CDP is not thread-safe
-# even within the same greenlet).
-_lock = threading.Lock()
+_GOTO_TIMEOUT_MS = 25000
+_API_CALL_TIMEOUT_MS = 10000  # JS AbortController timeout
 
-# Per-page API call timeout in ms (injected into JS fetch via AbortController)
-_API_TIMEOUT_MS = 30000
-# Per-stock total timeout in seconds — a threading.Timer will force-close
-# the browser if the stock fetch exceeds this, causing the hung evaluate()
-# to throw and the next stock to auto-create a fresh browser.
-_BROWSER_TIMEOUT_SEC = 120
+# Module-level browser state (single-threaded — no threading.Timer)
+_pw_instance = None
+_browser = None
+_context: "BrowserContext | None" = None
+_waf_solved = False
+_browser_lock = None  # created on demand
+
+_HTML_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    text = _HTML_RE.sub(" ", text)
+    return " ".join(text.split())
 
 
 def _build_symbol(stock_code: str) -> str:
-    """Build Xueqiu symbol from 6-digit A-share code."""
     code = str(stock_code).zfill(6)
     if code.startswith(("6", "9")):
         return f"SH{code}"
@@ -60,86 +66,104 @@ def _build_symbol(stock_code: str) -> str:
     return f"SH{code}"
 
 
-def _get_page() -> "Page":
-    """Return a page from the thread-local browser context.
+def _ensure_context() -> "BrowserContext":
+    """Return the module-level browser context, creating it on first call."""
+    global _pw_instance, _browser, _context, _browser_lock
 
-    Each OS thread gets its own Playwright instance because the sync
-    greenlet is thread-affine.
-    """
     from playwright.sync_api import sync_playwright
 
-    if getattr(_tls, "browser", None) is None or not _tls.browser.is_connected():
-        with _lock:
-            if getattr(_tls, "browser", None) is None or not _tls.browser.is_connected():
-                if getattr(_tls, "pw_instance", None) is not None:
-                    try:
-                        _tls.pw_instance.stop()
-                    except Exception:
-                        pass
-                pw = sync_playwright().start()
-                _tls.pw_instance = pw
-                _tls.browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                )
-                _tls.context = _tls.browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1920, "height": 1080},
-                    locale="zh-CN",
-                )
-                _tls.context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
-                    window.chrome = {runtime: {}};
-                """)
-    return _tls.context.new_page()
+    if _browser is not None:
+        try:
+            if _browser.is_connected():
+                return _context
+        except Exception:
+            pass
+        # Browser is dead — clean up, including stale storage_state
+        _browser = None
+        _context = None
+        try:
+            os.remove(_STATE_FILE)
+        except OSError:
+            pass
 
+    if _browser_lock is None:
+        import threading
+        _browser_lock = threading.Lock()
 
-def _kill_chromes() -> None:
-    """Kill all Chromium processes owned by this user.  Called by a
-    threading.Timer when a stock fetch exceeds the per-stock timeout.
-    This is more reliable than browser.close() which requires a working
-    DevTools connection (which is exactly what hangs).
-    """
-    import subprocess
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "chrome-headless-shell.exe"],
-            capture_output=True,
-            timeout=10,
+    with _browser_lock:
+        if _browser is not None:
+            try:
+                if _browser.is_connected():
+                    return _context
+            except Exception:
+                pass
+
+        if _pw_instance is not None:
+            try:
+                _pw_instance.stop()
+            except Exception:
+                pass
+
+        _pw_instance = sync_playwright().start()
+
+        storage_state = None
+        if os.path.exists(_STATE_FILE):
+            try:
+                with open(_STATE_FILE) as f:
+                    storage_state = json.load(f)
+            except Exception:
+                pass
+
+        _browser = _pw_instance.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
+        _context = _browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-CN",
+            storage_state=storage_state,
+        )
+        _context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+            window.chrome = {runtime: {}};
+        """)
+
+        def _block_route(route):
+            rt = route.request.resource_type
+            if rt in ("image", "font", "media", "stylesheet"):
+                route.abort()
+            elif "analytics" in route.request.url or "collect" in route.request.url:
+                route.abort()
+            else:
+                route.continue_()
+
+        _context.route("**/*", _block_route)
+        return _context
+
+
+def _save_browser_state(context: "BrowserContext") -> None:
+    try:
+        state = context.storage_state()
+        os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
+        with open(_STATE_FILE, "w") as f:
+            json.dump(state, f)
     except Exception:
         pass
 
 
-_HTML_RE = re.compile(r"<[^>]+>")
-
-
-def _strip_html(text: str) -> str:
-    """Strip HTML tags and collapse whitespace."""
-    text = _HTML_RE.sub(" ", text)
-    return " ".join(text.split())
-
-
 class XueqiuNewsSource:
-    """Fetch stock-related discussions and news from Xueqiu.
-
-    Cloudflare WAF is bypassed by loading the stock page in headless
-    Chromium (which auto-solves the JS challenge), then calling the
-    internal status API through the authenticated session.
-
-    Each API call has a JS-level 30s timeout via AbortController so
-    a hung request cannot stall the pipeline indefinitely.
-    """
+    """Fetch stock discussions from Xueqiu via Playwright."""
 
     def fetch_news(
         self,
@@ -148,70 +172,85 @@ class XueqiuNewsSource:
         end_date: str | None = None,
         max_pages: int = 3,
     ) -> pd.DataFrame:
-        """Fetch posts for a stock from Xueqiu.
+        global _waf_solved
 
-        Args:
-            stock_code: 6-digit A-share code.
-            start_date: YYYY-MM-DD filter (inclusive).
-            end_date: YYYY-MM-DD filter (inclusive).
-            max_pages: Pages to fetch (20 items/page, max 50).
-
-        Returns:
-            DataFrame with columns: date, title, body, url.
-        """
         symbol = _build_symbol(stock_code)
         end_dt = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
         start_dt = pd.Timestamp(start_date) if start_date else end_dt - pd.Timedelta(days=30)
+        max_pages = min(max_pages, 50)
 
-        page = None
-        timer = None
         try:
-            page = _get_page()
+            context = _ensure_context()
         except Exception as e:
-            logger.warning("Playwright not available for Xueqiu: %s", e)
+            logger.warning("Playwright not available: %s", e)
             return pd.DataFrame(columns=["date", "title", "body", "url"])
 
+        page = None
         try:
-            timer = threading.Timer(
-                _BROWSER_TIMEOUT_SEC, lambda: _kill_chromes(),
+            page = context.new_page()
+
+            waf_solved = _waf_solved
+            target_url = (
+                f"{_BASE_URL}/S/{symbol}" if not waf_solved
+                else _BASE_URL + "/"
             )
-            timer.start()
+
+            try:
+                page.goto(
+                    target_url,
+                    timeout=_GOTO_TIMEOUT_MS,
+                    wait_until="domcontentloaded",
+                )
+                if not waf_solved:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    time.sleep(0.8)
+                    try:
+                        page.evaluate(
+                            '() => { const m = document.querySelector(".modals.dimmer");'
+                            " if(m) m.remove(); }"
+                        )
+                    except Exception:
+                        pass
+                    _waf_solved = True
+                    _save_browser_state(context)
+                    logger.debug("WAF solved via %s", symbol)
+            except Exception as e:
+                logger.debug("goto failed for %s: %s", stock_code, e)
+                if waf_solved:
+                    try:
+                        page.goto(
+                            f"{_BASE_URL}/S/{symbol}",
+                            timeout=_GOTO_TIMEOUT_MS,
+                            wait_until="domcontentloaded",
+                        )
+                    except Exception:
+                        pass
+                    _waf_solved = True
+                    _save_browser_state(context)
 
             collected: list[dict] = []
-            max_pages = min(max_pages, 50)
-
-            for waf_attempt in range(3):
-                # Navigate to stock page for WAF cookies
-                page.goto(
-                    f"{_BASE_URL}/S/{symbol}",
-                    timeout=60000, wait_until="domcontentloaded",
-                )
-                try:
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    pass
-                time.sleep(1.5)
-                page.evaluate(
-                    '() => { const m = document.querySelector(".modals.dimmer");'
-                    " if(m) m.remove(); }"
-                )
-                time.sleep(0.3)
-
+            for waf_round in range(3):
                 waf_ok = True
                 page_items: list[dict] = []
+
                 for page_num in range(1, max_pages + 1):
                     api_url = _API_URL.format(symbol=symbol, page=page_num)
                     js = (
                         "async () => {"
                         f"  const ctrl = new AbortController();"
-                        f"  const timer = setTimeout(() => ctrl.abort(), {_API_TIMEOUT_MS});"
+                        f"  const t = setTimeout(() => ctrl.abort(), {_API_CALL_TIMEOUT_MS});"
                         "  try {"
-                        f"    const resp = await fetch('{api_url}',"
+                        f"    const r = await fetch('{api_url}',"
                         "      {credentials: 'include', signal: ctrl.signal});"
-                        "    const text = await resp.text();"
-                        "    return JSON.stringify({ok: resp.ok, text: text});"
+                        "    const text = await r.text();"
+                        "    return JSON.stringify({ok: r.ok, text: text});"
+                        "  } catch(e) {"
+                        "    return JSON.stringify({ok: false, text: '', err: e.message || String(e)});"
                         "  } finally {"
-                        "    clearTimeout(timer);"
+                        "    clearTimeout(t);"
                         "  }"
                         "}"
                     )
@@ -219,19 +258,10 @@ class XueqiuNewsSource:
                         raw = page.evaluate(js)
                         wrapper = json.loads(raw)
                     except Exception:
-                        logger.debug(
-                            "Xueqiu evaluate failed page %d for %s",
-                            page_num, stock_code,
-                        )
+                        logger.debug("evaluate failed p%d for %s", page_num, stock_code)
                         break
 
                     if not wrapper.get("ok"):
-                        # HTTP error (429, 403, etc.) — stop, WAF may need refresh
-                        logger.debug(
-                            "Xueqiu HTTP %s on page %d for %s",
-                            "error" if not wrapper.get("ok") else "ok",
-                            page_num, stock_code,
-                        )
                         if page_num == 1:
                             waf_ok = False
                         break
@@ -287,12 +317,22 @@ class XueqiuNewsSource:
                         break
 
                 if not waf_ok:
+                    _waf_solved = False
+                    try:
+                        page.goto(
+                            f"{_BASE_URL}/S/{symbol}",
+                            timeout=_GOTO_TIMEOUT_MS,
+                            wait_until="domcontentloaded",
+                        )
+                        _waf_solved = True
+                        _save_browser_state(context)
+                    except Exception:
+                        pass
                     page_items.clear()
                     continue
 
                 collected = page_items
-                if collected:
-                    break  # success — got data
+                break
 
             if not collected:
                 return pd.DataFrame(columns=["date", "title", "body", "url"])
@@ -300,7 +340,6 @@ class XueqiuNewsSource:
             df = pd.DataFrame(collected)
             df["date"] = pd.to_datetime(df["date"])
             df = df[df["date"] >= start_dt]
-            # Include all timestamps on end_date (not just midnight)
             df = df[df["date"] < end_dt + pd.Timedelta(days=1)]
             df = df.drop_duplicates(subset=["title", "date"])
             df = df.sort_values("date", ascending=False)
@@ -310,16 +349,15 @@ class XueqiuNewsSource:
         except Exception as e:
             msg = str(e)
             if "closed" in msg.lower() or "connection" in msg.lower():
-                logger.warning(
-                    "Xueqiu browser closed (likely timeout) for %s, will restart browser",
-                    stock_code,
-                )
+                logger.warning("Browser closed for %s, will restart", stock_code)
+                global _browser, _context
+                _browser = None
+                _context = None
+                _waf_solved = False
             else:
-                logger.debug("Xueqiu fetch for %s failed: %s", stock_code, e)
+                logger.debug("Fetch failed for %s: %s", stock_code, e)
             return pd.DataFrame(columns=["date", "title", "body", "url"])
         finally:
-            if timer is not None:
-                timer.cancel()
             if page is not None:
                 try:
                     page.close()
