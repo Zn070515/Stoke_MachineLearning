@@ -166,15 +166,10 @@ class FeaturePipeline:
         comment_df: pd.DataFrame | None = None,
         xueqiu_df: pd.DataFrame | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build features and return (X, y, aligned_close).
+        """Build features for a single stock. Returns (X, y, aligned_close).
 
-        All auxiliary DataFrames must have a 'date' column and be
-        pre-filtered to the stock's date range.  Market data are merged
-        by date; fundamentals should already be forward-filled to daily;
-        ETF flow is merged by date after mapping stock to sector;
-        guba_df provides Guba forum sentiment aggregated to daily;
-        comment_df provides AKShare market comment scores (daily);
-        xueqiu_df provides Xueqiu forum sentiment aggregated to daily.
+        For multi-stock cross-sectional normalization, use
+        build_features_from_panel() instead.
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
@@ -189,6 +184,92 @@ class FeaturePipeline:
             X = selector.fit_transform(X, y)
 
         return X, y, aligned_close
+
+    def build_features_from_panel(
+        self,
+        panel: pd.DataFrame,
+        target_col: str = "close",
+        *,
+        cross_sectional: bool = True,
+        cs_stages: list[str] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Build features from a multi-stock panel with cross-sectional normalization.
+
+        Parameters
+        ----------
+        panel : DataFrame from PanelBuilder
+            Must have columns: date, stock_code, open, high, low, close,
+            volume, sector, size_proxy.
+        target_col : str
+            Column to use as prediction target (default: "close").
+        cross_sectional : bool
+            If True, apply CrossSectionNormalizer after feature engineering.
+        cs_stages : list[str] or None
+            Stages for CrossSectionNormalizer. Default: ["sector", "size", "rank"].
+
+        Returns
+        -------
+        X : ndarray (n_total_samples, seq_len, n_features) or (n_total_samples, n_features*seq_len)
+        y : ndarray (n_total_samples,)
+        aligned_close : ndarray (n_total_samples+1,)
+        stock_indices : ndarray (n_total_samples,) int
+            Maps each sample back to its stock index in panel["stock_code"].unique().
+        """
+        if panel.empty:
+            empty = np.array([], dtype=np.float32)
+            return empty, np.array([], dtype=np.int64), empty, np.array([], dtype=np.int64)
+
+        codes = sorted(panel["stock_code"].unique())
+
+        # 1. Engineer features per stock
+        engineered_frames: list[pd.DataFrame] = []
+        for code in codes:
+            mask = panel["stock_code"] == code
+            df_stock = panel[mask].copy()
+            feats = self._engineer_features(df_stock)
+            engineered_frames.append(feats)
+
+        # 2. Recombine into panel
+        feats_panel = pd.concat(engineered_frames, ignore_index=True)
+        feats_panel = feats_panel.sort_values(["date", "stock_code"]).reset_index(drop=True)
+
+        # 3. Cross-sectional normalization on the feature panel
+        if cross_sectional:
+            from stoke_ml.preprocessing.numeric.cross_section import CrossSectionNormalizer
+            csn = CrossSectionNormalizer(
+                enabled=True,
+                stages=cs_stages or ["sector", "size", "rank"],
+            )
+            feats_panel = csn.fit_transform(feats_panel)
+
+        # 4. Create sequences per stock, track stock origin
+        X_parts, y_parts, close_parts, idx_parts = [], [], [], []
+        for i, code in enumerate(codes):
+            mask = feats_panel["stock_code"] == code
+            df_stock = feats_panel[mask].sort_values("date").reset_index(drop=True)
+            X_s, y_s, close_s = self._create_sequences(df_stock, target_col)
+            if len(X_s) > 0:
+                X_parts.append(X_s)
+                y_parts.append(y_s)
+                close_parts.append(close_s)
+                idx_parts.append(np.full(len(X_s), i, dtype=np.int64))
+
+        if not X_parts:
+            empty = np.array([], dtype=np.float32)
+            return empty, np.array([], dtype=np.int64), empty, np.array([], dtype=np.int64)
+
+        X_all = np.concatenate(X_parts, axis=0)
+        y_all = np.concatenate(y_parts, axis=0)
+        close_all = np.concatenate(close_parts, axis=0)
+        stock_idx = np.concatenate(idx_parts, axis=0)
+
+        # 5. Optional: feature selection on the combined dataset
+        if self.use_feature_selection and self.flat_mode and len(X_all) > 0:
+            from stoke_ml.features.selection import FeatureSelector
+            selector = FeatureSelector(mi_k=self.feature_selection_k, sfs_k=0)
+            X_all = selector.fit_transform(X_all, y_all)
+
+        return X_all, y_all, close_all, stock_idx
 
     # ------------------------------------------------------------------
     # Feature engineering
@@ -586,7 +667,7 @@ class FeaturePipeline:
     def _create_sequences(
         self, df: pd.DataFrame, target_col: str
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        drop_cols = ["date", "stock_code"]
+        drop_cols = ["date", "stock_code", "sector", "size_proxy"]
         feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
         feat_df = feat_df.dropna()
 
