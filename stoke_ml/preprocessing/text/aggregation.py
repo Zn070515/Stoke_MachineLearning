@@ -115,7 +115,6 @@ def _daily_stats(group: pd.DataFrame) -> pd.Series:
     # --- Topic features (from TopicModeler) -----------------------------
     if "topic_id" in group.columns and "topic_probability" in group.columns:
         topics = group["topic_id"].values
-        probs = group["topic_probability"].values
 
         valid_mask = topics >= 0
         valid_topics = topics[valid_mask]

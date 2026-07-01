@@ -267,6 +267,9 @@ class NewsStorage:
             columns={k: v for k, v in _rename.items() if k in gold.columns}
         )
 
+        # Mark real-data rows before ZI merge (mirrors legacy path)
+        gold["has_news"] = True
+
         # ZI fill missing trading days — discover columns dynamically
         numeric_cols = [
             c for c in gold.columns

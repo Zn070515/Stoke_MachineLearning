@@ -61,8 +61,12 @@ class PreprocessingChain(PreprocessingStep):
         return current
 
     def fit_transform(self, df, **kwargs):
-        self.fit(df, **kwargs)
-        return self.transform(df, **kwargs)
+        """Fit then transform in a single pass — each step runs once."""
+        current = df.copy()
+        for step in self.steps:
+            step.fit(current, **kwargs)
+            current = step.transform(current, **kwargs)
+        return current
 
     def add(self, step: PreprocessingStep) -> PreprocessingChain:
         self.steps.append(step)

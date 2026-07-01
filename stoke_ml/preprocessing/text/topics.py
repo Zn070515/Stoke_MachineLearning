@@ -157,7 +157,11 @@ class TopicModeler(PreprocessingStep):
         texts = self._build_texts(df)
 
         try:
-            topics, probs = self._model.transform(texts)
+            embeddings = self._get_embeddings(texts)
+            if embeddings is not None:
+                topics, probs = self._model.transform(texts, embeddings=embeddings)
+            else:
+                topics, probs = self._model.transform(texts)
             df["topic_id"] = topics.astype("int16")
             df["topic_probability"] = probs.astype(np.float32)
         except Exception as e:
