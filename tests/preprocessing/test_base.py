@@ -8,7 +8,7 @@ from stoke_ml.preprocessing.base import PreprocessingStep, PreprocessingChain
 class _AddOne(PreprocessingStep):
     def fit(self, df, **kwargs):
         return self
-    def transform(self, df):
+    def transform(self, df, **kwargs):
         df = df.copy()
         df["x"] = df["x"] + 1
         return df
@@ -18,21 +18,21 @@ class _ScaleByFit(PreprocessingStep):
     def fit(self, df, **kwargs):
         self.mean_ = df["x"].mean()
         return self
-    def transform(self, df):
+    def transform(self, df, **kwargs):
         df = df.copy()
         df["x"] = df["x"] - self.mean_
         return df
 
 
 class _DropColumn(PreprocessingStep):
-    def transform(self, df):
+    def transform(self, df, **kwargs):
         return df.drop(columns=["y"], errors="ignore")
 
 
 class _FilterMinLength(PreprocessingStep):
     def __init__(self, min_length=5):
         self.min_length = min_length
-    def transform(self, df):
+    def transform(self, df, **kwargs):
         return df[df["text"].str.len() >= self.min_length].copy()
 
 
@@ -99,7 +99,7 @@ class TestPreprocessingChain:
             def fit(self, df, **kwargs):
                 self.n_fit_rows_ = len(df)
                 return self
-            def transform(self, df):
+            def transform(self, df, **kwargs):
                 return df
         chain = PreprocessingChain([_Counter(), _AddOne(), _Counter()])
         chain.fit(pd.DataFrame({"x": [1, 2, 3]}))
