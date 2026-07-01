@@ -159,7 +159,7 @@ class TestFeatureRegistry:
             baseline_stats={"mean": 0.0, "std": 1.0},
         ))
         new_stats = {"feat": {"mean": 2.0, "std": 1.0}}
-        drifted = reg.check_drift(new_stats, p_threshold=0.01)
+        drifted = reg.check_drift(new_stats, sigma_threshold=1.0)
         assert len(drifted) >= 1
         assert drifted[0]["feature"] == "feat"
 

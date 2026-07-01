@@ -10,12 +10,46 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from collections.abc import Iterator
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class _RegistryEncoder(json.JSONEncoder):
+    """JSON encoder that converts numpy scalars to Python native types."""
+
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+
+def _to_json_safe(obj):
+    """Recursively convert numpy types in nested structures to Python natives."""
+    if isinstance(obj, dict):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_safe(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 
 @dataclass
@@ -44,16 +78,20 @@ class FeatureDefinition:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["value_range"] = list(self.value_range) if self.value_range else None
+        d["value_range"] = list(self.value_range) if self.value_range is not None else None
+        d = _to_json_safe(d)
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> FeatureDefinition:
         vr = d.get("value_range")
-        if vr and isinstance(vr, list):
-            d = {**d, "value_range": tuple(vr)}
-        return cls(**{k: v for k, v in d.items()
-                      if k in cls.__dataclass_fields__})
+        if isinstance(vr, list):
+            d = {**d, "value_range": tuple(vr) if vr else None}
+        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        unknown = set(d.keys()) - set(cls.__dataclass_fields__)
+        if unknown:
+            logger.debug("FeatureDefinition.from_dict: ignoring unknown keys %s", unknown)
+        return cls(**known)
 
 
 class FeatureRegistry:
@@ -67,6 +105,13 @@ class FeatureRegistry:
     # -- mutation -------------------------------------------------------
 
     def register(self, feature: FeatureDefinition) -> None:
+        if feature.name in self._features:
+            existing = self._features[feature.name]
+            if existing.to_dict() != feature.to_dict():
+                logger.warning(
+                    "FeatureRegistry: overwriting '%s' with different definition",
+                    feature.name,
+                )
         self._features[feature.name] = feature
 
     # -- query ----------------------------------------------------------
@@ -102,46 +147,50 @@ class FeatureRegistry:
         if fmt == "json":
             return json.dumps(
                 {name: fd.to_dict() for name, fd in self._features.items()},
-                ensure_ascii=False, indent=2,
+                ensure_ascii=False, indent=2, cls=_RegistryEncoder,
             )
         raise ValueError(f"Unknown format: {fmt}")
 
     def check_drift(
         self,
         new_stats: dict[str, dict],
-        p_threshold: float = 0.01,
+        sigma_threshold: float = 3.0,
     ) -> list[dict]:
-        """Two-sample KS approximation: compare new_stats to baseline_stats.
+        """Deterministic drift detection: compare new_stats to baseline_stats.
+
+        Uses sigma-based threshold on mean shift: |new_mean - baseline_mean|
+        divided by baseline_std. A feature triggers an alert when the shift
+        exceeds *sigma_threshold* standard deviations.
 
         *new_stats* is {feature_name: {mean, std}}.
-        Returns list of {feature, p_value, new_mean, baseline_mean}
-        for features with p < p_threshold.
+        Returns list of {feature, sigma_shift, new_mean, baseline_mean}.
         """
         alerts = []
-        try:
-            from scipy import stats
-        except ImportError:
-            return alerts
-
         for name, baseline in self._features.items():
             if not baseline.baseline_stats or name not in new_stats:
                 continue
             bm = baseline.baseline_stats
             nm = new_stats[name]
             try:
-                ks_stat, p_val = stats.ks_2samp(
-                    np.random.normal(bm["mean"], bm.get("std", 1.0), 100),
-                    np.random.normal(nm["mean"], nm.get("std", 1.0), 100),
-                )
-                if p_val < p_threshold:
+                b_mean = float(bm.get("mean", 0.0))
+                b_std = float(bm.get("std", 1.0))
+                n_mean = float(nm.get("mean", 0.0))
+                if not np.isfinite(b_mean) or not np.isfinite(n_mean):
+                    continue
+                if b_std <= 0:
+                    continue
+                sigma_shift = abs(n_mean - b_mean) / b_std
+                if sigma_shift > sigma_threshold:
                     alerts.append({
                         "feature": name,
-                        "p_value": float(p_val),
-                        "new_mean": nm["mean"],
-                        "baseline_mean": bm["mean"],
+                        "sigma_shift": round(sigma_shift, 3),
+                        "new_mean": round(n_mean, 4),
+                        "baseline_mean": round(b_mean, 4),
                     })
-            except Exception:
-                pass
+            except (TypeError, ValueError) as e:
+                logger.debug(
+                    "check_drift: skipping '%s' — bad stats: %s", name, e,
+                )
         return alerts
 
     # -- persistence ----------------------------------------------------
@@ -149,9 +198,20 @@ class FeatureRegistry:
     def save(self, path: Path | str) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = [fd.to_dict() for fd in self._features.values()]
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        data = [_to_json_safe(fd.to_dict()) for fd in self._features.values()]
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix=".json", prefix=".registry_", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
     @classmethod
     def load(cls, path: Path | str) -> FeatureRegistry:
