@@ -56,10 +56,9 @@ class QualityMonitor(PreprocessingStep):
                     "missing_rate": float(missing_rate),
                 })
 
-            # Check for infinite values
-            finites = np.isfinite(values)
-            if not finites.all():
-                n_inf = (~finites).sum()
+            # Check for infinite values (NaN already reported above)
+            n_inf = np.isinf(values).sum()
+            if n_inf > 0:
                 self._report.append({
                     "level": "ERROR",
                     "column": col,
