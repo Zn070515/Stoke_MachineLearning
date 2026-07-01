@@ -67,35 +67,39 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
     ))
     pp.register_chain("text", text_chain)
 
-    # Numeric chain
+    # Numeric cleaning chain (FeaturePipeline-safe: no scaling, no higher-order)
     num_cfg = pp_cfg.get("numeric", {})
-    num_chain = PreprocessingChain(name="numeric_default")
-
+    clean_chain = PreprocessingChain(name="numeric_clean")
     oc = num_cfg.get("outlier", {})
-    num_chain.add(OutlierDetector(
+    clean_chain.add(OutlierDetector(
         threshold=oc.get("threshold", 5.0),
         clip=oc.get("clip", True),
     ))
     mc = num_cfg.get("missing", {})
-    num_chain.add(MissingImputer(
+    clean_chain.add(MissingImputer(
         short_gap_max=mc.get("short_gap_max", 2),
         medium_gap_max=mc.get("medium_gap_max", 10),
     ))
     cs = num_cfg.get("cross_section", {})
-    num_chain.add(CrossSectionNormalizer(
+    clean_chain.add(CrossSectionNormalizer(
         enabled=cs.get("enabled", True),
         stages=cs.get("stages", ["sector", "size", "adaptive"]),
     ))
+    pp.register_chain("numeric", clean_chain)
+
+    # Numeric full chain (standalone: includes scaling and higher-order features)
+    full_chain = PreprocessingChain(name="numeric_full")
+    for step in clean_chain.steps:
+        full_chain.add(step)
     sc = num_cfg.get("scaling", {})
-    num_chain.add(RobustScaler(
+    full_chain.add(RobustScaler(
         window_days=sc.get("window_days", 252),
         winsorize_sigma=sc.get("winsorize_sigma", 3.0),
         min_periods=min(sc.get("min_periods", 63), sc.get("window_days", 252)),
     ))
     ho = num_cfg.get("higher_order", {})
     if ho.get("enabled", True):
-        num_chain.add(HigherOrderDeriver(enabled=True))
-
-    pp.register_chain("numeric", num_chain)
+        full_chain.add(HigherOrderDeriver(enabled=True))
+    pp.register_chain("numeric_full", full_chain)
 
     return pp

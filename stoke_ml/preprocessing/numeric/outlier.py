@@ -48,6 +48,8 @@ class OutlierDetector(PreprocessingStep):
             if col not in df.columns:
                 continue
             if self.clip:
+                if df[col].dtype.kind == "i":
+                    df[col] = df[col].astype(np.float64)
                 mask = df[col].notna()
                 df.loc[mask, col] = df.loc[mask, col].clip(lower, upper)
         return df

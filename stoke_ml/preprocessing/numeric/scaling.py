@@ -78,7 +78,10 @@ class RobustScaler(PreprocessingStep):
             ).apply(
                 lambda x: np.median(np.abs(x - np.median(x))), raw=True
             )
-            scaled = (w_values - roll_median.values) / (roll_mad.values * 1.4826 + 1e-10)
+            # Adaptive epsilon: 0.1% of rolling median, floor at 1e-8
+            med_abs = np.abs(roll_median.values)
+            eps = np.maximum(med_abs * 1e-3, 1e-8)
+            scaled = (w_values - roll_median.values) / (roll_mad.values * 1.4826 + eps)
             df[col] = scaled.astype(np.float32)
 
         return df
