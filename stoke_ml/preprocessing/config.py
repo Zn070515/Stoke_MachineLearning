@@ -18,7 +18,6 @@ from stoke_ml.preprocessing.numeric.missing import MissingImputer
 from stoke_ml.preprocessing.numeric.scaling import RobustScaler
 from stoke_ml.preprocessing.numeric.cross_section import CrossSectionNormalizer
 from stoke_ml.preprocessing.numeric.higher_order import HigherOrderDeriver
-from stoke_ml.preprocessing.monitor.quality import QualityMonitor
 
 logger = logging.getLogger(__name__)
 

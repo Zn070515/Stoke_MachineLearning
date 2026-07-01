@@ -5,7 +5,6 @@ Limit-up/down moves (+-9.5% daily change) are real signals, not outliers.
 """
 
 import numpy as np
-import pandas as pd
 from stoke_ml.preprocessing.base import PreprocessingStep
 
 

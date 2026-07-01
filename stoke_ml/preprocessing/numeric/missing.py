@@ -6,7 +6,6 @@ Long gaps (>10 days): NaN preserved + has_gap_{col} flag generated.
 """
 
 import numpy as np
-import pandas as pd
 from stoke_ml.preprocessing.base import PreprocessingStep
 
 

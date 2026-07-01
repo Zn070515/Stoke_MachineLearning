@@ -1,7 +1,6 @@
 """Data quality monitor: missing, constant, infinite, duplicate checks."""
 
 import numpy as np
-import pandas as pd
 from stoke_ml.preprocessing.base import PreprocessingStep
 
 
