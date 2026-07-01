@@ -197,6 +197,9 @@ class FeaturePipeline:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
 
+        if self.use_new_preprocessing and self.preprocessing:
+            df = self.preprocessing.run("numeric", df)
+
         df = self._merge_sentiment(df, sentiment_df)
         df = self._merge_announcements(df, announcement_df)
         df = self._merge_margin(df, margin_df)
