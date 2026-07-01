@@ -63,6 +63,12 @@ TEMPORAL_BASE_COLS = [
     "volume_ratio", "atr_14", "rsi_12",
 ]
 
+# Rich text features from DailyAggregator (new preprocessing text chain).
+# Per-source prefixes are applied by the benchmark/data-loading layer.
+_AGGREGATOR_BASE_COLS = [
+    "bipolar_sent", "agreement", "attention", "weighted_sent",
+]
+
 
 class FeaturePipeline:
     """End-to-end feature engineering for stock prediction."""
@@ -134,9 +140,13 @@ class FeaturePipeline:
         if isinstance(cfg, str):
             from stoke_ml.config import load_config as _load_cfg
             cfg = _load_cfg(cfg)
-        if cfg is not None and hasattr(cfg, "get"):
-            from omegaconf import OmegaConf
-            cfg = OmegaConf.to_container(cfg, resolve=True)
+        if cfg is not None and not isinstance(cfg, dict):
+            try:
+                from omegaconf import OmegaConf
+                cfg = OmegaConf.to_container(cfg, resolve=True)
+            except Exception:
+                cfg = {}
+        if isinstance(cfg, dict):
             return PreprocessingPipeline.from_config(cfg.get("preprocessing", cfg))
         return None
 
@@ -165,11 +175,12 @@ class FeaturePipeline:
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
         xueqiu_df: pd.DataFrame | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return_dates: bool = False,
+    ) -> tuple:
         """Build features for a single stock. Returns (X, y, aligned_close).
 
-        For multi-stock cross-sectional normalization, use
-        build_features_from_panel() instead.
+        If *return_dates* is True, also returns (sample_dates) as a 4-tuple.
+        Dates track the prediction date for each sample after dropna + sequencing.
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
@@ -177,6 +188,10 @@ class FeaturePipeline:
             announcement_df, guba_df, comment_df, xueqiu_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
+
+        if return_dates:
+            dates = self._get_sample_dates(feats)
+            return X, y, aligned_close, dates
 
         if self.use_feature_selection and self.flat_mode and len(X) > 0:
             from stoke_ml.features.selection import FeatureSelector
@@ -334,6 +349,13 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, GUBA_COLS)
             temporal_cols += _active_cols(df, COMMENT_COLS)
             temporal_cols += _active_cols(df, XUEQIU_COLS)
+            # New text features from DailyAggregator (any source prefix)
+            temporal_cols += _active_cols(df, [
+                c for c in df.columns
+                if c.endswith("_bipolar_sent") or c.endswith("_agreement")
+                or c.endswith("_attention") or c.endswith("_weighted_sent")
+                or c in ("bipolar_sent", "agreement", "attention", "weighted_sent")
+            ])
             df = add_lag_features(df, temporal_cols, self.LAGS)
             df = add_rolling_features(df, temporal_cols, self.ROLLING_WINDOWS)
             df = add_calendar_features(df)
@@ -351,8 +373,14 @@ class FeaturePipeline:
             return df
         s = sentiment_df.copy()
         s["date"] = pd.to_datetime(s["date"])
-        df = df.merge(s[["date"] + SENTIMENT_COLS], on="date", how="left")
-        for col in SENTIMENT_COLS:
+        available = [c for c in SENTIMENT_COLS if c in s.columns]
+        extra = [c for c in s.columns
+                 if c not in SENTIMENT_COLS and c not in ("date", "stock_code")
+                 and not c.startswith("has_")]
+        if not available and not extra:
+            return df
+        df = df.merge(s[["date"] + available + extra], on="date", how="left")
+        for col in available + extra:
             if col == "has_news":
                 df[col] = df[col].fillna(False).astype(bool)
             elif col == "news_count":
@@ -361,16 +389,13 @@ class FeaturePipeline:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
 
         # Lag sentiment by 1 trading day to prevent look-ahead bias.
-        # Without timestamps, day-t news may include post-15:00 releases
-        # the market hasn't absorbed yet. Using sentiment[t-1] with
-        # price[t] ensures all news was fully priced before prediction.
-        for col in SENTIMENT_COLS:
+        for col in available + extra:
             df[col] = df[col].shift(1)
         df["has_news"] = df["has_news"].fillna(False).astype(bool)
         df["news_count"] = df["news_count"].fillna(0).astype("int16")
-        for col in ["sentiment_mean", "sentiment_std",
-                     "positive_ratio", "negative_ratio"]:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        for col in available + extra:
+            if col not in ("has_news", "news_count") and col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
 
         return df
 
@@ -390,13 +415,19 @@ class FeaturePipeline:
             "negative_ratio": "ann_negative_ratio",
             "has_announce": "has_announce",
         }
-        available = {k: v for k, v in col_map.items() if k in a.columns}
-        if not available:
+        mapped_cols = {k: v for k, v in col_map.items() if k in a.columns}
+        # Extra columns (e.g. ann_bipolar_sent from DailyAggregator) — merge directly
+        extra = [c for c in a.columns
+                 if c not in col_map and c not in ("date", "stock_code")
+                 and not c.startswith("has_")]
+        if not mapped_cols and not extra:
             return df
-        rename = {k: v for k, v in available.items()}
-        a_renamed = a[["date"] + list(available.keys())].rename(columns=rename)
+        rename = {k: v for k, v in mapped_cols.items()}
+        merged_cols = list(rename.values()) + extra
+        source_cols = list(rename.keys()) + extra
+        a_renamed = a[["date"] + source_cols].rename(columns=rename)
         df = df.merge(a_renamed, on="date", how="left")
-        for _, target_col in available.items():
+        for target_col in merged_cols:
             if target_col == "has_announce":
                 df[target_col] = df[target_col].fillna(False).astype(bool)
             elif "count" in target_col:
@@ -404,7 +435,7 @@ class FeaturePipeline:
             else:
                 df[target_col] = df[target_col].fillna(0.0).astype(np.float32)
         # Same PIT lag as news sentiment
-        for _, target_col in available.items():
+        for target_col in merged_cols:
             df[target_col] = df[target_col].shift(1)
         df["has_announce"] = df["has_announce"].fillna(False).astype(bool)
         df["ann_count"] = df["ann_count"].fillna(0).astype("int16")
@@ -531,24 +562,26 @@ class FeaturePipeline:
         g = guba_df.copy()
         g["date"] = pd.to_datetime(g["date"])
         available = [c for c in GUBA_COLS if c in g.columns]
-        if not available:
+        extra = [c for c in g.columns
+                 if c not in GUBA_COLS and c not in ("date", "stock_code")
+                 and not c.startswith("has_")]
+        if not available and not extra:
             return df
-        df = df.merge(g[["date"] + available], on="date", how="left")
-        for col in available:
+        df = df.merge(g[["date"] + available + extra], on="date", how="left")
+        for col in available + extra:
             if col == "has_guba_post":
                 df[col] = df[col].fillna(False).astype(bool)
             elif col == "guba_post_count":
                 df[col] = df[col].fillna(0).astype("int16")
             else:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: guba sentiment[t-1] paired with price[t]
-        for col in available:
+        # PIT lag: sentiment[t-1] paired with price[t]
+        for col in available + extra:
             df[col] = df[col].shift(1)
         df["has_guba_post"] = df["has_guba_post"].fillna(False).astype(bool)
         df["guba_post_count"] = df["guba_post_count"].fillna(0).astype("int16")
-        for col in ["guba_sentiment_mean", "guba_sentiment_std",
-                     "guba_positive_ratio", "guba_negative_ratio"]:
-            if col in df.columns:
+        for col in available + extra:
+            if col not in ("has_guba_post", "guba_post_count") and col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
@@ -560,23 +593,25 @@ class FeaturePipeline:
         c = comment_df.copy()
         c["date"] = pd.to_datetime(c["date"])
         available = [col for col in COMMENT_COLS if col in c.columns]
-        if not available:
+        extra = [col for col in c.columns
+                 if col not in COMMENT_COLS and col not in ("date", "stock_code")
+                 and not col.startswith("has_")]
+        if not available and not extra:
             return df
-        df = df.merge(c[["date"] + available], on="date", how="left")
-        for col in available:
+        df = df.merge(c[["date"] + available + extra], on="date", how="left")
+        for col in available + extra:
             if col == "has_comment":
                 df[col] = df[col].fillna(False).astype(bool)
             else:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         # PIT lag: comment data[t-1] paired with price[t]
-        for col in available:
+        for col in available + extra:
             df[col] = df[col].shift(1)
         if "has_comment" in df.columns:
             df["has_comment"] = df["has_comment"].fillna(False).astype(bool)
         else:
-            # derive from comment_score when not in input (e.g. load_daily vs build_features)
             df["has_comment"] = df.get("comment_score", pd.Series(dtype=float)).notna()
-        for col in COMMENT_COLS:
+        for col in COMMENT_COLS + extra:
             if col != "has_comment" and col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
@@ -589,24 +624,26 @@ class FeaturePipeline:
         x = xueqiu_df.copy()
         x["date"] = pd.to_datetime(x["date"])
         available = [c for c in XUEQIU_COLS if c in x.columns]
-        if not available:
+        extra = [c for c in x.columns
+                 if c not in XUEQIU_COLS and c not in ("date", "stock_code")
+                 and not c.startswith("has_")]
+        if not available and not extra:
             return df
-        df = df.merge(x[["date"] + available], on="date", how="left")
-        for col in available:
+        df = df.merge(x[["date"] + available + extra], on="date", how="left")
+        for col in available + extra:
             if col == "has_xueqiu_post":
                 df[col] = df[col].fillna(False).astype(bool)
             elif col == "xueqiu_post_count":
                 df[col] = df[col].fillna(0).astype("int16")
             else:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: xueqiu sentiment[t-1] paired with price[t]
-        for col in available:
+        # PIT lag: sentiment[t-1] paired with price[t]
+        for col in available + extra:
             df[col] = df[col].shift(1)
         df["has_xueqiu_post"] = df["has_xueqiu_post"].fillna(False).astype(bool)
         df["xueqiu_post_count"] = df["xueqiu_post_count"].fillna(0).astype("int16")
-        for col in ["xueqiu_sentiment_mean", "xueqiu_sentiment_std",
-                     "xueqiu_positive_ratio", "xueqiu_negative_ratio"]:
-            if col in df.columns:
+        for col in available + extra:
+            if col not in ("has_xueqiu_post", "xueqiu_post_count") and col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
@@ -669,6 +706,8 @@ class FeaturePipeline:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         drop_cols = ["date", "stock_code", "sector", "size_proxy"]
         feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+        # Replace inf with NaN so dropna handles both
+        feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
         feat_df = feat_df.dropna()
 
         close = feat_df[target_col].values
@@ -697,6 +736,24 @@ class FeaturePipeline:
         y = target[self.seq_len - 1: self.seq_len - 1 + n_samples]
         aligned_close = close[self.seq_len - 1: self.seq_len + n_samples]
         return X, y, aligned_close.astype(np.float32)
+
+    def _get_sample_dates(self, feats: pd.DataFrame) -> np.ndarray:
+        """Return the prediction date for each sample after dropna + sequencing.
+
+        Must match _create_sequences exactly in the rows it keeps.
+        """
+        drop_cols = ["date", "stock_code", "sector", "size_proxy"]
+        # Reconstruct the dropna mask (same as _create_sequences)
+        feat_df = feats.drop(columns=[c for c in drop_cols if c in feats.columns])
+        valid_mask = feat_df.notna().all(axis=1)
+        # Get dates for valid rows
+        valid_dates = feats.loc[valid_mask.values, "date"].values
+        if len(valid_dates) < self.seq_len + self.horizon:
+            return np.array([], dtype="datetime64[ns]")
+        n_samples = len(valid_dates) - self.seq_len - self.horizon + 1
+        # Sample i predicts return ending at valid_dates[seq_len-1+i+horizon]
+        return valid_dates[self.seq_len - 1 + self.horizon:
+                           self.seq_len - 1 + self.horizon + n_samples]
 
 
 def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:
