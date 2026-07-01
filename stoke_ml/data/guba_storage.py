@@ -232,11 +232,15 @@ class GubaStorage:
         self,
         stock_code: str,
         analyzer: object | None = None,
+        preprocessing_pipeline: object | None = None,
     ) -> pd.DataFrame:
         """Aggregate silver posts to daily Guba sentiment features.
 
         Uses ZI method: days without posts get zero-filled sentiment
         plus a has_guba_post=False flag.
+
+        If *preprocessing_pipeline* is provided, runs the new text chain
+        instead of the legacy simple mean/std aggregation.
         """
         silver = self.load_silver(stock_code)
         if silver.empty:
@@ -250,7 +254,66 @@ class GubaStorage:
             else:
                 silver["sentiment_title"] = 0.0
 
-        # Group by aligned_date
+        if preprocessing_pipeline is not None:
+            return self._silver_to_gold_new(silver, stock_code, preprocessing_pipeline)
+
+        return self._silver_to_gold_legacy(silver, stock_code)
+
+    def _silver_to_gold_new(
+        self,
+        silver: pd.DataFrame,
+        stock_code: str,
+        pp: object,
+    ) -> pd.DataFrame:
+        """New path: text preprocessing chain → daily aggregation."""
+        silver = pp.run("text_pre", silver)
+
+        tm = pp.topic_modeler
+        if tm is not None and tm._enabled:
+            silver = tm.transform(silver)
+
+        gold = pp.run("text_aggregate", silver)
+        gold["stock_code"] = stock_code
+
+        numeric_cols = [
+            c for c in gold.columns
+            if c not in ("date", "stock_code") and not c.startswith("has_")
+            and gold[c].dtype in ("float32", "float64", "int16", "int32", "int64")
+        ]
+        bool_cols = [c for c in gold.columns if c.startswith("has_")]
+
+        if len(gold) >= 2:
+            all_dates = self._calendar.get_trading_days(
+                gold["date"].min(), gold["date"].max()
+            )
+            date_df = pd.DataFrame({"date": all_dates})
+            date_df["date"] = pd.to_datetime(date_df["date"]).dt.date
+            gold["date"] = pd.to_datetime(gold["date"]).dt.date
+            gold = date_df.merge(gold, on="date", how="left")
+            gold["stock_code"] = stock_code
+            for col in bool_cols:
+                if col in gold.columns:
+                    gold[col] = gold[col].fillna(False).astype(bool)
+            for col in numeric_cols:
+                if col in gold.columns:
+                    gold[col] = gold[col].fillna(0.0).astype(np.float32)
+
+        for col in ("guba_sentiment_mean", "guba_sentiment_std", "guba_post_count",
+                     "guba_positive_ratio", "guba_negative_ratio", "has_guba_post"):
+            if col not in gold.columns:
+                if col == "has_guba_post":
+                    gold[col] = False
+                elif col == "guba_post_count":
+                    gold[col] = np.int16(0)
+                else:
+                    gold[col] = np.float32(0.0)
+
+        return gold
+
+    def _silver_to_gold_legacy(
+        self, silver: pd.DataFrame, stock_code: str
+    ) -> pd.DataFrame:
+        """Legacy path: simple mean/std aggregation (backward compatible)."""
         silver["aligned_date"] = pd.to_datetime(silver["aligned_date"])
         daily = (
             silver.groupby("aligned_date")

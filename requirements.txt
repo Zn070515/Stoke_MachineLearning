@@ -28,9 +28,16 @@ efinance>=0.4
 tushare>=1.4
 baostock>=0.8
 
-# NLP (Phase 3)
+# NLP
 transformers>=4.35
 jieba>=0.42
+
+# BERTopic — optional, text quality chain (Phase 3)
+# Gracefully degrades to no-op if not installed
+bertopic>=0.16
+umap-learn>=0.5
+hdbscan>=0.8
+sentence-transformers>=2.2
 
 # Config & monitoring
 hydra-core>=1.3

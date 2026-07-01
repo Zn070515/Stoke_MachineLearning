@@ -112,6 +112,58 @@ def _daily_stats(group: pd.DataFrame) -> pd.Series:
                 (body * w).sum() / (w.sum() or 1.0)
             )
 
+    # --- Topic features (from TopicModeler) -----------------------------
+    if "topic_id" in group.columns and "topic_probability" in group.columns:
+        topics = group["topic_id"].values
+        probs = group["topic_probability"].values
+
+        valid_mask = topics >= 0
+        valid_topics = topics[valid_mask]
+
+        if len(valid_topics) > 0:
+            unique_topics = np.unique(valid_topics)
+
+            for tid in unique_topics:
+                mask = topics == tid
+                tid_int = int(tid)
+                if "sentiment_title" in group.columns:
+                    topic_sent = group.loc[mask, "sentiment_title"].fillna(0.0).mean()
+                    stats[f"topic_{tid_int}_sent"] = float(topic_sent)
+                stats[f"topic_{tid_int}_ratio"] = (
+                    float(mask.sum() / n) if n > 0 else 0.0
+                )
+
+            if len(unique_topics) > 1:
+                topic_counts = np.array([
+                    (topics == tid).sum() for tid in unique_topics
+                ])
+                topic_props = topic_counts / topic_counts.sum()
+                topic_ent = -float(np.sum(
+                    topic_props * np.log(topic_props + 1e-10)
+                ))
+            else:
+                topic_ent = 0.0
+            stats["topic_entropy"] = topic_ent
+
+            topic_counts = [(int(tid), int((topics == tid).sum())) for tid in unique_topics]
+            dominant = max(topic_counts, key=lambda x: x[1]) if topic_counts else (-1, 0)
+            stats["topic_dominant"] = dominant[0]
+
+            topic_sents = []
+            for tid in unique_topics:
+                mask = topics == tid
+                if "sentiment_title" in group.columns and mask.any():
+                    topic_sents.append(
+                        group.loc[mask, "sentiment_title"].fillna(0.0).mean()
+                    )
+            stats["topic_sent_dispersion"] = (
+                float(np.std(topic_sents)) if len(topic_sents) > 1 else 0.0
+            )
+        else:
+            stats["topic_entropy"] = 0.0
+            stats["topic_dominant"] = -1
+            stats["topic_sent_dispersion"] = 0.0
+
     return pd.Series(stats)
 
 

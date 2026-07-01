@@ -44,6 +44,11 @@ class PreprocessingPipeline:
     def list_chains(self) -> list[str]:
         return sorted(self._chains.keys())
 
+    @property
+    def topic_modeler(self):
+        """The TopicModeler instance, if configured. May be None."""
+        return getattr(self, "_topic_modeler", None)
+
     @classmethod
     def from_config(cls, config: dict) -> PreprocessingPipeline:
         """Build pipeline from configuration dict.

@@ -12,6 +12,8 @@ from stoke_ml.preprocessing.base import PreprocessingChain
 from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
 from stoke_ml.preprocessing.text.bipolar import BipolarClassifier
 from stoke_ml.preprocessing.text.decay import TimeDecayWeighter
+from stoke_ml.preprocessing.text.quality import QualityFilter
+from stoke_ml.preprocessing.text.topics import TopicModeler
 from stoke_ml.preprocessing.text.aggregation import DailyAggregator
 from stoke_ml.preprocessing.numeric.outlier import OutlierDetector
 from stoke_ml.preprocessing.numeric.missing import MissingImputer
@@ -25,6 +27,8 @@ _STEP_REGISTRY = {
     "BipolarClassifier": BipolarClassifier,
     "TimeDecayWeighter": TimeDecayWeighter,
     "DailyAggregator": DailyAggregator,
+    "QualityFilter": QualityFilter,
+    "TopicModeler": TopicModeler,
     "OutlierDetector": OutlierDetector,
     "MissingImputer": MissingImputer,
     "RobustScaler": RobustScaler,
@@ -52,20 +56,53 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
 
     # Text chain
     text_cfg = pp_cfg.get("text", {})
-    text_chain = PreprocessingChain(name="text_default")
-    text_chain.add(BipolarClassifier(
+    bipolar = BipolarClassifier(
         pos_threshold=text_cfg.get("bipolar", {}).get("threshold_positive", 0.2),
         neg_threshold=text_cfg.get("bipolar", {}).get("threshold_negative", -0.2),
-    ))
+    )
     decay_cfg = text_cfg.get("time_decay", {})
-    text_chain.add(TimeDecayWeighter(
+    decay = TimeDecayWeighter(
         halflife_days=decay_cfg.get("halflife_days", 7),
-    ))
+    )
     agg_cfg = text_cfg.get("aggregation", {})
-    text_chain.add(DailyAggregator(
+    aggregator = DailyAggregator(
         windows=tuple(agg_cfg.get("windows", [3, 5, 10, 20])),
+    )
+
+    # text_pre: QualityFilter → BipolarClassifier → TimeDecayWeighter (per-post)
+    text_pre = PreprocessingChain(name="text_pre")
+    qf_cfg = text_cfg.get("quality_filter", {})
+    text_pre.add(QualityFilter(
+        min_text_length=qf_cfg.get("min_text_length", 5),
+        max_duplicate_similarity=qf_cfg.get("max_duplicate_similarity", 0.9),
+        remove_html=qf_cfg.get("remove_html", True),
     ))
-    pp.register_chain("text", text_chain)
+    text_pre.add(bipolar)
+    text_pre.add(decay)
+    pp.register_chain("text_pre", text_pre)
+
+    # text_aggregate: DailyAggregator only
+    text_agg = PreprocessingChain(name="text_aggregate")
+    text_agg.add(aggregator)
+    pp.register_chain("text_aggregate", text_agg)
+
+    # text: full chain for standalone use
+    text_full = PreprocessingChain(name="text")
+    for step in text_pre.steps:
+        text_full.add(step)
+    text_full.add(aggregator)
+    pp.register_chain("text", text_full)
+
+    # Topic modeler (cross-stock fit, per-stock transform — not in chain)
+    topic_cfg = text_cfg.get("topic_model", {})
+    if topic_cfg.get("enabled", False):
+        pp._topic_modeler = TopicModeler(
+            enabled=True,
+            n_topics=topic_cfg.get("n_topics", "auto"),
+            min_topic_size=topic_cfg.get("min_topic_size", 50),
+            model_cache_dir=topic_cfg.get("model_cache_dir", "models/bertopic"),
+            embedding_model=topic_cfg.get("embedding_model", "finbert"),
+        )
 
     # Numeric cleaning chain (FeaturePipeline-safe: no scaling, no higher-order)
     num_cfg = pp_cfg.get("numeric", {})
