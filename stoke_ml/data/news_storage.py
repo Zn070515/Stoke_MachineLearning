@@ -289,12 +289,14 @@ class NewsStorage:
             gold["date"] = pd.to_datetime(gold["date"]).dt.date
             gold = date_df.merge(gold, on="date", how="left")
             gold["stock_code"] = stock_code
-            for col in bool_cols:
-                if col in gold.columns:
-                    gold[col] = gold[col].fillna(False).astype(bool)
-            for col in numeric_cols:
-                if col in gold.columns:
-                    gold[col] = gold[col].fillna(0.0).astype(np.float32)
+
+        # NaN-fill always runs (not gated by len >= 2)
+        for col in bool_cols:
+            if col in gold.columns:
+                gold[col] = gold[col].fillna(False).astype(bool)
+        for col in numeric_cols:
+            if col in gold.columns:
+                gold[col] = gold[col].fillna(0.0).astype(np.float32)
 
         # Topic columns need sentinel-aware ZI fill
         for col in [c for c in gold.columns if c.startswith("topic_")]:

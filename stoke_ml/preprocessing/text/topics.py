@@ -55,6 +55,8 @@ class TopicModeler(PreprocessingStep):
         self.embedding_model = embedding_model
 
         self._model = None
+        self._finbert_model = None
+        self._tfidf_vectorizer = None
         self._enabled = enabled and self._check_deps()
         if self._enabled:
             os.makedirs(self.model_cache_dir, exist_ok=True)
@@ -210,19 +212,41 @@ class TopicModeler(PreprocessingStep):
     def _get_embeddings(self, texts: list[str]):
         """Produce document embeddings for BERTopic.
 
-        Returns None if no embedding method is available.
+        Caches the embedding model on first call (during fit) and reuses it
+        on subsequent calls (during per-stock transform) to guarantee
+        consistent embedding dimensionality.
         """
+        # Already cached: reuse to guarantee dimension consistency
+        if self._finbert_model is not None:
+            try:
+                return self._finbert_model.encode(
+                    texts, show_progress_bar=True, batch_size=32,
+                )
+            except Exception as e:
+                logger.warning("FinBERT embeddings failed during transform: %s", e)
+                return None
+
+        if self._tfidf_vectorizer is not None:
+            try:
+                import jieba
+                tokenized = [" ".join(jieba.cut(t)) for t in texts]
+                return self._tfidf_vectorizer.transform(tokenized)
+            except Exception as e:
+                logger.warning("TF-IDF transform failed: %s", e)
+                return None
+
+        # First call (during fit): determine and cache the embedding method
         if self.embedding_model == "finbert":
             try:
                 from sentence_transformers import SentenceTransformer
-                model = SentenceTransformer(
+                self._finbert_model = SentenceTransformer(
                     "yiyanghkust/finbert-tone-chinese",
                     cache_folder=self.model_cache_dir,
                 )
                 logger.info(
                     "Computing FinBERT embeddings for %d texts...", len(texts)
                 )
-                return model.encode(
+                return self._finbert_model.encode(
                     texts,
                     show_progress_bar=True,
                     batch_size=32,
@@ -238,8 +262,8 @@ class TopicModeler(PreprocessingStep):
             from sklearn.feature_extraction.text import CountVectorizer
 
             tokenized = [" ".join(jieba.cut(t)) for t in texts]
-            vectorizer = CountVectorizer(max_features=5000)
-            return vectorizer.fit_transform(tokenized)
+            self._tfidf_vectorizer = CountVectorizer(max_features=5000)
+            return self._tfidf_vectorizer.fit_transform(tokenized)
         except Exception as e:
             logger.warning("TF-IDF fallback also failed: %s", e)
             return None
