@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from stoke_ml.features.technical import TechnicalIndicators
 from stoke_ml.features.scoring import TrendScorer
+from stoke_ml.features.interaction import InteractionFeatures
 from stoke_ml.features.temporal import (
     add_lag_features, add_rolling_features, add_calendar_features,
 )
@@ -88,6 +89,9 @@ class FeaturePipeline:
         use_fundamental: bool = True,
         use_etf_flow: bool = True,
         use_xueqiu: bool = True,
+        use_interaction: bool = True,
+        use_feature_selection: bool = False,
+        feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
         preprocessing_config: dict | str | None = None,
     ):
@@ -107,6 +111,9 @@ class FeaturePipeline:
         self.use_fundamental = use_fundamental
         self.use_etf_flow = use_etf_flow
         self.use_xueqiu = use_xueqiu
+        self.use_interaction = use_interaction
+        self.use_feature_selection = use_feature_selection
+        self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
         self._preprocessing_config = preprocessing_config
         self._preprocessing = None
@@ -114,6 +121,7 @@ class FeaturePipeline:
             self._preprocessing = self._build_preprocessing()
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
+        self._interaction = InteractionFeatures()
 
     # ------------------------------------------------------------------
     # Preprocessing integration
@@ -174,6 +182,12 @@ class FeaturePipeline:
             announcement_df, guba_df, comment_df, xueqiu_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
+
+        if self.use_feature_selection and self.flat_mode and len(X) > 0:
+            from stoke_ml.features.selection import FeatureSelector
+            selector = FeatureSelector(mi_k=self.feature_selection_k, sfs_k=0)
+            X = selector.fit_transform(X, y)
+
         return X, y, aligned_close
 
     # ------------------------------------------------------------------
@@ -217,6 +231,9 @@ class FeaturePipeline:
             df = self._scorer.score(df)
 
         df = self._add_microstructure(df)
+
+        if self.use_interaction:
+            df = self._interaction.compute_all(df)
 
         if self.use_temporal:
             temporal_cols = list(TEMPORAL_BASE_COLS)

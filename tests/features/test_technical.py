@@ -114,3 +114,39 @@ class TestTechnicalIndicators:
         df = _make_ohlcv(3)
         result = ti.compute_all(df)
         assert len(result) == 3
+
+    def test_adx_added(self):
+        ti = TechnicalIndicators()
+        df = _make_ohlcv(200)
+        result = ti.compute_all(df)
+        for col in ["adx", "adxr", "pdi", "mdi"]:
+            assert col in result.columns
+        # ADX should be between 0 and 100
+        valid = result["adx"].dropna()
+        assert (valid >= 0).all()
+        assert (valid <= 100).all()
+
+    def test_mfi_added(self):
+        ti = TechnicalIndicators()
+        df = _make_ohlcv(200)
+        result = ti.compute_all(df)
+        assert "mfi_14" in result.columns
+        valid = result["mfi_14"].dropna()
+        assert (valid >= 0).all()
+        assert (valid <= 100).all()
+
+    def test_cmo_added(self):
+        ti = TechnicalIndicators()
+        df = _make_ohlcv(200)
+        result = ti.compute_all(df)
+        assert "cmo_14" in result.columns
+        # CMO ranges -100 to +100
+        valid = result["cmo_14"].dropna()
+        assert (valid >= -100).all()
+        assert (valid <= 100).all()
+
+    def test_trix_added(self):
+        ti = TechnicalIndicators()
+        df = _make_ohlcv(200)
+        result = ti.compute_all(df)
+        assert "trix" in result.columns

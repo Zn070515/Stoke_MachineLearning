@@ -52,6 +52,8 @@ def select_by_sfs(
     """
     n_samples, n_features = X.shape
     k = min(k, n_features)
+    if k == 0:
+        return np.empty((n_samples, 0)), np.array([], dtype=np.int64)
 
     def _make_model():
         if model_type == "lgbm":
@@ -122,12 +124,16 @@ class FeatureSelector:
                      n_features, mi_limit, min(self.sfs_k, mi_limit))
 
         X_mi, self.mi_indices = select_by_mutual_info(X, y, k=mi_limit)
-        sfs_limit = min(self.sfs_k, X_mi.shape[1])
-        X_sfs, sfs_local = select_by_sfs(
-            X_mi, y, k=sfs_limit, model_type=self.model_type,
-        )
-        self.sfs_indices = self.mi_indices[sfs_local]
-        return X_sfs
+        if self.sfs_k > 0:
+            sfs_limit = min(self.sfs_k, X_mi.shape[1])
+            X_out, sfs_local = select_by_sfs(
+                X_mi, y, k=sfs_limit, model_type=self.model_type,
+            )
+            self.sfs_indices = self.mi_indices[sfs_local]
+        else:
+            self.sfs_indices = self.mi_indices
+            X_out = X_mi
+        return X_out
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         """Apply saved selection to new data."""

@@ -162,6 +162,18 @@ class TechnicalIndicators:
         # ── 19. Rolling window: Aroon & volume stats (Alpha158) ───────
         new.update(_rolling_aroon_vol(high, low, close, volume))
 
+        # ── 20. ADX — Average Directional Index (trend strength) ──────
+        new.update(_adx(high, low, close))
+
+        # ── 21. MFI — Money Flow Index (volume-weighted RSI) ───────────
+        new.update(_mfi(high, low, close, volume))
+
+        # ── 22. CMO — Chande Momentum Oscillator ───────────────────────
+        new.update(_cmo(close))
+
+        # ── 23. TRIX — Triple exponential average ─────────────────────
+        new.update(_trix(close))
+
         # ── Batch-assign all new columns at once (no fragmentation) ────
         new_df = pd.DataFrame(new, index=result.index)
         result = pd.concat([result, new_df], axis=1)
@@ -329,3 +341,65 @@ def _rolling_aroon_vol(high, low, close, volume):
         out[f"vsumn_{d}d"] = vsumn
         out[f"vsumd_{d}d"] = vsump - vsumn
     return out
+
+
+def _adx(high, low, close):
+    """ADX — Average Directional Index (14-day, trend strength indicator)."""
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    plus_dm = up_move.where((up_move > 0) & (up_move > down_move), 0.0)
+    minus_dm = down_move.where((down_move > 0) & (down_move > up_move), 0.0)
+
+    atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    plus_di14 = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14.replace(0, 1e-10)
+    minus_di14 = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14.replace(0, 1e-10)
+    dx = 100 * (plus_di14 - minus_di14).abs() / (plus_di14 + minus_di14).replace(0, 1e-10)
+    adx14 = dx.ewm(alpha=1 / 14, adjust=False).mean()
+    adxr = (adx14 + adx14.shift(14)) / 2
+
+    return {
+        "adx": adx14,
+        "adxr": adxr,
+        "pdi": plus_di14,
+        "mdi": minus_di14,
+    }
+
+
+def _mfi(high, low, close, volume):
+    """MFI — Money Flow Index (14-day, volume-weighted RSI)."""
+    tp = (high + low + close) / 3
+    raw_mf = tp * volume
+    tp_diff = tp.diff()
+    pos_flow = raw_mf.where(tp_diff > 0, 0.0)
+    neg_flow = raw_mf.where(tp_diff < 0, 0.0)
+    pos_sum = pos_flow.rolling(14).sum()
+    neg_sum = neg_flow.rolling(14).sum()
+    mr = pos_sum / neg_sum.replace(0, 1e-10)
+    mfi14 = 100 - (100 / (1 + mr))
+    return {"mfi_14": mfi14}
+
+
+def _cmo(close):
+    """CMO — Chande Momentum Oscillator (14-day)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    sum_gain = gain.rolling(14).sum()
+    sum_loss = loss.rolling(14).sum()
+    cmo14 = 100 * (sum_gain - sum_loss) / (sum_gain + sum_loss).replace(0, 1e-10)
+    return {"cmo_14": cmo14}
+
+
+def _trix(close):
+    """TRIX — Triple exponential average oscillator (15-day)."""
+    ema1 = close.ewm(span=15, adjust=False).mean()
+    ema2 = ema1.ewm(span=15, adjust=False).mean()
+    ema3 = ema2.ewm(span=15, adjust=False).mean()
+    trix = (ema3 - ema3.shift(1)) / ema3.shift(1).replace(0, 1e-10) * 100
+    return {"trix": trix}
