@@ -76,7 +76,7 @@ class MissingImputer(PreprocessingStep):
                     filled = self._kalman_fill(values, start, end)
                     if filled is not None:
                         values[start:end] = filled
-                    elif start > 0 and end < n:
+                    elif start > 0 and end < n and not np.isnan(values[start - 1]) and not np.isnan(values[end]):
                         left = values[start - 1]
                         right = values[end]
                         step = (right - left) / (length + 1)
@@ -85,10 +85,10 @@ class MissingImputer(PreprocessingStep):
                 else:
                     has_long_gap = True
 
-            if has_long_gap:
-                gap_flags[col] = is_nan
-
             df[col] = values
+
+            if has_long_gap:
+                gap_flags[col] = np.isnan(values)
 
         for col, nan_mask in gap_flags.items():
             df[f"has_gap_{col}"] = nan_mask.astype("int8")

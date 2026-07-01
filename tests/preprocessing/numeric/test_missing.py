@@ -19,11 +19,14 @@ class TestMissingImputer:
             "y": [10.0, np.nan, np.nan, np.nan, 50.0],
         })
         result = mi.fit_transform(df)
-        # Medium gap: attempt Kalman, fallback to linear
-        # At minimum, should not crash and should return same length
         assert len(result) == 5
-        # At least one value should be filled (either Kalman or linear fallback)
-        assert not np.isnan(result["x"].iloc[1]) or not np.isnan(result["x"].iloc[2])
+        # All three gap positions should be filled (Kalman or linear fallback)
+        assert not np.isnan(result["x"].iloc[1])
+        assert not np.isnan(result["x"].iloc[2])
+        assert not np.isnan(result["x"].iloc[3])
+        assert not np.isnan(result["y"].iloc[1])
+        assert not np.isnan(result["y"].iloc[2])
+        assert not np.isnan(result["y"].iloc[3])
 
     def test_long_gap_keeps_nan(self):
         mi = MissingImputer(short_gap_max=1, medium_gap_max=2)
@@ -32,14 +35,16 @@ class TestMissingImputer:
         assert np.isnan(result["x"].iloc[5])
 
     def test_generates_gap_flags(self):
-        mi = MissingImputer(short_gap_max=1, medium_gap_max=1)
+        mi = MissingImputer()  # default medium_gap_max=10
         df = pd.DataFrame({
-            "x": [1.0, np.nan, np.nan, np.nan, 5.0],
-            "y": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "x": [1.0] + [np.nan] * 15 + [5.0] * 5,
+            "y": [1.0] * 21,
         })
         result = mi.fit_transform(df)
         flag_cols = [c for c in result.columns if c.startswith("has_gap_")]
         assert len(flag_cols) >= 1
+        # Gap positions should be flagged
+        assert result["has_gap_x"].iloc[5] == 1
 
     def test_no_gaps_no_flags(self):
         mi = MissingImputer()
