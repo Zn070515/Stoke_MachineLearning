@@ -34,9 +34,18 @@ _STEP_REGISTRY = {
 
 
 def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
-    """Assemble PreprocessingPipeline from config dict."""
-    pp = PreprocessingPipeline()
+    """Assemble PreprocessingPipeline from config dict.
 
+    Accepts plain dict or OmegaConf DictConfig.
+    """
+    if cfg is not None and not isinstance(cfg, dict):
+        try:
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+        except Exception:
+            cfg = {}
+
+    pp = PreprocessingPipeline()
     pp_cfg = cfg if isinstance(cfg, dict) else {}
     if not pp_cfg:
         return pp

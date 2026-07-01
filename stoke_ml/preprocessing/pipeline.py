@@ -49,6 +49,14 @@ class PreprocessingPipeline:
         """Build pipeline from configuration dict.
 
         *config* is the 'preprocessing' section from config.yaml.
+        Accepts plain dict or OmegaConf DictConfig.
         """
         from stoke_ml.preprocessing.config import build_pipeline_from_config
+
+        if config is not None and not isinstance(config, dict):
+            try:
+                from omegaconf import OmegaConf
+                config = OmegaConf.to_container(config, resolve=True)
+            except Exception:
+                config = {}
         return build_pipeline_from_config(config)
