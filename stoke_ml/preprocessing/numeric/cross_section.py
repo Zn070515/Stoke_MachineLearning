@@ -6,9 +6,12 @@ Three-stage pipeline:
 3. Adaptive: strengthen neutralization in high-volatility regimes
 """
 
+import logging
 import numpy as np
 import pandas as pd
 from stoke_ml.preprocessing.base import PreprocessingStep
+
+logger = logging.getLogger(__name__)
 
 
 class CrossSectionNormalizer(PreprocessingStep):
@@ -45,9 +48,9 @@ class CrossSectionNormalizer(PreprocessingStep):
         for stage in self.stages:
             if stage == "sector" and "sector" in df.columns:
                 df = self._sector_neutralize(df, cols)
-            elif stage == "size" and "market_cap" in df.columns:
+            if stage == "size" and "market_cap" in df.columns:
                 df = self._size_neutralize(df, cols)
-            elif stage == "adaptive":
+            if stage == "adaptive":
                 df = self._adaptive_strength(df, cols)
 
         return df
@@ -106,7 +109,10 @@ class CrossSectionNormalizer(PreprocessingStep):
                             beta[2] * log_mcap2.loc[common])
                     result.loc[common] = y.loc[common].values - pred.values
                 except np.linalg.LinAlgError:
-                    pass
+                    logger.warning(
+                        "OLS failed for %s on %s (%d stocks), leaving NaN",
+                        col, date, len(common),
+                    )
             df[col] = result.astype(np.float32)
         return df
 
@@ -118,9 +124,12 @@ class CrossSectionNormalizer(PreprocessingStep):
         """
         if "close" not in df.columns:
             return df
-        returns = df["close"].pct_change()
-        sigma_short = returns.rolling(20).std()
-        sigma_long = returns.rolling(60).std()
+        if "stock_code" in df.columns:
+            returns = df.groupby("stock_code")["close"].pct_change()
+        else:
+            returns = df["close"].pct_change()
+        sigma_short = returns.rolling(20, min_periods=10).std()
+        sigma_long = returns.rolling(60, min_periods=30).std()
         rel_vol = (sigma_short - sigma_long) / sigma_long.replace(0, 1.0)
         alpha = 1.0 + 0.5 * rel_vol.clip(-0.5, 1.0)
 

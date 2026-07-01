@@ -26,6 +26,10 @@ class TestCrossSectionNormalizer:
         })
         result = csn.fit_transform(df)
         assert "x" in result.columns
+        assert "x_raw" in result.columns
+        # Within each (date, sector), median should be 0 after neutralization
+        medians = result.groupby(["date", "sector"])["x"].median()
+        assert (medians.abs() < 0.01).all()
 
     def test_empty_df(self):
         csn = CrossSectionNormalizer()
@@ -52,3 +56,35 @@ class TestCrossSectionNormalizer:
         })
         result = csn.fit_transform(df)
         np.testing.assert_array_equal(result["z"].values, df["z"].values)
+
+    def test_size_stage_computes_residuals(self):
+        csn = CrossSectionNormalizer(stages=["size"])
+        df = pd.DataFrame({
+            "date": ["2024-01-02"] * 15,
+            "stock_code": [f"S{i}" for i in range(15)],
+            "x": [float(i * 10) for i in range(15)],
+            "market_cap": [1e8 + i * 5e7 for i in range(15)],
+        })
+        result = csn.fit_transform(df)
+        assert "x" in result.columns
+        assert "x_pre_size" in result.columns
+
+    def test_adaptive_stage_applies_alpha(self):
+        csn = CrossSectionNormalizer(stages=["adaptive"])
+        rng = np.random.RandomState(42)
+        n = 40
+        prices = 100 + rng.randn(n).cumsum()
+        df = pd.DataFrame({
+            "date": pd.date_range("2024-01-01", periods=n, freq="B"),
+            "stock_code": ["S1"] * n,
+            "close": prices,
+            "x": rng.randn(n).astype(np.float64),
+        })
+        result = csn.fit_transform(df)
+        assert "x" in result.columns
+        # With adaptive scaling, values should differ from original
+        not_nan = result["x"].notna() & df["x"].notna()
+        assert not np.allclose(
+            result["x"].loc[not_nan].values,
+            df["x"].loc[not_nan].values,
+        )

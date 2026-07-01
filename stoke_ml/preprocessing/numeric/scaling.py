@@ -50,26 +50,35 @@ class RobustScaler(PreprocessingStep):
         for col in numeric_cols:
             if col in skip:
                 continue
-            values = df[col].values.astype(np.float64)
-            # Winsorize
-            mean = np.nanmean(values)
-            std = np.nanstd(values)
-            if std > 1e-10:
-                upper = mean + self.winsorize_sigma * std
-                lower = mean - self.winsorize_sigma * std
-                values = np.clip(values, lower, upper)
+            series = pd.Series(df[col].values, index=df.index)
 
-            # Rolling robust scale
-            series = pd.Series(values, index=df.index)
-            roll_median = series.rolling(
+            # Rolling winsorize (PIT-safe: backward-looking only)
+            roll_mean = series.rolling(
+                self.window_days, min_periods=self.min_periods
+            ).mean()
+            roll_std = series.rolling(
+                self.window_days, min_periods=self.min_periods
+            ).std()
+            upper = roll_mean + self.winsorize_sigma * roll_std
+            lower = roll_mean - self.winsorize_sigma * roll_std
+            values = series.values.astype(np.float64)
+            w_values = np.where(
+                roll_std.values > 1e-10,
+                np.clip(values, lower.values, upper.values),
+                values,
+            )
+
+            # Rolling robust scale: z = (x - rolling_median) / (rolling_MAD * 1.4826)
+            win_series = pd.Series(w_values, index=df.index)
+            roll_median = win_series.rolling(
                 self.window_days, min_periods=self.min_periods
             ).median()
-            roll_mad = series.rolling(
+            roll_mad = win_series.rolling(
                 self.window_days, min_periods=self.min_periods
             ).apply(
                 lambda x: np.median(np.abs(x - np.median(x))), raw=True
             )
-            scaled = (values - roll_median.values) / (roll_mad.values * 1.4826 + 1e-10)
+            scaled = (w_values - roll_median.values) / (roll_mad.values * 1.4826 + 1e-10)
             df[col] = scaled.astype(np.float32)
 
         return df
