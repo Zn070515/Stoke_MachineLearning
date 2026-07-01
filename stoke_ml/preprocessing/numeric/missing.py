@@ -96,7 +96,11 @@ class MissingImputer(PreprocessingStep):
 
     @staticmethod
     def _kalman_fill(values: np.ndarray, start: int, end: int) -> np.ndarray | None:
-        """Attempt Kalman smoothing on a gap segment."""
+        """Attempt Kalman smoothing on a gap segment.
+
+        Fits a local-level model on pre-gap observations, forecasts into
+        the gap, and blends toward the post-gap anchor for continuity.
+        """
         try:
             from statsmodels.tsa.statespace.structural import UnobservedComponents
         except ImportError:
@@ -107,20 +111,22 @@ class MissingImputer(PreprocessingStep):
         pre = pre[~np.isnan(pre)]
         post = post[~np.isnan(post)]
 
-        observed = np.concatenate([pre, values[start:end], post]) if len(post) > 0 else np.concatenate([pre, values[start:end]])
         if len(pre) < 2:
             return None
 
         try:
+            gap_len = end - start
             model = UnobservedComponents(
-                observed,
-                level='local level',
-                irregular=True,
+                pre, level='local level', irregular=True,
             )
             fitted = model.fit(disp=False)
-            smoothed = fitted.smoothed_state[0]
-            gap_len = end - start
-            pre_len = len(pre)
-            return smoothed[pre_len:pre_len + gap_len]
+            forecast = fitted.forecast(steps=gap_len)
+
+            # Blend forecast toward post-gap anchor for smooth continuity
+            if len(post) > 0:
+                anchor = float(post[0])
+                blend = np.linspace(0.0, 0.5, gap_len)
+                return forecast * (1.0 - blend) + anchor * blend
+            return forecast
         except Exception:
             return None
