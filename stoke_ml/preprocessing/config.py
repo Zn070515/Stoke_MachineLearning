@@ -82,6 +82,7 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
     num_chain.add(RobustScaler(
         window_days=sc.get("window_days", 252),
         winsorize_sigma=sc.get("winsorize_sigma", 3.0),
+        min_periods=min(sc.get("min_periods", 63), sc.get("window_days", 252)),
     ))
     ho = num_cfg.get("higher_order", {})
     if ho.get("enabled", True):
