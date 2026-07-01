@@ -187,71 +187,7 @@ Key settings: `features.seq_len=60`, `features.target_horizon=1`, `training.vali
 
 Use for fast model comparison before full-scale training.
 
-## Ablation Results (95 stocks, 1000 bootstrap samples)
-
-| Config | MCC | 95% CI | Δ vs technical |
-|---|---|---|---|
-| technical | 0.0136 | [-0.0035, 0.0312] | — |
-| + sentiment | 0.0279 | [0.0095, 0.0464] | +0.0143 |
-| + guba | 0.0219 | [0.0032, 0.0384] | +0.0084 |
-| + comment | 0.0224 | [0.0045, 0.0408] | +0.0089 |
-| ALL | 0.0261 | [0.0104, 0.0426] | +0.0125 |
-
-- All text dimensions improve MCC vs technical-only (all CIs > 0)
-- News sentiment has largest effect (+104% MCC)
-- ALL config underperforms +sentiment alone (dimension explosion)
-- Δ CIs all cross zero — need more data or stronger signal for significance
-
-Full analysis: `docs/project-analysis-2026-06-29.md`
-
-## 2026-07-01 Benchmark Findings (3 controlled experiments)
-
-### 1. Feature Selection (20 stocks, 99 folds, XGBoost flat)
-
-| Config | MCC | Features |
-|--------|-----|----------|
-| technical | 0.0631 | 1605 |
-| sentiment | 0.0589 | 1915 |
-| all | 0.0478 | 4075 |
-| **all_mi** | **0.0685** | **200** |
-
-- **Dimension explosion confirmed**: ALL (4075 features) WORSE than technical-only by -0.0153
-- **MI filter fixes it**: 200 features → best MCC at +0.0054 vs baseline
-- Script: `scripts/benchmark_feature_selection.py`
-
-### 2. Preprocessing A/B (20 stocks, 99 folds, XGBoost flat)
-
-| Config | MCC |
-|--------|-----|
-| old (current pipeline) | 0.0690 |
-| new_numeric (outlier→missing→robust scaling) | 0.0449 |
-
-- **Δ = -0.0241**: Numeric preprocessing DEGRADES XGBoost performance
-- **Root cause**: Tree models don't benefit from normalization; outlier clipping removes informative extremes; robust scaling distorts distribution
-- **Design intent**: This preprocessing chain is for DL models (LSTM/Transformer), not trees
-- Script: `scripts/benchmark_preprocessing.py`
-
-### 3. Label Types (10 stocks, 50 folds, XGBoost flat)
-
-| Label | MCC |
-|-------|-----|
-| abs (price[t+1] > price[t]) | 0.0603 |
-| rel (stock_ret > sector_median_ret) | -0.0073 |
-
-- **Δ = -0.0676**: Sector-relative outperformance is near-random with current features
-- **Interpretation**: Features capture market beta, not stock-specific alpha
-- Script: `scripts/benchmark_labels.py`
-
-### Actionable Conclusions
-
-| Finding | Implication |
-|---------|-------------|
-| MI filter is best config | Always use `mi_k=200` for flat XGBoost |
-| Numeric preprocessing hurts trees | Only enable for LSTM/Transformer training |
-| Sector-relative labels not learnable | Needs alpha-oriented features (higher moments, liquidity metrics) |
-| MCC ceiling ≈ 0.07 with current features | Next breakthrough requires better signal: DL models, richer alpha features, or multi-stock cross-sectional training |
-
-CSV outputs in `models/checkpoints/feature_selection_benchmark.csv`, `preprocessing_benchmark.csv`, `label_benchmark.csv`.
+Benchmark findings & research: `docs/research-findings.md`
 
 ## Agent skills
 
