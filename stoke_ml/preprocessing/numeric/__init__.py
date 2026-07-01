@@ -4,10 +4,12 @@ from stoke_ml.preprocessing.numeric.outlier import OutlierDetector
 from stoke_ml.preprocessing.numeric.missing import MissingImputer
 from stoke_ml.preprocessing.numeric.scaling import RobustScaler
 from stoke_ml.preprocessing.numeric.cross_section import CrossSectionNormalizer
+from stoke_ml.preprocessing.numeric.higher_order import HigherOrderDeriver
 
 __all__ = [
     "OutlierDetector",
     "MissingImputer",
     "RobustScaler",
     "CrossSectionNormalizer",
+    "HigherOrderDeriver",
 ]
