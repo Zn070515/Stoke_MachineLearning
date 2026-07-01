@@ -19,9 +19,16 @@ _HTML_RE = re.compile(r"<[^>]*>")
 
 
 def _clean_text(val):
-    """Strip HTML and return cleaned string, handling None/NaN."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
+    """Strip HTML and return cleaned string, handling None/NaN/pd.NA."""
+    if val is None:
         return ""
+    if isinstance(val, float) and np.isnan(val):
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
     return _HTML_RE.sub("", str(val)).strip()
 
 
@@ -99,8 +106,8 @@ class QualityFilter(PreprocessingStep):
             else None
         )
         if date_col is not None and len(df) > 1:
-            df[date_col] = pd.to_datetime(df[date_col])
-            df = df.sort_values(date_col)
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.dropna(subset=[date_col])
 
             texts = []
             for i in range(len(df)):

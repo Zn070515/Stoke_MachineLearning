@@ -275,9 +275,24 @@ class GubaStorage:
         gold = pp.run("text_aggregate", silver)
         gold["stock_code"] = stock_code
 
+        # Map generic DailyAggregator column names to guba-specific legacy names
+        _rename = {
+            "sent_mean": "guba_sentiment_mean",
+            "sent_std": "guba_sentiment_std",
+            "post_count": "guba_post_count",
+            "bull_ratio": "guba_positive_ratio",
+            "bear_ratio": "guba_negative_ratio",
+        }
+        gold = gold.rename(
+            columns={k: v for k, v in _rename.items() if k in gold.columns}
+        )
+
+        # ZI fill missing trading days — discover columns dynamically
         numeric_cols = [
             c for c in gold.columns
-            if c not in ("date", "stock_code") and not c.startswith("has_")
+            if c not in ("date", "stock_code")
+            and not c.startswith("has_")
+            and not c.startswith("topic_")
             and gold[c].dtype in ("float32", "float64", "int16", "int32", "int64")
         ]
         bool_cols = [c for c in gold.columns if c.startswith("has_")]
@@ -298,6 +313,14 @@ class GubaStorage:
                 if col in gold.columns:
                     gold[col] = gold[col].fillna(0.0).astype(np.float32)
 
+        # Topic columns need sentinel-aware ZI fill
+        for col in [c for c in gold.columns if c.startswith("topic_")]:
+            if col == "topic_dominant":
+                gold[col] = gold[col].fillna(-1).astype("int16")
+            else:
+                gold[col] = gold[col].fillna(0.0).astype(np.float32)
+
+        # Ensure standard columns exist
         for col in ("guba_sentiment_mean", "guba_sentiment_std", "guba_post_count",
                      "guba_positive_ratio", "guba_negative_ratio", "has_guba_post"):
             if col not in gold.columns:

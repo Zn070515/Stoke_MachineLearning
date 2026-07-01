@@ -228,18 +228,14 @@ class TopicModeler(PreprocessingStep):
                     "FinBERT embeddings unavailable (%s), falling back to TF-IDF", e
                 )
 
-        # TF-IDF fallback
+        # TF-IDF fallback (pre-tokenize to avoid deprecated sklearn tokenizer param)
         try:
             import jieba
             from sklearn.feature_extraction.text import CountVectorizer
 
-            def _tokenize(text):
-                return list(jieba.cut(text))
-
-            vectorizer = CountVectorizer(
-                tokenizer=_tokenize, max_features=5000
-            )
-            return vectorizer.fit_transform(texts)
+            tokenized = [" ".join(jieba.cut(t)) for t in texts]
+            vectorizer = CountVectorizer(max_features=5000)
+            return vectorizer.fit_transform(tokenized)
         except Exception as e:
             logger.warning("TF-IDF fallback also failed: %s", e)
             return None

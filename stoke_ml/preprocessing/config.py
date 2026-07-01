@@ -86,11 +86,23 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
     text_agg.add(aggregator)
     pp.register_chain("text_aggregate", text_agg)
 
-    # text: full chain for standalone use
+    # text: full chain for standalone use (independent instances, not shared)
     text_full = PreprocessingChain(name="text")
-    for step in text_pre.steps:
-        text_full.add(step)
-    text_full.add(aggregator)
+    text_full.add(QualityFilter(
+        min_text_length=qf_cfg.get("min_text_length", 5),
+        max_duplicate_similarity=qf_cfg.get("max_duplicate_similarity", 0.9),
+        remove_html=qf_cfg.get("remove_html", True),
+    ))
+    text_full.add(BipolarClassifier(
+        pos_threshold=text_cfg.get("bipolar", {}).get("threshold_positive", 0.2),
+        neg_threshold=text_cfg.get("bipolar", {}).get("threshold_negative", -0.2),
+    ))
+    text_full.add(TimeDecayWeighter(
+        halflife_days=decay_cfg.get("halflife_days", 7),
+    ))
+    text_full.add(DailyAggregator(
+        windows=tuple(agg_cfg.get("windows", [3, 5, 10, 20])),
+    ))
     pp.register_chain("text", text_full)
 
     # Topic modeler (cross-stock fit, per-stock transform — not in chain)

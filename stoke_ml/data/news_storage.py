@@ -254,10 +254,25 @@ class NewsStorage:
         gold = pp.run("text_aggregate", silver)
         gold["stock_code"] = stock_code
 
-        # ZI fill missing trading days — discover all numeric columns dynamically
+        # Map generic DailyAggregator column names to legacy source-specific names
+        # so FeaturePipeline and save_daily_sentiment() see the expected columns.
+        _rename = {
+            "sent_mean": "sentiment_mean",
+            "sent_std": "sentiment_std",
+            "post_count": "news_count",
+            "bull_ratio": "positive_ratio",
+            "bear_ratio": "negative_ratio",
+        }
+        gold = gold.rename(
+            columns={k: v for k, v in _rename.items() if k in gold.columns}
+        )
+
+        # ZI fill missing trading days — discover columns dynamically
         numeric_cols = [
             c for c in gold.columns
-            if c not in ("date", "stock_code") and not c.startswith("has_")
+            if c not in ("date", "stock_code")
+            and not c.startswith("has_")
+            and not c.startswith("topic_")
             and gold[c].dtype in ("float32", "float64", "int16", "int32", "int64")
         ]
         bool_cols = [c for c in gold.columns if c.startswith("has_")]
@@ -277,6 +292,13 @@ class NewsStorage:
             for col in numeric_cols:
                 if col in gold.columns:
                     gold[col] = gold[col].fillna(0.0).astype(np.float32)
+
+        # Topic columns need sentinel-aware ZI fill
+        for col in [c for c in gold.columns if c.startswith("topic_")]:
+            if col == "topic_dominant":
+                gold[col] = gold[col].fillna(-1).astype("int16")
+            else:
+                gold[col] = gold[col].fillna(0.0).astype(np.float32)
 
         # Ensure standard columns exist
         for col in ("sentiment_mean", "sentiment_std", "news_count",
