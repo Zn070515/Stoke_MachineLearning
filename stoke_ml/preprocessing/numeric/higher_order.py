@@ -17,7 +17,6 @@ class HigherOrderDeriver(PreprocessingStep):
     """
 
     _VOL_WINDOWS = (5, 10, 20, 60)
-    _MOMENT_WINDOW = 20
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
@@ -33,7 +32,6 @@ class HigherOrderDeriver(PreprocessingStep):
         if "close" in df.columns:
             close = df["close"]
             returns = close.pct_change()
-            log_ret = np.log(close / close.shift(1))
 
             # Return distribution moments (20-day rolling)
             df["skew_20d"] = (
