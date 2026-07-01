@@ -37,6 +37,39 @@ def compute_classification_metrics(
     }
 
 
+def bootstrap_ci(
+    values: np.ndarray,
+    statistic: str = "mean",
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    random_state: int = 42,
+) -> tuple[float, float]:
+    """Bootstrap confidence interval for a summary statistic.
+
+    Args:
+        values: 1-D array of per-stock/per-fold metric values.
+        statistic: "mean" only for now.
+        n_boot: number of bootstrap resamples.
+        alpha: 1 - confidence level (0.05 → 95% CI).
+        random_state: seed for reproducibility.
+
+    Returns:
+        (ci_low, ci_high) tuple.
+    """
+    rng = np.random.RandomState(random_state)
+    boot_stats = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.choice(len(values), size=len(values), replace=True)
+        if statistic == "mean":
+            boot_stats[i] = np.mean(values[idx])
+        else:
+            raise ValueError(f"Unsupported statistic: {statistic}")
+    boot_stats = np.sort(boot_stats)
+    lo = int(n_boot * alpha / 2)
+    hi = int(n_boot * (1 - alpha / 2))
+    return float(boot_stats[lo]), float(boot_stats[hi])
+
+
 def compute_financial_metrics(
     prices: np.ndarray, predictions: np.ndarray
 ) -> dict:

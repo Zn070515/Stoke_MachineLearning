@@ -146,6 +146,7 @@ Existing checkpoints: `lstm_000001_final.ckpt`, `lstm_601318_final.ckpt`, `xgboo
 - `WalkForwardSplitter`: Fixed-size sliding window with chronological splits only (NO shuffle). Default: 2yr train / 3mo validation / 3mo step.
 - `compute_classification_metrics(y_true, y_pred)`: MCC (primary), accuracy, precision, recall, F1
 - `compute_financial_metrics(close_prices, predictions)`: Sharpe, max drawdown, win rate, profit factor
+- `bootstrap_ci(values, statistic="mean", n_boot=2000)`: bootstrap 95% CI for per-stock metric arrays
 - `aligned_close` in pipeline output has `n_samples+1` elements to produce `n_samples` returns matching `n_samples` predictions
 
 ### Crawler (`stoke_ml/crawler/`)
@@ -178,6 +179,13 @@ Key settings: `features.seq_len=60`, `features.target_horizon=1`, `training.vali
 | ALL config dimension explosion (24,300 features) | Use +sentiment instead |
 | FinBERT first load needs network or pre-cached model | Use `HF_ENDPOINT=https://hf-mirror.com` |
 | Ablation Δ CIs cross zero (need >100 stocks or stronger signal) | Active research |
+| Playwright browser can hang indefinitely during WAF bypass | Use `threading.Timer(timeout, lambda: os._exit(1))` as hard kill-switch |
+
+## Quick-Eval Stock Basket (15 stocks, cross-sector)
+
+`000001`(银行) `600519`(白酒) `000725`(科技) `600276`(医药) `000651`(家电) `601318`(保险) `600900`(电力) `002415`(海康) `000858`(五粮液) `600036`(招行) `002594`(比亚迪) `601088`(神华) `300750`(宁德) `688981`(中芯) `002493`(荣盛)
+
+Use for fast model comparison before full-scale training.
 
 ## Ablation Results (95 stocks, 1000 bootstrap samples)
 
