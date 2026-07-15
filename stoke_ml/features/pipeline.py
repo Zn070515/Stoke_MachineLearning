@@ -69,6 +69,50 @@ _AGGREGATOR_BASE_COLS = [
     "bipolar_sent", "agreement", "attention", "weighted_sent",
 ]
 
+# ── New multi-shape preprocessing (spec §6) ──
+
+FLOW_COLS = [
+    "flow_intensity", "flow_z", "flow_momentum",
+    "flow_persistence_5d", "flow_persistence_10d", "flow_persistence_20d",
+    "flow_divergence", "flow_residual", "flow_spread_large_small",
+]
+
+BLOCK_TRADE_COLS = [
+    "bt_count", "bt_total_amount", "bt_vwap_premium",
+    "bt_deep_discount_count", "bt_permanent_impact", "bt_temporary_impact",
+    "bt_volatility_6d",
+]
+
+SHAREHOLDER_COLS = [
+    "sh_hnum_change_pct", "sh_hnum_zscore", "sh_pcrc",
+    "sh_consecutive_neg", "sh_dual_concentration_signal", "sh_avg_shares_held",
+]
+
+LOCKUP_COLS = [
+    "lu_pressure", "lu_ratio", "lu_days_until",
+    "lu_event_count", "lu_is_vc_backed",
+]
+
+DIVIDEND_COLS = [
+    "dv_yield", "dv_effective_yield", "dv_months_since_last",
+]
+
+BOARD_COLS = [
+    "is_zt", "is_zb", "is_dt", "is_yzt",
+    "consecutive_zt", "board_height_20d", "seal_strength", "seal_success",
+    "net_zt_proportion", "break_rate", "advance_rate", "max_board_height",
+]
+
+SECTOR_COLS = [
+    "sector_relative_strength", "sector_breadth_z",
+    "sector_rrg_y", "sector_rrg_x", "sector_rrg_quadrant",
+]
+
+CONCEPT_COLS = [
+    "board_count", "has_hot_board", "avg_concept_heat",
+    "is_concept_leader", "board_overlap_score",
+]
+
 
 class FeaturePipeline:
     """End-to-end feature engineering for stock prediction."""
@@ -97,6 +141,14 @@ class FeaturePipeline:
         use_xueqiu: bool = True,
         use_interaction: bool = True,
         use_feature_selection: bool = False,
+        use_capital_flow: bool = False,
+        use_block_trade: bool = False,
+        use_shareholder: bool = False,
+        use_lockup: bool = False,
+        use_dividend: bool = False,
+        use_board: bool = False,
+        use_sector: bool = False,
+        use_concept: bool = False,
         feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
         preprocessing_config: dict | str | None = None,
@@ -119,6 +171,14 @@ class FeaturePipeline:
         self.use_xueqiu = use_xueqiu
         self.use_interaction = use_interaction
         self.use_feature_selection = use_feature_selection
+        self.use_capital_flow = use_capital_flow
+        self.use_block_trade = use_block_trade
+        self.use_shareholder = use_shareholder
+        self.use_lockup = use_lockup
+        self.use_dividend = use_dividend
+        self.use_board = use_board
+        self.use_sector = use_sector
+        self.use_concept = use_concept
         self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
         self._preprocessing_config = preprocessing_config
@@ -175,6 +235,14 @@ class FeaturePipeline:
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
         xueqiu_df: pd.DataFrame | None = None,
+        capital_flow_df: pd.DataFrame | None = None,
+        block_trade_df: pd.DataFrame | None = None,
+        shareholder_df: pd.DataFrame | None = None,
+        lockup_df: pd.DataFrame | None = None,
+        dividend_df: pd.DataFrame | None = None,
+        board_df: pd.DataFrame | None = None,
+        sector_df: pd.DataFrame | None = None,
+        concept_df: pd.DataFrame | None = None,
         return_dates: bool = False,
     ) -> tuple:
         """Build features for a single stock. Returns (X, y, aligned_close).
@@ -186,6 +254,8 @@ class FeaturePipeline:
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, etf_flow_df,
             announcement_df, guba_df, comment_df, xueqiu_df,
+            capital_flow_df, block_trade_df, shareholder_df,
+            lockup_df, dividend_df, board_df, sector_df, concept_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
 
@@ -303,6 +373,14 @@ class FeaturePipeline:
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
         xueqiu_df: pd.DataFrame | None = None,
+        capital_flow_df: pd.DataFrame | None = None,
+        block_trade_df: pd.DataFrame | None = None,
+        shareholder_df: pd.DataFrame | None = None,
+        lockup_df: pd.DataFrame | None = None,
+        dividend_df: pd.DataFrame | None = None,
+        board_df: pd.DataFrame | None = None,
+        sector_df: pd.DataFrame | None = None,
+        concept_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
@@ -320,6 +398,16 @@ class FeaturePipeline:
         df = self._merge_guba(df, guba_df)
         df = self._merge_comment(df, comment_df)
         df = self._merge_xueqiu(df, xueqiu_df)
+
+        # New multi-shape preprocessing
+        df = self._merge_capital_flow(df, capital_flow_df)
+        df = self._merge_block_trade(df, block_trade_df)
+        df = self._merge_shareholder(df, shareholder_df)
+        df = self._merge_lockup(df, lockup_df)
+        df = self._merge_dividend(df, dividend_df)
+        df = self._merge_board(df, board_df)
+        df = self._merge_sector(df, sector_df)
+        df = self._merge_concept(df, concept_df)
 
         if self.use_technical:
             df = self._ti.compute_all(df)
@@ -349,6 +437,23 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, GUBA_COLS)
             temporal_cols += _active_cols(df, COMMENT_COLS)
             temporal_cols += _active_cols(df, XUEQIU_COLS)
+            # New multi-shape columns (dynamic — pick up whatever was merged)
+            temporal_cols += _active_cols(df, FLOW_COLS)
+            temporal_cols += _active_cols(df, BLOCK_TRADE_COLS)
+            temporal_cols += _active_cols(df, SHAREHOLDER_COLS)
+            temporal_cols += _active_cols(df, LOCKUP_COLS)
+            temporal_cols += _active_cols(df, DIVIDEND_COLS)
+            temporal_cols += _active_cols(df, BOARD_COLS)
+            temporal_cols += _active_cols(df, SECTOR_COLS)
+            temporal_cols += _active_cols(df, CONCEPT_COLS)
+            # Dynamic columns: concept momentum, board momentum, sector momentum
+            temporal_cols += _active_cols(df, [
+                c for c in df.columns
+                if c.startswith("momentum_") or c.startswith("concept_momentum_")
+                or c.startswith("board_momentum_") or c.startswith("sector_rrg_")
+                or c.startswith("seal_type_") or c.startswith("market_state_")
+                or c.startswith("cb_")
+            ])
             # New text features from DailyAggregator (any source prefix)
             temporal_cols += _active_cols(df, [
                 c for c in df.columns
@@ -647,6 +752,64 @@ class FeaturePipeline:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
+    # ── Multi-shape preprocessing merge methods ──────────────────────
+
+    def _merge_capital_flow(self, df: pd.DataFrame,
+                            flow_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_capital_flow and flow_df is not None
+                and not flow_df.empty):
+            return df
+        return _merge_daily_aux(df, flow_df)
+
+    def _merge_block_trade(self, df: pd.DataFrame,
+                           bt_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_block_trade and bt_df is not None
+                and not bt_df.empty):
+            return df
+        return _merge_daily_aux(df, bt_df)
+
+    def _merge_shareholder(self, df: pd.DataFrame,
+                           sh_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_shareholder and sh_df is not None
+                and not sh_df.empty):
+            return df
+        return _merge_daily_aux(df, sh_df)
+
+    def _merge_lockup(self, df: pd.DataFrame,
+                      lu_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_lockup and lu_df is not None
+                and not lu_df.empty):
+            return df
+        return _merge_daily_aux(df, lu_df)
+
+    def _merge_dividend(self, df: pd.DataFrame,
+                        dv_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_dividend and dv_df is not None
+                and not dv_df.empty):
+            return df
+        return _merge_daily_aux(df, dv_df)
+
+    def _merge_board(self, df: pd.DataFrame,
+                     board_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_board and board_df is not None
+                and not board_df.empty):
+            return df
+        return _merge_daily_aux(df, board_df)
+
+    def _merge_sector(self, df: pd.DataFrame,
+                      sector_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_sector and sector_df is not None
+                and not sector_df.empty):
+            return df
+        return _merge_daily_aux(df, sector_df)
+
+    def _merge_concept(self, df: pd.DataFrame,
+                       concept_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not (self.use_concept and concept_df is not None
+                and not concept_df.empty):
+            return df
+        return _merge_daily_aux(df, concept_df)
+
     # ------------------------------------------------------------------
     # Microstructure features
     # ------------------------------------------------------------------
@@ -759,3 +922,49 @@ class FeaturePipeline:
 def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:
     """Return the subset of *candidates* that exist in *df*."""
     return [c for c in candidates if c in df.columns]
+
+
+def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
+    """Merge a preprocessed auxiliary DataFrame on date with ZI fill + PIT lag.
+
+    Any column that exists in *aux* (except date, stock_code, has_* flags)
+    is merged and lagged by 1 trading day.
+    """
+    a = aux.copy()
+    a["date"] = pd.to_datetime(a["date"])
+    # Drop stock-level columns — we merge on date only
+    a = a.drop(columns=["stock_code"], errors="ignore")
+    a = a.drop_duplicates(subset="date", keep="last")
+
+    skip = {"date", "stock_code"}
+    available = [c for c in a.columns if c not in skip]
+    if not available:
+        return df
+
+    df = df.merge(a[["date"] + available], on="date", how="left")
+    for col in available:
+        if col.startswith("has_"):
+            df[col] = df[col].fillna(False).astype(bool)
+        elif "count" in col:
+            df[col] = df[col].fillna(0).astype("int16")
+        elif col.endswith("_streak") or col.endswith("_quadrant"):
+            df[col] = df[col].fillna(0).astype(np.int16)
+        else:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+
+    # PIT lag: feature[t-1] paired with price[t]
+    for col in available:
+        df[col] = df[col].shift(1)
+
+    # Re-fill after shift (first row becomes NaN)
+    for col in available:
+        if col.startswith("has_"):
+            df[col] = df[col].fillna(False).astype(bool)
+        elif "count" in col:
+            df[col] = df[col].fillna(0).astype("int16")
+        elif col.endswith("_streak") or col.endswith("_quadrant"):
+            df[col] = df[col].fillna(0).astype(np.int16)
+        else:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+
+    return df
