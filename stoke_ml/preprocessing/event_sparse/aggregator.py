@@ -46,6 +46,7 @@ class EventToDaily(PreprocessingStep):
         df: pd.DataFrame,
         close_prices: Optional[pd.DataFrame] = None,
         trading_dates: Optional[pd.DatetimeIndex] = None,
+        **kwargs,
     ) -> pd.DataFrame:
         if df.empty:
             return df

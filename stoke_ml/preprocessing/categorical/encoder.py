@@ -109,19 +109,20 @@ class ConceptBlockEncoder(PreprocessingStep):
     # ── L2: multi-hot ──────────────────────────────────────────────────
 
     def _add_multihot(self, df, vocab):
-        """Create multi-hot columns cb_0..cb_{N-1} via vectorized get_dummies."""
+        """Create multi-hot columns cb_0..cb_{N-1} via vectorized get_dummies.
+
+        Each cb_j maps to vocab[j] regardless of which boards are present
+        in the current batch — column semantics are stable across stocks.
+        """
         if "board_name" not in df.columns or "stock_code" not in df.columns:
             return
-        # Vectorized: one-hot encode board_name, then reindex against vocab
         dummies = pd.get_dummies(df["board_name"], dtype=np.int8)
-        # Keep only vocabulary columns, fill missing with 0
-        available = [b for b in vocab if b in dummies.columns]
-        for j, board in enumerate(available):
+        for j, board in enumerate(vocab):
             col = f"cb_{j}"
-            df[col] = dummies[board]
-        # For vocab entries not seen in this batch, create zero columns
-        for j in range(len(available), len(vocab)):
-            df[f"cb_{j}"] = np.int8(0)
+            if board in dummies.columns:
+                df[col] = dummies[board]
+            else:
+                df[col] = np.int8(0)
 
     # ── L3: derived ────────────────────────────────────────────────────
 

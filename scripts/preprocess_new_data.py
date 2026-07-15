@@ -124,13 +124,15 @@ def main():
             logger.warning("Unknown type: %s", dtype)
             continue
         storage_key, chain_name = TYPE_MAP[dtype]
-        chain = pp._chains.get(chain_name)
+        chain = pp.get_chain(chain_name)
         if chain is None:
             logger.warning("Chain '%s' not configured, skipping %s", chain_name, dtype)
             continue
 
         if dtype == "board":
-            _process_board(dtype, chain, stock_list, data_dir, args)
+            _process_board(chain, stock_list, data_dir, args)
+        elif dtype == "sector":
+            _process_sector(chain, stock_list, data_dir, args)
         elif storage_key:
             _process_standard(dtype, storage_key, chain, stock_list, data_dir, args)
 
@@ -160,7 +162,7 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     logger.info("  %s: %d rows saved (%.1fs)", dtype, total, time.time() - t0)
 
 
-def _process_board(dtype, chain, stock_list, data_dir, args):
+def _process_board(chain, stock_list, data_dir, args):
     """Process board data: load limit_up pools → broadcast to stocks."""
     logger.info("=== board: %d stocks ===", len(stock_list))
     t0 = time.time()
@@ -177,6 +179,8 @@ def _process_board(dtype, chain, stock_list, data_dir, args):
                 frames.append(pdf)
         if frames:
             pools[pool_name] = pd.concat(frames, ignore_index=True)
+        else:
+            logger.warning("No %s pool data found for %s–%s", pool_name, args.start, args.end)
 
     # Load sentiment if available
     sentiment = None
@@ -190,24 +194,18 @@ def _process_board(dtype, chain, stock_list, data_dir, args):
         if frames:
             sentiment = pd.concat(frames, ignore_index=True)
     except Exception:
-        pass
+        logger.warning("Failed to load limit_up_sentiment", exc_info=True)
 
+    from stoke_ml.data.storage import DataStorage
+    ds = DataStorage(data_dir)
     dest = MarketWideStorage(data_dir, args.save_to or "board_processed")
     total = 0
     for code in stock_list:
         try:
-            # Load K-line as base DataFrame for date index
-            from stoke_ml.data.storage import DataStorage
-            ds = DataStorage(data_dir)
             base = ds.load(code, args.start, args.end)
             if base.empty:
                 continue
-            # Apply chain (BoardBroadcaster will use pools from kwargs)
-            step = chain.steps[0] if chain.steps else None
-            if step is not None and hasattr(step, "transform"):
-                processed = step.transform(base, pools=pools, sentiment=sentiment)
-            else:
-                processed = chain.fit_transform(base)
+            processed = chain.fit_transform(base, pools=pools, sentiment=sentiment)
             if not processed.empty:
                 dest.save(processed)
                 total += len(processed)
@@ -215,6 +213,55 @@ def _process_board(dtype, chain, stock_list, data_dir, args):
             logger.debug("board preprocessing failed for %s", code, exc_info=True)
 
     logger.info("  board: %d rows saved (%.1fs)", total, time.time() - t0)
+
+
+def _process_sector(chain, stock_list, data_dir, args):
+    """Process sector data: load industry ranking + sector map → broadcast to stocks."""
+    logger.info("=== sector: %d stocks ===", len(stock_list))
+    t0 = time.time()
+
+    # Load industry ranking (market-wide, not per-stock)
+    import json
+    ir_storage = MarketWideStorage(data_dir, "industry_ranking")
+    ir_frames = []
+    for code in stock_list:
+        ir_df = ir_storage.load(code, args.start, args.end)
+        if not ir_df.empty:
+            ir_frames.append(ir_df)
+    if not ir_frames:
+        logger.warning("No industry_ranking data found for %s–%s", args.start, args.end)
+        return
+    industry_ranking = pd.concat(ir_frames, ignore_index=True)
+
+    # Load sector map from cache CSV
+    sector_map = {}
+    cache_path = os.path.join(data_dir, "a_shares", "stock_sector_cache.csv")
+    if os.path.exists(cache_path):
+        sector_df = pd.read_csv(cache_path, dtype=str)
+        sector_map = dict(zip(sector_df["stock_code"], sector_df["sector"]))
+    else:
+        logger.warning("No stock_sector_cache.csv found — sector preprocessing skipped")
+        return
+
+    from stoke_ml.data.storage import DataStorage
+    ds = DataStorage(data_dir)
+    dest = MarketWideStorage(data_dir, args.save_to or "industry_ranking_processed")
+    total = 0
+    for code in stock_list:
+        try:
+            base = ds.load(code, args.start, args.end)
+            if base.empty:
+                continue
+            processed = chain.fit_transform(
+                base, industry_ranking=industry_ranking, sector_map=sector_map,
+            )
+            if not processed.empty:
+                dest.save(processed)
+                total += len(processed)
+        except Exception:
+            logger.debug("sector preprocessing failed for %s", code, exc_info=True)
+
+    logger.info("  sector: %d rows saved (%.1fs)", total, time.time() - t0)
 
 
 if __name__ == "__main__":

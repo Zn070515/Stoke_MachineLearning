@@ -178,8 +178,8 @@ class SectorBroadcaster(PreprocessingStep):
 def _cross_sectional_zscore(df, col, window):
     """Cross-sectional z-score: (value - date_mean) / date_std per date.
 
-    Uses rolling *window* of trading days to compute mean/std, falling back
-    to expanding-window when fewer than *window* dates are available.
+    Uses rolling *window* of trading days to smooth both mean and std,
+    falling back to expanding-window when fewer than *window* dates available.
     Winsorizes at 1%/99% within each cross-section before z-scoring.
     """
     date_mean = (
@@ -196,6 +196,4 @@ def _cross_sectional_zscore(df, col, window):
     lo = df.groupby("date")[col].transform(lambda s: s.quantile(0.01))
     hi = df.groupby("date")[col].transform(lambda s: s.quantile(0.99))
     clipped = df[col].clip(lo, hi)
-    # Use ddof=0 so single-sector days produce 0 instead of NaN
-    day_std = df.groupby("date")[col].transform("std").replace(0, np.nan)
-    return ((clipped - date_mean) / (day_std.fillna(1e-8))).astype(np.float32)
+    return ((clipped - date_mean) / (date_std.replace(0, np.nan).fillna(1e-8))).astype(np.float32)

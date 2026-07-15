@@ -59,7 +59,7 @@ class FlowDecomposer(PreprocessingStep):
         self.extreme_threshold = extreme_threshold
         self.residualize = residualize
 
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    def transform(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         if df.empty:
             return df
         df = df.copy()

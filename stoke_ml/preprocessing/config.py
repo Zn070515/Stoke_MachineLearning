@@ -171,16 +171,16 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
             residualize=flow_cfg.get("residualize", True),
         ))
         flow_chain.add(OutlierDetector(
-            threshold=oc.get("threshold", 5.0), clip=oc.get("clip", True),
+            threshold=flow_cfg.get("outlier_threshold", oc.get("threshold", 5.0)),
+            clip=oc.get("clip", True),
         ))
         flow_chain.add(MissingImputer(
-            short_gap_max=mc.get("short_gap_max", 2),
-            medium_gap_max=mc.get("medium_gap_max", 10),
+            short_gap_max=flow_cfg.get("short_gap_max", mc.get("short_gap_max", 2)),
+            medium_gap_max=flow_cfg.get("medium_gap_max", mc.get("medium_gap_max", 10)),
         ))
-        flow_chain.add(CrossSectionNormalizer(
-            enabled=cs.get("enabled", True),
-            stages=cs.get("stages", ["sector", "size", "adaptive"]),
-        ))
+        # NOTE: CrossSectionNormalizer is NOT included here — it requires
+        # cross-stock peers per date and is applied at the panel level in
+        # FeaturePipeline.build_features_from_panel() instead.
         pp.register_chain("flow", flow_chain)
 
     # ── Shape B: event_sparse chains (one per event type) ──

@@ -945,7 +945,7 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     for col in available:
         if col.startswith("has_"):
             df[col] = df[col].fillna(False).astype(bool)
-        elif "count" in col:
+        elif col.endswith("_count"):
             df[col] = df[col].fillna(0).astype("int16")
         elif col.endswith("_streak") or col.endswith("_quadrant"):
             df[col] = df[col].fillna(0).astype(np.int16)
@@ -960,7 +960,7 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     for col in available:
         if col.startswith("has_"):
             df[col] = df[col].fillna(False).astype(bool)
-        elif "count" in col:
+        elif col.endswith("_count"):
             df[col] = df[col].fillna(0).astype("int16")
         elif col.endswith("_streak") or col.endswith("_quadrant"):
             df[col] = df[col].fillna(0).astype(np.int16)

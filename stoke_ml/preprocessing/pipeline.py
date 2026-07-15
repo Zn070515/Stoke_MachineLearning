@@ -37,9 +37,13 @@ class PreprocessingPipeline:
         if chain is None:
             raise KeyError(
                 f"Chain '{chain_name}' not found. "
-                f"Available: {list(self._chains.keys())}"
+                f"Available: {self.list_chains()}"
             )
         return chain.fit_transform(df, **kwargs)
+
+    def get_chain(self, name: str):
+        """Return the named PreprocessingChain, or None if not registered."""
+        return self._chains.get(name)
 
     def list_chains(self) -> list[str]:
         return sorted(self._chains.keys())
