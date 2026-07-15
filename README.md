@@ -23,13 +23,33 @@ data/a_shares/
 ├── margin/{year}/{month}/{stock}.parquet        融资融券数据
 ├── northbound/{year}/{month}/{stock}.parquet    北向资金数据
 ├── fundamentals/{year}/{quarter}/{stock}.parquet 季度基本面 (ROE/PE/PB/EPS等)
-└── etf_flow/{year}/{month}/sector_{name}.parquet 行业ETF资金流
+├── etf_flow/{year}/{month}/sector_{name}.parquet 行业ETF资金流
+├── capital_flow/{year}/{month}/{stock}.parquet  资金流向 (主力净流入, 新浪财经)
+├── block_trade/{year}/{month}/{stock}.parquet   大宗交易记录
+├── shareholder/{year}/{month}/{stock}.parquet   股东户数变化
+├── lockup/{year}/{month}/{stock}.parquet        限售解禁日历
+├── lockup_upcoming/{year}/{month}/{stock}.parquet 即将解禁预告
+├── dividend/{year}/{month}/{stock}.parquet      分红送转历史
+├── limit_up_zt/{year}/{month}/{stock}.parquet   涨停池 (每日)
+├── limit_up_zb/{year}/{month}/{stock}.parquet   炸板池 (每日)
+├── limit_up_dt/{year}/{month}/{stock}.parquet   跌停池 (每日)
+├── limit_up_yzt/{year}/{month}/{stock}.parquet  昨日涨停表现池
+├── limit_up_sentiment/{year}/{month}/{stock}.parquet 打板情绪汇总
+├── industry_ranking/{year}/{month}/{stock}.parquet 行业排名 (申万一级)
+└── concept_blocks/{year}/{month}/{stock}.parquet 概念板块成员
 
 stoke_ml/
 ├── crawler/          6层反封锁爬虫 (TLS/指纹/代理池/限速/熔断/Playwright降级)
 ├── data/             数据源、存储引擎、故障切换、交易日历、Medallion管道
 ├── features/         技术指标、趋势评分、时序特征、新闻NLP、FeaturePipeline
-├── preprocessing/    [NEW] 模块化预处理系统 (text/numeric/monitor/registry)
+├── preprocessing/    模块化预处理系统 (4种数据形态 × 独立预处理链)
+│   ├── text/         QualityFilter → Bipolar → TimeDecay → TopicModeler → DailyAggregator
+│   ├── numeric/      Outlier(MAD) → Missing(Kalman) → CrossSection → RobustScaler → HigherOrder
+│   ├── daily_continuous/  FlowDecomposer (主力资金流分解)
+│   ├── event_sparse/      EventToDaily (稀疏事件→日频聚合)
+│   ├── cross_sectional/   BoardBroadcaster + SectorBroadcaster (打板/行业广播)
+│   ├── categorical/       ConceptBlockEncoder (概念板块6层编码)
+│   └── monitor/           CoverageMonitor + DriftMonitor (KS-test漂移检测)
 ├── models/           XGBoost基线、LSTM、Transformer、SimpleAttention
 ├── evaluation/       Walk-Forward拆分、MCC、夏普、金融指标
 └── config.py         YAML配置加载 (OmegaConf)
@@ -72,7 +92,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py --max-pages 20
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_guba.py --max-pages 10
 ```
 
-### 市场数据 (龙虎榜/融资融券/北向资金)
+### 市场数据 (龙虎榜/融资融券/北向资金/ETF资金流)
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_market_data.py --type all
@@ -82,6 +102,37 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_market_data.py --type all
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_fundamentals.py
+```
+
+### 数据中心数据 (资金流向/大宗交易/股东户数/解禁/分红/打板/行业/概念)
+
+```bash
+# 下载全部12种数据类型
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type all
+
+# 按类型下载
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type capital_flow
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type block_trade
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type limit_up     # 全部打板数据
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type industry_ranking
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type concept_blocks
+
+# 指定日期范围 + 单只股票测试
+PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type block_trade --start 2024-01-01 --stocks 600519
+```
+
+### 数据预处理 (4种形态 → 统一日频特征)
+
+```bash
+# 全部类型预处理
+PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type all
+
+# 按形态预处理
+PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type flow
+PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type event --event-type block_trade
+PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type board
+PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type sector
+PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type concept --stocks 600519,000001
 ```
 
 ### 四源故障切换
@@ -95,7 +146,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_fundamentals.py
 
 ## 特征维度
 
-FeaturePipeline 支持 **10个辅助维度** (全部左连接 + ZI填充 + PIT lag(1))：
+FeaturePipeline 支持 **14个辅助维度** (全部左连接 + ZI填充 + PIT lag(1))：
 
 | 维度 | 开关 | 列数 | 密度 | 数据源 |
 |------|------|------|------|--------|
@@ -109,8 +160,12 @@ FeaturePipeline 支持 **10个辅助维度** (全部左连接 + ZI填充 + PIT l
 | dragon_tiger (龙虎榜) | `use_dragon_tiger` | 3 | 低 | AKShare |
 | fundamental (基本面) | `use_fundamental` | 8 | 低(季频) | AKShare |
 | ETF flow (资金流) | `use_etf_flow` | 2 | 高(行业级) | 东方财富 |
+| capital flow (资金流向) | `use_capital_flow` | 6 | 高 | 新浪财经 |
+| block trade (大宗交易) | `use_block_trade` | 5 | 低 | 东方财富 |
+| board (打板) | `use_board` | 9 | 低 | 东方财富 |
+| concept (概念板块) | `use_concept` | 100+ | 中 | 东方财富 |
 
-**ALL config: ~405 features × 60 seq_len = 24,300 flat dimensions.**
+**ALL config: ~600+ features × 60 seq_len = 36,000 flat dimensions.**
 
 ## 模型训练
 
@@ -149,14 +204,26 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --ablation
 - ALL受维度爆炸影响，不如+sentiment单独使用
 - Δ CIs全部跨零 — 统计显著性需要更多数据
 
-## 预处理系统 (NEW — 开发中)
+## 预处理系统
 
-替换 ZI填零+简单均值 为模块化预处理链：
+模块化预处理架构，按4种数据形态独立设计预处理链：
 
 ```
-文本链: Quality → Bipolar → TimeDecay → Topic(BERTopic) → Aggregation
-数值链: Outlier(MAD) → Missing(Kalman/线性) → CrossSection(行业/市值/自适应) → RobustScaler → HigherOrder
-监控:  输入层 → 变换层 → 输出层(KS-test漂移检测)
+Shape A (daily_continuous):  FlowDecomposer → 主力/超大/大/中/小单分解
+Shape B (event_sparse):      EventToDaily → 稀疏事件→日频聚合 + 衰减
+Shape C (cross_sectional):   BoardBroadcaster / SectorBroadcaster → 打板/行业广播
+Shape D (categorical):       ConceptBlockEncoder → 6层概念编码 (multi-hot→heat→动量→共现)
+
+文本链 (Phase 3):   QualityFilter → BipolarClassifier → TimeDecayWeighter → TopicModeler → DailyAggregator
+数值链 (Phase 4):   OutlierDetector(MAD) → MissingImputer(Kalman) → CrossSectionNormalizer → RobustScaler → HigherOrder
+监控 (Phase 5):     CoverageMonitor + DriftMonitor (KS-test漂移检测)
+```
+
+### 管道对比
+
+```bash
+# 对比新旧预处理的模型表现
+PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 ```
 
 - 设计文档: `docs/superpowers/specs/2026-07-01-preprocessing-redesign-design.md`
@@ -181,8 +248,12 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --ablation
 | `training.validation.train_years` | 2 | 训练窗口 |
 | `training.validation.val_months` | 3 | 验证窗口 |
 | `model.params.max_depth` | 6 | XGBoost树深度 |
-| `preprocessing.text.time_decay.halflife_days` | 7 | 时间衰减半衰期 |
+| `preprocessing.text.time_decay.halflife_days` | 7 | 文本时间衰减半衰期 |
 | `preprocessing.numeric.scaling.winsorize_sigma` | 3.0 | ±3σ截尾 |
+| `preprocessing.numeric.outlier.threshold` | 5.0 | MAD异常值阈值 |
+| `preprocessing.numeric.missing.medium_gap_method` | kalman | 中空档填充方法 (linear/kalman) |
+| `preprocessing.cross_sectional.board.consecutive_lookback` | 20 | 连板回看天数 |
+| `preprocessing.concept.top_n` | 100 | 概念板块编码数量 |
 
 ## 已知问题
 
@@ -190,9 +261,12 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --ablation
 |------|------|
 | Guba post body不可用 (详情页SPA, WAF拦截) | 由雪球论坛源替代 |
 | 雪球IP被WAF封禁 (aliyun) | Playwright可绕过, API仍受保护 |
-| ALL config维度爆炸 (24,300维) | 用+sentiment替代ALL |
+| ALL config维度爆炸 (~36,000维) | 用+sentiment替代ALL |
 | FinBERT首次加载需网络或预缓存模型 | 设 `HF_ENDPOINT=https://hf-mirror.com` |
 | 消融Δ CIs跨零 (需>100 stocks或更强信号) | 活跃研究中 |
+| EastMoney push2his 资金流向API下线 (2026-07) | 已切换至新浪财经 (仅总净额, 无分层) |
+| BERTopic 依赖链 (umap/hdbscan/sentence-transformers) | 可选安装, 缺失时降级为TF-IDF |
+| Playwright browser 在WAF绕过时可能无限挂起 | `threading.Timer(timeout, os._exit)` 硬杀 |
 
 ## 设计文档
 

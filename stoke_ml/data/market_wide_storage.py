@@ -47,9 +47,12 @@ class MarketWideStorage:
         if df.empty:
             return
         df = df.copy()
-        df["date"] = pd.to_datetime(df["date"])
-        df["year"] = df["date"].dt.year
-        df["month"] = df["date"].dt.month
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        if df.empty:
+            return
+        df["year"] = df["date"].dt.year.astype(int)
+        df["month"] = df["date"].dt.month.astype(int)
 
         base = self._base_dir()
         for (year, month, code), group in df.groupby(["year", "month", "stock_code"]):
