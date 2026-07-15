@@ -922,6 +922,136 @@ class FeaturePipeline:
         return valid_dates[self.seq_len - 1 + self.horizon:
                            self.seq_len - 1 + self.horizon + n_samples]
 
+    def build_panel_features(
+        self,
+        panel: pd.DataFrame,
+        target_col: str = "close",
+    ) -> dict:
+        """Build panel-format features for TFT training from a multi-stock panel.
+
+        The input panel must have columns: date, stock_code, open, high, low,
+        close, volume (plus any auxiliary feature columns already merged).
+
+        Returns a dict with pre-built numpy arrays:
+            static_features: (N_stocks, static_dim)
+            past_known: (N_stocks, T, past_known_dim)
+            past_observed: (N_stocks, T, past_observed_dim)
+            y_direction: (N_stocks, T)
+            y_return: (N_stocks, T)
+            y_volatility: (N_stocks, T) — 5-day realized vol
+        """
+        codes = sorted(panel["stock_code"].unique())
+        N = len(codes)
+
+        # Engineer features per stock (reuses existing pipeline)
+        all_feat_dfs = []
+        for code in codes:
+            mask = panel["stock_code"] == code
+            df_stock = panel[mask].sort_values("date").reset_index(drop=True)
+            feats = self._engineer_features(df_stock)
+            all_feat_dfs.append(feats)
+
+        # Find common max length
+        lengths = [len(df) for df in all_feat_dfs]
+        max_T = min(max(lengths), 3000)  # cap at ~12 years
+
+        if max_T < self.seq_len + 5:
+            raise ValueError(
+                f"Max timesteps ({max_T}) must be > seq_len+5 ({self.seq_len + 5})"
+            )
+
+        # Determine feature dimensions from first stock
+        first_df = all_feat_dfs[0]
+        static_cols_available = [c for c in _STATIC_FEATURE_COLS if c in first_df.columns]
+        pk_cols_available = [c for c in _PAST_KNOWN_COLS if c in first_df.columns]
+        po_cols_available = [c for c in _PAST_OBSERVED_COLS if c in first_df.columns]
+
+        static_dim = len(static_cols_available)
+        pk_dim = len(pk_cols_available)
+        po_dim = len(po_cols_available)
+
+        # Pre-allocate
+        static_arr = np.zeros((N, static_dim), dtype=np.float32)
+        pk_arr = np.zeros((N, max_T, pk_dim), dtype=np.float32)
+        po_arr = np.zeros((N, max_T, po_dim), dtype=np.float32)
+        y_dir_arr = np.zeros((N, max_T), dtype=np.int64)
+        y_ret_arr = np.zeros((N, max_T), dtype=np.float32)
+        y_vol_arr = np.zeros((N, max_T), dtype=np.float32)
+
+        for i, df in enumerate(all_feat_dfs):
+            if len(df) == 0:
+                continue
+
+            df = df.sort_values("date").reset_index(drop=True)
+            T_i = min(len(df), max_T)
+
+            # Static: take first row values
+            static_arr[i] = df[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
+
+            # Past known
+            pk_arr[i, :T_i] = df[pk_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
+
+            # Past observed
+            po_arr[i, :T_i] = df[po_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
+
+            # Targets
+            close = df[target_col].values[:T_i]
+            ret_1d = np.zeros(T_i, dtype=np.float32)
+            ret_1d[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-8)
+            y_dir_arr[i, :T_i] = (ret_1d > 0).astype(np.int64)
+            y_ret_arr[i, :T_i] = ret_1d
+
+            # 5-day realized volatility
+            for t in range(5, T_i):
+                y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))
+
+        return {
+            "static_features": static_arr,
+            "past_known": pk_arr,
+            "past_observed": po_arr,
+            "y_direction": y_dir_arr,
+            "y_return": y_ret_arr,
+            "y_volatility": y_vol_arr,
+        }
+
+
+# ── TFT feature column definitions ──────────────────────────────────────
+
+_STATIC_FEATURE_COLS = [
+    "market_cap_quantile",
+]
+
+_PAST_KNOWN_COLS = [
+    "open", "high", "low", "close", "volume",
+    "ma_5", "ma_10", "ma_20", "ma_60", "ma_120",
+    "ema_12", "ema_26", "macd", "macd_signal", "macd_hist",
+    "rsi_6", "rsi_12", "rsi_24",
+    "kdj_k", "kdj_d", "kdj_j",
+    "boll_pct_b", "atr_14",
+    "roc_10", "willr_14", "cci_14", "obv",
+    "volume_ratio_5", "volume_ratio_20",
+    "day_of_week", "day_of_month", "month", "quarter",
+    "is_limit_up", "is_limit_down", "gap_up_pct", "gap_down_pct",
+    "volume_anomaly", "limit_up_streak",
+    # Fundamental (forward-filled quarterly)
+    "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
+    "debt_ratio", "gross_margin", "net_margin",
+]
+
+_PAST_OBSERVED_COLS = [
+    "sentiment_mean", "sentiment_std", "news_count",
+    "positive_ratio", "negative_ratio",
+    "guba_sentiment_mean", "guba_sentiment_std",
+    "xueqiu_sentiment_mean", "xueqiu_sentiment_std",
+    "comment_score", "comment_attention",
+    "ann_sentiment_mean", "ann_sentiment_std",
+    "main_net", "margin_net", "north_net_buy",
+    "lhb_net_amount", "sector_etf_flow",
+    "flow_intensity", "flow_z", "flow_momentum",
+    "board_momentum_mean", "board_momentum_max",
+    "avg_concept_heat", "is_concept_leader",
+]
+
 
 def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:
     """Return the subset of *candidates* that exist in *df*."""

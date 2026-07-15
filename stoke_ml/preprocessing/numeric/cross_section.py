@@ -211,6 +211,48 @@ def _zscore_normalize(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+class PanelZScoreNormalizer:
+    """Z-score per date across all stocks for panel feature tensors.
+
+    Simpler than CrossSectionNormalizer — only does (x - μ_day) / σ_day
+    with pre-computed per-date statistics. Designed for use by
+    FeaturePipeline.build_panel_features() before tensor construction.
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        self.eps = eps
+        self._daily_mean: dict = {}
+        self._daily_std: dict = {}
+
+    def fit(self, df: pd.DataFrame, feature_cols: list[str]) -> "PanelZScoreNormalizer":
+        """Compute per-date μ, σ across all stocks."""
+        if df.empty:
+            return self
+        df = df.copy()
+        df["_dt"] = pd.to_datetime(df["date"], errors="coerce")
+        for dt, grp in df.groupby("_dt"):
+            dt_str = dt.strftime("%Y-%m-%d")
+            self._daily_mean[dt_str] = grp[feature_cols].mean().to_dict()
+            self._daily_std[dt_str] = grp[feature_cols].std().to_dict()
+        return self
+
+    def transform(self, df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+        """Apply (x - μ_day) / σ_day per date."""
+        if df.empty or not self._daily_mean:
+            return df
+        df = df.copy()
+        df["_dt"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        for col in feature_cols:
+            if col not in df.columns:
+                continue
+            mu = df["_dt"].map(lambda d: self._daily_mean.get(d, {}).get(col, 0.0))
+            sigma = df["_dt"].map(lambda d: self._daily_std.get(d, {}).get(col, 1.0))
+            sigma = sigma.clip(lower=self.eps)
+            df[col] = (df[col] - mu) / sigma
+        df.drop(columns=["_dt"], inplace=True)
+        return df
+
+
 def _adaptive_strength(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     """Amplify features in high-volatility regimes.
 
