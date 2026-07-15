@@ -1,165 +1,126 @@
-"""Capital flow data source (资金流向) via EastMoney push2 / push2his.
+"""Capital flow data source (资金流向) via Sina Finance.
 
-Provides per-stock daily and minute-level capital flow:
+Provides per-stock daily capital flow:
 - Main force net flow (主力净流入)
-- Super-large order net flow (超大单)
-- Large order net flow (大单)
-- Medium order net flow (中单)
-- Small order net flow (小单)
 
-All amounts in CNY (元).
+EastMoney push2his daily endpoint went offline 2026-07; switched to Sina
+Finance which returns net_amount (total net flow). Tiered breakdown
+(super/large/mid/small) is not available from Sina.
 
-API endpoints:
-- Minute: push2.eastmoney.com/api/qt/stock/fflow/kline/get
-- Daily 120d: push2his.eastmoney.com/api/qt/stock/fflow/daykline/get
+API endpoint:
+- Sina: vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/
+  MoneyFlow.ssl_qsfx_zjlrqs
 """
 
+import json
 import logging
+import urllib.error
+import urllib.request
 from typing import Optional
 
 import pandas as pd
 
-from stoke_ml.crawler.eastmoney import EastMoneyClient
-
 logger = logging.getLogger(__name__)
 
-PUSH2_FFLOW_URL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-PUSH2HIS_FFLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+SINA_FFLOW_URL = (
+    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "MoneyFlow.ssl_qsfx_zjlrqs"
+)
 
-EASTMONEY_HEADERS = {
-    "Referer": "https://quote.eastmoney.com/",
-    "Origin": "https://quote.eastmoney.com",
-}
+SINA_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 DAILY_NET_COLS = [
     "date", "stock_code",
     "main_net", "small_net", "mid_net", "large_net", "super_net",
 ]
 
-MINUTE_NET_COLS = [
-    "time", "stock_code",
-    "main_net", "small_net", "mid_net", "large_net", "super_net",
-]
 
-
-def _market_code(stock_code: str) -> str:
-    """EastMoney market prefix: 1 for SH (6xxxxx), 0 for SZ."""
-    return "1" if stock_code.startswith("6") else "0"
+def _sina_market_code(code: str) -> str:
+    """Sina market prefix: sh for 6xxxxx/9xxxxx, sz for 0xxxxx/3xxxxx, bj for 8xxxxx."""
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    if code.startswith("8"):
+        return f"bj{code}"
+    return f"sz{code}"
 
 
 class CapitalFlowSource:
-    """Fetch per-stock capital flow from EastMoney."""
+    """Fetch per-stock capital flow from Sina Finance.
 
-    SOURCE_NAME = "eastmoney_capital_flow"
+    Sina only provides total net_amount (no tier breakdown). We map
+    net_amount → main_net and leave tier columns as 0 so that
+    FlowDecomposer's L2-L4 layers still work.
+    """
+
+    SOURCE_NAME = "sina_capital_flow"
 
     def __init__(self, min_interval: float = 1.2):
-        self._client = EastMoneyClient(min_interval=min_interval)
+        self._min_interval = min_interval
+        self._session = None
 
-    def fetch_daily(self, code: str) -> pd.DataFrame:
-        """Fetch 120 trading days of daily capital flow for a stock.
+    def fetch_daily(self, code: str, days: int = 120) -> pd.DataFrame:
+        """Fetch daily capital flow from Sina Finance.
 
         Returns DataFrame with columns:
             date, stock_code, main_net, small_net, mid_net,
             large_net, super_net
-        All amounts in CNY.
         """
-        secid = f"{_market_code(code)}.{code}"
-        params = {
-            "secid": secid,
-            "fields1": "f1,f2,f3,f7",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,"
-                       "f60,f61,f62,f63,f64,f65",
-            "lmt": "120",
-        }
+        prefix = _sina_market_code(code)
+        url = (
+            f"{SINA_FFLOW_URL}?page=1&num={days}&sort=opendate&asc=0"
+            f"&daima={prefix}"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": SINA_UA,
+                "Referer": "https://finance.sina.com.cn/",
+            },
+        )
         try:
-            r = self._client.get(
-                PUSH2HIS_FFLOW_URL, params=params,
-                headers=EASTMONEY_HEADERS, timeout=15,
-            )
-            r.raise_for_status()
-            d = r.json()
-        except Exception:
-            logger.warning("Capital flow daily fetch failed for %s", code)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                text = r.read().decode("utf-8", "ignore")
+        except (urllib.error.URLError, OSError) as e:
+            logger.warning("Sina fund flow request failed for %s: %s", code, e)
             return pd.DataFrame(columns=DAILY_NET_COLS)
 
-        klines = d.get("data", {}).get("klines", [])
-        if not klines:
+        if "[" not in text or "]" not in text:
+            logger.warning("Sina fund flow empty response for %s", code)
+            return pd.DataFrame(columns=DAILY_NET_COLS)
+
+        try:
+            arr = json.loads(text[text.index("[") : text.rindex("]") + 1])
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Sina fund flow JSON parse failed for %s", code)
             return pd.DataFrame(columns=DAILY_NET_COLS)
 
         rows = []
-        for line in klines:
-            parts = line.split(",")
-            if len(parts) < 6:
-                continue
+        for x in arr:
+            net = float(x.get("netamount") or 0)
             rows.append({
-                "date": parts[0],
+                "date": x.get("opendate", ""),
                 "stock_code": code,
-                "main_net": _safe_float(parts[1]),
-                "small_net": _safe_float(parts[2]),
-                "mid_net": _safe_float(parts[3]),
-                "large_net": _safe_float(parts[4]),
-                "super_net": _safe_float(parts[5]),
+                "main_net": net,
+                "small_net": 0.0,
+                "mid_net": 0.0,
+                "large_net": 0.0,
+                "super_net": 0.0,
             })
 
+        if not rows:
+            return pd.DataFrame(columns=DAILY_NET_COLS)
         df = pd.DataFrame(rows, columns=DAILY_NET_COLS)
-        if not df.empty and "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-        return df
-
-    def fetch_minute(self, code: str) -> pd.DataFrame:
-        """Fetch today's minute-level capital flow for a stock.
-
-        Returns DataFrame with columns:
-            time, stock_code, main_net, small_net, mid_net,
-            large_net, super_net
-        All amounts in CNY.
-        """
-        secid = f"{_market_code(code)}.{code}"
-        params = {
-            "secid": secid,
-            "klt": 1,  # 1-minute bars
-            "fields1": "f1,f2,f3,f7",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57",
-        }
-        try:
-            r = self._client.get(
-                PUSH2_FFLOW_URL, params=params,
-                headers=EASTMONEY_HEADERS, timeout=10,
-            )
-            r.raise_for_status()
-            d = r.json()
-        except Exception:
-            logger.warning("Capital flow minute fetch failed for %s", code)
-            return pd.DataFrame(columns=MINUTE_NET_COLS)
-
-        rows = []
-        for line in d.get("data", {}).get("klines", []):
-            parts = line.split(",")
-            if len(parts) < 6:
-                continue
-            rows.append({
-                "time": parts[0],
-                "stock_code": code,
-                "main_net": _safe_float(parts[1]),
-                "small_net": _safe_float(parts[2]),
-                "mid_net": _safe_float(parts[3]),
-                "large_net": _safe_float(parts[4]),
-                "super_net": _safe_float(parts[5]),
-            })
-
-        df = pd.DataFrame(rows, columns=MINUTE_NET_COLS)
-        if not df.empty and "time" in df.columns:
-            df["time"] = pd.to_datetime(df["time"])
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
         return df
 
     def fetch_batch(
         self, codes: list[str], start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Fetch daily capital flow for multiple stocks.
-
-        Date filtering is applied post-fetch (API always returns 120d).
-        """
+        """Fetch daily capital flow for multiple stocks."""
         frames = []
         for code in codes:
             df = self.fetch_daily(code)
@@ -175,14 +136,4 @@ class CapitalFlowSource:
         return pd.concat(frames, ignore_index=True)
 
     def close(self):
-        self._client.close()
-
-
-def _safe_float(val: str) -> float:
-    """Parse float, return 0.0 for '-' or invalid values."""
-    if val == "-" or val is None:
-        return 0.0
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return 0.0
+        pass
