@@ -34,3 +34,4 @@ models/checkpoints/
 wandb/
 
 lightning_logs/models/
+lightning_logs/
