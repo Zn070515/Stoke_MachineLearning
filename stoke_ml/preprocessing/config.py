@@ -20,6 +20,11 @@ from stoke_ml.preprocessing.numeric.missing import MissingImputer
 from stoke_ml.preprocessing.numeric.scaling import RobustScaler
 from stoke_ml.preprocessing.numeric.cross_section import CrossSectionNormalizer
 from stoke_ml.preprocessing.numeric.higher_order import HigherOrderDeriver
+from stoke_ml.preprocessing.daily_continuous.flow import FlowDecomposer
+from stoke_ml.preprocessing.event_sparse.aggregator import EventToDaily
+from stoke_ml.preprocessing.cross_sectional.board import BoardBroadcaster
+from stoke_ml.preprocessing.cross_sectional.sector import SectorBroadcaster
+from stoke_ml.preprocessing.categorical.encoder import ConceptBlockEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,11 @@ _STEP_REGISTRY = {
     "RobustScaler": RobustScaler,
     "CrossSectionNormalizer": CrossSectionNormalizer,
     "HigherOrderDeriver": HigherOrderDeriver,
+    "FlowDecomposer": FlowDecomposer,
+    "EventToDaily": EventToDaily,
+    "BoardBroadcaster": BoardBroadcaster,
+    "SectorBroadcaster": SectorBroadcaster,
+    "ConceptBlockEncoder": ConceptBlockEncoder,
 }
 
 
@@ -150,5 +160,74 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
     if ho.get("enabled", True):
         full_chain.add(HigherOrderDeriver(enabled=True))
     pp.register_chain("numeric_full", full_chain)
+
+    # ── Shape A: daily_continuous chain "flow" ──
+    flow_cfg = pp_cfg.get("flow", {})
+    if flow_cfg.get("enabled", True):
+        flow_chain = PreprocessingChain(name="flow")
+        flow_chain.add(FlowDecomposer(
+            persistence_windows=tuple(flow_cfg.get("persistence_windows", [5, 10, 20])),
+            intensity_window=flow_cfg.get("intensity_window", 20),
+            residualize=flow_cfg.get("residualize", True),
+        ))
+        flow_chain.add(OutlierDetector(
+            threshold=oc.get("threshold", 5.0), clip=oc.get("clip", True),
+        ))
+        flow_chain.add(MissingImputer(
+            short_gap_max=mc.get("short_gap_max", 2),
+            medium_gap_max=mc.get("medium_gap_max", 10),
+        ))
+        flow_chain.add(CrossSectionNormalizer(
+            enabled=cs.get("enabled", True),
+            stages=cs.get("stages", ["sector", "size", "adaptive"]),
+        ))
+        pp.register_chain("flow", flow_chain)
+
+    # ── Shape B: event_sparse chains (one per event type) ──
+    event_cfg = pp_cfg.get("event", {})
+    for etype in ["block_trade", "shareholder", "lockup", "dividend"]:
+        ecfg = event_cfg.get(etype, {})
+        echain = PreprocessingChain(name=f"event_{etype}")
+        echain.add(EventToDaily(
+            event_type=etype,
+            decay_halflife_days=ecfg.get("decay_halflife_days", 90),
+            forward_fill_max=ecfg.get("forward_fill_max", 5),
+        ))
+        echain.add(MissingImputer(
+            short_gap_max=ecfg.get("short_gap_max", 5),
+            medium_gap_max=ecfg.get("medium_gap_max", 60),
+        ))
+        pp.register_chain(f"event_{etype}", echain)
+
+    # ── Shape C: cross_sectional chains ──
+    cs_cfg = pp_cfg.get("cross_sectional", {})
+    if cs_cfg.get("board", {}).get("enabled", True):
+        board_chain = PreprocessingChain(name="board")
+        board_chain.add(BoardBroadcaster(
+            consecutive_lookback=cs_cfg.get("board", {}).get("consecutive_lookback", 20),
+        ))
+        pp.register_chain("board", board_chain)
+
+    if cs_cfg.get("sector", {}).get("enabled", True):
+        sector_chain = PreprocessingChain(name="sector")
+        sector_chain.add(SectorBroadcaster(
+            momentum_windows=tuple(
+                cs_cfg.get("sector", {}).get("momentum_windows", [5, 20, 60, 252])
+            ),
+            breadth_normalize_window=cs_cfg.get("sector", {}).get(
+                "breadth_normalize_window", 252
+            ),
+        ))
+        pp.register_chain("sector", sector_chain)
+
+    # ── Shape D: categorical chain ──
+    concept_cfg = pp_cfg.get("concept", {})
+    if concept_cfg.get("enabled", True):
+        concept_chain = PreprocessingChain(name="concept")
+        concept_chain.add(ConceptBlockEncoder(
+            top_n=concept_cfg.get("top_n", 100),
+            min_stocks_per_board=concept_cfg.get("min_stocks_per_board", 5),
+        ))
+        pp.register_chain("concept", concept_chain)
 
     return pp
