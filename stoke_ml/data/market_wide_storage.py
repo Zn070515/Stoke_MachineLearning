@@ -9,7 +9,13 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-MARKET_DATA_TYPES = ["dragon_tiger", "margin", "northbound"]
+MARKET_DATA_TYPES = [
+    "dragon_tiger", "margin", "northbound",
+    "capital_flow", "limit_up_zt", "limit_up_zb", "limit_up_dt", "limit_up_yzt",
+    "limit_up_sentiment", "block_trade", "shareholder", "lockup", "lockup_upcoming",
+    "dividend", "industry_ranking", "concept_blocks",
+    "sina_fund_flow",
+]
 
 
 class MarketWideStorage:
