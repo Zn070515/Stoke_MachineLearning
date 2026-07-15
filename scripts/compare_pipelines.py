@@ -160,7 +160,7 @@ def _compare_stock(storage, analyzer, pp, code, args):
 def _train_compare(code, gold_new, gold_legacy, source):
     """Quick XGBoost train on both gold variants, return MCC delta."""
     cfg = load_config()
-    storage = DataStorage(cfg.project.data_dir, TradingCalendar("a_shares"))
+    storage = DataStorage(cfg.project.data_dir)
     date_end = datetime.now().strftime("%Y-%m-%d")
 
     ohlcv = storage.load_daily(code, start_date="2015-01-01", end_date=date_end)
@@ -197,7 +197,7 @@ def _train_compare(code, gold_new, gold_legacy, source):
 
         model = XGBoostBaseline(
             n_estimators=100, max_depth=3, learning_rate=0.1,
-            subsample=0.8, colsample_bytree=0.8, random_state=42,
+            subsample=0.8, colsample_bytree=0.8,
         )
         model.fit(X[train_idx], y[train_idx])
         preds = model.predict(X[val_idx])

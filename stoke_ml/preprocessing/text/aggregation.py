@@ -35,9 +35,8 @@ class DailyAggregator(PreprocessingStep):
             return df
         df[date_col] = pd.to_datetime(df[date_col])
 
-        daily = df.groupby(date_col).apply(
-            _daily_stats, include_groups=False
-        ).reset_index()
+        daily = df.groupby(date_col).apply(_daily_stats)
+        daily = daily.reset_index(level=-1, drop=True).reset_index()
         daily.rename(columns={date_col: "date"}, inplace=True)
 
         if len(daily) > 0:
@@ -163,7 +162,7 @@ def _daily_stats(group: pd.DataFrame) -> pd.Series:
             stats["topic_dominant"] = -1
             stats["topic_sent_dispersion"] = 0.0
 
-    return pd.Series(stats)
+    return pd.DataFrame([stats])
 
 
 def _safe_skew(arr: np.ndarray) -> float:

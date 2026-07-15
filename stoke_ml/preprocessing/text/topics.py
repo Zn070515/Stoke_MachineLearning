@@ -86,6 +86,7 @@ class TopicModeler(PreprocessingStep):
             try:
                 import joblib
                 self._model = joblib.load(cache_path)
+                self._restore_embedder(source)
                 logger.info("Loaded cached BERTopic model from %s", cache_path)
                 return self
             except Exception:
@@ -159,13 +160,19 @@ class TopicModeler(PreprocessingStep):
         texts = self._build_texts(df)
 
         try:
+            from hdbscan.prediction import approximate_predict
+
             embeddings = self._get_embeddings(texts)
-            if embeddings is not None:
-                topics, probs = self._model.transform(texts, embeddings=embeddings)
-            else:
-                topics, probs = self._model.transform(texts)
-            df["topic_id"] = topics.astype("int16")
-            df["topic_probability"] = probs.astype(np.float32)
+            if embeddings is None:
+                raise RuntimeError("Failed to produce embeddings")
+            # Manually run UMAP → HDBSCAN (bypasses BERTopic 0.17.4
+            # transform() bug with pre-computed embeddings).
+            reduced = self._model.umap_model.transform(embeddings)
+            topics, probs = approximate_predict(
+                self._model.hdbscan_model, reduced,
+            )
+            df["topic_id"] = np.asarray(topics, dtype="int16")
+            df["topic_probability"] = np.asarray(probs, dtype=np.float32)
         except Exception as e:
             logger.warning("Topic transform failed: %s", e)
             df["topic_id"] = -1
@@ -274,13 +281,49 @@ class TopicModeler(PreprocessingStep):
         meta_path = os.path.join(
             self.model_cache_dir, f"bertopic_{source}_meta.json"
         )
+        used_embedding = "finbert" if self._finbert_model is not None else "tfidf"
         meta = {
             "source": source,
             "n_topics_found": n_topics,
             "n_docs_trained": n_docs,
             "min_topic_size": self.min_topic_size,
-            "embedding_model": self.embedding_model,
+            "embedding_model": used_embedding,
             "training_date": pd.Timestamp.now().isoformat(),
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    def _restore_embedder(self, source: str) -> None:
+        """Pre-load the correct embedding model to match cached BERTopic.
+
+        Called after loading a cached BERTopic model from disk to ensure
+        ``_get_embeddings()`` uses the same embedding type the model was
+        trained with.
+        """
+        meta_path = os.path.join(
+            self.model_cache_dir, f"bertopic_{source}_meta.json"
+        )
+        used_embedding = self.embedding_model  # default
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                used_embedding = meta.get("embedding_model", self.embedding_model)
+            except Exception:
+                pass
+
+        if used_embedding == "finbert":
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._finbert_model = SentenceTransformer(
+                    "yiyanghkust/finbert-tone-chinese",
+                    cache_folder=self.model_cache_dir,
+                )
+                logger.info("Restored FinBERT embedder to match cached model")
+            except Exception as e:
+                logger.warning("Cannot restore FinBERT embedder: %s", e)
+        else:
+            logger.warning(
+                "Cached model used TF-IDF embeddings, but restore requires "
+                "re-fitting the vectorizer. Use force_retrain=True."
+            )

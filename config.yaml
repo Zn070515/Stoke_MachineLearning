@@ -123,7 +123,7 @@ preprocessing:
       method: "ema"
       halflife_days: 7
     topic_model:
-      enabled: false
+      enabled: true
       n_topics: "auto"
       min_topic_size: 50
       model_cache_dir: "models/bertopic"
