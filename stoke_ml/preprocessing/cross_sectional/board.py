@@ -161,10 +161,16 @@ class BoardBroadcaster(PreprocessingStep):
         else:
             df["_cycle_penalty"] = 1.0
 
+        # Only ZT stocks should have meaningful seal scores; others → 0
         df["seal_strength"] = (
             df["_base_score"] * df["_time_factor"] * df["_cycle_penalty"]
-        ).astype(np.float32)
-        df["seal_success"] = df["is_zb"].eq(0).astype(np.int8)
+        )
+        df["seal_strength"] = (
+            df["seal_strength"].where(df["is_zt"] == 1, 0.0).astype(np.float32)
+        )
+        df["seal_success"] = (
+            (df["is_zt"] == 1) & (df["is_zb"] == 0)
+        ).astype(np.int8)
 
         # Cleanup temp columns
         for c in ["_base_score", "_time_factor", "_cycle_penalty",
@@ -177,8 +183,9 @@ class BoardBroadcaster(PreprocessingStep):
     def _broadcast_sentiment(self, df, sentiment):
         """Merge market-level sentiment indices to all rows."""
         sent = sentiment.copy()
-        if "date" in sent.columns:
-            sent["date"] = pd.to_datetime(sent["date"], errors="coerce")
+        if "date" not in sent.columns:
+            return df
+        sent["date"] = pd.to_datetime(sent["date"], errors="coerce")
         expected = ["break_rate", "advance_rate", "max_board_height"]
         available = [c for c in expected if c in sent.columns]
         if not available:
@@ -208,20 +215,29 @@ class BoardBroadcaster(PreprocessingStep):
         df["_break_rate"] = df["_n_zb"] / (df["_n_zt"] + df["_n_zb"] + 1).astype(float)
 
         # State classification
+        n_total = df["_n_zt"] + df["_n_dt"] + df["_n_zb"]
         df["market_state_strong"] = (
             (df["_n_zt"] > 80) & (df["_break_rate"] < 0.15)
         ).astype(np.int8)
         df["market_state_volatile"] = (df["_break_rate"] > 0.25).astype(np.int8)
         df["market_state_weak"] = (df["_n_zt"] < 20).astype(np.int8)
+        df["market_state_ice"] = (
+            (df["_n_zt"] < 10) & (df["_break_rate"] > 0.4)
+        ).astype(np.int8)
+        df["market_state_frenzy"] = (
+            (df["_n_zt"] > 120) & (df["_break_rate"] < 0.10)
+        ).astype(np.int8)
         df["market_state_normal"] = (
             ~df["market_state_strong"].astype(bool)
             & ~df["market_state_volatile"].astype(bool)
             & ~df["market_state_weak"].astype(bool)
+            & ~df["market_state_ice"].astype(bool)
+            & ~df["market_state_frenzy"].astype(bool)
         ).astype(np.int8)
 
-        # Net proportions
+        # Net proportions — per-date normalization (total stocks in pools per day)
         df["net_zt_proportion"] = (
-            (df["_n_zt"] - df["_n_dt"]) / max(df["_n_zt"].max() + df["_n_dt"].max(), 1)
+            (df["_n_zt"] - df["_n_dt"]) / n_total.replace(0, 1)
         ).astype(np.float32)
 
         # Cleanup

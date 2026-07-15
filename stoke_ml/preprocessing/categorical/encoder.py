@@ -37,6 +37,13 @@ class ConceptBlockEncoder(PreprocessingStep):
         min_stocks_per_board: int = 5,
         momentum_months: tuple[int, ...] = (3, 6, 12),
     ):
+        if top_n < 1:
+            raise ValueError(f"top_n must be >= 1, got {top_n}")
+        if min_stocks_per_board < 1:
+            raise ValueError(f"min_stocks_per_board must be >= 1, got {min_stocks_per_board}")
+        for m in momentum_months:
+            if m <= 0:
+                raise ValueError(f"momentum_months values must be > 0, got {m}")
         self.top_n = top_n
         self.min_stocks_per_board = min_stocks_per_board
         self.momentum_months = momentum_months
@@ -70,7 +77,11 @@ class ConceptBlockEncoder(PreprocessingStep):
 
         vocab = self._vocabulary
         if not vocab:
-            # Infer vocabulary on the fly if not fitted
+            logger.warning(
+                "ConceptBlockEncoder not fitted — inferring vocabulary from "
+                "current batch. This may produce different columns between "
+                "train/test. Call fit() on the full dataset first."
+            )
             if "board_name" in df.columns:
                 counts = df.groupby("board_name").size()
                 vocab = counts.nlargest(self.top_n).index.tolist()
@@ -98,26 +109,40 @@ class ConceptBlockEncoder(PreprocessingStep):
     # ── L2: multi-hot ──────────────────────────────────────────────────
 
     def _add_multihot(self, df, vocab):
-        """Create multi-hot columns cb_0..cb_{N-1}."""
+        """Create multi-hot columns cb_0..cb_{N-1} via vectorized get_dummies."""
         if "board_name" not in df.columns or "stock_code" not in df.columns:
             return
-        # Build stock×board matrix per date
-        for j, board in enumerate(vocab):
+        # Vectorized: one-hot encode board_name, then reindex against vocab
+        dummies = pd.get_dummies(df["board_name"], dtype=np.int8)
+        # Keep only vocabulary columns, fill missing with 0
+        available = [b for b in vocab if b in dummies.columns]
+        for j, board in enumerate(available):
             col = f"cb_{j}"
-            df[col] = (df["board_name"] == board).astype(np.int8)
+            df[col] = dummies[board]
+        # For vocab entries not seen in this batch, create zero columns
+        for j in range(len(available), len(vocab)):
+            df[f"cb_{j}"] = np.int8(0)
 
     # ── L3: derived ────────────────────────────────────────────────────
 
     def _add_derived(self, df):
         """Per-stock derived features from multi-hot columns."""
-        cb_cols = [c for c in df.columns if c.startswith("cb_")]
-        if not cb_cols:
-            return
-        df["board_count"] = df[cb_cols].sum(axis=1).astype(np.int16)
-
         if "board_change_pct" in df.columns:
             df["_board_pct"] = pd.to_numeric(df["board_change_pct"], errors="coerce")
-            # Mean momentum per stock across its boards
+
+        # Board count: number of distinct boards per stock-date (aggregate from long format)
+        if "date" in df.columns and "stock_code" in df.columns:
+            board_counts = df.groupby(["date", "stock_code"]).size().reset_index(name="_n_boards")
+            board_counts = board_counts.set_index(["date", "stock_code"])
+            df["board_count"] = (
+                df.set_index(["date", "stock_code"])
+                .index.map(board_counts["_n_boards"].to_dict())
+            )
+            df["board_count"] = df["board_count"].fillna(0).astype(np.int16)
+            df.reset_index(drop=True, inplace=True)
+
+        if "board_change_pct" in df.columns:
+            # Mean/max momentum per stock across its boards (use cleaned column)
             df["board_momentum_mean"] = (
                 df.groupby(["date", "stock_code"])["_board_pct"]
                 .transform("mean")
@@ -128,15 +153,14 @@ class ConceptBlockEncoder(PreprocessingStep):
                 .transform("max")
                 .astype(np.float32)
             )
-            if "_board_pct" in df.columns:
-                df.drop(columns=["_board_pct"], inplace=True)
 
-        if "board_change_pct" in df.columns:
+        if "_board_pct" in df.columns:
             daily_top10 = (
-                df.groupby("date")["board_change_pct"]
+                df.groupby("date")["_board_pct"]
                 .transform(lambda s: s.rank(pct=True) > 0.9)
             )
             df["has_hot_board"] = daily_top10.astype(np.int8)
+            df.drop(columns=["_board_pct"], inplace=True)
 
     # ── L4: concept heat ───────────────────────────────────────────────
 
@@ -148,13 +172,13 @@ class ConceptBlockEncoder(PreprocessingStep):
         """
         if "board_change_pct" not in df.columns:
             return
-        pct = pd.to_numeric(df["board_change_pct"], errors="coerce")
-        # Percentile of board change within each date
+        df["_pct_clean"] = pd.to_numeric(df["board_change_pct"], errors="coerce")
         df["avg_concept_heat"] = (
-            df.groupby(["date", "stock_code"])[pct.name or "board_change_pct"]
+            df.groupby(["date", "stock_code"])["_pct_clean"]
             .transform(lambda s: s.rank(pct=True).mean())
             .astype(np.float32)
         )
+        df.drop(columns=["_pct_clean"], inplace=True)
 
     # ── L5: concept momentum ───────────────────────────────────────────
 
@@ -162,18 +186,22 @@ class ConceptBlockEncoder(PreprocessingStep):
         """Compute concept momentum over multiple windows (months→trading days)."""
         if "board_change_pct" not in df.columns:
             return
-        pct = pd.to_numeric(df["board_change_pct"], errors="coerce")
+        df["_pct_clean"] = pd.to_numeric(df["board_change_pct"], errors="coerce")
+        # Sort by date within each board before rolling
+        if "date" in df.columns:
+            df = df.sort_values(["board_name", "date"])
         days_per_month = 21
         for m in self.momentum_months:
             w = m * days_per_month
             col = f"concept_momentum_{m}m"
             df[col] = (
-                df.groupby("board_name")[pct.name or "board_change_pct"]
+                df.groupby("board_name")["_pct_clean"]
                 .transform(
                     lambda s: s.rolling(w, min_periods=max(5, w // 4)).sum()
                 )
                 .astype(np.float32)
             )
+        df.drop(columns=["_pct_clean"], inplace=True)
 
     # ── L6: co-occurrence ──────────────────────────────────────────────
 

@@ -76,8 +76,8 @@ class SectorBroadcaster(PreprocessingStep):
         # L1-2: join sector features
         df = df.merge(ir, on=["date", "sector_code"], how="left", suffixes=("", "_sec"))
 
-        # L3: sector momentum
-        self._add_sector_momentum(df, ir)
+        # L3-4: sector momentum + RRG (returns merged df)
+        df = self._add_sector_momentum(df, ir)
 
         # L4: breadth normalization
         if "up_count" in df.columns and "down_count" in df.columns:
@@ -89,8 +89,9 @@ class SectorBroadcaster(PreprocessingStep):
                 df, "sector_breadth_raw", self.breadth_normalize_window
             )
 
-        # L5: rotation signals
+        # L5: rotation signals (require date-sorted df)
         if "rank" in df.columns:
+            df = df.sort_values(["stock_code", "date"])
             df["sector_rank_change"] = (
                 df.groupby("stock_code")["rank"].diff().fillna(0).astype(np.int16)
             )
@@ -112,12 +113,15 @@ class SectorBroadcaster(PreprocessingStep):
         return df
 
     def _add_sector_momentum(self, df, industry_ranking):
-        """Compute sector momentum for each window."""
+        """Compute sector momentum for each window and RRG features.
+
+        Returns the df mutated with new columns merged in.
+        """
         ir = industry_ranking.copy()
         if "date" not in ir.columns or "sector_code" not in ir.columns:
-            return
+            return df
         if "change_pct" not in ir.columns:
-            return
+            return df
 
         ir = ir.sort_values(["sector_code", "date"])
         for w in self.momentum_windows:
@@ -138,38 +142,60 @@ class SectorBroadcaster(PreprocessingStep):
             )
             df = df.merge(ir_mom, on=["date", "sector_code"], how="left")
 
-        # RRG: 252-bar z-score of cumulative return (simplified)
-        if "sector_code" in df.columns and 252 in self.momentum_windows:
-            # RS-Ratio: cumulative return relative to benchmark
-            df["_rs_ratio"] = df.groupby("stock_code")["change_pct"].transform(
-                lambda s: s.rolling(252, min_periods=63).sum()
+        # RRG: compute sector-level RS-Ratio from industry_ranking (not per-stock)
+        ir_sector = ir.copy()
+        if 252 in self.momentum_windows:
+            ir_sector["_cum_return"] = (
+                ir_sector.groupby("sector_code")["change_pct"]
+                .transform(lambda s: s.rolling(252, min_periods=63).sum())
             )
-            global_mean = df.groupby("date")["_rs_ratio"].transform("mean")
-            global_std = df.groupby("date")["_rs_ratio"].transform("std")
-            df["sector_rrg_y"] = (
-                (df["_rs_ratio"] - global_mean) / (global_std + 1e-8)
-            ).astype(np.float32)
-            # RS-Momentum: rate of change of RS-Ratio
-            df["sector_rrg_x"] = (
-                df.groupby("stock_code")["sector_rrg_y"]
+            # RS-Momentum: cumulative return cross-sectional z-score per date
+            date_mean = ir_sector.groupby("date")["_cum_return"].transform("mean")
+            date_std = ir_sector.groupby("date")["_cum_return"].transform("std")
+            ir_sector["_rrg_y"] = (
+                (ir_sector["_cum_return"] - date_mean) / (date_std + 1e-8)
+            )
+            # RS-Momentum: rate of change of RS-Ratio over 10d
+            ir_sector["_rrg_x"] = (
+                ir_sector.groupby("sector_code")["_rrg_y"]
                 .diff(10)
                 .fillna(0)
-                .astype(np.float32)
             )
-            # Quadrant
+            ir_rrg = ir_sector[["date", "sector_code", "_rrg_y", "_rrg_x"]]
+            df = df.merge(ir_rrg, on=["date", "sector_code"], how="left")
+            df["sector_rrg_y"] = df["_rrg_y"].astype(np.float32)
+            df["sector_rrg_x"] = df["_rrg_x"].astype(np.float32)
+            df.drop(columns=["_rrg_y", "_rrg_x"], inplace=True, errors="ignore")
+            # Quadrant: x>0=leading, x<0=lagging  ×  y>0=strong, y<0=weak
             df["sector_rrg_quadrant"] = (
-                (df["sector_rrg_x"] > 0).astype(int) * 2
-                + (df["sector_rrg_y"] > 0).astype(int)
+                (df["sector_rrg_x"].gt(0).astype(int)) * 2
+                + df["sector_rrg_y"].gt(0).astype(int)
             ).astype(np.int8)
-            df.drop(columns=["_rs_ratio"], inplace=True, errors="ignore")
+
+        return df
 
 
 def _cross_sectional_zscore(df, col, window):
-    """Cross-sectional z-score: (value - date_mean) / date_std per date."""
-    date_mean = df.groupby("date")[col].transform("mean")
-    date_std = df.groupby("date")[col].transform("std")
-    # Winsorize before z-scoring
+    """Cross-sectional z-score: (value - date_mean) / date_std per date.
+
+    Uses rolling *window* of trading days to compute mean/std, falling back
+    to expanding-window when fewer than *window* dates are available.
+    Winsorizes at 1%/99% within each cross-section before z-scoring.
+    """
+    date_mean = (
+        df.groupby("date")[col].transform("mean")
+        .rolling(window, min_periods=1)
+        .mean()
+    )
+    date_std = (
+        df.groupby("date")[col].transform("std")
+        .rolling(window, min_periods=1)
+        .mean()
+    )
+    # Winsorize within each date cross-section before z-scoring
     lo = df.groupby("date")[col].transform(lambda s: s.quantile(0.01))
     hi = df.groupby("date")[col].transform(lambda s: s.quantile(0.99))
     clipped = df[col].clip(lo, hi)
-    return ((clipped - date_mean) / (date_std + 1e-8)).astype(np.float32)
+    # Use ddof=0 so single-sector days produce 0 instead of NaN
+    day_std = df.groupby("date")[col].transform("std").replace(0, np.nan)
+    return ((clipped - date_mean) / (day_std.fillna(1e-8))).astype(np.float32)
