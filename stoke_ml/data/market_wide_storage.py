@@ -15,6 +15,10 @@ MARKET_DATA_TYPES = [
     "limit_up_sentiment", "block_trade", "shareholder", "lockup", "lockup_upcoming",
     "dividend", "industry_ranking", "concept_blocks",
     "sina_fund_flow",
+    # Processed output variants
+    "capital_flow_processed", "block_trade_processed", "shareholder_processed",
+    "lockup_processed", "dividend_processed", "industry_ranking_processed",
+    "concept_blocks_processed", "board_processed",
 ]
 
 

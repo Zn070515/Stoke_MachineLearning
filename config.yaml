@@ -152,6 +152,52 @@ preprocessing:
     higher_order:
       enabled: true
 
+  # Shape A: daily_continuous — capital flow preprocessing
+  flow:
+    enabled: true
+    persistence_windows: [5, 10, 20]
+    intensity_window: 20
+    residualize: true
+
+  # Shape B: event_sparse — per event type configuration
+  event:
+    block_trade:
+      decay_halflife_days: 90
+      forward_fill_max: 5
+      short_gap_max: 5
+      medium_gap_max: 60
+    shareholder:
+      decay_halflife_days: 90
+      forward_fill_max: 5
+      short_gap_max: 5
+      medium_gap_max: 60
+    lockup:
+      decay_halflife_days: 180
+      forward_fill_max: 5
+      short_gap_max: 5
+      medium_gap_max: 60
+    dividend:
+      decay_halflife_days: 365
+      forward_fill_max: 5
+      short_gap_max: 5
+      medium_gap_max: 60
+
+  # Shape C: cross_sectional — board & sector broadcasting
+  cross_sectional:
+    board:
+      enabled: true
+      consecutive_lookback: 20
+    sector:
+      enabled: true
+      momentum_windows: [5, 20, 60, 252]
+      breadth_normalize_window: 252
+
+  # Shape D: categorical — concept block encoding
+  concept:
+    enabled: true
+    top_n: 100
+    min_stocks_per_board: 5
+
   monitor:
     enabled: true
     log_dir: "logs/quality"
