@@ -56,7 +56,15 @@ class PanelDataset(Dataset):
         y_ret = self.y_return[stock_idx, end]
         y_vol = self.y_volatility[stock_idx, end]
 
-        # Convert targets to tensors (handle both np and torch inputs)
+        # Convert to tensors (handle both np and torch inputs)
+        if not isinstance(static, torch.Tensor):
+            static = torch.from_numpy(np.asarray(static, dtype=np.float32))
+        else:
+            static = static.clone().detach().float()
+        if not isinstance(pk, torch.Tensor):
+            pk = torch.from_numpy(np.asarray(pk, dtype=np.float32))
+        if not isinstance(po, torch.Tensor):
+            po = torch.from_numpy(np.asarray(po, dtype=np.float32))
         if isinstance(y_dir, torch.Tensor):
             y_dir = y_dir.clone().detach().long()
         else:
