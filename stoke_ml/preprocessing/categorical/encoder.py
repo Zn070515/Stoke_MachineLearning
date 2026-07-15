@@ -133,14 +133,11 @@ class ConceptBlockEncoder(PreprocessingStep):
 
         # Board count: number of distinct boards per stock-date (aggregate from long format)
         if "date" in df.columns and "stock_code" in df.columns:
-            board_counts = df.groupby(["date", "stock_code"]).size().reset_index(name="_n_boards")
-            board_counts = board_counts.set_index(["date", "stock_code"])
             df["board_count"] = (
-                df.set_index(["date", "stock_code"])
-                .index.map(board_counts["_n_boards"].to_dict())
+                df.groupby(["date", "stock_code"])["board_name"]
+                .transform("size")
+                .astype(np.int16)
             )
-            df["board_count"] = df["board_count"].fillna(0).astype(np.int16)
-            df.reset_index(drop=True, inplace=True)
 
         if "board_change_pct" in df.columns:
             # Mean/max momentum per stock across its boards (use cleaned column)
@@ -174,12 +171,14 @@ class ConceptBlockEncoder(PreprocessingStep):
         if "board_change_pct" not in df.columns:
             return
         df["_pct_clean"] = pd.to_numeric(df["board_change_pct"], errors="coerce")
+        # Cross-sectional rank within each date (all boards), then average per stock
+        df["_pct_rank"] = df.groupby("date")["_pct_clean"].rank(pct=True)
         df["avg_concept_heat"] = (
-            df.groupby(["date", "stock_code"])["_pct_clean"]
-            .transform(lambda s: s.rank(pct=True).mean())
+            df.groupby(["date", "stock_code"])["_pct_rank"]
+            .transform("mean")
             .astype(np.float32)
         )
-        df.drop(columns=["_pct_clean"], inplace=True)
+        df.drop(columns=["_pct_clean", "_pct_rank"], inplace=True)
 
     # ── L5: concept momentum ───────────────────────────────────────────
 
@@ -188,9 +187,9 @@ class ConceptBlockEncoder(PreprocessingStep):
         if "board_change_pct" not in df.columns:
             return
         df["_pct_clean"] = pd.to_numeric(df["board_change_pct"], errors="coerce")
-        # Sort by date within each board before rolling
+        # Sort by date within each board before rolling (inplace to mutate caller's df)
         if "date" in df.columns:
-            df = df.sort_values(["board_name", "date"])
+            df.sort_values(["board_name", "date"], inplace=True)
         days_per_month = 21
         for m in self.momentum_months:
             w = m * days_per_month

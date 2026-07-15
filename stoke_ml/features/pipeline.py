@@ -808,6 +808,10 @@ class FeaturePipeline:
         if not (self.use_concept and concept_df is not None
                 and not concept_df.empty):
             return df
+        # Aggregate from long format (one row per stock-board-date) to wide
+        # (one row per stock-date) before merging.
+        if "board_name" in concept_df.columns:
+            concept_df = _aggregate_concept_long(concept_df)
         return _merge_daily_aux(df, concept_df)
 
     # ------------------------------------------------------------------
@@ -944,7 +948,10 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(a[["date"] + available], on="date", how="left")
     for col in available:
         if col.startswith("has_"):
-            df[col] = df[col].fillna(False).astype(bool)
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(0).astype(np.int8)
+            else:
+                df[col] = df[col].fillna(False).astype(bool)
         elif col.endswith("_count"):
             df[col] = df[col].fillna(0).astype("int16")
         elif col.endswith("_streak") or col.endswith("_quadrant"):
@@ -959,7 +966,10 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     # Re-fill after shift (first row becomes NaN)
     for col in available:
         if col.startswith("has_"):
-            df[col] = df[col].fillna(False).astype(bool)
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(0).astype(np.int8)
+            else:
+                df[col] = df[col].fillna(False).astype(bool)
         elif col.endswith("_count"):
             df[col] = df[col].fillna(0).astype("int16")
         elif col.endswith("_streak") or col.endswith("_quadrant"):
@@ -968,3 +978,39 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].fillna(0.0).astype(np.float32)
 
     return df
+
+
+def _aggregate_concept_long(concept_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate concept data from long format to per-stock-per-date.
+
+    ConceptBlockEncoder outputs one row per (date, stock_code, board_name).
+    Multi-hot columns (cb_*) and per-board momentum columns need to be
+    collapsed to a single row per (date, stock_code) before merging with
+    the main feature DataFrame.
+    """
+    agg_spec = {}
+    # Multi-hot: max works as OR (1 if any board has the flag)
+    cb_cols = [c for c in concept_df.columns if c.startswith("cb_")]
+    agg_spec.update({c: (c, "max") for c in cb_cols})
+    # Per-board momentum: average across boards
+    mom_cols = [c for c in concept_df.columns if c.startswith("concept_momentum_")]
+    agg_spec.update({c: (c, "mean") for c in mom_cols})
+    bmom_cols = [c for c in concept_df.columns if c.startswith("board_momentum_")]
+    agg_spec.update({c: (c, "mean") for c in bmom_cols})
+    # Per-stock columns: same value across rows (take first)
+    static_cols = [
+        c for c in concept_df.columns
+        if c not in {"date", "stock_code", "board_name"}
+        and c not in cb_cols
+        and c not in mom_cols
+        and c not in bmom_cols
+    ]
+    agg_spec.update({c: (c, "first") for c in static_cols})
+
+    key_cols = ["date", "stock_code"]
+    available = [c for c in key_cols if c in concept_df.columns]
+    return (
+        concept_df.groupby(available, as_index=False)
+        .agg(**agg_spec)
+        .reset_index(drop=True)
+    )

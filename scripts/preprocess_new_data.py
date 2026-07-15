@@ -157,7 +157,7 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
                 dest.save(processed)
                 total += len(processed)
         except Exception:
-            logger.debug("%s preprocessing failed for %s", dtype, code, exc_info=True)
+            logger.warning("%s preprocessing failed for %s", dtype, code, exc_info=True)
 
     logger.info("  %s: %d rows saved (%.1fs)", dtype, total, time.time() - t0)
 
