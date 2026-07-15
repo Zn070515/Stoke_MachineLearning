@@ -4,12 +4,11 @@ Integrates: TLS spoofing + fingerprint headers + session pool
 + proxy rotation + rate limiting. Provides a simple get/post
 interface that routes through all defense layers transparently.
 """
-from urllib.parse import urlparse
 from stoke_ml.crawler.tls import TLSSession
 from stoke_ml.crawler.fingerprint import FingerprintGenerator
 from stoke_ml.crawler.session_pool import SessionPool
 from stoke_ml.crawler.proxy_pool import ProxyPool, Proxy
-from stoke_ml.crawler.rate_limiter import RateLimiter
+from stoke_ml.crawler.rate_limiter import RateLimiter, _extract_domain
 
 
 class CrawlerClient:
@@ -52,7 +51,7 @@ class CrawlerClient:
         return self._request("POST", url, **kwargs)
 
     def _request(self, method: str, url: str, **kwargs):
-        domain = urlparse(url).netloc
+        domain = _extract_domain(url)
 
         if not self._rate_limiter.can_request(domain):
             raise RuntimeError(f"Rate limit or circuit breaker: {domain}")
@@ -68,7 +67,7 @@ class CrawlerClient:
         if proxy:
             kwargs["proxies"] = {"http": proxy.url, "https": proxy.url}
 
-        self._rate_limiter.wait()
+        self._rate_limiter.wait(domain)
         session = self._session_pool.get_session()
 
         try:

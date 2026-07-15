@@ -1,15 +1,135 @@
-"""Adaptive rate limiter with circuit breaker pattern.
+"""Adaptive rate limiter with per-host throttling + circuit breaker.
 
-Features:
-- Random jitter delays between requests
-- Exponential backoff on 429/503 responses
-- Circuit breaker: stop requesting a domain after N consecutive failures
-- Daily quota tracking per domain
+Per-host throttling (HostThrottle) ensures different domains never block each
+other — an EastMoney call spaced at 1.0 s doesn't delay a Sina call at 0.3 s.
+The lock is held only during bookkeeping, not across sleep, so distinct buckets
+fire concurrently without contention.
+
+Ported from Vibe-Trading's HostThrottle pattern (backtest/loaders/_http.py).
 """
-import time
+import logging
 import random
+import threading
+import time
 from collections import defaultdict
+from typing import Optional
 
+logger = logging.getLogger(__name__)
+
+# ── Per-host minimum interval defaults (seconds) ─────────────────────────
+# These are conservative defaults tuned from real-world WAF behavior.
+# Override per host by setting env var STOKE_ML_<HOST>_MIN_INTERVAL.
+
+HOST_CONFIGS: dict[str, float] = {
+    "eastmoney.com": 1.0,
+    "push2.eastmoney.com": 1.0,
+    "push2his.eastmoney.com": 1.0,
+    "push2ex.eastmoney.com": 1.0,
+    "datacenter-web.eastmoney.com": 1.0,
+    "sina.com.cn": 0.3,
+    "sina.com": 0.3,
+    "10jqka.com.cn": 0.5,
+    "tushare.pro": 0.3,
+    "akshare": 0.5,
+    "baostock": 0.3,
+}
+DEFAULT_HOST_INTERVAL = 2.0
+
+# Upper bound on random jitter added on top of min_interval so parallel callers
+# de-synchronize instead of all firing the instant the interval elapses.
+_JITTER_MAX_S = 0.4
+
+
+def _extract_domain(url: str) -> str:
+    """Extract bare domain (no port) from URL for host-key lookup.
+
+    >>> _extract_domain("https://push2.eastmoney.com/api/qt/slist/get")
+    'push2.eastmoney.com'
+    >>> _extract_domain("http://localhost:8080/path")
+    'localhost'
+    """
+    from urllib.parse import urlparse
+    netloc = urlparse(url).netloc or "default"
+    return netloc.partition(":")[0]
+
+
+def _resolve_interval(domain: str) -> float:
+    """Resolve minimum interval for a domain.
+
+    Checks HOST_CONFIGS for exact and suffix matches (e.g. 'push2.eastmoney.com'
+    matches 'eastmoney.com' via suffix), then env var override, then default.
+    """
+    if domain in HOST_CONFIGS:
+        base = HOST_CONFIGS[domain]
+    else:
+        # Suffix match: push2.eastmoney.com matches eastmoney.com
+        base = DEFAULT_HOST_INTERVAL
+        for suffix, interval in HOST_CONFIGS.items():
+            if domain.endswith(suffix):
+                base = interval
+                break
+
+    # Env var override: STOKE_ML_<DOMAIN_WITH_DOTS_AS_UNDERSCORES>_MIN_INTERVAL
+    env_key = f"STOKE_ML_{domain.replace('.', '_').replace('-', '_')}_MIN_INTERVAL"
+    import os
+    env_val = os.environ.get(env_key)
+    if env_val:
+        try:
+            val = float(env_val)
+            if val > 0:
+                return val
+            logger.warning(
+                "Env %s=%s is not positive, using default %.1fs for %s",
+                env_key, env_val, base, domain,
+            )
+        except ValueError:
+            logger.warning(
+                "Env %s=%s is not a valid float, using default %.1fs for %s",
+                env_key, env_val, base, domain,
+            )
+    return base
+
+
+# ── HostThrottle ─────────────────────────────────────────────────────────
+
+class HostThrottle:
+    """Process-wide per-bucket minimum-spacing gate.
+
+    One instance guards all callers. ``wait(bucket, min_interval)`` blocks until
+    at least ``min_interval`` seconds (plus jitter) have elapsed since the last
+    request tagged with the same ``bucket``. The lock is held only for the
+    bookkeeping arithmetic, not across the sleep, so distinct buckets never
+    block one another.
+    """
+
+    def __init__(self) -> None:
+        self._last: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def wait(self, bucket: str, min_interval: float) -> None:
+        """Block until ``bucket`` is allowed to fire, then record the slot.
+
+        The *reserved fire time* (jitter included) is what gets stored, so the
+        next caller spaces off this caller's actual fire instant. Jitter only
+        pushes a slot later, never earlier — consecutive requests stay at least
+        ``min_interval`` apart even during concurrent bursts.
+        """
+        if min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            last = self._last.get(bucket)
+            if last is None or now >= last + min_interval:
+                fire_at = now
+            else:
+                fire_at = last + min_interval + random.uniform(0.0, _JITTER_MAX_S)
+            self._last[bucket] = fire_at
+        sleep_for = fire_at - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+# ── CircuitBreaker (unchanged) ───────────────────────────────────────────
 
 class CircuitBreaker:
     """Stops requests to a domain after consecutive failures."""
@@ -44,8 +164,16 @@ class CircuitBreaker:
         return True
 
 
+# ── RateLimiter (per-host upgrade) ───────────────────────────────────────
+
 class RateLimiter:
-    """Adaptive request rate limiter."""
+    """Adaptive request rate limiter with per-host throttling.
+
+    Uses HostThrottle internally so different domains get independent
+    spacing. The legacy ``wait()`` (no domain) still works for backward
+    compatibility with ConcurrentDownloader — it uses a shared "default"
+    bucket with the configured base delay.
+    """
 
     def __init__(
         self,
@@ -67,14 +195,27 @@ class RateLimiter:
             failure_threshold=failure_threshold,
             cooldown_seconds=cooldown_seconds,
         )
+        self._throttle = HostThrottle()
 
     @property
     def current_delay(self) -> float:
         return self._current_delay
 
-    def wait(self):
-        jitter = self._current_delay * self._jitter * (0.5 + random.random())
-        time.sleep(self._current_delay + jitter)
+    def wait(self, domain: Optional[str] = None):
+        """Block until the next request is allowed.
+
+        Args:
+            domain: Optional host domain. When provided, uses per-host
+                throttling (spacing from HOST_CONFIGS). When None, uses
+                the legacy global delay (backward-compatible).
+        """
+        if domain:
+            interval = _resolve_interval(domain)
+            self._throttle.wait(domain, interval)
+        else:
+            # Legacy mode: global delay with jitter
+            jitter = self._current_delay * self._jitter * (0.5 + random.random())
+            time.sleep(self._current_delay + jitter)
 
     def report_429(self):
         self._current_delay = min(self._current_delay * 2, self._max_backoff)
