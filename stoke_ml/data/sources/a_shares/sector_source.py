@@ -71,8 +71,8 @@ class IndustryRankingSource:
             )
             r.raise_for_status()
             d = r.json()
-        except Exception:
-            logger.warning("Industry ranking fetch failed")
+        except Exception as e:
+            logger.warning("Industry ranking fetch failed: %s", e)
             return pd.DataFrame(columns=INDUSTRY_RANKING_COLS)
 
         items = d.get("data", {}).get("diff", [])
@@ -101,14 +101,26 @@ class IndustryRankingSource:
     def fetch_batch(
         self, start_date: str, end_date: str,
     ) -> pd.DataFrame:
-        """Fetch industry rankings over a date range."""
-        dates = pd.date_range(start=start_date, end=end_date, freq="B")
+        """Fetch industry rankings over a date range.
+
+        Uses A-share trading calendar (not US freq='B') to avoid
+        hammering the API on non-trading days.
+        """
+        from stoke_ml.data.calendar import TradingCalendar
+        calendar = TradingCalendar("a_shares")
+        dates = calendar.get_trading_days(start_date, end_date)
+
         frames = []
-        for d in dates:
+        for i, d in enumerate(dates):
             date_str = d.strftime("%Y-%m-%d")
             df = self.fetch(date=date_str)
             if not df.empty:
                 frames.append(df)
+            if (i + 1) % 60 == 0:
+                logger.info(
+                    "  industry_ranking: %d/%d days (%.0f%%)",
+                    i + 1, len(dates), (i + 1) / len(dates) * 100,
+                )
         if not frames:
             return pd.DataFrame(columns=INDUSTRY_RANKING_COLS)
         return pd.concat(frames, ignore_index=True)
