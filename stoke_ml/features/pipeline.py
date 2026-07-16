@@ -117,6 +117,12 @@ CONCEPT_COLS = [
     "is_concept_leader", "board_overlap_score",
 ]
 
+INDUSTRY_COLS = [
+    "ind_pct_up", "ind_return_mean", "ind_return_std",
+    "ind_return_max", "ind_return_min", "ind_return_skew",
+    "ind_dispersion_20d",
+]
+
 MACRO_COLS = [
     "shibor_O_N", "shibor_1W", "shibor_2W", "shibor_1M",
     "shibor_3M", "shibor_6M", "shibor_9M", "shibor_1Y",
@@ -165,6 +171,7 @@ class FeaturePipeline:
         use_sector: bool = False,
         use_concept: bool = False,
         use_macro: bool = True,
+        use_industry: bool = True,
         feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
         preprocessing_config: dict | str | None = None,
@@ -196,6 +203,7 @@ class FeaturePipeline:
         self.use_sector = use_sector
         self.use_concept = use_concept
         self.use_macro = use_macro
+        self.use_industry = use_industry
         self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
         self._preprocessing_config = preprocessing_config
@@ -204,6 +212,7 @@ class FeaturePipeline:
             self._preprocessing = self._build_preprocessing()
         self._warned_missing: set[str] = set()
         self._macro_cache: pd.DataFrame | None = None
+        self._industry_cache: pd.DataFrame | None = None
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
         self._interaction = InteractionFeatures()
@@ -269,6 +278,7 @@ class FeaturePipeline:
         sector_df: pd.DataFrame | None = None,
         concept_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
+        industry_df: pd.DataFrame | None = None,
         return_dates: bool = False,
     ) -> tuple:
         """Build features for a single stock. Returns (X, y, aligned_close).
@@ -282,7 +292,7 @@ class FeaturePipeline:
             announcement_df, guba_df, comment_df, xueqiu_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
-            macro_df=macro_df,
+            macro_df=macro_df, industry_df=industry_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
 
@@ -409,6 +419,7 @@ class FeaturePipeline:
         sector_df: pd.DataFrame | None = None,
         concept_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
+        industry_df: pd.DataFrame | None = None,
         skip_temporal: bool = False,
     ) -> pd.DataFrame:
         df = df.copy()
@@ -438,6 +449,7 @@ class FeaturePipeline:
         df = self._merge_sector(df, sector_df)
         df = self._merge_concept(df, concept_df)
         df = self._merge_macro(df, macro_df)
+        df = self._merge_industry(df, industry_df)
 
         if self.use_technical:
             df = self._ti.compute_all(df)
@@ -477,6 +489,7 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, SECTOR_COLS)
             temporal_cols += _active_cols(df, CONCEPT_COLS)
             temporal_cols += _active_cols(df, MACRO_COLS)
+            temporal_cols += _active_cols(df, INDUSTRY_COLS)
             # Dynamic columns: concept momentum, board momentum, sector momentum
             temporal_cols += _active_cols(df, [
                 c for c in df.columns
@@ -931,6 +944,55 @@ class FeaturePipeline:
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)
         # PIT lag: macro data available after close → shift to t+1
+        for col in available:
+            df[col] = df[col].shift(1)
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
+
+    def _merge_industry(self, df: pd.DataFrame,
+                        industry_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        """Merge cross-sectional industry stats (no per-stock mapping needed)."""
+        if not self.use_industry:
+            return df
+        if industry_df is None:
+            industry_df = self._industry_cache
+            if industry_df is None:
+                import os
+                from stoke_ml.config import load_config
+                cfg = load_config()
+                path = os.path.join(cfg.project.data_dir, "a_shares", "industry", "industry_returns.parquet")
+                if not os.path.exists(path):
+                    self._warn_if_missing("industry")
+                    return df
+                raw = pd.read_parquet(path)
+                # Compute cross-sectional stats from 90 industry returns
+                industry_df = pd.DataFrame({
+                    "date": pd.to_datetime(raw.index),
+                    "ind_pct_up": (raw > 0).sum(axis=1).values / raw.notna().sum(axis=1).values,
+                    "ind_return_mean": raw.mean(axis=1).values,
+                    "ind_return_std": raw.std(axis=1).values,
+                    "ind_return_max": raw.max(axis=1).values,
+                    "ind_return_min": raw.min(axis=1).values,
+                    "ind_return_skew": raw.skew(axis=1).values,
+                })
+                # Rolling dispersion: 20-day std of cross-sectional std
+                industry_df["ind_dispersion_20d"] = (
+                    industry_df["ind_return_std"].rolling(20).std().fillna(0.0)
+                )
+                for col in INDUSTRY_COLS:
+                    industry_df[col] = industry_df[col].astype(np.float32)
+                self._industry_cache = industry_df
+        if industry_df.empty:
+            return df
+        ind = industry_df.copy()
+        ind["date"] = pd.to_datetime(ind["date"])
+        available = [c for c in INDUSTRY_COLS if c in ind.columns]
+        if not available:
+            return df
+        df = df.merge(ind[["date"] + available], on="date", how="left")
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
         for col in available:
             df[col] = df[col].shift(1)
         for col in available:
