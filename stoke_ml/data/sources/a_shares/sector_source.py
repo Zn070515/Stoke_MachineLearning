@@ -3,12 +3,19 @@
 Two sources:
 - IndustryRankingSource: daily industry sector ranking (全行业板块排名)
 - ConceptBlockSource: per-stock concept/industry/region board membership (概念板块归属)
+
+Note: push2 APIs don't need curl-cffi impersonation — plain requests works
+and is more reliable. EastMoneyClient's TLS fingerprinting is overkill here.
 """
 
+import json
 import logging
+import random
+import time
 from typing import Optional
 
 import pandas as pd
+import requests
 
 from stoke_ml.crawler.eastmoney import EastMoneyClient
 
@@ -21,6 +28,12 @@ EASTMONEY_HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
     "Origin": "https://quote.eastmoney.com",
 }
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 INDUSTRY_RANKING_COLS = [
     "date", "rank", "name", "code", "change_pct",
@@ -44,20 +57,56 @@ class IndustryRankingSource:
 
     One call returns ~100 industries ranked by change %. Uses
     EastMoney's internal sector classification (m:90+t:2).
+
+    Uses plain urllib instead of EastMoneyClient because the push2
+    API doesn't require TLS fingerprint impersonation.
     """
 
     SOURCE_NAME = "eastmoney_industry_ranking"
 
-    def __init__(self, min_interval: float = 1.2):
-        self._client = EastMoneyClient(min_interval=min_interval)
+    def __init__(self, min_interval: float = 2.5):
+        self._min_interval = min_interval
+        self._last_call: float = 0.0
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": _UA, **EASTMONEY_HEADERS,
+        })
+
+    def _throttle(self):
+        """Sleep until min_interval has passed since last call, plus jitter."""
+        elapsed = time.time() - self._last_call
+        wait = max(0.0, self._min_interval - elapsed) + random.uniform(0.3, 1.5)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.time()
+
+    def _get_json(self, url: str, params: dict, timeout: int = 15) -> dict:
+        """GET a push2 API and return parsed JSON dict.
+
+        Uses a persistent Session for connection pooling.  Retries up
+        to 5 times with jittered exponential backoff — push2delay CDN
+        is aggressive with rate-limiting on bursty traffic.
+        """
+        last_err = None
+        for attempt in range(5):
+            try:
+                r = self._session.get(url, params=params, timeout=timeout)
+                r.raise_for_status()
+                return r.json()
+            except (requests.RequestException, json.JSONDecodeError) as e:
+                last_err = e
+                if attempt < 4:
+                    backoff = 3.0 * (2 ** attempt) + random.uniform(0.5, 2.0)
+                    time.sleep(backoff)
+        raise last_err  # type: ignore[misc]
 
     def fetch(self, date: Optional[str] = None) -> pd.DataFrame:
         """Fetch industry sector ranking for a trading day.
 
         Returns DataFrame sorted by rank with: rank, name, code,
-        change_pct, up_count(上涨家数), down_count(下跌家数),
-        leader(领涨股), leader_change(领涨股涨幅).
+        change_pct, up_count, down_count, leader, leader_change.
         """
+        self._throttle()
         params = {
             "pn": "1", "pz": "200", "po": "1", "np": "1",
             "fltt": "2", "invt": "2", "fid": "f3",
@@ -65,12 +114,7 @@ class IndustryRankingSource:
             "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
         }
         try:
-            r = self._client.get(
-                PUSH2_CLIST_URL, params=params,
-                headers=EASTMONEY_HEADERS, timeout=15,
-            )
-            r.raise_for_status()
-            d = r.json()
+            d = self._get_json(PUSH2_CLIST_URL, params)
         except Exception as e:
             logger.warning("Industry ranking fetch failed: %s", e)
             return pd.DataFrame(columns=INDUSTRY_RANKING_COLS)
@@ -126,7 +170,7 @@ class IndustryRankingSource:
         return pd.concat(frames, ignore_index=True)
 
     def close(self):
-        self._client.close()
+        self._session.close()
 
 
 # ── Concept block membership (概念板块归属) ─────────────────────────────
