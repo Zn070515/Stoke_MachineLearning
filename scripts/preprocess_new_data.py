@@ -138,7 +138,11 @@ def main():
 
 
 def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
-    """Process standard per-stock data: load → transform → save."""
+    """Process standard per-stock data: load → transform → save.
+
+    Passes K-line data as ``daily_data`` kwarg so that market-cap
+    normalization and amount-ratio features can activate downstream.
+    """
     logger.info("=== %s: %d stocks (%s to %s) ===",
                 dtype, len(stock_list), args.start, args.end)
     t0 = time.time()
@@ -146,13 +150,22 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     output_key = args.save_to or f"{storage_key}_processed"
     dest = MarketWideStorage(data_dir, output_key)
 
+    from stoke_ml.data.storage import DataStorage
+    ds = DataStorage(data_dir)
+
     total = 0
     for code in stock_list:
         try:
             raw = source.load(code, args.start, args.end)
             if raw.empty:
                 continue
-            processed = chain.fit_transform(raw)
+            # Load K-line daily data for market-cap context features
+            daily_data = None
+            try:
+                daily_data = ds.load_daily(code, args.start, args.end)
+            except Exception:
+                pass
+            processed = chain.fit_transform(raw, daily_data=daily_data)
             if not processed.empty:
                 dest.save(processed)
                 total += len(processed)
@@ -196,16 +209,44 @@ def _process_board(chain, stock_list, data_dir, args):
     except Exception:
         logger.warning("Failed to load limit_up_sentiment", exc_info=True)
 
+    # Build concept_map from concept block data for same-concept ZT stats
+    concept_map = {}
+    try:
+        concept_storage = MarketWideStorage(data_dir, "concept_blocks")
+        c_frames = []
+        for code in stock_list:
+            cdf = concept_storage.load(code, args.start, args.end)
+            if not cdf.empty:
+                c_frames.append(cdf)
+        if c_frames:
+            concept_all = pd.concat(c_frames, ignore_index=True)
+            if "stock_code" in concept_all.columns and "board_name" in concept_all.columns:
+                # Use most frequent concept per stock as primary
+                concept_map = (
+                    concept_all.groupby("stock_code")["board_name"]
+                    .agg(lambda x: x.value_counts().index[0] if len(x) > 0 else None)
+                    .dropna()
+                    .to_dict()
+                )
+                # Normalize keys to str for consistent lookup against df["stock_code"]
+                concept_map = {str(k): v for k, v in concept_map.items()}
+            logger.info("  Built concept_map: %d stocks → concept", len(concept_map))
+    except Exception:
+        logger.debug("No concept data available for board ZT stats", exc_info=True)
+
     from stoke_ml.data.storage import DataStorage
     ds = DataStorage(data_dir)
     dest = MarketWideStorage(data_dir, args.save_to or "board_processed")
     total = 0
     for code in stock_list:
         try:
-            base = ds.load(code, args.start, args.end)
+            base = ds.load_daily(code, args.start, args.end)
             if base.empty:
                 continue
-            processed = chain.fit_transform(base, pools=pools, sentiment=sentiment)
+            processed = chain.fit_transform(
+                base, pools=pools, sentiment=sentiment,
+                concept_map=concept_map if concept_map else None,
+            )
             if not processed.empty:
                 dest.save(processed)
                 total += len(processed)
@@ -249,7 +290,7 @@ def _process_sector(chain, stock_list, data_dir, args):
     total = 0
     for code in stock_list:
         try:
-            base = ds.load(code, args.start, args.end)
+            base = ds.load_daily(code, args.start, args.end)
             if base.empty:
                 continue
             processed = chain.fit_transform(
