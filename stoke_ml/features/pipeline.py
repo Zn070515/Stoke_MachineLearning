@@ -117,6 +117,17 @@ CONCEPT_COLS = [
     "is_concept_leader", "board_overlap_score",
 ]
 
+MACRO_COLS = [
+    "shibor_O_N", "shibor_1W", "shibor_2W", "shibor_1M",
+    "shibor_3M", "shibor_6M", "shibor_9M", "shibor_1Y",
+    "fx_usd_cny", "fx_eur_cny", "fx_jpy_cny", "fx_hkd_cny", "fx_gbp_cny",
+    "bond_cn_2y", "bond_cn_5y", "bond_cn_10y", "bond_cn_30y",
+    "bond_cn_10y2y_spread",
+    "bond_us_2y", "bond_us_5y", "bond_us_10y", "bond_us_30y",
+    "bond_us_10y2y_spread",
+    "gdp_cn_yoy", "m2_yoy", "m1_yoy", "sf_total", "cpi_yoy",
+]
+
 
 class FeaturePipeline:
     """End-to-end feature engineering for stock prediction."""
@@ -153,6 +164,7 @@ class FeaturePipeline:
         use_board: bool = False,
         use_sector: bool = False,
         use_concept: bool = False,
+        use_macro: bool = True,
         feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
         preprocessing_config: dict | str | None = None,
@@ -183,6 +195,7 @@ class FeaturePipeline:
         self.use_board = use_board
         self.use_sector = use_sector
         self.use_concept = use_concept
+        self.use_macro = use_macro
         self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
         self._preprocessing_config = preprocessing_config
@@ -190,6 +203,7 @@ class FeaturePipeline:
         if use_new_preprocessing and preprocessing_config:
             self._preprocessing = self._build_preprocessing()
         self._warned_missing: set[str] = set()
+        self._macro_cache: pd.DataFrame | None = None
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
         self._interaction = InteractionFeatures()
@@ -254,6 +268,7 @@ class FeaturePipeline:
         board_df: pd.DataFrame | None = None,
         sector_df: pd.DataFrame | None = None,
         concept_df: pd.DataFrame | None = None,
+        macro_df: pd.DataFrame | None = None,
         return_dates: bool = False,
     ) -> tuple:
         """Build features for a single stock. Returns (X, y, aligned_close).
@@ -267,6 +282,7 @@ class FeaturePipeline:
             announcement_df, guba_df, comment_df, xueqiu_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
+            macro_df=macro_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
 
@@ -392,6 +408,7 @@ class FeaturePipeline:
         board_df: pd.DataFrame | None = None,
         sector_df: pd.DataFrame | None = None,
         concept_df: pd.DataFrame | None = None,
+        macro_df: pd.DataFrame | None = None,
         skip_temporal: bool = False,
     ) -> pd.DataFrame:
         df = df.copy()
@@ -420,6 +437,7 @@ class FeaturePipeline:
         df = self._merge_board(df, board_df)
         df = self._merge_sector(df, sector_df)
         df = self._merge_concept(df, concept_df)
+        df = self._merge_macro(df, macro_df)
 
         if self.use_technical:
             df = self._ti.compute_all(df)
@@ -458,6 +476,7 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, BOARD_COLS)
             temporal_cols += _active_cols(df, SECTOR_COLS)
             temporal_cols += _active_cols(df, CONCEPT_COLS)
+            temporal_cols += _active_cols(df, MACRO_COLS)
             # Dynamic columns: concept momentum, board momentum, sector momentum
             temporal_cols += _active_cols(df, [
                 c for c in df.columns
@@ -878,6 +897,45 @@ class FeaturePipeline:
         if "board_name" in concept_df.columns:
             concept_df = _aggregate_concept_long(concept_df)
         return _merge_daily_aux(df, concept_df)
+
+    def _merge_macro(self, df: pd.DataFrame,
+                     macro_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        if not self.use_macro:
+            return df
+        if macro_df is None:
+            macro_df = getattr(self, '_macro_cache', None)
+            if macro_df is None:
+                import os
+                from stoke_ml.config import load_config
+                cfg = load_config()
+                path = os.path.join(cfg.project.data_dir, "a_shares", "macro", "macro_daily.parquet")
+                if not os.path.exists(path):
+                    self._warn_if_missing("macro")
+                    return df
+                macro_df = pd.read_parquet(path)
+                self._macro_cache = macro_df
+        if macro_df.empty:
+            return df
+        macro = macro_df.reset_index() if macro_df.index.name == "date" else macro_df.copy()
+        if "date" not in macro.columns:
+            if isinstance(macro.index, pd.DatetimeIndex):
+                macro = macro.reset_index()
+                macro = macro.rename(columns={"index": "date"})
+            else:
+                return df
+        macro["date"] = pd.to_datetime(macro["date"])
+        available = [c for c in MACRO_COLS if c in macro.columns]
+        if not available:
+            return df
+        df = df.merge(macro[["date"] + available], on="date", how="left")
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: macro data available after close → shift to t+1
+        for col in available:
+            df[col] = df[col].shift(1)
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
 
     # ------------------------------------------------------------------
     # Microstructure features
