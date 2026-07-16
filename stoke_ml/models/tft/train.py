@@ -224,7 +224,8 @@ def train_tft(
         # Full metrics (Sharpe + IC) every 5 epochs for early stopping
         if (epoch + 1) % 5 == 0:
             sharpe, val_metrics = evaluate_sharpe(
-                model, val_data, config, device, return_metrics=True,
+                model, val_data, config, device,
+                return_metrics=True, horizon=config.horizon,
             )
             history["val_sharpe"].append(sharpe)
             ic = val_metrics.get("ic", 0.0)

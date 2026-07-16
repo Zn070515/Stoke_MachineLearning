@@ -48,6 +48,7 @@ class TFTConfig:
 
     # Output
     num_direction_classes: int = 3  # down / flat / up
+    horizon: int = 1  # forward-return horizon (trading days)
 
     # Hardware
     use_amp: bool = False

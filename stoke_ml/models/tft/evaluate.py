@@ -7,18 +7,29 @@ from stoke_ml.models.tft.config import TFTConfig
 from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
 
 
-def compute_sharpe(daily_returns: torch.Tensor, annualize: bool = True) -> float:
+def compute_sharpe(
+    daily_returns: torch.Tensor,
+    annualize: bool = True,
+    horizon: int = 1,
+) -> float:
+    """Sharpe ratio from non-overlapping period returns.
+
+    Args:
+        daily_returns: period returns (each covers `horizon` trading days).
+        annualize: multiply by sqrt(periods_per_year) if True.
+        horizon: number of trading days each return covers.
+    """
     if len(daily_returns) < 2:
         return 0.0
     mean = daily_returns.mean().item()
     std = daily_returns.std().item()
     if std < 1e-8:
-        return 0.0  # flat returns → zero Sharpe, not inf
+        return 0.0
     sharpe = mean / std
     if annualize:
-        sharpe *= np.sqrt(252)
-    # Clamp to reasonable range for early-stopping compatibility
-    return float(max(min(sharpe, 10.0), -10.0))
+        # ~252/horizon non-overlapping periods per year
+        sharpe *= np.sqrt(252 / horizon)
+    return float(sharpe)
 
 
 def evaluate_sharpe(
@@ -27,13 +38,14 @@ def evaluate_sharpe(
     config: TFTConfig,
     device: torch.device,
     top_k: int = 20,
+    horizon: int = 1,
     return_metrics: bool = False,
 ) -> float | tuple[float, dict]:
     """Time-varying top-K portfolio evaluation.
 
-    For each validation day, ranks stocks by predicted return, selects
-    top-K, and computes equal-weight portfolio return. This correctly
-    measures a daily-rebalanced strategy rather than a static ranking.
+    For each validation day (subsampled by horizon to avoid overlap),
+    ranks stocks by predicted return, selects top-K, and computes
+    equal-weight portfolio return using non-overlapping forward returns.
     """
     model.eval()
     val_ds = PanelDataset(val_data, seq_len=config.seq_len)
@@ -70,8 +82,12 @@ def evaluate_sharpe(
     if k == 0:
         return 0.0
 
+    # Subsample by horizon to avoid overlapping returns inflating Sharpe.
+    # When horizon=5, day t's return and day t+1's return share 4/5 days,
+    # which makes std artificially low. Striding by horizon gives independent
+    # observations.
     portfolio_returns = []
-    for t in range(n_windows):
+    for t in range(0, n_windows, horizon):
         _, top_idx = torch.topk(preds[:, t], k)
         ret = actuals[top_idx, t].mean().item()
         if np.isfinite(ret):
@@ -82,7 +98,7 @@ def evaluate_sharpe(
             return 0.0, {"ic": 0.0}
         return 0.0
     portfolio_daily = torch.tensor(portfolio_returns, dtype=torch.float32)
-    sharpe = compute_sharpe(portfolio_daily)
+    sharpe = compute_sharpe(portfolio_daily, horizon=horizon)
 
     if not return_metrics:
         return sharpe

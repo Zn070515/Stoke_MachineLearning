@@ -381,6 +381,7 @@ def main():
         max_epochs=args.epochs,
         compile_model=not args.no_compile,
         num_workers=8,
+        horizon=args.horizon,
     )
     logger.info("TFT config: hidden=%d layers=%d heads=%d batch=%d lr=%.1e",
                 config.hidden_dim, config.lstm_layers, config.attention_heads,
