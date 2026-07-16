@@ -252,7 +252,7 @@ def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
     ok: list[str] = []
     n_neg, n_vol, n_nan = 0, 0, 0
     for code in stock_list:
-        df = ds.load_daily(code, "2015-01-01", None)
+        df = ds.load_daily(code, "2015-01-01", "2099-12-31")
         if df is None or df.empty:
             continue
         close = df["close"].values
