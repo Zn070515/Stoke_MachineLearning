@@ -62,6 +62,8 @@ FUNDAMENTAL_COLS = [
     "debt_ratio", "gross_margin", "net_margin",
 ]
 
+VALUATION_COLS = ["pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm"]
+
 TEMPORAL_BASE_COLS = [
     "open", "high", "low", "close", "volume",
     "volume_ratio", "atr_14", "rsi_12",
@@ -158,6 +160,7 @@ class FeaturePipeline:
         use_northbound: bool = True,
         use_dragon_tiger: bool = True,
         use_fundamental: bool = True,
+        use_valuation: bool = True,
         use_etf_flow: bool = True,
         use_xueqiu: bool = True,
         use_interaction: bool = True,
@@ -190,6 +193,7 @@ class FeaturePipeline:
         self.use_northbound = use_northbound
         self.use_dragon_tiger = use_dragon_tiger
         self.use_fundamental = use_fundamental
+        self.use_valuation = use_valuation
         self.use_etf_flow = use_etf_flow
         self.use_xueqiu = use_xueqiu
         self.use_interaction = use_interaction
@@ -264,6 +268,7 @@ class FeaturePipeline:
         northbound_df: pd.DataFrame | None = None,
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
+        valuation_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
@@ -288,7 +293,7 @@ class FeaturePipeline:
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
-            dragon_tiger_df, fundamental_df, etf_flow_df,
+            dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
             announcement_df, guba_df, comment_df, xueqiu_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
@@ -405,6 +410,7 @@ class FeaturePipeline:
         northbound_df: pd.DataFrame | None = None,
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
+        valuation_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
@@ -434,6 +440,7 @@ class FeaturePipeline:
         df = self._merge_northbound(df, northbound_df)
         df = self._merge_dragon_tiger(df, dragon_tiger_df)
         df = self._merge_fundamental(df, fundamental_df)
+        df = self._merge_valuation(df, valuation_df)
         df = self._merge_etf_flow(df, etf_flow_df)
         df = self._merge_guba(df, guba_df)
         df = self._merge_comment(df, comment_df)
@@ -475,6 +482,7 @@ class FeaturePipeline:
                 MARGIN_COLS + NORTHBOUND_COLS + DRAGON_TIGER_COLS
             ))
             temporal_cols += _active_cols(df, FUNDAMENTAL_COLS)
+            temporal_cols += _active_cols(df, VALUATION_COLS)
             temporal_cols += _active_cols(df, ETF_FLOW_COLS)
             temporal_cols += _active_cols(df, GUBA_COLS)
             temporal_cols += _active_cols(df, COMMENT_COLS)
@@ -711,6 +719,24 @@ class FeaturePipeline:
             fd = fd.drop_duplicates(subset="date", keep="last")
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
+        return df
+
+    def _merge_valuation(self, df: pd.DataFrame,
+                         valuation_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not self.use_valuation:
+            return df
+        if valuation_df is None or valuation_df.empty:
+            self._warn_if_missing("valuation")
+            return df
+        vd = valuation_df.copy()
+        vd["date"] = pd.to_datetime(vd["date"])
+        vd = vd.drop_duplicates(subset="date", keep="last")
+        available = [c for c in VALUATION_COLS if c in vd.columns]
+        if not available:
+            return df
+        df = df.merge(vd[["date"] + available], on="date", how="left")
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
@@ -1153,6 +1179,7 @@ class FeaturePipeline:
                 northbound_df=stock_aux.get("northbound"),
                 dragon_tiger_df=stock_aux.get("dragon_tiger"),
                 fundamental_df=stock_aux.get("fundamental"),
+                valuation_df=stock_aux.get("valuation"),
                 etf_flow_df=stock_aux.get("etf_flow"),
                 capital_flow_df=stock_aux.get("capital_flow"),
                 block_trade_df=stock_aux.get("block_trade"),
@@ -1389,6 +1416,8 @@ _PAST_KNOWN_COLS = [
     # Fundamental (forward-filled quarterly)
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
+    # Valuation (Baostock daily PE/PB/PS/PCF)
+    "pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm",
 ] + _alpha158_factor_names()
 
 _PAST_OBSERVED_COLS = [

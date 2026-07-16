@@ -223,6 +223,16 @@ def load_aux_data(
     except Exception:
         logger.warning("Dividend data not available, skipping")
 
+    # --- Valuation (daily PE/PB/PS/PCF from Baostock) ---
+    try:
+        val_storage = MarketWideStorage(data_dir, "valuation")
+        for code in stock_list:
+            df = val_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["valuation"] = df
+    except Exception:
+        logger.warning("Valuation data not available, skipping")
+
     loaded = sum(1 for v in result.values() if v)
     logger.info("Aux data loaded for %d/%d stocks", loaded, len(stock_list))
     return result
@@ -301,6 +311,7 @@ def main():
         use_fundamental=True, use_etf_flow=True, use_xueqiu=True,
         use_capital_flow=True, use_block_trade=True,
         use_shareholder=True, use_lockup=True, use_dividend=True,
+        use_valuation=True,
         use_board=False, use_sector=False, use_concept=False,
     )
     panel_data = fp.build_panel_features(panel, aux_data=aux_data)
