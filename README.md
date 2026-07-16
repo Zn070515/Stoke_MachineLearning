@@ -50,7 +50,7 @@ stoke_ml/
 │   ├── cross_sectional/   BoardBroadcaster + SectorBroadcaster (打板/行业广播)
 │   ├── categorical/       ConceptBlockEncoder (概念板块6层编码)
 │   └── monitor/           CoverageMonitor + DriftMonitor (KS-test漂移检测)
-├── models/           XGBoost基线、LSTM、Transformer、SimpleAttention
+├── models/           TFT Panel联合训练、XGBoost基线、LSTM、Transformer、SimpleAttention
 ├── evaluation/       Walk-Forward拆分、MCC、夏普、金融指标
 └── config.py         YAML配置加载 (OmegaConf)
 ```
@@ -165,9 +165,32 @@ FeaturePipeline 支持 **14个辅助维度** (全部左连接 + ZI填充 + PIT l
 | board (打板) | `use_board` | 9 | 低 | 东方财富 |
 | concept (概念板块) | `use_concept` | 100+ | 中 | 东方财富 |
 
-**ALL config: ~600+ features × 60 seq_len = 36,000 flat dimensions.**
+**ALL config: ~600+ features × 60 seq_len = 36,000 flat dimensions (XGBoost模式).**
+
+**TFT Panel 格式**: 221 PastKnown + 29 PastObserved + 4 Static = 254 features × 60 seq_len. 跨股票截面归一化 (per-date z-score).
 
 ## 模型训练
+
+### TFT Panel 联合训练 (主力模型, RTX 4090)
+
+```bash
+# 500只股票 Panel 联合训练 (多任务: 方向+涨跌幅+波动率)
+PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --stocks 500 --horizon 5 --epochs 20 --max-folds 3
+
+# 少量股票快速测试
+PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --stocks 50 --epochs 5 --max-folds 1
+
+# 指定股票训练
+PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --stock-list 600519,000001,000858
+```
+
+TFT (Temporal Fusion Transformer) 配置:
+- **输入**: Static(4) + PastKnown(221) + PastObserved(29) × seq_len=60
+- **架构**: 2×LSTM + 4-head Multi-Head Attention + Variable Selection Network + GRN
+- **多任务**: CrossEntropy(方向3类) + AdjMSE(涨跌幅) + MSE(波动率) + RankICLoss(截面排序)
+- **损失加权**: UncertaintyLoss (Kendall et al. 2018) 自适应任务权重
+- **验证**: Purged Walk-Forward (504天训练 / 63天验证 / 63天步长 / 60天purge)
+- **评估指标**: 年化Sharpe + Spearman Rank IC (截面排序能力)
 
 ### XGBoost 基线
 
@@ -263,14 +286,18 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 | 雪球IP被WAF封禁 (aliyun) | Playwright可绕过, API仍受保护 |
 | ALL config维度爆炸 (~36,000维) | 用+sentiment替代ALL |
 | FinBERT首次加载需网络或预缓存模型 | 设 `HF_ENDPOINT=https://hf-mirror.com` |
-| 消融Δ CIs跨零 (需>100 stocks或更强信号) | 活跃研究中 |
+| 消融Δ CIs跨零 (需>100 stocks或更强信号) | TFT panel联合训练解决 |
 | EastMoney push2his 资金流向API下线 (2026-07) | 已切换至新浪财经 (仅总净额, 无分层) |
 | BERTopic 依赖链 (umap/hdbscan/sentence-transformers) | 可选安装, 缺失时降级为TF-IDF |
 | Playwright browser 在WAF绕过时可能无限挂起 | `threading.Timer(timeout, os._exit)` 硬杀 |
+| TFT UncertaintyLoss 收敛后 train loss 变负 | 正常 (log_var → ln(task_loss)), 已收紧clamp |
+| TFT multi-horizon Sharpe 年化虚高 | 已修复: stride=horizon去重叠 + sqrt(252/horizon)年化 |
 
 ## 设计文档
 
 - [股票预测系统设计](docs/superpowers/specs/2026-06-19-stock-prediction-design.md)
+- [TFT Panel 联合训练设计](docs/superpowers/specs/2026-07-15-tft-panel-training-design.md)
+- [TFT Panel 实施计划](docs/superpowers/plans/2026-07-15-tft-panel-training-plan.md)
 - [预处理系统重构设计](docs/superpowers/specs/2026-07-01-preprocessing-redesign-design.md)
 - [预处理重构实施计划](docs/superpowers/plans/2026-07-01-preprocessing-redesign-plan.md)
 - [新闻管道最佳实践研究](docs/research/news-pipeline-best-practices.md)
