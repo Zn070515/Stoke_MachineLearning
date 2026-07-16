@@ -464,6 +464,11 @@ class FeaturePipeline:
         df = self._merge_macro(df, macro_df)
         df = self._merge_industry(df, industry_df)
 
+        # Defragment after ~17 merge calls — each merge adds new columns,
+        # and subsequent df["col"] assignments on fragmented frames trigger
+        # PerformanceWarning from pandas.
+        df = df.copy()
+
         if self.use_technical:
             df = self._ti.compute_all(df)
         if self.use_scoring:
@@ -951,9 +956,9 @@ class FeaturePipeline:
                 df = df.merge(ind_ret_df, on="date", how="left")
                 # Stock vs industry excess return (computable before lag)
                 if "pct_change" in df.columns:
-                    df["stock_vs_industry"] = (
+                    df[["stock_vs_industry"]] = (
                         df["pct_change"] - df["ind_matched_return"].fillna(0.0)
-                    ).astype(np.float32)
+                    ).to_frame().astype(np.float32)
                 # PIT lag + fill for industry-matched columns
                 _batch_fill_shift(df, ["ind_matched_return", "stock_vs_industry"])
 
