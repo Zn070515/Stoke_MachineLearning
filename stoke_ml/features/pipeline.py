@@ -122,7 +122,7 @@ CONCEPT_COLS = [
 INDUSTRY_COLS = [
     "ind_pct_up", "ind_return_mean", "ind_return_std",
     "ind_return_max", "ind_return_min", "ind_return_skew",
-    "ind_dispersion_20d",
+    "ind_dispersion_20d", "ind_matched_return", "stock_vs_industry",
 ]
 
 MACRO_COLS = [
@@ -978,16 +978,18 @@ class FeaturePipeline:
 
     def _merge_industry(self, df: pd.DataFrame,
                         industry_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        """Merge cross-sectional industry stats (no per-stock mapping needed)."""
+        """Merge industry-level and stock-vs-industry relative features."""
         if not self.use_industry:
             return df
         if industry_df is None:
             industry_df = self._industry_cache
             if industry_df is None:
+                import json
                 import os
                 from stoke_ml.config import load_config
                 cfg = load_config()
-                path = os.path.join(cfg.project.data_dir, "a_shares", "industry", "industry_returns.parquet")
+                ind_dir = os.path.join(cfg.project.data_dir, "a_shares", "industry")
+                path = os.path.join(ind_dir, "industry_returns.parquet")
                 if not os.path.exists(path):
                     self._warn_if_missing("industry")
                     return df
@@ -1006,9 +1008,17 @@ class FeaturePipeline:
                 industry_df["ind_dispersion_20d"] = (
                     industry_df["ind_return_std"].rolling(20).std().fillna(0.0)
                 )
-                for col in INDUSTRY_COLS:
+                for col in [c for c in INDUSTRY_COLS if c in industry_df.columns]:
                     industry_df[col] = industry_df[col].astype(np.float32)
                 self._industry_cache = industry_df
+                # Cache sector map and raw industry returns for per-stock features
+                self._industry_returns = raw
+                sm_path = os.path.join(ind_dir, "sector_map.json")
+                if os.path.exists(sm_path):
+                    with open(sm_path, "r", encoding="utf-8") as f:
+                        self._sector_map = json.load(f)
+                else:
+                    self._sector_map = {}
         if industry_df.empty:
             return df
         ind = industry_df.copy()
@@ -1016,6 +1026,33 @@ class FeaturePipeline:
         available = [c for c in INDUSTRY_COLS if c in ind.columns]
         if not available:
             return df
+
+        # -- Per-stock industry-relative features (if sector_map loaded) --
+        sm = getattr(self, "_sector_map", {})
+        ir = getattr(self, "_industry_returns", None)
+        if sm and ir is not None and "stock_code" in df.columns:
+            stock_code = str(df["stock_code"].iloc[0]) if len(df) > 0 else ""
+            ind_name = sm.get(stock_code, "")
+            if ind_name and ind_name in ir.columns:
+                ind_ret = ir[ind_name].copy()
+                ind_ret_df = pd.DataFrame({
+                    "date": pd.to_datetime(ir.index),
+                    "ind_matched_return": ind_ret.values,
+                })
+                ind_ret_df["date"] = pd.to_datetime(ind_ret_df["date"])
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.merge(ind_ret_df, on="date", how="left")
+                df["ind_matched_return"] = (
+                    df["ind_matched_return"].fillna(0.0).astype(np.float32)
+                )
+                # Stock vs industry excess return
+                if "pct_change" in df.columns:
+                    df["stock_vs_industry"] = (
+                        df["pct_change"] - df["ind_matched_return"]
+                    ).astype(np.float32)
+                df["ind_matched_return"] = df["ind_matched_return"].shift(1)
+                df["ind_matched_return"] = df["ind_matched_return"].fillna(0.0).astype(np.float32)
+
         df = df.merge(ind[["date"] + available], on="date", how="left")
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)

@@ -463,6 +463,7 @@ def _download_industry_ranking(data_dir, args):
     df = source.fetch_batch(args.start, args.end)
 
     if not df.empty:
+        df = df.rename(columns={"code": "stock_code"})
         storage = MarketWideStorage(data_dir, "industry_ranking")
         storage.save(df)
         logger.info("  industry_ranking: %d rows saved (%.1fs)",
