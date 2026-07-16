@@ -53,8 +53,8 @@ def main():
                         help="Start date filter YYYY-MM-DD (default: 2015-01-01)")
     parser.add_argument("--end", type=str, default=None,
                         help="End date filter YYYY-MM-DD (default: today)")
-    parser.add_argument("--max-pages", type=int, default=10,
-                        help="Pages per stock, ~80 posts/page (default: 10)")
+    parser.add_argument("--max-pages", type=int, default=500,
+                        help="Pages per stock, ~80 posts/page (default: 500, reaches ~2019 for avg stock)")
     parser.add_argument("--sleep", type=float, default=None,
                         help="Seconds between stocks (default: from config)")
     parser.add_argument("--skip-sentiment", action="store_true",
@@ -97,16 +97,37 @@ def main():
     total_posts = 0
     success, fail, empty, skipped = 0, 0, 0, 0
 
-    # Resume: skip stocks already on disk
+    # Resume: only skip stocks whose raw data already covers back to start_date.
+    # If the existing file only has recent posts (from a shallow earlier run),
+    # delete it and re-download with full depth.
+    import pandas as pd
+    start_ts = pd.Timestamp(args.start)
     pending = []
     for code in codes:
         raw_path = os.path.join(data_dir, "a_shares", "guba_raw", f"{code}.parquet")
         if os.path.exists(raw_path):
-            skipped += 1
-        else:
-            pending.append(code)
+            try:
+                existing = pd.read_parquet(raw_path)
+                if not existing.empty and "date" in existing.columns:
+                    existing_dates = pd.to_datetime(existing["date"], errors="coerce")
+                    oldest = existing_dates.min()
+                    if pd.notna(oldest) and oldest <= start_ts:
+                        skipped += 1
+                        continue
+                logger.info("  %s: existing data incomplete (oldest=%s < %s), re-downloading",
+                            code,
+                            str(existing_dates.min().date()) if not existing_dates.empty and pd.notna(existing_dates.min()) else "N/A",
+                            args.start)
+                os.remove(raw_path)
+            except Exception:
+                logger.debug("  %s: could not read existing file, re-downloading", code)
+                try:
+                    os.remove(raw_path)
+                except Exception:
+                    pass
+        pending.append(code)
     if skipped:
-        logger.info("Skipping %d stocks already on disk, %d remaining", skipped, len(pending))
+        logger.info("Skipping %d stocks with complete data, %d remaining", skipped, len(pending))
     codes = pending
 
     # Shared save function used by both paths
