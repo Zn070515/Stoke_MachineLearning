@@ -53,5 +53,5 @@ class TestPanelDataset:
         assert pk.shape == (4, 60, 20)
         assert po.shape == (4, 60, 12)
         assert y_dir.shape == (4,)
-        assert y_ret.shape == (4, 1)
-        assert y_vol.shape == (4, 1)
+        assert y_ret.shape == (4,)
+        assert y_vol.shape == (4,)

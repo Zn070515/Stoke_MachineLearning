@@ -26,7 +26,7 @@ class TestTFTModel:
 
         direction, ret, vol = self.model(static, past_known, past_obs)
 
-        assert direction.shape == (B, 2)
+        assert direction.shape == (B, 3)
         assert ret.shape == (B, 1)
         assert vol.shape == (B, 1)
         assert (vol >= 0).all()
