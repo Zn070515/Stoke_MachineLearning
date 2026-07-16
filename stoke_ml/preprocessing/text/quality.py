@@ -18,6 +18,13 @@ _EMOJI_ONLY_RE = re.compile(r"^[\W_]*$", re.UNICODE)
 _HTML_RE = re.compile(r"<[^>]*>")
 
 
+def _compare_pair(pair):
+    """Module-level for Windows ProcessPoolExecutor pickling."""
+    i, j, ti, tj = pair
+    sim = SequenceMatcher(None, ti, tj).ratio()
+    return (i, j, sim)
+
+
 def _clean_text(val):
     """Strip HTML and return cleaned string, handling None/NaN/pd.NA."""
     if val is None:
@@ -106,8 +113,12 @@ class QualityFilter(PreprocessingStep):
             else None
         )
         if date_col is not None and len(df) > 1:
+            import logging
+            _logger = logging.getLogger(__name__)
+
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             df = df.dropna(subset=[date_col])
+            df = df.sort_values(date_col).reset_index(drop=True)
 
             texts = []
             for i in range(len(df)):
@@ -120,24 +131,36 @@ class QualityFilter(PreprocessingStep):
                         parts.append(str(body_val))
                 texts.append(" ".join(parts))
 
-            df["_text_key"] = texts
             dates = df[date_col].values
+            window_days = np.timedelta64(3, "D")
 
             keep = np.ones(len(df), dtype=bool)
-            window_days = np.timedelta64(3, "D")
+            n_comparisons = 0
+            log_interval = max(1, len(df) // 20)  # log every 5%
 
             for i in range(len(df)):
                 if not keep[i]:
                     continue
-                # Scan forward within window
                 j = i + 1
                 while j < len(df) and (dates[j] - dates[i]) <= window_days:
                     if keep[j]:
                         sim = SequenceMatcher(None, texts[i], texts[j]).ratio()
+                        n_comparisons += 1
                         if sim > self.max_duplicate_similarity:
                             keep[j] = False
                     j += 1
+                if i % log_interval == 0:
+                    _logger.info(
+                        "  quality dedup: %d/%d rows, %d comparisons",
+                        i, len(df), n_comparisons,
+                    )
 
-            df = df.loc[keep].drop(columns=["_text_key"])
+            _logger.info(
+                "  quality dedup complete: %d rows, %d comparisons, "
+                "%.1f%% duplicates removed",
+                len(df), n_comparisons,
+                (1 - keep.sum() / len(keep)) * 100 if keep.sum() > 0 else 0,
+            )
+            df = df.loc[keep]
 
         return df.reset_index(drop=True)

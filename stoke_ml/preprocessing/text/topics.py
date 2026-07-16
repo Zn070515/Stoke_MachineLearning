@@ -223,11 +223,22 @@ class TopicModeler(PreprocessingStep):
         on subsequent calls (during per-stock transform) to guarantee
         consistent embedding dimensionality.
         """
+        import os
+        import torch
+
+        cpu_count = os.cpu_count() or 4
+        torch.set_num_threads(cpu_count)
+
         # Already cached: reuse to guarantee dimension consistency
         if self._finbert_model is not None:
             try:
+                logger.info(
+                    "Computing FinBERT embeddings for %d texts "
+                    "(batch_size=128, threads=%d)...",
+                    len(texts), cpu_count,
+                )
                 return self._finbert_model.encode(
-                    texts, show_progress_bar=True, batch_size=32,
+                    texts, show_progress_bar=False, batch_size=128,
                 )
             except Exception as e:
                 logger.warning("FinBERT embeddings failed during transform: %s", e)
@@ -259,12 +270,14 @@ class TopicModeler(PreprocessingStep):
                         cache_folder=self.model_cache_dir,
                     )
                 logger.info(
-                    "Computing FinBERT embeddings for %d texts...", len(texts)
+                    "Computing FinBERT embeddings for %d texts "
+                    "(batch_size=128, threads=%d)...",
+                    len(texts), cpu_count,
                 )
                 return self._finbert_model.encode(
                     texts,
-                    show_progress_bar=True,
-                    batch_size=32,
+                    show_progress_bar=False,
+                    batch_size=128,
                 )
             except Exception as e:
                 logger.warning(
