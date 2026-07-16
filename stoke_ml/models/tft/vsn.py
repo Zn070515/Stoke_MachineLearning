@@ -30,17 +30,21 @@ class VariableSelectionNetwork(nn.Module):
         self.input_dim = input_dim
         weight_hidden = max(hidden_dim // 4, 8)
 
+        # Scale initialization by 1/sqrt(num_features) so that the weighted
+        # sum over features has roughly unit variance regardless of N.
+        init_scale = (num_features ** -0.5) if num_features > 0 else 1.0
+
         if input_dim == 1:
             # Scalar path — memory efficient
-            # Weight net: per-feature learnable basis for value→weight mapping
             self.weight_basis = nn.Parameter(
-                torch.randn(num_features, weight_hidden) * 0.02
+                torch.randn(num_features, weight_hidden) * 0.02 * init_scale
             )
-            self.weight_bias = nn.Parameter(torch.zeros(num_features, weight_hidden))
+            self.weight_bias = nn.Parameter(
+                torch.zeros(num_features, weight_hidden)
+            )
             self.weight_out = nn.Linear(weight_hidden, 1)
-            # Feature embeddings: each scalar feature → hidden_dim via embedding * value
             self.feat_emb = nn.Parameter(
-                torch.randn(num_features, hidden_dim) * 0.02
+                torch.randn(num_features, hidden_dim) * 0.02 * init_scale
             )
         else:
             # Dense path for non-scalar inputs
@@ -69,7 +73,13 @@ class VariableSelectionNetwork(nn.Module):
             return self._forward_dense(x, context, B, T, N, D)
 
     def _forward_scalar(self, x, context, B, T, N):
-        """Efficient path for D=1: no (B*T*N, hidden) intermediates."""
+        """Memory-efficient path for D=1.
+
+        Avoids materializing the full (B,T,N,H) tensor by chunking over
+        the feature dimension N.  When N is large (e.g. 200+ features),
+        the naive outer product would need B*T*N*H*4 bytes — easily >20 GB
+        on a 24 GB GPU.
+        """
         x_val = x.squeeze(-1)  # (B, T, N)
 
         # Weight: map each scalar through per-feature basis
@@ -79,11 +89,25 @@ class VariableSelectionNetwork(nn.Module):
         w = self.weight_out(w).squeeze(-1)  # (B, T, N)
         weights = F.softmax(w, dim=-1)  # (B, T, N)
 
-        # Feature representations: (B,T,N,H) via broadcasting
-        features = x_val.unsqueeze(-1) * self.feat_emb  # (B,T,N,H)
+        # Chunked feature combination — each chunk adds its contribution
+        # to the weighted sum directly, so we never hold all (B,T,N,H).
+        H = self.feat_emb.shape[1]
+        combined = torch.zeros(B, T, H, device=x.device, dtype=x.dtype)
 
-        # Weighted sum → (B,T,H)
-        combined = (features * weights.unsqueeze(-1)).sum(dim=2)  # (B, T, H)
+        # Size each chunk so its intermediate fits within ~1 GB.
+        # (B * T * C * H * 4) ≤ 1 GB  →  C ≤ 1GB / (B*T*H*4)
+        max_chunk_bytes = 1 * 1024 ** 3
+        elem_bytes = 4
+        max_chunk = max(1, max_chunk_bytes // (B * T * H * elem_bytes))
+        chunk_size = min(max_chunk, 64)
+
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            x_c = x_val[:, :, start:end]                     # (B, T, C)
+            e_c = self.feat_emb[start:end]                    # (C, H)
+            f_c = x_c.unsqueeze(-1) * e_c                     # (B, T, C, H)
+            w_c = weights[:, :, start:end]                    # (B, T, C)
+            combined += (f_c * w_c.unsqueeze(-1)).sum(dim=2)  # (B, T, H)
 
         # Output GRN
         combined_flat = combined.reshape(B * T, -1)

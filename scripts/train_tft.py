@@ -112,7 +112,7 @@ def load_aux_data(
     try:
         fs = FundamentalStorage(data_dir)
         for code in stock_list:
-            df = fs.build_features(code, start_date, end_date)
+            df = fs.load(code, "2010-01-01", end_date)
             if df is not None and not df.empty:
                 result[code]["fundamental"] = df
     except Exception:
@@ -125,17 +125,17 @@ def load_aux_data(
 
 def main():
     parser = argparse.ArgumentParser(description="Train TFT panel model")
-    parser.add_argument("--stocks", type=int, default=None,
+    parser.add_argument("--stocks", type=int, default=100,
                         help="Limit to first N stocks")
     parser.add_argument("--stock-list", type=str, default=None,
                         help="Comma-separated stock codes")
     parser.add_argument("--start", type=str, default="2015-01-01")
     parser.add_argument("--end", type=str, default=None)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-folds", type=int, default=3,
                         help="Limit number of walk-forward folds (default: 3)")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
@@ -217,9 +217,11 @@ def main():
         learning_rate=args.lr,
         max_epochs=args.epochs,
         compile_model=not args.no_compile,
+        num_workers=8,
     )
-    logger.info("TFT config: hidden=%d batch=%d lr=%.1e",
-                config.hidden_dim, config.batch_size, config.learning_rate)
+    logger.info("TFT config: hidden=%d layers=%d heads=%d batch=%d lr=%.1e",
+                config.hidden_dim, config.lstm_layers, config.attention_heads,
+                config.batch_size, config.learning_rate)
 
     # Purged walk-forward splits
     train_len = 504

@@ -1044,6 +1044,10 @@ class FeaturePipeline:
                 concept_df=stock_aux.get("concept"),
                 skip_temporal=True,  # TFT LSTM learns temporal patterns natively
             )
+            # Calendar features are normally added by the temporal path;
+            # we still want them when skip_temporal=True (TFT benefits from
+            # day-of-week/month/quarter signals for seasonality).
+            feats = add_calendar_features(feats)
             all_feat_dfs.append(feats)
 
         # Find common max length
@@ -1150,6 +1154,18 @@ class FeaturePipeline:
             for t in range(6, T_i):
                 y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))  # ret_1d[t-5:t] excludes ret_1d[t]
 
+        # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
+        # Alpha158 factors can produce Inf from near-zero divisors (e.g.
+        # open0 = open/close with close≈0 for suspended stocks).  The z-score
+        # normalization also amplifies tiny variance features.
+        pk_arr = np.nan_to_num(pk_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        pk_arr = np.clip(pk_arr, -10.0, 10.0)
+        po_arr = np.nan_to_num(po_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        po_arr = np.clip(po_arr, -10.0, 10.0)
+        static_arr = np.nan_to_num(static_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        y_ret_arr = np.nan_to_num(y_ret_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        y_vol_arr = np.nan_to_num(y_vol_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
         return {
             "static_features": static_arr,
             "past_known": pk_arr,
@@ -1166,34 +1182,106 @@ _STATIC_FEATURE_COLS = [
     "market_cap_quantile",
 ]
 
+# Alpha158 rolling-window factor name generator.
+# Must stay in sync with _WINDOWS in stoke_ml/features/technical.py.
+_ALPHA158_WINDOWS = [5, 10, 20, 30, 60]
+
+
+def _alpha158_factor_names() -> list[str]:
+    """Return Alpha158 rolling-window factor column names for all windows."""
+    names: list[str] = []
+    for d in _ALPHA158_WINDOWS:
+        names.extend([
+            f"max_{d}d", f"min_{d}d", f"qtlu_{d}d", f"qtld_{d}d",
+            f"rank_{d}d", f"rsv_{d}d",
+            f"corr_{d}d", f"cord_{d}d",
+            f"beta_{d}d", f"rsqr_{d}d", f"resi_{d}d",
+            f"vma_{d}d", f"vstd_{d}d",
+            f"cntp_{d}d", f"cntn_{d}d", f"cntd_{d}d",
+            f"sump_{d}d", f"sumn_{d}d", f"sumd_{d}d",
+            f"imax_{d}d", f"imin_{d}d", f"imxd_{d}d",
+            f"wvma_{d}d", f"vsump_{d}d", f"vsumn_{d}d", f"vsumd_{d}d",
+        ])
+    return names
+
+
 _PAST_KNOWN_COLS = [
+    # OHLCV
     "open", "high", "low", "close", "volume",
+    # Moving averages
     "ma_5", "ma_10", "ma_20", "ma_60", "ma_120",
-    "ema_12", "ema_26", "macd", "macd_signal", "macd_hist",
+    "ema_12", "ema_26",
+    # MACD
+    "macd_dif", "macd_dea", "macd_hist",
+    # RSI
     "rsi_6", "rsi_12", "rsi_24",
-    "kdj_k", "kdj_d", "kdj_j",
-    "boll_pct_b", "atr_14",
-    "roc_10", "willr_14", "cci_14", "obv",
-    "volume_ratio_5", "volume_ratio_20",
-    "day_of_week", "day_of_month", "month", "quarter",
+    # KDJ (9-day and 14-day)
+    "kdj_k_9", "kdj_d_9", "kdj_j_9",
+    "kdj_k_14", "kdj_d_14", "kdj_j_14",
+    # Bollinger Bands
+    "boll_mid", "boll_upper", "boll_lower", "boll_pct",
+    # ATR
+    "atr_14",
+    # ROC
+    "roc_6", "roc_12", "roc_20",
+    # Williams %R
+    "wr_10", "wr_20",
+    # CCI
+    "cci_14", "cci_20",
+    # Historical volatility
+    "vol_5", "vol_20",
+    # Volume
+    "volume_ma5", "volume_ratio", "vol_up_ratio_20", "obv",
+    # Amount (conditional on availability)
+    "amount_ma5", "amount_ratio", "turnover_proxy",
+    # K-bar microstructural (Alpha158 K-series, 9 factors)
+    "kmid", "klen", "kmid2", "kup", "kup2",
+    "klow", "klow2", "ksft", "ksft2",
+    # Price standardization (Alpha158, 3 factors)
+    "open0", "high0", "low0",
+    # ADX family (trend strength)
+    "adx", "adxr", "pdi", "mdi",
+    # MFI / CMO / TRIX
+    "mfi_14", "cmo_14", "trix",
+    # Microstructure
     "is_limit_up", "is_limit_down", "gap_up_pct", "gap_down_pct",
-    "volume_anomaly", "limit_up_streak",
+    "volume_ratio_20", "volume_anomaly", "limit_up_streak",
+    # Calendar
+    "day_of_week", "day_of_month", "month", "quarter",
     # Fundamental (forward-filled quarterly)
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
-]
+] + _alpha158_factor_names()
 
 _PAST_OBSERVED_COLS = [
+    # Sentiment (news)
     "sentiment_mean", "sentiment_std", "news_count",
     "positive_ratio", "negative_ratio",
+    # Guba
     "guba_sentiment_mean", "guba_sentiment_std",
+    "guba_positive_ratio", "guba_negative_ratio", "guba_post_count",
+    # Xueqiu
     "xueqiu_sentiment_mean", "xueqiu_sentiment_std",
-    "comment_score", "comment_attention",
+    "xueqiu_positive_ratio", "xueqiu_negative_ratio", "xueqiu_post_count",
+    # Comment
+    "comment_score", "comment_attention", "comment_institution", "comment_trend",
+    # Announcement
     "ann_sentiment_mean", "ann_sentiment_std",
-    "main_net", "margin_net", "north_net_buy",
-    "lhb_net_amount", "sector_etf_flow",
+    # Margin
+    "margin_balance", "margin_buy", "short_balance", "margin_net",
+    # Northbound
+    "north_hold_pct", "north_net_buy",
+    # Dragon Tiger
+    "lhb_net_amount", "lhb_buy_ratio",
+    # ETF flow
+    "sector_etf_flow", "sector_etf_amount",
+    # Capital flow
     "flow_intensity", "flow_z", "flow_momentum",
-    "board_momentum_mean", "board_momentum_max",
+    # Board
+    "is_zt", "is_zb", "board_height_20d", "seal_strength",
+    # Sector
+    "sector_relative_strength", "sector_breadth_z",
+    # Concept
     "avg_concept_heat", "is_concept_leader",
 ]
 
