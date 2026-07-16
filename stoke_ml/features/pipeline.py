@@ -222,9 +222,15 @@ class FeaturePipeline:
         self._interaction = InteractionFeatures()
 
     def _warn_if_missing(self, key: str) -> None:
-        """Emit one-time warning when use_*=True but no data was passed."""
+        """Emit one-time debug log when use_*=True but no data was passed.
+
+        Many data types (lockup, shareholder, block_trade, etc.) are sparse
+        by nature — only a subset of stocks or dates have records.  This is
+        expected, not a problem, so we log at DEBUG instead of WARNING to
+        avoid noise during training runs.
+        """
         if key not in self._warned_missing:
-            logger.warning("use_%s=True but no %s data provided", key, key)
+            logger.debug("use_%s=True but no %s data for this stock", key, key)
             self._warned_missing.add(key)
 
     # ------------------------------------------------------------------
@@ -1070,19 +1076,22 @@ class FeaturePipeline:
     def _add_microstructure(df: pd.DataFrame) -> pd.DataFrame:
         """Add market microstructure features from OHLCV data.
 
-        Adds: limit_up, limit_down, gap_up_pct, gap_down_pct,
-        volume_ratio_20, turnover_anomaly.
+        Computes limit-up/down signals and seal quality proxies from K-line
+        alone — no dependency on limit-up pool data (which only covers ~2
+        weeks via EastMoney push2ex).
         """
         df = df.copy()
         close = df.get("close")
         _open = df.get("open")
+        high = df.get("high")
+        low = df.get("low")
         volume = df.get("volume")
         if close is None:
             return df
 
         prev_close = close.shift(1)
 
-        # Limit up/down (A-share: 10% daily limit)
+        # Limit up/down (A-share: ±10% daily limit; STAR/GEM: ±20%)
         pct = (close - prev_close) / prev_close.replace(0, np.nan)
         df["is_limit_up"] = (pct >= 0.098).astype(np.float32)
         df["is_limit_down"] = (pct <= -0.098).astype(np.float32)
@@ -1092,6 +1101,22 @@ class FeaturePipeline:
             gap = (_open - prev_close) / prev_close.replace(0, np.nan)
             df["gap_up_pct"] = gap.clip(lower=0).fillna(0).astype(np.float32)
             df["gap_down_pct"] = (-gap).clip(lower=0).fillna(0).astype(np.float32)
+
+        # Seal quality proxies (no pool data needed)
+        if high is not None and low is not None:
+            is_up = df["is_limit_up"] > 0
+            # One-word board (一字板): limit-up with open==high==low==close
+            df["is_one_word_board"] = (
+                is_up & (_open == high) & (high == low) & (low == close)
+            ).astype(np.float32)
+            # Seal quality on limit-up days: close/high ratio
+            # 1.0 = sealed at day high (strong), < 1.0 = retreated from high
+            seal_q = np.where(
+                is_up & (high > 0),
+                (close / high.replace(0, np.nan)).clip(0, 1),
+                0.0,
+            )
+            df["seal_quality"] = seal_q.astype(np.float32)
 
         # Volume anomaly: ratio of current volume to 20-day median
         if volume is not None:
@@ -1108,6 +1133,14 @@ class FeaturePipeline:
             .groupby((df["is_limit_up"] == 0).cumsum())
             .cumsum()
             .astype(np.float32)
+        )
+
+        # Rolling limit-up count (short-term momentum proxy)
+        df["limit_up_count_5d"] = (
+            df["is_limit_up"].rolling(5, min_periods=1).sum().astype(np.float32)
+        )
+        df["limit_up_count_20d"] = (
+            df["is_limit_up"].rolling(20, min_periods=5).sum().astype(np.float32)
         )
 
         return df
@@ -1132,6 +1165,16 @@ class FeaturePipeline:
         close = feat_df[target_col].values
         ret = (close[self.horizon:] - close[: -self.horizon]) / (close[: -self.horizon] + 1e-8)
         target = np.where(ret > 0.003, 2, np.where(ret < -0.003, 0, 1))
+        # Bias correction: mask untradable limit-up/down labels.
+        # Uses 1-day returns for the 9.5% check — the A-share ±10% limit is a
+        # 1-day concept; horizon returns can cross 9.5% over multiple days
+        # without ever hitting a limit board.
+        LIMIT_THRESHOLD = 0.095
+        ret_1d = (close[1:] - close[:-1]) / (close[:-1] + 1e-8)
+        ret_1d_aligned = ret_1d[: len(ret)]  # same start index as horizon ret
+        zt = (ret_1d_aligned > LIMIT_THRESHOLD) & (target == 2)
+        dt = (ret_1d_aligned < -LIMIT_THRESHOLD) & (target == 0)
+        target[zt | dt] = -100  # PyTorch CE ignore_index
 
         price_cols = ["open", "high", "low", "close", "date"]
         X_cols = [c for c in feat_df.columns if c not in price_cols]
@@ -1155,6 +1198,7 @@ class FeaturePipeline:
 
         y = target[self.seq_len - 1: self.seq_len - 1 + n_samples]
         aligned_close = close[self.seq_len - 1: self.seq_len - 1 + n_samples + 1]
+
         return X, y, aligned_close.astype(np.float32)
 
     def _get_sample_dates(self, feats: pd.DataFrame) -> np.ndarray:
@@ -1232,6 +1276,10 @@ class FeaturePipeline:
             # we still want them when skip_temporal=True (TFT benefits from
             # day-of-week/month/quarter signals for seasonality).
             feats = add_calendar_features(feats)
+            # Defragment after many df["col"] = ... assignments in merge methods.
+            # Without this, pandas emits PerformanceWarning and slows down
+            # subsequent operations.
+            feats = feats.copy()
             all_feat_dfs.append(feats)
 
         # Align columns across all stocks — sparse data types (dragon_tiger,
@@ -1242,15 +1290,23 @@ class FeaturePipeline:
             for df in all_feat_dfs:
                 all_cols.update(df.columns)
             for i, df in enumerate(all_feat_dfs):
-                for col in all_cols - set(df.columns):
-                    if col.startswith("has_"):
-                        df[col] = False
-                    elif col == "date":
+                missing = all_cols - set(df.columns)
+                if not missing:
+                    continue
+                fill_data: dict[str, np.ndarray] = {}
+                n = len(df)
+                for col in missing:
+                    if col == "date":
                         continue
+                    elif col.startswith("has_"):
+                        fill_data[col] = np.full(n, False)
                     elif col.endswith("_count") or col.endswith("_streak"):
-                        df[col] = 0
+                        fill_data[col] = np.zeros(n, dtype=np.int16)
                     else:
-                        df[col] = np.float32(0.0)
+                        fill_data[col] = np.zeros(n, dtype=np.float32)
+                if fill_data:
+                    fill_df = pd.DataFrame(fill_data, index=df.index)
+                    all_feat_dfs[i] = pd.concat([df, fill_df], axis=1)
 
         # Find common max length
         lengths = [len(df) for df in all_feat_dfs]
@@ -1267,23 +1323,13 @@ class FeaturePipeline:
         pk_cols_available = [c for c in _PAST_KNOWN_COLS if c in first_df.columns]
         po_cols_available = [c for c in _PAST_OBSERVED_COLS if c in first_df.columns]
 
-        # Compute market_cap_quantile if not present (size proxy from avg close)
-        if "market_cap_quantile" not in first_df.columns:
-            stock_avg_closes = {}
-            for i, df in enumerate(all_feat_dfs):
-                if len(df) > 0 and "close" in df.columns:
-                    # Use first 20 days average as size proxy — zero look-ahead
-                    stock_avg_closes[codes[i]] = df["close"].iloc[:min(20, len(df))].mean()
-            if stock_avg_closes:
-                all_avgs = np.array(list(stock_avg_closes.values()))
-                quantiles = np.searchsorted(
-                    np.sort(all_avgs), all_avgs
-                ).astype(np.float32) / len(all_avgs)
-                cap_map = {c: q for c, q in zip(stock_avg_closes.keys(), quantiles)}
-                for i, df in enumerate(all_feat_dfs):
-                    df["market_cap_quantile"] = cap_map.get(codes[i], 0.5)
-                static_cols_available = [c for c in _STATIC_FEATURE_COLS
-                                         if c in first_df.columns or c in all_feat_dfs[0].columns]
+        # Compute static features from first 20 days (zero look-ahead bias).
+        # Stock-invariant characteristics — size, liquidity, risk, price tier.
+        static_needed = [c for c in _STATIC_FEATURE_COLS if c not in first_df.columns]
+        if static_needed:
+            _compute_static_quantiles(all_feat_dfs, codes, static_needed)
+            static_cols_available = [c for c in _STATIC_FEATURE_COLS
+                                     if c in first_df.columns or c in all_feat_dfs[0].columns]
 
         # ── Per-date cross-sectional z-score normalization ──
         # Normalize each feature across stocks within each date, so that
@@ -1324,6 +1370,7 @@ class FeaturePipeline:
         y_dir_arr = np.zeros((N, max_T), dtype=np.int64)
         y_ret_arr = np.zeros((N, max_T), dtype=np.float32)
         y_vol_arr = np.zeros((N, max_T), dtype=np.float32)
+        stock_T = np.zeros(N, dtype=np.int32)  # actual per-stock length
 
         for i, df in enumerate(all_feat_dfs):
             if len(df) == 0:
@@ -1331,6 +1378,7 @@ class FeaturePipeline:
 
             df = df.sort_values("date").reset_index(drop=True)
             T_i = min(len(df), max_T)
+            stock_T[i] = T_i
 
             # Static: take first row values
             if static_dim > 0:
@@ -1356,6 +1404,29 @@ class FeaturePipeline:
             for t in range(6, T_i):
                 y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))  # ret_1d[t-5:t] excludes ret_1d[t]
 
+        # ── Limit-up/down bias correction ──
+        # On days where a stock hits limit-up, positive returns are
+        # untradable — you cannot enter a buy position.  On limit-down
+        # days, negative returns are untradable.  Both should be ignored
+        # during training so the model does not learn fake alpha.
+        # Uses return-threshold heuristic (|ret| > 9.5%) as universal
+        # fallback — works even without board features enabled.
+        # Reference: ml-quant-trading bias.py (see docs/research-findings.md §6.9).
+        LIMIT_THRESHOLD = 0.095
+        T_max = y_dir_arr.shape[1]
+        for i in range(N):
+            T_i = int(stock_T[i])
+            if T_i < 2:
+                continue
+            ret = y_ret_arr[i, :T_i]
+            # ZT day: return ≈ +9.5% or higher → masked if UP label (class 2)
+            zt_mask = (ret > LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 2)
+            # DT day: return ≈ -9.5% or lower → masked if DOWN label (class 0)
+            dt_mask = (ret < -LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 0)
+            full_mask = np.zeros(T_max, dtype=bool)
+            full_mask[:T_i] = zt_mask | dt_mask
+            y_dir_arr[i, full_mask] = -100  # PyTorch CE ignore_index
+
         # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
         # Alpha158 factors can produce Inf from near-zero divisors (e.g.
         # open0 = open/close with close≈0 for suspended stocks).  The z-score
@@ -1380,8 +1451,75 @@ class FeaturePipeline:
 
 # ── TFT feature column definitions ──────────────────────────────────────
 
+
+def _compute_static_quantiles(
+    all_feat_dfs: list[pd.DataFrame],
+    codes: list[str],
+    needed: list[str],
+) -> None:
+    """Compute stock-invariant quantile features from first 20 days.
+
+    Mutates all_feat_dfs in-place.  Uses only the first 20 data points per stock
+    so there is zero forward-looking bias — characteristics valid at any timestamp.
+    """
+    n = len(all_feat_dfs)
+    first_n = 20
+
+    def _quantile_map(values: np.ndarray) -> dict[str, float]:
+        sorted_vals = np.sort(values)
+        q = np.searchsorted(sorted_vals, values).astype(np.float32) / len(values)
+        return {c: round(float(q[i]), 6) for i, c in enumerate(codes)}
+
+    # Extract per-stock statistics from the first 20-day window
+    if "market_cap_quantile" in needed:
+        raw = np.array([
+            all_feat_dfs[i]["close"].iloc[:min(first_n, len(all_feat_dfs[i]))].mean()
+            if len(all_feat_dfs[i]) > 0 and "close" in all_feat_dfs[i].columns else 0.0
+            for i in range(n)
+        ], dtype=np.float32)
+        cap_map = _quantile_map(raw)
+        for i, df in enumerate(all_feat_dfs):
+            df["market_cap_quantile"] = cap_map.get(codes[i], 0.5)
+
+    if "liquidity_quantile" in needed:
+        raw = np.zeros(n, dtype=np.float32)
+        for i, df in enumerate(all_feat_dfs):
+            if len(df) > 0 and "volume" in df.columns and "close" in df.columns:
+                n_days = min(first_n, len(df))
+                raw[i] = (df["volume"].iloc[:n_days] * df["close"].iloc[:n_days]).mean()
+        liq_map = _quantile_map(raw)
+        for i, df in enumerate(all_feat_dfs):
+            df["liquidity_quantile"] = liq_map.get(codes[i], 0.5)
+
+    if "volatility_quantile" in needed:
+        raw = np.zeros(n, dtype=np.float32)
+        for i, df in enumerate(all_feat_dfs):
+            if len(df) > 0 and "close" in df.columns:
+                n_days = min(first_n, len(df))
+                if n_days >= 3:
+                    c = df["close"].iloc[:n_days].values.astype(np.float64)
+                    log_ret = np.log(np.maximum(c[1:] / c[:-1], 1e-12))
+                    raw[i] = float(np.std(log_ret))
+        vol_map = _quantile_map(raw)
+        for i, df in enumerate(all_feat_dfs):
+            df["volatility_quantile"] = vol_map.get(codes[i], 0.5)
+
+    if "price_level_quantile" in needed:
+        raw = np.array([
+            all_feat_dfs[i]["close"].iloc[:min(first_n, len(all_feat_dfs[i]))].iloc[-1]
+            if len(all_feat_dfs[i]) > 0 and "close" in all_feat_dfs[i].columns else 0.0
+            for i in range(n)
+        ], dtype=np.float32)
+        price_map = _quantile_map(raw)
+        for i, df in enumerate(all_feat_dfs):
+            df["price_level_quantile"] = price_map.get(codes[i], 0.5)
+
+
 _STATIC_FEATURE_COLS = [
-    "market_cap_quantile",
+    "market_cap_quantile",       # size proxy (avg close first 20d)
+    "liquidity_quantile",        # dollar-volume proxy (avg volume×close first 20d)
+    "volatility_quantile",       # risk profile (log-return std first 20d)
+    "price_level_quantile",      # nominal price tier (avg close)
 ]
 
 # Alpha158 rolling-window factor name generator.
@@ -1448,6 +1586,8 @@ _PAST_KNOWN_COLS = [
     # Microstructure
     "is_limit_up", "is_limit_down", "gap_up_pct", "gap_down_pct",
     "volume_ratio_20", "volume_anomaly", "limit_up_streak",
+    "is_one_word_board", "seal_quality",
+    "limit_up_count_5d", "limit_up_count_20d",
     # Calendar
     "day_of_week", "day_of_month", "month", "quarter",
     # Fundamental (forward-filled quarterly)
@@ -1481,10 +1621,25 @@ _PAST_OBSERVED_COLS = [
     "sector_etf_flow", "sector_etf_amount",
     # Capital flow
     "flow_intensity", "flow_z", "flow_momentum",
+    "flow_market_cap_adj", "broad_main_net",
+    # Block trade
+    "buyer_is_inst", "buyer_is_hot_money",
+    "seller_is_inst", "seller_is_hot_money",
+    "premium_pct_wavg", "permanent_impact", "temporary_impact",
+    "amount_vol_6d", "is_deep_discount",
+    "trade_count", "premium_pct_mean", "total_amount",
+    # Shareholder
+    "HN_z", "PCRC", "dual_concentration_signal",
+    # Lockup
+    "unlock_pressure", "unlock_pressure_mcap",
+    "days_to_nearest_unlock", "unlock_count_upcoming",
     # Board
     "is_zt", "is_zb", "board_height_20d", "seal_strength",
+    "seal_intensity", "concept_zt_count", "concept_zt_ratio",
+    "concept_board_height",
     # Sector
     "sector_relative_strength", "sector_breadth_z",
+    "sector_vol_volatility", "sector_turnover_z", "sector_alpha",
     # Concept
     "avg_concept_heat", "is_concept_leader",
 ]
@@ -1493,6 +1648,17 @@ _PAST_OBSERVED_COLS = [
 def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:
     """Return the subset of *candidates* that exist in *df*."""
     return [c for c in candidates if c in df.columns]
+
+
+def _has_col_in_any_stock(all_feat_dfs: list[pd.DataFrame], col_name: str) -> str | None:
+    """Check whether a named feature column exists in any stock's DataFrame.
+
+    Returns the column name if found, None otherwise.
+    """
+    for df in all_feat_dfs:
+        if col_name in df.columns:
+            return col_name
+    return None
 
 
 def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:

@@ -87,8 +87,14 @@ def train_tft(
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
                 l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
-                l_ret = mse_loss(pred_ret.squeeze(-1), y_ret)
-                l_vol = mse_loss(pred_vol.squeeze(-1), y_vol)
+                # Mask ZT/DT timesteps for return/volatility heads:
+                # y_dir=-100 flags untradable days (CE ignore_index); MSE has
+                # no ignore mechanism, so we manually zero out those timesteps.
+                mask = (y_dir != -100).float()
+                ret_err = (pred_ret.squeeze(-1) - y_ret).pow(2) * mask
+                l_ret = ret_err.sum() / mask.sum().clamp(min=1)
+                vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
+                l_vol = vol_err.sum() / mask.sum().clamp(min=1)
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):

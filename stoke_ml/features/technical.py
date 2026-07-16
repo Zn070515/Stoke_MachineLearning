@@ -120,7 +120,7 @@ class TechnicalIndicators:
             )
 
         # ── 12. Historical volatility ──────────────────────────────────
-        log_ret = np.log(close / close.shift(1))
+        log_ret = np.log(np.maximum(close / close.shift(1), 1e-12))
         for period in [5, 20]:
             new[f"vol_{period}"] = (
                 log_ret.rolling(period).std() * np.sqrt(252)
@@ -313,7 +313,7 @@ def _rolling_counts(close, volume):
 def _rolling_aroon_vol(high, low, close, volume):
     """Aroon & volume change stats (Alpha158, 5 windows × 6 types)."""
     vol_change = volume.diff()
-    abs_ret = (close.diff() / close.shift(1)).abs()
+    abs_ret = (close.diff() / close.shift(1).replace(0, 1e-10)).abs()
     out = {}
     for d in _WINDOWS:
         def _aroon_up(win):
