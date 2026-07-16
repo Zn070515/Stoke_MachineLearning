@@ -9,7 +9,7 @@ from torch.amp import GradScaler, autocast
 
 from stoke_ml.models.tft.config import TFTConfig
 from stoke_ml.models.tft.model import TFTModel
-from stoke_ml.models.tft.loss import UncertaintyLoss
+from stoke_ml.models.tft.loss import UncertaintyLoss, AdjMSELoss
 from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
 from stoke_ml.models.tft.evaluate import evaluate_sharpe
 
@@ -23,6 +23,42 @@ def _set_seed(seed: int | None) -> None:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+
+
+def _compute_val_loss(
+    model: nn.Module,
+    val_loader: DataLoader,
+    ce_loss: nn.Module,
+    ret_loss: nn.Module,
+    loss_fn: UncertaintyLoss,
+    device: torch.device,
+    use_amp: bool,
+) -> float:
+    """Quick val loss pass every epoch — drives ReduceLROnPlateau."""
+    model.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for static, pk, po, y_dir, y_ret, y_vol in val_loader:
+            static = static.to(device)
+            pk = pk.to(device)
+            po = po.to(device)
+            y_dir = y_dir.to(device)
+            y_ret = y_ret.to(device)
+            y_vol = y_vol.to(device)
+            with autocast("cuda", enabled=use_amp):
+                pred_dir, pred_ret, pred_vol = model(static, pk, po)
+                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
+                mask = (y_dir != -100).float()
+                # AdjMSE for returns (sign-aware), MSE for volatility
+                l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
+                                 y_ret[mask > 0]) if mask.sum() > 1 else torch.tensor(0.0, device=device)
+                vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
+                l_vol = vol_err.sum() / mask.sum().clamp(min=1)
+                loss = loss_fn([l_ce, l_ret, l_vol])
+            total += loss.item()
+            n += 1
+    model.train()
+    return total / max(n, 1)
 
 
 def train_tft(
@@ -51,6 +87,7 @@ def train_tft(
 
     loss_fn = UncertaintyLoss(num_tasks=3).to(device)
     ce_loss = nn.CrossEntropyLoss()
+    ret_loss = AdjMSELoss(gamma=0.1)  # sign-aware: wrong-sign → 11× penalty
 
     optimizer = torch.optim.AdamW([
         {"params": model.parameters()},
@@ -66,6 +103,13 @@ def train_tft(
         drop_last=True, persistent_workers=config.num_workers > 0,
     )
 
+    val_ds = PanelDataset(val_data, seq_len=config.seq_len)
+    val_loader = DataLoader(
+        val_ds, batch_size=config.batch_size,
+        shuffle=False, collate_fn=panel_collate,
+        num_workers=0, pin_memory=False,
+    )
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -79,7 +123,8 @@ def train_tft(
     best_sharpe = -float("inf")
     best_state = None
     patience_counter = 0
-    history = {"train_loss": [], "val_sharpe": [], "val_ic": []}
+    history = {"train_loss": [], "val_loss": [], "val_sharpe": [], "val_ic": []}
+    use_amp = config.use_amp and device.type == "cuda"
 
     for epoch in range(config.max_epochs):
         model.train()
@@ -97,13 +142,16 @@ def train_tft(
             y_ret = y_ret.to(device)
             y_vol = y_vol.to(device)
 
-            use_amp = config.use_amp and device.type == "cuda"
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
                 l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
                 mask = (y_dir != -100).float()
-                ret_err = (pred_ret.squeeze(-1) - y_ret).pow(2) * mask
-                l_ret = ret_err.sum() / mask.sum().clamp(min=1)
+                # AdjMSE: sign-aware loss — wrong-sign predictions cost 11× more
+                if mask.sum() > 1:
+                    l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
+                                     y_ret[mask > 0])
+                else:
+                    l_ret = torch.tensor(0.0, device=device)
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
                 l_vol = vol_err.sum() / mask.sum().clamp(min=1)
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
@@ -121,7 +169,7 @@ def train_tft(
 
             if (batch_idx + 1) % config.grad_accum_steps == 0 and backward_done:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_value_(model.parameters(), 3.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -137,7 +185,7 @@ def train_tft(
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad.mul_(scale)
-            torch.nn.utils.clip_grad_value_(model.parameters(), 3.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -145,16 +193,16 @@ def train_tft(
         avg_loss = epoch_loss / max(len(train_loader), 1)
         history["train_loss"].append(avg_loss)
 
-        logger.info("Epoch %d/%d: loss=%.4f (ce=%.4f ret=%.4f vol=%.4f | "
-                    "lv=[%.6f,%.6f,%.6f]) lr=%.2e",
-                    epoch + 1, config.max_epochs, avg_loss,
-                    l_ce.item(), l_ret.item(), l_vol.item(),
-                    loss_fn.log_vars[0].item(),
-                    loss_fn.log_vars[1].item(),
-                    loss_fn.log_vars[2].item(),
-                    optimizer.param_groups[0]["lr"])
+        # Compute validation loss EVERY epoch (drives ReduceLROnPlateau).
+        # pytorch-forecasting monitors val_loss, not train_loss — without
+        # this the scheduler never fires because train_loss always drops.
+        val_loss = _compute_val_loss(
+            model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
+        )
+        history["val_loss"].append(val_loss)
+        scheduler.step(val_loss)
 
-        # Validate every 5 epochs
+        # Full metrics (Sharpe + IC) every 5 epochs for early stopping
         if (epoch + 1) % 5 == 0:
             sharpe, val_metrics = evaluate_sharpe(
                 model, val_data, config, device, return_metrics=True,
@@ -162,11 +210,11 @@ def train_tft(
             history["val_sharpe"].append(sharpe)
             ic = val_metrics.get("ic", 0.0)
             history["val_ic"].append(ic)
-            logger.info("Epoch %d/%d: loss=%.4f, val_sharpe=%.4f, val_IC=%.4f",
-                        epoch + 1, config.max_epochs, avg_loss, sharpe, ic)
-
-            # ReduceLROnPlateau on validation loss
-            scheduler.step(avg_loss)
+            logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f "
+                        "sharpe=%.4f IC=%.4f lr=%.2e",
+                        epoch + 1, config.max_epochs, avg_loss, val_loss,
+                        sharpe, ic,
+                        optimizer.param_groups[0]["lr"])
 
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
@@ -175,10 +223,14 @@ def train_tft(
             else:
                 patience_counter += 1
 
-            if patience_counter >= config.early_stop_patience // 5:  # checks every 5 epochs
+            if patience_counter >= config.early_stop_patience // 5:
                 logger.info("Early stopping at epoch %d (best Sharpe=%.4f)",
                             epoch + 1, best_sharpe)
                 break
+        else:
+            logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f lr=%.2e",
+                        epoch + 1, config.max_epochs, avg_loss, val_loss,
+                        optimizer.param_groups[0]["lr"])
 
     if best_state is not None:
         model.load_state_dict(best_state)
