@@ -282,7 +282,8 @@ class NewsStorage:
 
         if len(gold) >= 2:
             all_dates = self._calendar.get_trading_days(
-                gold["date"].min(), gold["date"].max()
+                pd.Timestamp(gold["date"].min()).date(),
+                pd.Timestamp(gold["date"].max()).date(),
             )
             date_df = pd.DataFrame({"date": all_dates})
             date_df["date"] = pd.to_datetime(date_df["date"]).dt.date

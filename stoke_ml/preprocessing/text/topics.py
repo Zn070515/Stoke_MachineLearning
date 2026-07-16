@@ -246,10 +246,18 @@ class TopicModeler(PreprocessingStep):
         if self.embedding_model == "finbert":
             try:
                 from sentence_transformers import SentenceTransformer
-                self._finbert_model = SentenceTransformer(
-                    "yiyanghkust/finbert-tone-chinese",
-                    cache_folder=self.model_cache_dir,
-                )
+                # Try local-only first to avoid HF timeouts when model is cached
+                try:
+                    self._finbert_model = SentenceTransformer(
+                        "yiyanghkust/finbert-tone-chinese",
+                        cache_folder=self.model_cache_dir,
+                        local_files_only=True,
+                    )
+                except Exception:
+                    self._finbert_model = SentenceTransformer(
+                        "yiyanghkust/finbert-tone-chinese",
+                        cache_folder=self.model_cache_dir,
+                    )
                 logger.info(
                     "Computing FinBERT embeddings for %d texts...", len(texts)
                 )
@@ -315,10 +323,17 @@ class TopicModeler(PreprocessingStep):
         if used_embedding == "finbert":
             try:
                 from sentence_transformers import SentenceTransformer
-                self._finbert_model = SentenceTransformer(
-                    "yiyanghkust/finbert-tone-chinese",
-                    cache_folder=self.model_cache_dir,
-                )
+                try:
+                    self._finbert_model = SentenceTransformer(
+                        "yiyanghkust/finbert-tone-chinese",
+                        cache_folder=self.model_cache_dir,
+                        local_files_only=True,
+                    )
+                except Exception:
+                    self._finbert_model = SentenceTransformer(
+                        "yiyanghkust/finbert-tone-chinese",
+                        cache_folder=self.model_cache_dir,
+                    )
                 logger.info("Restored FinBERT embedder to match cached model")
             except Exception as e:
                 logger.warning("Cannot restore FinBERT embedder: %s", e)
