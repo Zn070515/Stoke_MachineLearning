@@ -68,6 +68,17 @@ def load_aux_data(
     except Exception:
         logger.warning("Sentiment data not available, skipping")
 
+    # --- Announcements ---
+    try:
+        from stoke_ml.data.announcement_storage import AnnouncementStorage
+        a_store = AnnouncementStorage(data_dir)
+        for code in stock_list:
+            df = a_store.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["announcement"] = df
+    except Exception:
+        logger.warning("Announcement data not available, skipping")
+
     # --- Guba ---
     try:
         gs = GubaStorage(data_dir)
@@ -284,7 +295,7 @@ def main():
     # Build features
     fp = FeaturePipeline(
         seq_len=252,
-        use_sentiment=True, use_announcements=False,
+        use_sentiment=True, use_announcements=True,
         use_guba=True, use_comment=True, use_margin=True,
         use_northbound=True, use_dragon_tiger=True,
         use_fundamental=True, use_etf_flow=True, use_xueqiu=True,
