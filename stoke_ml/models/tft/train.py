@@ -9,7 +9,7 @@ from torch.amp import GradScaler, autocast
 
 from stoke_ml.models.tft.config import TFTConfig
 from stoke_ml.models.tft.model import TFTModel
-from stoke_ml.models.tft.loss import UncertaintyLoss, AdjMSELoss
+from stoke_ml.models.tft.loss import UncertaintyLoss, AdjMSELoss, RankICLoss
 from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
 from stoke_ml.models.tft.evaluate import evaluate_sharpe
 
@@ -33,6 +33,8 @@ def _compute_val_loss(
     loss_fn: UncertaintyLoss,
     device: torch.device,
     use_amp: bool,
+    rank_ic_loss: nn.Module | None = None,
+    rank_ic_weight: float = 0.0,
 ) -> float:
     """Quick val loss pass every epoch — drives ReduceLROnPlateau."""
     model.eval()
@@ -55,6 +57,12 @@ def _compute_val_loss(
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
                 l_vol = vol_err.sum() / mask.sum().clamp(min=1)
                 loss = loss_fn([l_ce, l_ret, l_vol])
+                if rank_ic_loss is not None and mask.sum() > 4:
+                    valid_pred = pred_ret.squeeze(-1)[mask > 0]
+                    valid_target = y_ret[mask > 0]
+                    l_rankic = rank_ic_loss(valid_pred, valid_target)
+                    if torch.isfinite(l_rankic):
+                        loss = loss + rank_ic_weight * l_rankic
             total += loss.item()
             n += 1
     model.train()
@@ -88,6 +96,8 @@ def train_tft(
     loss_fn = UncertaintyLoss(num_tasks=3).to(device)
     ce_loss = nn.CrossEntropyLoss()
     ret_loss = AdjMSELoss(gamma=0.1)  # sign-aware: wrong-sign → 11× penalty
+    rank_ic_loss = RankICLoss(temperature=0.5)  # cross-sectional ranking objective
+    rank_ic_weight = 0.1  # small weight — ranking signal is complementary
 
     optimizer = torch.optim.AdamW([
         {"params": model.parameters()},
@@ -155,6 +165,15 @@ def train_tft(
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
                 l_vol = vol_err.sum() / mask.sum().clamp(min=1)
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
+                # RankICLoss: cross-sectional ranking objective (soft Spearman)
+                # applied across valid positions in the batch as a proxy for
+                # true date-level cross-section.
+                if mask.sum() > 4:
+                    valid_pred = pred_ret.squeeze(-1)[mask > 0]
+                    valid_target = y_ret[mask > 0]
+                    l_rankic = rank_ic_loss(valid_pred, valid_target)
+                    if torch.isfinite(l_rankic):
+                        total_loss = total_loss + rank_ic_weight * l_rankic
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 logger.warning(

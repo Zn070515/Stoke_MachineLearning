@@ -60,3 +60,33 @@ class AdjMSELoss(nn.Module):
             torch.full_like(squared, 1.0 + self.gamma),
         )
         return (squared * weight).mean()
+
+
+def _pearson(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Differentiable Pearson correlation for a batch (e.g. one cross-section)."""
+    xm = x - x.mean()
+    ym = y - y.mean()
+    denom = (xm.pow(2).sum().sqrt() * ym.pow(2).sum().sqrt()).clamp_min(1e-12)
+    return (xm * ym).sum() / denom
+
+
+class RankICLoss(nn.Module):
+    """Differentiable Spearman rank IC via soft-rank trick.
+
+    Spearman = Pearson on ranks. Uses a temperature-softened pairwise
+    comparison to approximate ranks in a gradient-friendly way.
+
+    From ml-quant-trading (Du 2025): optimising for ranking directly
+    aligns the loss with cross-sectional evaluation metrics (IC).
+    """
+
+    def __init__(self, temperature: float = 1.0) -> None:
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return -_pearson(self._soft_rank(pred), self._soft_rank(target))
+
+    def _soft_rank(self, x: torch.Tensor) -> torch.Tensor:
+        diffs = (x.unsqueeze(0) - x.unsqueeze(1)) / self.temperature
+        return torch.sigmoid(diffs).sum(dim=0)

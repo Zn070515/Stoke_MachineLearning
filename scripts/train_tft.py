@@ -238,10 +238,48 @@ def load_aux_data(
     return result
 
 
+def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
+    """Filter out stocks with corrupted price data.
+
+    Checks: close > 0, daily-return std < 50 %, no obviously bogus prices.
+    Returns only the codes that pass all checks.
+    """
+    import pandas as pd
+    import numpy as np
+    from stoke_ml.data.storage import DataStorage
+
+    ds = DataStorage(data_dir)
+    ok: list[str] = []
+    n_neg, n_vol, n_nan = 0, 0, 0
+    for code in stock_list:
+        df = ds.load_daily(code, "2015-01-01", None)
+        if df is None or df.empty:
+            continue
+        close = df["close"].values
+        if np.isnan(close).all():
+            n_nan += 1
+            continue
+        if (close <= 0).any():
+            n_neg += 1
+            continue
+        ret = np.diff(close) / (close[:-1] + 1e-8)
+        if np.nanstd(ret) > 0.50:  # >50 % daily vol = data error
+            n_vol += 1
+            continue
+        ok.append(code)
+    if n_neg or n_vol or n_nan:
+        logger.warning(
+            "Data quality: %d stocks filtered out "
+            "(negative prices=%d, extreme vol=%d, all NaN=%d) → %d kept",
+            n_neg + n_vol + n_nan, n_neg, n_vol, n_nan, len(ok),
+        )
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train TFT panel model")
-    parser.add_argument("--stocks", type=int, default=100,
-                        help="Limit to first N stocks")
+    parser.add_argument("--stocks", type=int, default=500,
+                        help="Limit to first N stocks (default: 500)")
     parser.add_argument("--stock-list", type=str, default=None,
                         help="Comma-separated stock codes")
     parser.add_argument("--start", type=str, default="2015-01-01")
@@ -251,6 +289,8 @@ def main():
                         help="Limit number of walk-forward folds (default: 3)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--horizon", type=int, default=5,
+                        help="Forward return horizon in days (1/5/20)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
@@ -274,6 +314,13 @@ def main():
 
     if not stock_list:
         logger.error("No stocks found")
+        sys.exit(1)
+
+    # Data quality filter — remove stocks with corrupted prices before
+    # they can distort the training signal.
+    stock_list = _filter_quality(stock_list, data_dir)
+    if len(stock_list) < 20:
+        logger.error("Too few stocks pass quality filter (%d)", len(stock_list))
         sys.exit(1)
 
     logger.info("Loading K-line data for %d stocks from %s to %s...",
@@ -314,15 +361,15 @@ def main():
         use_valuation=True,
         use_board=False, use_sector=False, use_concept=False,
     )
-    panel_data = fp.build_panel_features(panel, aux_data=aux_data)
+    panel_data = fp.build_panel_features(panel, aux_data=aux_data, horizon=args.horizon)
 
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
     dims = f"S={panel_data['static_features'].shape[1]} " \
            f"PK={panel_data['past_known'].shape[2]} " \
            f"PO={panel_data['past_observed'].shape[2]}"
-    logger.info("Panel data: %d stocks × %d timesteps  dims: %s",
-                n_stocks, n_timesteps, dims)
+    logger.info("Panel data: %d stocks × %d timesteps  dims: %s  horizon=%d",
+                n_stocks, n_timesteps, dims, args.horizon)
 
     config = TFTConfig(
         seq_len=60,

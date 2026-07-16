@@ -1122,6 +1122,7 @@ class FeaturePipeline:
         panel: pd.DataFrame,
         target_col: str = "close",
         aux_data: dict[str, dict[str, pd.DataFrame]] | None = None,
+        horizon: int = 1,
     ) -> dict:
         """Build panel-format features for TFT training from a multi-stock panel.
 
@@ -1136,6 +1137,8 @@ class FeaturePipeline:
                       "announcement", "margin", "northbound", "dragon_tiger",
                       "fundamental", "etf_flow", "capital_flow", "block_trade",
                       "shareholder", "lockup", "dividend", "board", "sector", "concept".
+            horizon: forward return horizon in days (1/5/20). Direction
+                     threshold scales as 0.003 * sqrt(horizon).
 
         Returns:
             dict with numpy arrays: static_features, past_known, past_observed,
@@ -1197,6 +1200,10 @@ class FeaturePipeline:
         y_vol_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         stock_T = np.zeros(N_stocks, dtype=np.int32)
 
+        # Direction noise threshold — scale by sqrt(horizon)
+        # (0.003 per day, 1.0% / 5-day, 1.3% / 20-day)
+        dir_threshold = 0.003 * (horizon ** 0.5)
+
         for i, df in enumerate(all_feat_dfs):
             if len(df) == 0:
                 continue
@@ -1204,14 +1211,27 @@ class FeaturePipeline:
             T_i = min(len(df_sorted), max_T)
             stock_T[i] = T_i
             close_raw = df_sorted[target_col].values[:T_i]
-            ret_1d = np.full(T_i, np.nan, dtype=np.float32)
-            ret_1d[1:] = (close_raw[1:] - close_raw[:-1]) / (close_raw[:-1] + 1e-8)
+
+            # Forward return over `horizon` days
+            # ret[t] = (close[t+horizon] - close[t]) / close[t]
+            ret_fwd = np.full(T_i, np.nan, dtype=np.float32)
+            if T_i > horizon:
+                ret_fwd[:T_i - horizon] = (
+                    (close_raw[horizon:] - close_raw[:T_i - horizon])
+                    / (close_raw[:T_i - horizon] + 1e-8)
+                )
+            # Direction label with scaled noise threshold
             y_dir_arr[i, :T_i] = np.where(
-                ret_1d > 0.003, 2, np.where(ret_1d < -0.003, 0, 1),
+                ret_fwd > dir_threshold, 2,
+                np.where(ret_fwd < -dir_threshold, 0, 1),
             ).astype(np.int64)
-            y_ret_arr[i, :T_i] = ret_1d
+            y_ret_arr[i, :T_i] = ret_fwd
+
+            # Backward-looking realized volatility (always 5-day for stability,
+            # independent of prediction horizon — volatility is a conditioning
+            # signal, not the prediction target itself).
             for t in range(6, T_i):
-                y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))
+                y_vol_arr[i, t] = float(np.std(ret_fwd[max(0, t-5):t]))
 
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
