@@ -110,6 +110,12 @@ class SectorBroadcaster(PreprocessingStep):
                 df["leader"].astype(str) == df["stock_code"].astype(str)
             ).astype(np.int8)
 
+        # P1 #7: crowding indicators
+        df = self._add_crowding(df)
+
+        # P1 #8: residual momentum (strip market beta)
+        df = self._add_residual_momentum(df)
+
         return df
 
     def _add_sector_momentum(self, df, industry_ranking):
@@ -172,6 +178,127 @@ class SectorBroadcaster(PreprocessingStep):
                 + df["sector_rrg_y"].gt(0).astype(int)
             ).astype(np.int8)
 
+        return df
+
+    # ── P1 #7: crowding indicators ───────────────────────────────────
+
+    def _add_crowding(self, df):
+        """Sector-level crowding: volume volatility + turnover z-score.
+
+        Literature: 2024 quant research consensus — crowding is the most
+        important sector risk factor. High crowding → fragile sector
+        leadership, increased reversal probability.
+        """
+        if "sector_code" not in df.columns:
+            return df
+        required = ["volume", "date", "stock_code"]
+        if not all(c in df.columns for c in required):
+            return df
+
+        # Per-sector daily aggregate volume
+        sector_vol = (
+            df.groupby(["date", "sector_code"])["volume"]
+            .sum()
+            .reset_index(name="sector_volume")
+        )
+        # Rolling 20d coefficient of variation per sector
+        sector_vol = sector_vol.sort_values(["sector_code", "date"])
+        roll_mean = (
+            sector_vol.groupby("sector_code")["sector_volume"]
+            .rolling(20, min_periods=10).mean()
+            .reset_index(level=0, drop=True)
+        )
+        roll_std = (
+            sector_vol.groupby("sector_code")["sector_volume"]
+            .rolling(20, min_periods=10).std(ddof=0)
+            .reset_index(level=0, drop=True)
+        )
+        sector_vol["sector_vol_volatility"] = (
+            roll_std / (roll_mean.abs() + 1e-8)
+        ).astype(np.float32)
+
+        # Merge sector-level crowding back
+        df = df.merge(
+            sector_vol[["date", "sector_code", "sector_vol_volatility"]],
+            on=["date", "sector_code"], how="left",
+        )
+        df["sector_vol_volatility"] = df["sector_vol_volatility"].fillna(0).astype(np.float32)
+
+        # Turnover rate z-score (cross-sectional per date)
+        if "turnover_rate" in df.columns:
+            # Aggregate per sector
+            sector_turn = (
+                df.groupby(["date", "sector_code"])["turnover_rate"]
+                .mean()
+                .reset_index(name="sector_turnover")
+            )
+            date_mean = sector_turn.groupby("date")["sector_turnover"].transform("mean")
+            date_std = sector_turn.groupby("date")["sector_turnover"].transform("std")
+            sector_turn["sector_turnover_z"] = (
+                (sector_turn["sector_turnover"] - date_mean) / (date_std.replace(0, np.nan).fillna(1e-8))
+            ).clip(-5, 5).astype(np.float32)
+            df = df.merge(
+                sector_turn[["date", "sector_code", "sector_turnover_z"]],
+                on=["date", "sector_code"], how="left",
+            )
+            df["sector_turnover_z"] = df["sector_turnover_z"].fillna(0).astype(np.float32)
+
+        return df
+
+    # ── P1 #8: residual momentum ─────────────────────────────────────
+
+    def _add_residual_momentum(self, df):
+        """Strip market beta from sector returns via cross-sectional regression.
+
+        For each date, regresses sector return on market return and keeps
+        the residual — purified sector alpha, orthogonal to market direction.
+        """
+        if "sector_code" not in df.columns or "change_pct" not in df.columns:
+            return df
+        if "close" not in df.columns or "stock_code" not in df.columns:
+            return df
+
+        # Market return: equal-weighted mean of stock returns per date
+        if "close" in df.columns:
+            df_sorted = df.sort_values(["stock_code", "date"])
+            df_sorted["_ret"] = (
+                df_sorted.groupby("stock_code")["close"].pct_change()
+            )
+            mkt_ret = (
+                df_sorted.groupby("date")["_ret"]
+                .mean()
+                .reset_index(name="mkt_return")
+            )
+            df_sorted.drop(columns=["_ret"], inplace=True)
+        else:
+            return df
+
+        # Sector-level daily return (from industry_ranking change_pct)
+        if "change_pct" not in df.columns:
+            return df
+
+        # Merge market return and run per-date cross-sectional regression
+        df = df.merge(mkt_ret, on="date", how="left")
+
+        from numpy.polynomial import polynomial as P
+
+        def _residualize_date(grp):
+            # Dedup by sector_code so large sectors don't dominate regression
+            dedup = grp.drop_duplicates(subset=["sector_code"])
+            m = dedup["change_pct"].notna() & dedup["mkt_return"].notna()
+            if m.sum() < 3:
+                grp["sector_alpha"] = 0.0
+                return grp
+            c = P.polyfit(dedup.loc[m, "mkt_return"].values,
+                          dedup.loc[m, "change_pct"].values, 1)
+            fitted = c[0] + c[1] * grp["mkt_return"].fillna(0)
+            grp["sector_alpha"] = (
+                (grp["change_pct"].fillna(0) - fitted)
+            ).astype(np.float32)
+            return grp
+
+        df = df.groupby("date", group_keys=False).apply(_residualize_date)
+        df.drop(columns=["mkt_return"], inplace=True)
         return df
 
 

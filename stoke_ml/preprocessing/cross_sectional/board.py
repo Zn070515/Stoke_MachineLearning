@@ -38,6 +38,7 @@ class BoardBroadcaster(PreprocessingStep):
         df: pd.DataFrame,
         pools: Optional[dict[str, pd.DataFrame]] = None,
         sentiment: Optional[pd.DataFrame] = None,
+        concept_map: Optional[dict[str, str]] = None,
     ) -> pd.DataFrame:
         """Add board features to the per-stock OHLCV DataFrame.
 
@@ -46,6 +47,7 @@ class BoardBroadcaster(PreprocessingStep):
             pools: dict with keys "zt","zb","dt","yzt", each a DataFrame
                    with at least columns [date, stock_code].
             sentiment: limit_up_sentiment DataFrame with market-level indices.
+            concept_map: dict stock_code → concept_id for same-concept stats.
         """
         if df.empty:
             return df
@@ -96,9 +98,82 @@ class BoardBroadcaster(PreprocessingStep):
         # L5: market state classification
         df = self._classify_market_state(df, pools)
 
+        # P1 #9: same-concept ZT statistics
+        if concept_map and zt_pool is not None and not zt_pool.empty:
+            df = self._add_concept_zt_stats(df, zt_pool, concept_map)
+
         return df
 
-    # ── helpers ────────────────────────────────────────────────────────
+    # ── P1 #9: same-concept ZT statistics ─────────────────────────────
+
+    def _add_concept_zt_stats(self, df, zt_pool, concept_map):
+        """Compute concept-level ZT breadth and chain rate.
+
+        For each stock-date, counts how many stocks in the same concept
+        also hit ZT that day — a key measure of theme strength and
+        contagion risk per industry quant research.
+        """
+        zt = zt_pool.copy()
+        if "date" in zt.columns:
+            zt["date"] = pd.to_datetime(zt["date"], errors="coerce")
+        zt["stock_code"] = zt["stock_code"].astype(str)
+
+        # Map ZT stocks to their concepts
+        zt["concept_id"] = zt["stock_code"].map(concept_map)
+        zt = zt.dropna(subset=["concept_id"])
+
+        if zt.empty:
+            return df
+
+        # Per concept per date: ZT count + max consecutive ZT
+        concept_stats = (
+            zt.groupby(["date", "concept_id"])
+            .agg(concept_zt_count=("stock_code", "count"))
+            .reset_index()
+        )
+
+        # Map stocks to concepts
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["_concept_id"] = df["stock_code"].astype(str).map(concept_map)
+
+        df = df.merge(
+            concept_stats,
+            left_on=["date", "_concept_id"],
+            right_on=["date", "concept_id"],
+            how="left",
+        )
+        df["concept_zt_count"] = df["concept_zt_count"].fillna(0).astype(np.int16)
+
+        # Concept chain rate: ZT_count / total_stocks_in_concept
+        # Estimate total stocks per concept from the map
+        concept_sizes = pd.Series(list(concept_map.values())).value_counts()
+        df["_concept_size"] = df["_concept_id"].map(concept_sizes).fillna(1).astype(int)
+        df["concept_zt_ratio"] = (
+            df["concept_zt_count"] / df["_concept_size"].clip(lower=1)
+        ).astype(np.float32)
+
+        # Concept-level board height: max consecutive ZT within concept
+        if "consecutive_zt" in df.columns:
+            concept_height = (
+                df[df["is_zt"] == 1]
+                .groupby(["date", "_concept_id"])["consecutive_zt"]
+                .max()
+                .reset_index(name="concept_board_height")
+            )
+            df = df.merge(
+                concept_height,
+                on=["date", "_concept_id"],
+                how="left",
+            )
+            df["concept_board_height"] = (
+                df["concept_board_height"].fillna(0).astype(np.int16)
+            )
+
+        # Cleanup
+        df.drop(columns=["_concept_id", "_concept_size", "concept_id"],
+                 inplace=True, errors="ignore")
+        return df
 
     def _check_membership(self, df, pool_df):
         """Return boolean Series: True if this (date, stock_code) is in pool."""
@@ -125,12 +200,33 @@ class BoardBroadcaster(PreprocessingStep):
             zt_pool["date"] = pd.to_datetime(zt_pool["date"], errors="coerce")
         # Merge relevant columns
         seal_cols = ["date", "stock_code"]
-        available = [c for c in ["seal_type", "seal_time", "seal_cycles"] if c in zt_pool.columns]
+        available = [c for c in [
+            "seal_type", "seal_time", "seal_cycles",
+            "seal_fund", "float_cap", "seal_amount",
+        ] if c in zt_pool.columns]
         seal_cols.extend(available)
         if len(available) == 0:
             return df
         zt_slim = zt_pool[seal_cols].drop_duplicates(subset=["date", "stock_code"])
         df = df.merge(zt_slim, on=["date", "stock_code"], how="left")
+
+        # Seal intensity: seal_amount / float_cap (同花顺: 封单强度)
+        # This is the most important seal quality metric per THS quant research.
+        # Prefer seal_fund (EM ZT pool), fall back to seal_amount (THS data).
+        seal_amt_col = None
+        if "seal_fund" in df.columns:
+            seal_amt_col = "seal_fund"
+        elif "seal_amount" in df.columns:
+            seal_amt_col = "seal_amount"
+        if seal_amt_col and "float_cap" in df.columns:
+            denom = df["float_cap"].abs().replace(0, np.nan)
+            df["seal_intensity"] = (
+                df[seal_amt_col].abs() / denom
+            ).clip(0, 1).astype(np.float32)
+            # Only ZT stocks should have meaningful seal intensity
+            df["seal_intensity"] = (
+                df["seal_intensity"].where(df.get("is_zt", 0) == 1, 0.0)
+            )
 
         if "seal_type" in df.columns:
             for stype, col in [
@@ -174,7 +270,8 @@ class BoardBroadcaster(PreprocessingStep):
 
         # Cleanup temp columns
         for c in ["_base_score", "_time_factor", "_cycle_penalty",
-                   "seal_type", "seal_time", "seal_cycles"]:
+                   "seal_type", "seal_time", "seal_cycles",
+                   "seal_fund", "seal_amount", "float_cap"]:
             if c in df.columns:
                 df.drop(columns=[c], inplace=True)
 

@@ -73,6 +73,8 @@ class FlowDecomposer(PreprocessingStep):
         self._compute_intensity(df, flow_cols_present)
         self._compute_persistence(df, flow_cols_present)
         self._compute_divergence(df, flow_cols_present)
+        self._compute_market_cap_adj(df, flow_cols_present, **kwargs)
+        self._compute_broad_main(df, flow_cols_present)
         if self.residualize and "close" in df.columns:
             self._compute_residual(df)
         if "large_ratio" in df.columns and "small_ratio" in df.columns:
@@ -199,7 +201,60 @@ class FlowDecomposer(PreprocessingStep):
             (np.sign(price_z.fillna(0)) != np.sign(flow_z.fillna(0))).astype(np.int8)
         )
 
-    # ── L5: residualization ───────────────────────────────────────────
+    # ── L5: market-cap adjustment ──────────────────────────────────────
+
+    def _compute_market_cap_adj(self, df, flow_cols, **kwargs):
+        """Normalize main_net by market cap proxy (close price).
+
+        Literature: Kang (2025) shows market-cap-normalized money flow with
+        a simple linear model achieves Sharpe=1.30 vs LSTM Sharpe=0.07.
+        Uses ``close`` as a proxy when daily_data is unavailable; prefers
+        ``daily_data`` close column for proper per-date alignment.
+        """
+        if "main_net" not in flow_cols:
+            return
+        daily_data = kwargs.get("daily_data")
+        if daily_data is not None and not daily_data.empty:
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            merge_on = [c for c in ["date", "stock_code"] if c in df.columns]
+            if len(merge_on) == 2 and all(c in daily_data.columns for c in merge_on):
+                dd = daily_data.copy()
+                dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
+                merged = df.merge(
+                    dd[merge_on + ["close"]].rename(columns={"close": "_mcap_proxy"}),
+                    on=merge_on, how="left",
+                )
+                df["_mcap_proxy"] = merged["_mcap_proxy"]
+            elif "close" in df.columns:
+                df["_mcap_proxy"] = df["close"]
+            else:
+                return
+        elif "close" in df.columns:
+            df["_mcap_proxy"] = df["close"]
+        else:
+            return
+        denom = df["_mcap_proxy"].abs().replace(0, np.nan)
+        df["flow_market_cap_adj"] = (df["main_net"] / denom).astype(np.float32)
+        df.drop(columns=["_mcap_proxy"], inplace=True)
+
+    # ── L6: broad main force flow ──────────────────────────────────────
+
+    def _compute_broad_main(self, df, flow_cols):
+        """Generalized main-force flow: super + large + mid.
+
+        Open-source securities research (2024) shows merging large+mid+super
+        into a single "broad main force" metric improves long-short alpha
+        because it reduces noise from splitting artificially close tiers.
+        """
+        tiers = []
+        for c in ["super_net", "large_net", "mid_net"]:
+            if c in flow_cols:
+                tiers.append(df[c].fillna(0))
+        if tiers:
+            df["broad_main_net"] = sum(tiers).astype(np.float32)
+
+    # ── L7: residualization ───────────────────────────────────────────
 
     def _compute_residual(self, df):
         """Strip return contamination from flow signal.

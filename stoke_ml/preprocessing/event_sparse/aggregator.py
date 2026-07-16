@@ -57,11 +57,11 @@ class EventToDaily(PreprocessingStep):
             "lockup": self._transform_lockup,
             "dividend": self._transform_dividend,
         }
-        return dispatch[self.event_type](df, close_prices, trading_dates)
+        return dispatch[self.event_type](df, close_prices, trading_dates, **kwargs)
 
     # ── block_trade ────────────────────────────────────────────────────
 
-    def _transform_block_trade(self, df, close_prices, trading_dates):
+    def _transform_block_trade(self, df, close_prices, trading_dates, **kwargs):
         df = df.copy()
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -78,11 +78,30 @@ class EventToDaily(PreprocessingStep):
             agg_dict["total_amount"] = ("amount", "sum")
         if "volume" in df.columns:
             agg_dict["total_volume"] = ("volume", "sum")
-        if "buyer" in df.columns and "premium_pct" in df.columns:
+        if "buyer" in df.columns:
             agg_dict["buyer_is_inst"] = (
                 "buyer",
                 lambda x: x.astype(str)
-                .str.contains("机构|专用|瑞银|沪股通|深股通")
+                .str.contains("机构|专用|瑞银|沪股通|深股通|QFII|社保|保险|基金|证券")
+                .any(),
+            )
+            agg_dict["buyer_is_hot_money"] = (
+                "buyer",
+                lambda x: x.astype(str)
+                .str.contains("拉萨|团结路|江苏路|深圳分公司|浙江分公司|中金财富")
+                .any(),
+            )
+        if "seller" in df.columns:
+            agg_dict["seller_is_inst"] = (
+                "seller",
+                lambda x: x.astype(str)
+                .str.contains("机构|专用|瑞银|沪股通|深股通|QFII|社保|保险|基金|证券")
+                .any(),
+            )
+            agg_dict["seller_is_hot_money"] = (
+                "seller",
+                lambda x: x.astype(str)
+                .str.contains("拉萨|团结路|江苏路|深圳分公司|浙江分公司|中金财富")
                 .any(),
             )
 
@@ -134,6 +153,25 @@ class EventToDaily(PreprocessingStep):
                 grouped["premium_pct_mean"].lt(-8).astype(np.int8)
             )
 
+        # Amount ratio: block trade amount / daily total turnover
+        # (Guangda Securities: strongest block-trade alpha factor, 16.41% annual excess)
+        daily_data = kwargs.get("daily_data")
+        if daily_data is not None and not daily_data.empty and "total_amount" in grouped.columns:
+            merge_on = [c for c in ["date", "stock_code"] if c in grouped.columns]
+            if merge_on and all(c in daily_data.columns for c in merge_on):
+                dd = daily_data.copy()
+                dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
+                # Get daily total amount (in yuan) from K-line data
+                daily_amount_col = "amount" if "amount" in dd.columns else None
+                if daily_amount_col:
+                    merged = grouped.merge(
+                        dd[merge_on + [daily_amount_col]], on=merge_on, how="left"
+                    )
+                    denom = merged[daily_amount_col].abs().replace(0, np.nan)
+                    grouped["amount_ratio"] = (
+                        merged["total_amount"] / denom
+                    ).clip(0, 1).astype(np.float32)
+
         # Clean up temp columns
         if "_weighted" in df.columns:
             df.drop(columns=["_weighted"], inplace=True)
@@ -142,7 +180,7 @@ class EventToDaily(PreprocessingStep):
 
     # ── shareholder ────────────────────────────────────────────────────
 
-    def _transform_shareholder(self, df, close_prices, trading_dates):
+    def _transform_shareholder(self, df, close_prices, trading_dates, **kwargs):
         df = df.copy()
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -208,7 +246,7 @@ class EventToDaily(PreprocessingStep):
 
     # ── lockup ─────────────────────────────────────────────────────────
 
-    def _transform_lockup(self, df, close_prices, trading_dates):
+    def _transform_lockup(self, df, close_prices, trading_dates, **kwargs):
         df = df.copy()
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -222,6 +260,15 @@ class EventToDaily(PreprocessingStep):
         if "is_upcoming" not in df.columns:
             today = pd.Timestamp.now()
             df["is_upcoming"] = df["date"] > today
+
+        # VC-backed flag — set BEFORE split so both upcoming+hist inherit it
+        if "free_type" in df.columns:
+            df["is_vc_backed"] = (
+                df["free_type"]
+                .astype(str)
+                .str.contains("首发|IPO", na=False)
+                .astype(np.int8)
+            )
 
         upcoming = df[df["is_upcoming"]] if df["is_upcoming"].any() else pd.DataFrame()
         hist = df[~df["is_upcoming"]] if (~df["is_upcoming"]).any() else pd.DataFrame()
@@ -242,17 +289,36 @@ class EventToDaily(PreprocessingStep):
                 free_ratio * np.exp(-lam * upcoming["days_until_unlock"])
             ).astype(np.float32)
 
+            # Market-cap-normalized unlock impact (free_ratio × close)
+            if close_prices is not None:
+                cp = close_prices[["date", "stock_code", "close"]].copy()
+                upcoming = upcoming.merge(cp, on=["date", "stock_code"], how="left")
+                if "close" in upcoming.columns:
+                    upcoming["unlock_pressure_mcap"] = (
+                        upcoming["unlock_pressure"] * upcoming["close"].fillna(0)
+                    ).astype(np.float32)
+
             # Aggregate per stock: total upcoming
+            agg_dict = {
+                "unlock_pressure": ("unlock_pressure", "sum"),
+                "days_to_nearest_unlock": ("days_until_unlock", "min"),
+                "unlock_count_upcoming": ("date", "count"),
+            }
+            if "free_ratio" in upcoming.columns:
+                agg_dict["total_upcoming_ratio"] = ("free_ratio", "sum")
+            if "unlock_pressure_mcap" in upcoming.columns:
+                agg_dict["unlock_pressure_mcap"] = ("unlock_pressure_mcap", "sum")
             agg_upcoming = (
                 upcoming.groupby("stock_code")
-                .agg(
-                    unlock_pressure=("unlock_pressure", "sum"),
-                    total_upcoming_ratio=("free_ratio", "sum"),
-                    days_to_nearest_unlock=("days_until_unlock", "min"),
-                    unlock_count_upcoming=("date", "count"),
-                )
+                .agg(**agg_dict)
                 .reset_index()
             )
+            # Merge aggregated stats back into per-date upcoming records
+            if not agg_upcoming.empty:
+                upcoming = upcoming.merge(
+                    agg_upcoming, on="stock_code", how="left",
+                    suffixes=("", "_agg"),
+                )
 
         # Historical lockup return
         if not hist.empty and close_prices is not None:
@@ -267,15 +333,6 @@ class EventToDaily(PreprocessingStep):
                     .fillna(0)
                     .astype(np.float32)
                 )
-
-        # VC-backed flag
-        if "free_type" in df.columns:
-            df["is_vc_backed"] = (
-                df["free_type"]
-                .astype(str)
-                .str.contains("首发|IPO", na=False)
-                .astype(np.int8)
-            )
 
         result_parts = []
         if not hist.empty:
@@ -293,7 +350,7 @@ class EventToDaily(PreprocessingStep):
 
     # ── dividend ───────────────────────────────────────────────────────
 
-    def _transform_dividend(self, df, close_prices, trading_dates):
+    def _transform_dividend(self, df, close_prices, trading_dates, **kwargs):
         df = df.copy()
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
