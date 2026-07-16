@@ -36,7 +36,22 @@ import pandas as pd
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.market_wide_storage import MarketWideStorage
-from stoke_ml.data.sources.a_shares.limit_up_source import SENTIMENT_COLS
+from stoke_ml.data.sources.a_shares.capital_flow_source import CapitalFlowSource
+from stoke_ml.data.sources.a_shares.limit_up_source import LimitUpSource, SENTIMENT_COLS
+from stoke_ml.data.sources.a_shares.datacenter_sources import (
+    BlockTradeSource, ShareholderSource, LockupExpirySource, DividendSource,
+)
+try:
+    from stoke_ml.data.sources.a_shares.sector_source import (
+        IndustryRankingSource, ConceptBlockSource,
+    )
+except ImportError:
+    IndustryRankingSource = None  # type: ignore[assignment]
+    ConceptBlockSource = None  # type: ignore[assignment]
+try:
+    from stoke_ml.data.sources.a_shares.backup_sources import SinaFundFlowSource
+except ImportError:
+    SinaFundFlowSource = None  # type: ignore[assignment]
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -139,28 +154,6 @@ def main():
         ]
     else:
         to_download = [args.type]
-
-    # Lazy imports — only load source modules that are actually needed.
-    # Core sources (always needed for most download types):
-    from stoke_ml.data.sources.a_shares.capital_flow_source import CapitalFlowSource
-    from stoke_ml.data.sources.a_shares.limit_up_source import LimitUpSource
-    from stoke_ml.data.sources.a_shares.datacenter_sources import (
-        BlockTradeSource, ShareholderSource, LockupExpirySource, DividendSource,
-    )
-    # Optional sources — may fail if dependencies are missing:
-    try:
-        from stoke_ml.data.sources.a_shares.sector_source import (
-            IndustryRankingSource, ConceptBlockSource,
-        )
-    except ImportError:
-        IndustryRankingSource = None  # type: ignore[assignment]
-        ConceptBlockSource = None  # type: ignore[assignment]
-        logger.warning("sector_source unavailable — industry_ranking/concept_blocks skipped")
-    try:
-        from stoke_ml.data.sources.a_shares.backup_sources import SinaFundFlowSource
-    except ImportError:
-        SinaFundFlowSource = None  # type: ignore[assignment]
-        logger.warning("backup_sources unavailable — sina_fund_flow skipped")
 
     # ── Per-stock sources (capital_flow, block_trade, shareholder, etc.) ──
     per_stock_types = {
