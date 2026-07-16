@@ -389,6 +389,11 @@ def main():
         train_data["y_volatility"] = (train_data["y_volatility"] - vol_mean) / vol_std
         val_data["y_return"] = (val_data["y_return"] - ret_mean) / ret_std
         val_data["y_volatility"] = (val_data["y_volatility"] - vol_mean) / vol_std
+        # Clip normalized targets to [-5, 5] — regime changes can make
+        # validation returns several sigma larger than training, which
+        # would otherwise dominate the loss and destabilise training.
+        np.clip(val_data["y_return"], -5.0, 5.0, out=val_data["y_return"])
+        np.clip(val_data["y_volatility"], -5.0, 5.0, out=val_data["y_volatility"])
 
         logger.info("Fold %d/%d: train [%d:%d], val [%d:%d]",
                     fold, args.max_folds or "∞",

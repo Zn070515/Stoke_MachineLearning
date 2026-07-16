@@ -1184,6 +1184,35 @@ class FeaturePipeline:
             feats = feats.copy()
             all_feat_dfs.append(feats)
 
+        # ── Compute targets from RAW close BEFORE cross-sectional normalization ──
+        # Cross-sectional z-score normalization mutates close (and all PK/PO
+        # columns) to relative-value space.  Targets MUST be computed from raw
+        # prices — using z-score changes as returns distorts the signal.
+        lengths = [len(df) for df in all_feat_dfs]
+        max_T = min(max(lengths), 3000)
+
+        N_stocks = len(all_feat_dfs)
+        y_dir_arr = np.zeros((N_stocks, max_T), dtype=np.int64)
+        y_ret_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
+        y_vol_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
+        stock_T = np.zeros(N_stocks, dtype=np.int32)
+
+        for i, df in enumerate(all_feat_dfs):
+            if len(df) == 0:
+                continue
+            df_sorted = df.sort_values("date").reset_index(drop=True)
+            T_i = min(len(df_sorted), max_T)
+            stock_T[i] = T_i
+            close_raw = df_sorted[target_col].values[:T_i]
+            ret_1d = np.full(T_i, np.nan, dtype=np.float32)
+            ret_1d[1:] = (close_raw[1:] - close_raw[:-1]) / (close_raw[:-1] + 1e-8)
+            y_dir_arr[i, :T_i] = np.where(
+                ret_1d > 0.003, 2, np.where(ret_1d < -0.003, 0, 1),
+            ).astype(np.int64)
+            y_ret_arr[i, :T_i] = ret_1d
+            for t in range(6, T_i):
+                y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))
+
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
         # others, producing different column sets. Missing columns get ZI fill.
@@ -1209,10 +1238,6 @@ class FeaturePipeline:
                 if fill_data:
                     fill_df = pd.DataFrame(fill_data, index=df.index)
                     all_feat_dfs[i] = pd.concat([df, fill_df], axis=1)
-
-        # Find common max length
-        lengths = [len(df) for df in all_feat_dfs]
-        max_T = min(max(lengths), 3000)  # cap at ~12 years
 
         if max_T < self.seq_len + 5:
             raise ValueError(
@@ -1265,46 +1290,27 @@ class FeaturePipeline:
         pk_dim = len(pk_cols_available)
         po_dim = len(po_cols_available)
 
-        # Pre-allocate
-        static_arr = np.zeros((N, static_dim), dtype=np.float32)
-        pk_arr = np.zeros((N, max_T, pk_dim), dtype=np.float32)
-        po_arr = np.zeros((N, max_T, po_dim), dtype=np.float32)
-        y_dir_arr = np.zeros((N, max_T), dtype=np.int64)
-        y_ret_arr = np.zeros((N, max_T), dtype=np.float32)
-        y_vol_arr = np.zeros((N, max_T), dtype=np.float32)
-        stock_T = np.zeros(N, dtype=np.int32)  # actual per-stock length
+        # Pre-allocate feature arrays
+        static_arr = np.zeros((N_stocks, static_dim), dtype=np.float32)
+        pk_arr = np.zeros((N_stocks, max_T, pk_dim), dtype=np.float32)
+        po_arr = np.zeros((N_stocks, max_T, po_dim), dtype=np.float32)
 
         for i, df in enumerate(all_feat_dfs):
             if len(df) == 0:
                 continue
 
-            df = df.sort_values("date").reset_index(drop=True)
-            T_i = min(len(df), max_T)
-            stock_T[i] = T_i
+            df_sorted = df.sort_values("date").reset_index(drop=True)
+            T_i = min(len(df_sorted), max_T)
 
             # Static: take first row values
             if static_dim > 0:
-                static_arr[i] = df[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
+                static_arr[i] = df_sorted[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
 
             # Past known
-            pk_arr[i, :T_i] = df[pk_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
+            pk_arr[i, :T_i] = df_sorted[pk_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
 
             # Past observed
-            po_arr[i, :T_i] = df[po_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
-
-            # Targets
-            close = df[target_col].values[:T_i]
-            ret_1d = np.full(T_i, np.nan, dtype=np.float32)
-            ret_1d[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-8)
-            # Direction label with 0.3% noise threshold (3-class: up/flat/down)
-            y_dir_arr[i, :T_i] = np.where(
-                ret_1d > 0.003, 2, np.where(ret_1d < -0.003, 0, 1),
-            ).astype(np.int64)
-            y_ret_arr[i, :T_i] = ret_1d
-
-            # 5-day realized volatility (lagged: excludes current return)
-            for t in range(6, T_i):
-                y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))  # ret_1d[t-5:t] excludes ret_1d[t]
+            po_arr[i, :T_i] = df_sorted[po_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
 
         # ── Limit-up/down bias correction ──
         # On days where a stock hits limit-up, positive returns are
@@ -1316,7 +1322,7 @@ class FeaturePipeline:
         # Reference: ml-quant-trading bias.py (see docs/research-findings.md §6.9).
         LIMIT_THRESHOLD = 0.095
         T_max = y_dir_arr.shape[1]
-        for i in range(N):
+        for i in range(N_stocks):
             T_i = int(stock_T[i])
             if T_i < 2:
                 continue
