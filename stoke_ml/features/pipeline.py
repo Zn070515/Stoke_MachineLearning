@@ -545,23 +545,7 @@ class FeaturePipeline:
         if not available and not extra:
             return df
         df = df.merge(s[["date"] + available + extra], on="date", how="left")
-        for col in available + extra:
-            if col == "has_news":
-                df[col] = df[col].fillna(False).astype(bool)
-            elif col == "news_count":
-                df[col] = df[col].fillna(0).astype("int16")
-            else:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
-
-        # Lag sentiment by 1 trading day to prevent look-ahead bias.
-        for col in available + extra:
-            df[col] = df[col].shift(1)
-        df["has_news"] = df["has_news"].fillna(False).astype(bool)
-        df["news_count"] = df["news_count"].fillna(0).astype("int16")
-        for col in available + extra:
-            if col not in ("has_news", "news_count") and col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
-
+        _batch_fill_shift(df, available + extra)
         return df
 
     def _merge_announcements(self, df: pd.DataFrame,
@@ -594,22 +578,7 @@ class FeaturePipeline:
         source_cols = list(rename.keys()) + extra
         a_renamed = a[["date"] + source_cols].rename(columns=rename)
         df = df.merge(a_renamed, on="date", how="left")
-        for target_col in merged_cols:
-            if target_col == "has_announce":
-                df[target_col] = df[target_col].fillna(False).astype(bool)
-            elif "count" in target_col:
-                df[target_col] = df[target_col].fillna(0).astype("int16")
-            else:
-                df[target_col] = df[target_col].fillna(0.0).astype(np.float32)
-        # Same PIT lag as news sentiment
-        for target_col in merged_cols:
-            df[target_col] = df[target_col].shift(1)
-        df["has_announce"] = df["has_announce"].fillna(False).astype(bool)
-        df["ann_count"] = df["ann_count"].fillna(0).astype("int16")
-        for col in ["ann_sentiment_mean", "ann_sentiment_std",
-                     "ann_positive_ratio", "ann_negative_ratio"]:
-            if col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, merged_cols)
         return df
 
     def _merge_margin(self, df: pd.DataFrame,
@@ -627,13 +596,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(m[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: market-wide data available after close → shift to t+1
-        for col in available:
-            df[col] = df[col].shift(1)
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available)
         return df
 
     def _merge_northbound(self, df: pd.DataFrame,
@@ -651,13 +614,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(nb[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: market-wide data available after close → shift to t+1
-        for col in available:
-            df[col] = df[col].shift(1)
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available)
         return df
 
     def _merge_dragon_tiger(self, df: pd.DataFrame,
@@ -686,16 +643,7 @@ class FeaturePipeline:
         agg["lhb_buy_ratio"] = agg["lhb_buy_ratio"].fillna(0.5).astype(np.float32)
         agg["lhb_net_amount"] = agg["lhb_net_amount"].fillna(0.0).astype(np.float32)
         df = df.merge(agg, on="date", how="left")
-        for col in DRAGON_TIGER_COLS:
-            if col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: market-wide data available after close → shift to t+1
-        for col in DRAGON_TIGER_COLS:
-            if col in df.columns:
-                df[col] = df[col].shift(1)
-        for col in DRAGON_TIGER_COLS:
-            if col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, [c for c in DRAGON_TIGER_COLS if c in df.columns])
         return df
 
     def _merge_fundamental(self, df: pd.DataFrame,
@@ -725,8 +673,7 @@ class FeaturePipeline:
             fd = fd.drop_duplicates(subset="date", keep="last")
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        df[available] = df[available].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_valuation(self, df: pd.DataFrame,
@@ -743,8 +690,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(vd[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        df[available] = df[available].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_etf_flow(self, df: pd.DataFrame,
@@ -762,8 +708,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(ef[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        df[available] = df[available].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_guba(self, df: pd.DataFrame,
@@ -782,21 +727,7 @@ class FeaturePipeline:
         if not available and not extra:
             return df
         df = df.merge(g[["date"] + available + extra], on="date", how="left")
-        for col in available + extra:
-            if col == "has_guba_post":
-                df[col] = df[col].fillna(False).astype(bool)
-            elif col == "guba_post_count":
-                df[col] = df[col].fillna(0).astype("int16")
-            else:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: sentiment[t-1] paired with price[t]
-        for col in available + extra:
-            df[col] = df[col].shift(1)
-        df["has_guba_post"] = df["has_guba_post"].fillna(False).astype(bool)
-        df["guba_post_count"] = df["guba_post_count"].fillna(0).astype("int16")
-        for col in available + extra:
-            if col not in ("has_guba_post", "guba_post_count") and col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available + extra)
         return df
 
     def _merge_comment(self, df: pd.DataFrame,
@@ -815,21 +746,10 @@ class FeaturePipeline:
         if not available and not extra:
             return df
         df = df.merge(c[["date"] + available + extra], on="date", how="left")
-        for col in available + extra:
-            if col == "has_comment":
-                df[col] = df[col].fillna(False).astype(bool)
-            else:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: comment data[t-1] paired with price[t]
-        for col in available + extra:
-            df[col] = df[col].shift(1)
-        if "has_comment" in df.columns:
-            df["has_comment"] = df["has_comment"].fillna(False).astype(bool)
-        else:
+        _batch_fill_shift(df, available + extra)
+        # Guard: ensure has_comment exists (may be absent in sparse comment data)
+        if "has_comment" not in df.columns:
             df["has_comment"] = df.get("comment_score", pd.Series(dtype=float)).notna()
-        for col in COMMENT_COLS + extra:
-            if col != "has_comment" and col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_xueqiu(self, df: pd.DataFrame,
@@ -848,21 +768,7 @@ class FeaturePipeline:
         if not available and not extra:
             return df
         df = df.merge(x[["date"] + available + extra], on="date", how="left")
-        for col in available + extra:
-            if col == "has_xueqiu_post":
-                df[col] = df[col].fillna(False).astype(bool)
-            elif col == "xueqiu_post_count":
-                df[col] = df[col].fillna(0).astype("int16")
-            else:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: sentiment[t-1] paired with price[t]
-        for col in available + extra:
-            df[col] = df[col].shift(1)
-        df["has_xueqiu_post"] = df["has_xueqiu_post"].fillna(False).astype(bool)
-        df["xueqiu_post_count"] = df["xueqiu_post_count"].fillna(0).astype("int16")
-        for col in available + extra:
-            if col not in ("has_xueqiu_post", "xueqiu_post_count") and col in df.columns:
-                df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available + extra)
         return df
 
     # ── Multi-shape preprocessing merge methods ──────────────────────
@@ -973,13 +879,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(macro[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
-        # PIT lag: macro data available after close → shift to t+1
-        for col in available:
-            df[col] = df[col].shift(1)
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available)
         return df
 
     def _merge_industry(self, df: pd.DataFrame,
@@ -1014,8 +914,9 @@ class FeaturePipeline:
                 industry_df["ind_dispersion_20d"] = (
                     industry_df["ind_return_std"].rolling(20).std().fillna(0.0)
                 )
-                for col in [c for c in INDUSTRY_COLS if c in industry_df.columns]:
-                    industry_df[col] = industry_df[col].astype(np.float32)
+                ind_float_cols = [c for c in INDUSTRY_COLS if c in industry_df.columns]
+                if ind_float_cols:
+                    industry_df[ind_float_cols] = industry_df[ind_float_cols].astype(np.float32)
                 self._industry_cache = industry_df
                 # Cache sector map and raw industry returns for per-stock features
                 self._industry_returns = raw
@@ -1048,24 +949,19 @@ class FeaturePipeline:
                 ind_ret_df["date"] = pd.to_datetime(ind_ret_df["date"])
                 df["date"] = pd.to_datetime(df["date"])
                 df = df.merge(ind_ret_df, on="date", how="left")
-                df["ind_matched_return"] = (
-                    df["ind_matched_return"].fillna(0.0).astype(np.float32)
-                )
-                # Stock vs industry excess return
+                # Stock vs industry excess return (computable before lag)
                 if "pct_change" in df.columns:
                     df["stock_vs_industry"] = (
-                        df["pct_change"] - df["ind_matched_return"]
+                        df["pct_change"] - df["ind_matched_return"].fillna(0.0)
                     ).astype(np.float32)
-                df["ind_matched_return"] = df["ind_matched_return"].shift(1)
-                df["ind_matched_return"] = df["ind_matched_return"].fillna(0.0).astype(np.float32)
+                # PIT lag + fill for industry-matched columns
+                _batch_fill_shift(df, ["ind_matched_return", "stock_vs_industry"])
 
         df = df.merge(ind[["date"] + available], on="date", how="left")
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
-        for col in available:
-            df[col] = df[col].shift(1)
-        for col in available:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
+        # Batch fill → shift → fill (vectorized block assignment, no fragmentation)
+        df[available] = df[available].fillna(0.0).astype(np.float32)
+        df[available] = df[available].shift(1)
+        df[available] = df[available].fillna(0.0).astype(np.float32)
         return df
 
     # ------------------------------------------------------------------
@@ -1661,6 +1557,49 @@ def _has_col_in_any_stock(all_feat_dfs: list[pd.DataFrame], col_name: str) -> st
     return None
 
 
+def _batch_fill_shift(df: pd.DataFrame, cols: list[str]) -> None:
+    """Vectorized fill → shift → fill for merged aux columns.
+
+    Groups columns by dtype and does each operation in a single block
+    assignment — zero DataFrame fragmentation (no PerformanceWarning).
+    Mutates *df* in-place.
+    """
+    available = [c for c in cols if c in df.columns]
+    if not available:
+        return
+
+    # Partition by expected dtype
+    float_cols = [c for c in available
+                  if not c.startswith("has_")
+                  and not c.endswith("_count")
+                  and not c.endswith("_streak")
+                  and not c.endswith("_quadrant")]
+    int_cols = [c for c in available
+                if (c.endswith("_count") or c.endswith("_streak")
+                    or c.endswith("_quadrant"))
+                and not c.startswith("has_")]
+    bool_cols = [c for c in available if c.startswith("has_")]
+
+    # Pre-lag fill
+    if float_cols:
+        df[float_cols] = df[float_cols].fillna(0.0).astype(np.float32)
+    if int_cols:
+        df[int_cols] = df[int_cols].fillna(0).astype("int16")
+    if bool_cols:
+        df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
+
+    # PIT lag: feature[t-1] paired with price[t]
+    df[available] = df[available].shift(1)
+
+    # Post-lag fill (first row becomes NaN after shift)
+    if float_cols:
+        df[float_cols] = df[float_cols].fillna(0.0).astype(np.float32)
+    if int_cols:
+        df[int_cols] = df[int_cols].fillna(0).astype("int16")
+    if bool_cols:
+        df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
+
+
 def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     """Merge a preprocessed auxiliary DataFrame on date with ZI fill + PIT lag.
 
@@ -1691,37 +1630,7 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
         return df
 
     df = df.merge(a[["date"] + available], on="date", how="left")
-    for col in available:
-        if col.startswith("has_"):
-            if pd.api.types.is_numeric_dtype(df[col]):
-                df[col] = df[col].fillna(0).astype(np.int8)
-            else:
-                df[col] = df[col].fillna(False).astype(bool)
-        elif col.endswith("_count"):
-            df[col] = df[col].fillna(0).astype("int16")
-        elif col.endswith("_streak") or col.endswith("_quadrant"):
-            df[col] = df[col].fillna(0).astype(np.int16)
-        else:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
-
-    # PIT lag: feature[t-1] paired with price[t]
-    for col in available:
-        df[col] = df[col].shift(1)
-
-    # Re-fill after shift (first row becomes NaN)
-    for col in available:
-        if col.startswith("has_"):
-            if pd.api.types.is_numeric_dtype(df[col]):
-                df[col] = df[col].fillna(0).astype(np.int8)
-            else:
-                df[col] = df[col].fillna(False).astype(bool)
-        elif col.endswith("_count"):
-            df[col] = df[col].fillna(0).astype("int16")
-        elif col.endswith("_streak") or col.endswith("_quadrant"):
-            df[col] = df[col].fillna(0).astype(np.int16)
-        else:
-            df[col] = df[col].fillna(0.0).astype(np.float32)
-
+    _batch_fill_shift(df, available)
     return df
 
 
