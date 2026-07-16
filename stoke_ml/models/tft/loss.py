@@ -24,18 +24,11 @@ class UncertaintyLoss(nn.Module):
         )
 
     def forward(self, task_losses: list[torch.Tensor]) -> torch.Tensor:
-        """Compute weighted total loss.
-
-        Args:
-            task_losses: list of per-task scalar losses, e.g.,
-                [CE_loss, MSE_return_loss, MSE_vol_loss]
-
-        Returns:
-            scalar total loss with uncertainty weighting.
-        """
         assert len(task_losses) == self.num_tasks
-        total = torch.tensor(0.0, device=self.log_vars.device)
+        # Clamp log_vars to keep exp(-log_var) in fp16 safe range [-10, 12]
+        log_vars = torch.clamp(self.log_vars, -10.0, 12.0)
+        total = torch.tensor(0.0, device=log_vars.device, dtype=log_vars.dtype)
         for i, loss in enumerate(task_losses):
-            precision = torch.exp(-self.log_vars[i])
-            total = total + 0.5 * (precision * loss + self.log_vars[i])
+            precision = torch.exp(-log_vars[i])
+            total = total + 0.5 * (precision * loss + log_vars[i])
         return total

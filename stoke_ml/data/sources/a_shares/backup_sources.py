@@ -68,7 +68,7 @@ class SinaFundFlowSource:
 
     SOURCE_NAME = "sina_fund_flow"
 
-    def fetch(self, code: str, days: int = 60) -> pd.DataFrame:
+    def fetch(self, code: str, days: int = 3000) -> pd.DataFrame:
         """Fetch daily fund flow for a stock from Sina.
 
         Args:

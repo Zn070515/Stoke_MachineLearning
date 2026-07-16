@@ -41,8 +41,7 @@ class ConcurrentDownloader:
         failures: dict[str, str] = {}
 
         def _worker(code: str) -> tuple[str, pd.DataFrame | None, str | None]:
-            with self._lock:
-                self._rate_limiter.wait()
+            self._rate_limiter.wait()
             try:
                 df = fetch_fn(code)
                 return code, df, None

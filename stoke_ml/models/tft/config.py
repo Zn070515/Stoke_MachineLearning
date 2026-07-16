@@ -11,18 +11,18 @@ class TFTConfig:
     past_observed_dim: int = 120
 
     # Core
-    hidden_dim: int = 256
+    hidden_dim: int = 128
     lstm_layers: int = 2
     attention_heads: int = 4
-    grn_layers: int = 3
+    grn_layers: int = 2
     dropout: float = 0.15
 
     # Training
-    batch_size: int = 512
-    grad_accum_steps: int = 2
-    learning_rate: float = 1e-3
+    batch_size: int = 64
+    grad_accum_steps: int = 1
+    learning_rate: float = 3e-4
     weight_decay: float = 1e-4
-    warmup_steps: int = 1000
+    warmup_steps: int = 500
     max_grad_norm: float = 1.0
     max_epochs: int = 100
 
@@ -30,7 +30,7 @@ class TFTConfig:
     seq_len: int = 252
 
     # Output
-    num_direction_classes: int = 2
+    num_direction_classes: int = 3  # down / flat / up
 
     # Hardware
     use_amp: bool = True

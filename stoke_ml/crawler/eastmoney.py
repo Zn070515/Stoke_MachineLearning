@@ -33,12 +33,13 @@ logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 _session: Optional[curl_requests.Session] = None
 _last_call: float = 0.0
+_ref_count: int = 0
 
 DEFAULT_MIN_INTERVAL = 1.0  # seconds
 DEFAULT_TIMEOUT = 15  # seconds
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
-RETRY_BACKOFF = 0.6
+RETRY_BACKOFF = 60.0  # base seconds — EastMoney WAF cooldown is 60-300s
 
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
@@ -56,27 +57,30 @@ class EastMoneyClient:
         timeout: int = DEFAULT_TIMEOUT,
         impersonate: str = "chrome120",
     ):
+        global _ref_count
         self._min_interval = min_interval
         self._timeout = timeout
         self._impersonate = impersonate
         self._fingerprint = FingerprintGenerator(
             browser="chrome", device="desktop", os="windows",
         )
-        self._init_session()
+        with _lock:
+            _ref_count += 1
+        self._init_session(impersonate=impersonate)
 
     @staticmethod
-    def _init_session(_lock_held: bool = False):
+    def _init_session(impersonate: str = "chrome120", _lock_held: bool = False):
         """Create or re-create the shared curl-cffi session (idempotent)."""
         global _session
         if _lock_held:
             if _session is not None:
                 return
-            _session = curl_requests.Session(impersonate="chrome120")
+            _session = curl_requests.Session(impersonate=impersonate)
             return
         with _lock:
             if _session is not None:
                 return
-            _session = curl_requests.Session(impersonate="chrome120")
+            _session = curl_requests.Session(impersonate=impersonate)
 
     def get(
         self,
@@ -123,7 +127,7 @@ class EastMoneyClient:
 
         with _lock:
             if _session is None:
-                self._init_session(_lock_held=True)
+                self._init_session(impersonate=self._impersonate, _lock_held=True)
 
             elapsed = time.time() - _last_call
             wait = self._min_interval - elapsed
@@ -152,8 +156,11 @@ class EastMoneyClient:
             except Exception:
                 logger.debug("EastMoney request exception (attempt %d/%d)",
                              _attempt + 1, MAX_RETRIES + 1, exc_info=True)
-            finally:
-                _last_call = time.time()
+
+        # Only bump _last_call on success so failed requests don't
+        # needlessly delay the retry / next caller.
+        if resp is not None:
+            _last_call = time.time()
 
         # Connection errors (resp is None): EastMoney intermittently drops TCP
         # connections as a WAF measure. Retry with backoff, same as HTTP errors.
@@ -218,14 +225,15 @@ class EastMoneyClient:
             if d.get("result") and d["result"].get("data"):
                 return d["result"]["data"]
             return []
-        except Exception:
+        except (OSError, ValueError, KeyError):
             logger.debug("datacenter query failed: %s", report_name, exc_info=True)
             return []
 
     def close(self):
-        """Close the shared session (all instances share it, call once)."""
-        global _session
+        """Decrement refcount; close shared session only when last client exits."""
+        global _session, _ref_count
         with _lock:
-            if _session is not None:
+            _ref_count = max(0, _ref_count - 1)
+            if _ref_count == 0 and _session is not None:
                 _session.close()
                 _session = None

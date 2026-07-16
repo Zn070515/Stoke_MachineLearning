@@ -1,18 +1,20 @@
 """Train TFT panel model on A-share stocks.
 
 Usage:
-  PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py
-  PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --stocks 20 --epochs 30
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --stocks 20 --epochs 10 --max-folds 1
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --stock-list 600519,000001,000858
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_tft.py --no-aux  # skip auxiliary data for quick test
 """
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime
 
-import torch
 import numpy as np
+import pandas as pd
+import torch
 
 from stoke_ml.config import load_config
 from stoke_ml.features.pipeline import FeaturePipeline
@@ -25,19 +27,119 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _discover_stocks(data_dir: str, limit: int | None = None) -> list[str]:
+    daily_dir = os.path.join(data_dir, "a_shares", "daily")
+    if not os.path.isdir(daily_dir):
+        return []
+    stocks = sorted(
+        f.replace(".parquet", "")
+        for f in os.listdir(daily_dir) if f.endswith(".parquet")
+    )
+    return stocks[:limit] if limit else stocks
+
+
+def load_aux_data(
+    stock_list: list[str],
+    data_dir: str,
+    start_date: str,
+    end_date: str,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """Load auxiliary data (sentiment, guba, margin, etc.) per stock.
+
+    Returns: {stock_code: {"sentiment": df, "guba": df, ...}}
+    Only loads data types that exist on disk.
+    """
+    from stoke_ml.data.news_storage import NewsStorage
+    from stoke_ml.data.guba_storage import GubaStorage
+    from stoke_ml.data.xueqiu_storage import XueqiuStorage
+    from stoke_ml.data.market_wide_storage import MarketWideStorage
+    from stoke_ml.data.fundamental_storage import FundamentalStorage
+    from stoke_ml.data.comment_storage import CommentStorage
+
+    result: dict[str, dict[str, pd.DataFrame]] = {c: {} for c in stock_list}
+
+    # --- Sentiment (news) ---
+    try:
+        ns = NewsStorage(data_dir)
+        for code in stock_list:
+            df = ns.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["sentiment"] = df
+    except Exception:
+        logger.warning("Sentiment data not available, skipping")
+
+    # --- Guba ---
+    try:
+        gs = GubaStorage(data_dir)
+        for code in stock_list:
+            df = gs.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["guba"] = df
+    except Exception:
+        logger.warning("Guba data not available, skipping")
+
+    # --- Xueqiu ---
+    try:
+        xs = XueqiuStorage(data_dir)
+        for code in stock_list:
+            df = xs.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["xueqiu"] = df
+    except Exception:
+        logger.warning("Xueqiu data not available, skipping")
+
+    # --- Comment ---
+    try:
+        cs = CommentStorage(data_dir)
+        for code in stock_list:
+            df = cs.build_features(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["comment"] = df
+    except Exception:
+        logger.warning("Comment data not available, skipping")
+
+    # --- Margin ---
+    try:
+        margin_storage = MarketWideStorage(data_dir, "margin")
+        for code in stock_list:
+            df = margin_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["margin"] = df
+    except Exception:
+        logger.warning("Margin data not available, skipping")
+
+    # --- Fundamental ---
+    try:
+        fs = FundamentalStorage(data_dir)
+        for code in stock_list:
+            df = fs.build_features(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["fundamental"] = df
+    except Exception:
+        logger.warning("Fundamental data not available, skipping")
+
+    loaded = sum(1 for v in result.values() if v)
+    logger.info("Aux data loaded for %d/%d stocks", loaded, len(stock_list))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train TFT panel model")
     parser.add_argument("--stocks", type=int, default=None,
-                        help="Limit to first N stocks (for quick testing)")
+                        help="Limit to first N stocks")
     parser.add_argument("--stock-list", type=str, default=None,
                         help="Comma-separated stock codes")
     parser.add_argument("--start", type=str, default="2015-01-01")
     parser.add_argument("--end", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--max-folds", type=int, default=3,
+                        help="Limit number of walk-forward folds (default: 3)")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
+    parser.add_argument("--no-aux", action="store_true",
+                        help="Skip auxiliary data loading (faster startup)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -47,24 +149,23 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
-    # Load config and data
     cfg = load_config()
     data_dir = cfg.project.data_dir
 
-    from stoke_ml.data.storage import DataStorage
-    ds = DataStorage(data_dir)
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
     else:
-        stock_list = ds.list_stocks()
-        if args.stocks:
-            stock_list = stock_list[:args.stocks]
+        stock_list = _discover_stocks(data_dir, args.stocks)
+
+    if not stock_list:
+        logger.error("No stocks found")
+        sys.exit(1)
 
     logger.info("Loading K-line data for %d stocks from %s to %s...",
                 len(stock_list), args.start, args.end)
 
-    # Build per-stock DataFrames into a panel
-    import pandas as pd
+    from stoke_ml.data.storage import DataStorage
+    ds = DataStorage(data_dir)
     frames = []
     for code in stock_list:
         df = ds.load_daily(code, args.start, args.end)
@@ -78,6 +179,14 @@ def main():
     panel = pd.concat(frames, ignore_index=True)
     logger.info("Panel shape: %s", panel.shape)
 
+    # Load auxiliary data (unless --no-aux)
+    aux_data = None
+    if not args.no_aux:
+        logger.info("Loading auxiliary data...")
+        t_aux = time.time()
+        aux_data = load_aux_data(stock_list, data_dir, args.start, args.end)
+        logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
+
     # Build features
     fp = FeaturePipeline(
         seq_len=252,
@@ -89,13 +198,16 @@ def main():
         use_shareholder=False, use_lockup=False, use_dividend=False,
         use_board=False, use_sector=False, use_concept=False,
     )
-    panel_data = fp.build_panel_features(panel)
+    panel_data = fp.build_panel_features(panel, aux_data=aux_data)
 
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
-    logger.info("Panel data: %d stocks × %d timesteps", n_stocks, n_timesteps)
+    dims = f"S={panel_data['static_features'].shape[1]} " \
+           f"PK={panel_data['past_known'].shape[2]} " \
+           f"PO={panel_data['past_observed'].shape[2]}"
+    logger.info("Panel data: %d stocks × %d timesteps  dims: %s",
+                n_stocks, n_timesteps, dims)
 
-    # TFT config — infer input dims from built data
     config = TFTConfig(
         seq_len=252,
         static_dim=panel_data["static_features"].shape[1],
@@ -106,27 +218,29 @@ def main():
         max_epochs=args.epochs,
         compile_model=not args.no_compile,
     )
-    logger.info("TFT config: hidden=%d, total params ~%dM",
-                config.hidden_dim,
-                config.hidden_dim * config.hidden_dim * 4 // 1_000_000)
+    logger.info("TFT config: hidden=%d batch=%d lr=%.1e",
+                config.hidden_dim, config.batch_size, config.learning_rate)
 
     # Purged walk-forward splits
-    train_len = 504  # ~2 years
-    val_len = 63  # ~3 months
-    step = 63  # ~3 months
-    purge = 5
+    train_len = 504
+    val_len = 63
+    step = 63
+    purge = config.seq_len  # must be >= seq_len to prevent context overlap
     all_sharpes = []
 
     fold = 0
     train_start = 0
     while train_start + train_len + purge + val_len < n_timesteps:
+        if args.max_folds and fold >= args.max_folds:
+            break
         fold += 1
         train_end = train_start + train_len
         val_start = train_end + purge
         val_end = min(val_start + val_len, n_timesteps)
 
         train_slice = slice(train_start, train_end)
-        val_slice = slice(val_start, val_end)
+        val_context_start = max(0, val_start - config.seq_len)
+        val_slice = slice(val_context_start, val_end)
 
         train_data = {
             "static_features": panel_data["static_features"],
@@ -145,8 +259,9 @@ def main():
             "y_volatility": panel_data["y_volatility"][:, val_slice],
         }
 
-        logger.info("Fold %d: train [%d:%d], val [%d:%d]",
-                    fold, train_start, train_end, val_start, val_end)
+        logger.info("Fold %d/%d: train [%d:%d], val [%d:%d]",
+                    fold, args.max_folds or "∞",
+                    train_start, train_end, val_start, val_end)
 
         t0 = time.time()
         model, history = train_tft(config, train_data, val_data, device)

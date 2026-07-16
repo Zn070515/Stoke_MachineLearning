@@ -15,13 +15,18 @@ API endpoints:
 - data.10jqka.com.cn/dataapi/limit_up/limit_up_pool (同花顺涨停揭秘)
 """
 
+import json
 import logging
-from datetime import datetime
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import pandas as pd
 
 from stoke_ml.crawler.eastmoney import EastMoneyClient
+from stoke_ml.data.calendar import TradingCalendar
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +80,13 @@ SENTIMENT_COLS = [
 
 
 def _fmt_zt_time(t) -> str:
-    """Format limit-up time integer -> HH:MM:SS (92500 -> 09:25:00)."""
+    """Format limit-up time integer or string -> HH:MM:SS (92500 -> 09:25:00)."""
     if t is None or t == "":
         return ""
-    s = str(t).zfill(6)
+    s = str(t).strip()
+    if ":" in s:
+        return s  # already formatted like "09:25:00"
+    s = s.zfill(6)
     return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
 
 
@@ -260,12 +268,26 @@ class LimitUpSource:
 
         Returns dict with: zt_count, zb_count, dt_count, yzt_count,
         break_rate(%), max_height, advance_rate(%), ladder_2..ladder_6plus.
+
+        NOTE: This makes 4 EastMoney API calls per date (zt/zb/dt/yzt pools).
+        For batch use, prefer fetch_sentiment_batch() which iterates day-by-day
+        with serial throttling — avoid calling this in a tight loop without
+        the EastMoneyClient rate limiter (default 1.2s between calls).
         """
         zt = self.fetch_zt_pool(date)
         zb = self.fetch_zb_pool(date)
         dt = self.fetch_dt_pool(date)
         yzt = self.fetch_yzt_pool(date)
+        return self.compute_sentiment(date, zt, zb, dt, yzt)
 
+    @staticmethod
+    def compute_sentiment(date: str, zt: pd.DataFrame, zb: pd.DataFrame,
+                          dt: pd.DataFrame, yzt: pd.DataFrame) -> dict:
+        """Compute board sentiment from pre-fetched pool DataFrames.
+
+        Pure function — no API calls. Callers that already have pool data
+        on disk can load it and pass it here to avoid re-fetching.
+        """
         zt_n, zb_n, dt_n, yzt_n = len(zt), len(zb), len(dt), len(yzt)
 
         # Break rate: busted / (busted + sealed) * 100
@@ -283,7 +305,7 @@ class LimitUpSource:
             advance_rate = 0.0
 
         # Ladder: count by consecutive board count
-        ladder = {}
+        ladder: dict[int, int] = {}
         if zt_n:
             for days in zt["limit_days"]:
                 ladder[days] = ladder.get(days, 0) + 1
@@ -314,7 +336,8 @@ class LimitUpSource:
 
         Returns dict mapping pool name -> concatenated DataFrame.
         """
-        dates = pd.date_range(start=start_date, end=end_date, freq="B")
+        calendar = TradingCalendar("a_shares")
+        dates = calendar.get_trading_days(start_date, end_date)
         results: dict[str, list[pd.DataFrame]] = {p: [] for p in pools}
 
         for d in dates:
@@ -338,7 +361,8 @@ class LimitUpSource:
         self, start_date: str, end_date: str,
     ) -> pd.DataFrame:
         """Fetch daily sentiment summary over a date range."""
-        dates = pd.date_range(start=start_date, end=end_date, freq="B")
+        calendar = TradingCalendar("a_shares")
+        dates = calendar.get_trading_days(start_date, end_date)
         rows = []
         for d in dates:
             date_str = d.strftime("%Y-%m-%d")
@@ -371,9 +395,20 @@ class LimitUpSource:
             "date": _date8(date),
         }
         try:
-            r = self._client.get(url, params=params, timeout=10)
-            r.raise_for_status()
-            info = (r.json().get("data") or {}).get("info", [])
+            qs = urllib.parse.urlencode(params)
+            req = urllib.request.Request(
+                f"{url}?{qs}",
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://data.10jqka.com.cn/",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                info = (json.loads(r.read()).get("data") or {}).get("info", [])
         except Exception:
             logger.warning("同花顺 limit-up pool failed for %s", date)
             return pd.DataFrame(columns=THS_LIMIT_UP_COLS)
@@ -394,7 +429,10 @@ class LimitUpSource:
                 "seal_amount": _safe_float(it.get("order_amount")),
                 "high_days": it.get("high_days", ""),
                 "first_time": (
-                    datetime.fromtimestamp(int(ft)).strftime("%H:%M:%S")
+                    datetime.fromtimestamp(
+                        int(ft) // 1000 if int(ft) > 1e10 else int(ft),
+                        tz=timezone(timedelta(hours=8)),
+                    ).strftime("%H:%M:%S")
                     if ft else ""
                 ),
                 "is_again": _safe_int(it.get("is_again_limit")),

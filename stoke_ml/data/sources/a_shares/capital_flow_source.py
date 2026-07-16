@@ -14,6 +14,7 @@ API endpoint:
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -59,15 +60,23 @@ class CapitalFlowSource:
 
     def __init__(self, min_interval: float = 1.2):
         self._min_interval = min_interval
-        self._session = None
+        self._last_call: float = 0.0
 
-    def fetch_daily(self, code: str, days: int = 120) -> pd.DataFrame:
+    def _throttle(self):
+        """Sleep to maintain min_interval between API calls."""
+        elapsed = time.time() - self._last_call
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        self._last_call = time.time()
+
+    def fetch_daily(self, code: str, days: int = 3000) -> pd.DataFrame:
         """Fetch daily capital flow from Sina Finance.
 
         Returns DataFrame with columns:
             date, stock_code, main_net, small_net, mid_net,
             large_net, super_net
         """
+        self._throttle()
         prefix = _sina_market_code(code)
         url = (
             f"{SINA_FFLOW_URL}?page=1&num={days}&sort=opendate&asc=0"
@@ -82,10 +91,16 @@ class CapitalFlowSource:
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
-                text = r.read().decode("utf-8", "ignore")
+                raw = r.read()
         except (urllib.error.URLError, OSError) as e:
             logger.warning("Sina fund flow request failed for %s: %s", code, e)
             return pd.DataFrame(columns=DAILY_NET_COLS)
+
+        # Try UTF-8 first, fall back to GBK for legacy Sina responses
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
 
         if "[" not in text or "]" not in text:
             logger.warning("Sina fund flow empty response for %s", code)

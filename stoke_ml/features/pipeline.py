@@ -3,6 +3,8 @@
 Integrates K-line, sentiment, market-wide (margin/northbound/dragon-tiger),
 ETF sector flow, and fundamental data into a unified feature set.
 """
+import logging
+
 import pandas as pd
 import numpy as np
 from stoke_ml.features.technical import TechnicalIndicators
@@ -11,6 +13,8 @@ from stoke_ml.features.interaction import InteractionFeatures
 from stoke_ml.features.temporal import (
     add_lag_features, add_rolling_features, add_calendar_features,
 )
+
+logger = logging.getLogger(__name__)
 
 SENTIMENT_COLS = [
     "sentiment_mean", "sentiment_std", "news_count",
@@ -185,9 +189,16 @@ class FeaturePipeline:
         self._preprocessing = None
         if use_new_preprocessing and preprocessing_config:
             self._preprocessing = self._build_preprocessing()
+        self._warned_missing: set[str] = set()
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
         self._interaction = InteractionFeatures()
+
+    def _warn_if_missing(self, key: str) -> None:
+        """Emit one-time warning when use_*=True but no data was passed."""
+        if key not in self._warned_missing:
+            logger.warning("use_%s=True but no %s data provided", key, key)
+            self._warned_missing.add(key)
 
     # ------------------------------------------------------------------
     # Preprocessing integration
@@ -381,6 +392,7 @@ class FeaturePipeline:
         board_df: pd.DataFrame | None = None,
         sector_df: pd.DataFrame | None = None,
         concept_df: pd.DataFrame | None = None,
+        skip_temporal: bool = False,
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
@@ -419,7 +431,7 @@ class FeaturePipeline:
         if self.use_interaction:
             df = self._interaction.compute_all(df)
 
-        if self.use_temporal:
+        if self.use_temporal and not skip_temporal:
             temporal_cols = list(TEMPORAL_BASE_COLS)
             temporal_cols += _active_cols(df, [
                 "sentiment_mean", "sentiment_std",
@@ -473,8 +485,10 @@ class FeaturePipeline:
 
     def _merge_sentiment(self, df: pd.DataFrame,
                          sentiment_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_sentiment and sentiment_df is not None
-                and not sentiment_df.empty):
+        if not self.use_sentiment:
+            return df
+        if sentiment_df is None or sentiment_df.empty:
+            self._warn_if_missing("sentiment")
             return df
         s = sentiment_df.copy()
         s["date"] = pd.to_datetime(s["date"])
@@ -506,8 +520,10 @@ class FeaturePipeline:
 
     def _merge_announcements(self, df: pd.DataFrame,
                              announcement_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_announcements and announcement_df is not None
-                and not announcement_df.empty):
+        if not self.use_announcements:
+            return df
+        if announcement_df is None or announcement_df.empty:
+            self._warn_if_missing("announcements")
             return df
         a = announcement_df.copy()
         a["date"] = pd.to_datetime(a["date"])
@@ -552,8 +568,10 @@ class FeaturePipeline:
 
     def _merge_margin(self, df: pd.DataFrame,
                       margin_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_margin and margin_df is not None
-                and not margin_df.empty):
+        if not self.use_margin:
+            return df
+        if margin_df is None or margin_df.empty:
+            self._warn_if_missing("margin")
             return df
         m = margin_df.copy()
         m["date"] = pd.to_datetime(m["date"])
@@ -565,12 +583,19 @@ class FeaturePipeline:
         df = df.merge(m[["date"] + available], on="date", how="left")
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: market-wide data available after close → shift to t+1
+        for col in available:
+            df[col] = df[col].shift(1)
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_northbound(self, df: pd.DataFrame,
                           northbound_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_northbound and northbound_df is not None
-                and not northbound_df.empty):
+        if not self.use_northbound:
+            return df
+        if northbound_df is None or northbound_df.empty:
+            self._warn_if_missing("northbound")
             return df
         nb = northbound_df.copy()
         nb["date"] = pd.to_datetime(nb["date"])
@@ -582,12 +607,19 @@ class FeaturePipeline:
         df = df.merge(nb[["date"] + available], on="date", how="left")
         for col in available:
             df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: market-wide data available after close → shift to t+1
+        for col in available:
+            df[col] = df[col].shift(1)
+        for col in available:
+            df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_dragon_tiger(self, df: pd.DataFrame,
                             dt_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_dragon_tiger and dt_df is not None
-                and not dt_df.empty):
+        if not self.use_dragon_tiger:
+            return df
+        if dt_df is None or dt_df.empty:
+            self._warn_if_missing("dragon_tiger")
             return df
         dt = dt_df.copy()
         dt["date"] = pd.to_datetime(dt["date"])
@@ -611,12 +643,21 @@ class FeaturePipeline:
         for col in DRAGON_TIGER_COLS:
             if col in df.columns:
                 df[col] = df[col].fillna(0.0).astype(np.float32)
+        # PIT lag: market-wide data available after close → shift to t+1
+        for col in DRAGON_TIGER_COLS:
+            if col in df.columns:
+                df[col] = df[col].shift(1)
+        for col in DRAGON_TIGER_COLS:
+            if col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
         return df
 
     def _merge_fundamental(self, df: pd.DataFrame,
                            fundamental_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_fundamental and fundamental_df is not None
-                and not fundamental_df.empty):
+        if not self.use_fundamental:
+            return df
+        if fundamental_df is None or fundamental_df.empty:
+            self._warn_if_missing("fundamental")
             return df
         fd = fundamental_df.copy()
         # Drop metadata columns
@@ -644,8 +685,10 @@ class FeaturePipeline:
 
     def _merge_etf_flow(self, df: pd.DataFrame,
                         etf_flow_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_etf_flow and etf_flow_df is not None
-                and not etf_flow_df.empty):
+        if not self.use_etf_flow:
+            return df
+        if etf_flow_df is None or etf_flow_df.empty:
+            self._warn_if_missing("etf_flow")
             return df
         ef = etf_flow_df.copy()
         ef["date"] = pd.to_datetime(ef["date"])
@@ -661,8 +704,10 @@ class FeaturePipeline:
 
     def _merge_guba(self, df: pd.DataFrame,
                     guba_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_guba and guba_df is not None
-                and not guba_df.empty):
+        if not self.use_guba:
+            return df
+        if guba_df is None or guba_df.empty:
+            self._warn_if_missing("guba")
             return df
         g = guba_df.copy()
         g["date"] = pd.to_datetime(g["date"])
@@ -692,8 +737,10 @@ class FeaturePipeline:
 
     def _merge_comment(self, df: pd.DataFrame,
                        comment_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_comment and comment_df is not None
-                and not comment_df.empty):
+        if not self.use_comment:
+            return df
+        if comment_df is None or comment_df.empty:
+            self._warn_if_missing("comment")
             return df
         c = comment_df.copy()
         c["date"] = pd.to_datetime(c["date"])
@@ -723,8 +770,10 @@ class FeaturePipeline:
 
     def _merge_xueqiu(self, df: pd.DataFrame,
                       xueqiu_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_xueqiu and xueqiu_df is not None
-                and not xueqiu_df.empty):
+        if not self.use_xueqiu:
+            return df
+        if xueqiu_df is None or xueqiu_df.empty:
+            self._warn_if_missing("xueqiu")
             return df
         x = xueqiu_df.copy()
         x["date"] = pd.to_datetime(x["date"])
@@ -756,57 +805,73 @@ class FeaturePipeline:
 
     def _merge_capital_flow(self, df: pd.DataFrame,
                             flow_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_capital_flow and flow_df is not None
-                and not flow_df.empty):
+        if not self.use_capital_flow:
+            return df
+        if flow_df is None or flow_df.empty:
+            self._warn_if_missing("capital_flow")
             return df
         return _merge_daily_aux(df, flow_df)
 
     def _merge_block_trade(self, df: pd.DataFrame,
                            bt_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_block_trade and bt_df is not None
-                and not bt_df.empty):
+        if not self.use_block_trade:
+            return df
+        if bt_df is None or bt_df.empty:
+            self._warn_if_missing("block_trade")
             return df
         return _merge_daily_aux(df, bt_df)
 
     def _merge_shareholder(self, df: pd.DataFrame,
                            sh_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_shareholder and sh_df is not None
-                and not sh_df.empty):
+        if not self.use_shareholder:
+            return df
+        if sh_df is None or sh_df.empty:
+            self._warn_if_missing("shareholder")
             return df
         return _merge_daily_aux(df, sh_df)
 
     def _merge_lockup(self, df: pd.DataFrame,
                       lu_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_lockup and lu_df is not None
-                and not lu_df.empty):
+        if not self.use_lockup:
+            return df
+        if lu_df is None or lu_df.empty:
+            self._warn_if_missing("lockup")
             return df
         return _merge_daily_aux(df, lu_df)
 
     def _merge_dividend(self, df: pd.DataFrame,
                         dv_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_dividend and dv_df is not None
-                and not dv_df.empty):
+        if not self.use_dividend:
+            return df
+        if dv_df is None or dv_df.empty:
+            self._warn_if_missing("dividend")
             return df
         return _merge_daily_aux(df, dv_df)
 
     def _merge_board(self, df: pd.DataFrame,
                      board_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_board and board_df is not None
-                and not board_df.empty):
+        if not self.use_board:
+            return df
+        if board_df is None or board_df.empty:
+            self._warn_if_missing("board")
             return df
         return _merge_daily_aux(df, board_df)
 
     def _merge_sector(self, df: pd.DataFrame,
                       sector_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_sector and sector_df is not None
-                and not sector_df.empty):
+        if not self.use_sector:
+            return df
+        if sector_df is None or sector_df.empty:
+            self._warn_if_missing("sector")
             return df
         return _merge_daily_aux(df, sector_df)
 
     def _merge_concept(self, df: pd.DataFrame,
                        concept_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not (self.use_concept and concept_df is not None
-                and not concept_df.empty):
+        if not self.use_concept:
+            return df
+        if concept_df is None or concept_df.empty:
+            self._warn_if_missing("concept")
             return df
         # Aggregate from long format (one row per stock-board-date) to wide
         # (one row per stock-date) before merging.
@@ -847,7 +912,7 @@ class FeaturePipeline:
 
         # Volume anomaly: ratio of current volume to 20-day median
         if volume is not None:
-            vol_med = volume.rolling(20, min_periods=5).median()
+            vol_med = volume.shift(1).rolling(20, min_periods=5).median()
             df["volume_ratio_20"] = (volume / vol_med.replace(0, np.nan)).clip(0, 20)
             df["volume_ratio_20"] = df["volume_ratio_20"].fillna(1.0).astype(np.float32)
 
@@ -868,19 +933,24 @@ class FeaturePipeline:
     # Sequence creation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _prep_feature_df(df: pd.DataFrame) -> pd.DataFrame:
+        """Drop metadata columns and rows with inf/NaN — shared by sequencing methods."""
+        drop_cols = ["stock_code", "sector", "size_proxy"]
+        feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+        feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
+        return feat_df.dropna()
+
     def _create_sequences(
         self, df: pd.DataFrame, target_col: str
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        drop_cols = ["date", "stock_code", "sector", "size_proxy"]
-        feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
-        # Replace inf with NaN so dropna handles both
-        feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
-        feat_df = feat_df.dropna()
+        feat_df = self._prep_feature_df(df)
 
         close = feat_df[target_col].values
-        target = (close[self.horizon:] > close[: -self.horizon]).astype(int)
+        ret = (close[self.horizon:] - close[: -self.horizon]) / (close[: -self.horizon] + 1e-8)
+        target = np.where(ret > 0.003, 2, np.where(ret < -0.003, 0, 1))
 
-        price_cols = ["open", "high", "low", "close", "amount"]
+        price_cols = ["open", "high", "low", "close", "date"]
         X_cols = [c for c in feat_df.columns if c not in price_cols]
         X_data = feat_df[X_cols].values.astype(np.float32)
 
@@ -901,20 +971,16 @@ class FeaturePipeline:
             ], dtype=np.float32)
 
         y = target[self.seq_len - 1: self.seq_len - 1 + n_samples]
-        aligned_close = close[self.seq_len - 1: self.seq_len + n_samples]
+        aligned_close = close[self.seq_len - 1: self.seq_len - 1 + n_samples + 1]
         return X, y, aligned_close.astype(np.float32)
 
     def _get_sample_dates(self, feats: pd.DataFrame) -> np.ndarray:
         """Return the prediction date for each sample after dropna + sequencing.
 
-        Must match _create_sequences exactly in the rows it keeps.
+        Uses the same row filtering as _create_sequences via _prep_feature_df.
         """
-        drop_cols = ["date", "stock_code", "sector", "size_proxy"]
-        # Reconstruct the dropna mask (same as _create_sequences)
-        feat_df = feats.drop(columns=[c for c in drop_cols if c in feats.columns])
-        valid_mask = feat_df.notna().all(axis=1)
-        # Get dates for valid rows
-        valid_dates = feats.loc[valid_mask.values, "date"].values
+        feat_df = self._prep_feature_df(feats)
+        valid_dates = feat_df["date"].values
         if len(valid_dates) < self.seq_len + self.horizon:
             return np.array([], dtype="datetime64[ns]")
         n_samples = len(valid_dates) - self.seq_len - self.horizon + 1
@@ -926,29 +992,58 @@ class FeaturePipeline:
         self,
         panel: pd.DataFrame,
         target_col: str = "close",
+        aux_data: dict[str, dict[str, pd.DataFrame]] | None = None,
     ) -> dict:
         """Build panel-format features for TFT training from a multi-stock panel.
 
         The input panel must have columns: date, stock_code, open, high, low,
         close, volume (plus any auxiliary feature columns already merged).
 
-        Returns a dict with pre-built numpy arrays:
-            static_features: (N_stocks, static_dim)
-            past_known: (N_stocks, T, past_known_dim)
-            past_observed: (N_stocks, T, past_observed_dim)
-            y_direction: (N_stocks, T)
-            y_return: (N_stocks, T)
-            y_volatility: (N_stocks, T) — 5-day realized vol
+        Args:
+            panel: multi-stock DataFrame with columns date, stock_code, OHLCV.
+            target_col: column name for close price.
+            aux_data: optional dict stock_code → {aux_type: DataFrame}.
+                      aux_type keys: "sentiment", "guba", "xueqiu", "comment",
+                      "announcement", "margin", "northbound", "dragon_tiger",
+                      "fundamental", "etf_flow", "capital_flow", "block_trade",
+                      "shareholder", "lockup", "dividend", "board", "sector", "concept".
+
+        Returns:
+            dict with numpy arrays: static_features, past_known, past_observed,
+            y_direction, y_return, y_volatility.
         """
         codes = sorted(panel["stock_code"].unique())
         N = len(codes)
+        aux_data = aux_data or {}
 
         # Engineer features per stock (reuses existing pipeline)
         all_feat_dfs = []
         for code in codes:
             mask = panel["stock_code"] == code
             df_stock = panel[mask].sort_values("date").reset_index(drop=True)
-            feats = self._engineer_features(df_stock)
+            stock_aux = aux_data.get(code, {})
+            feats = self._engineer_features(
+                df_stock,
+                sentiment_df=stock_aux.get("sentiment"),
+                guba_df=stock_aux.get("guba"),
+                xueqiu_df=stock_aux.get("xueqiu"),
+                comment_df=stock_aux.get("comment"),
+                announcement_df=stock_aux.get("announcement"),
+                margin_df=stock_aux.get("margin"),
+                northbound_df=stock_aux.get("northbound"),
+                dragon_tiger_df=stock_aux.get("dragon_tiger"),
+                fundamental_df=stock_aux.get("fundamental"),
+                etf_flow_df=stock_aux.get("etf_flow"),
+                capital_flow_df=stock_aux.get("capital_flow"),
+                block_trade_df=stock_aux.get("block_trade"),
+                shareholder_df=stock_aux.get("shareholder"),
+                lockup_df=stock_aux.get("lockup"),
+                dividend_df=stock_aux.get("dividend"),
+                board_df=stock_aux.get("board"),
+                sector_df=stock_aux.get("sector"),
+                concept_df=stock_aux.get("concept"),
+                skip_temporal=True,  # TFT LSTM learns temporal patterns natively
+            )
             all_feat_dfs.append(feats)
 
         # Find common max length
@@ -965,6 +1060,52 @@ class FeaturePipeline:
         static_cols_available = [c for c in _STATIC_FEATURE_COLS if c in first_df.columns]
         pk_cols_available = [c for c in _PAST_KNOWN_COLS if c in first_df.columns]
         po_cols_available = [c for c in _PAST_OBSERVED_COLS if c in first_df.columns]
+
+        # Compute market_cap_quantile if not present (size proxy from avg close)
+        if "market_cap_quantile" not in first_df.columns:
+            stock_avg_closes = {}
+            for i, df in enumerate(all_feat_dfs):
+                if len(df) > 0 and "close" in df.columns:
+                    # Use first 20 days average as size proxy — zero look-ahead
+                    stock_avg_closes[codes[i]] = df["close"].iloc[:min(20, len(df))].mean()
+            if stock_avg_closes:
+                all_avgs = np.array(list(stock_avg_closes.values()))
+                quantiles = np.searchsorted(
+                    np.sort(all_avgs), all_avgs
+                ).astype(np.float32) / len(all_avgs)
+                cap_map = {c: q for c, q in zip(stock_avg_closes.keys(), quantiles)}
+                for i, df in enumerate(all_feat_dfs):
+                    df["market_cap_quantile"] = cap_map.get(codes[i], 0.5)
+                static_cols_available = [c for c in _STATIC_FEATURE_COLS
+                                         if c in first_df.columns or c in all_feat_dfs[0].columns]
+
+        # ── Per-date cross-sectional z-score normalization ──
+        # Normalize each feature across stocks within each date, so that
+        # a feature's value is expressed relative to the cross-section that
+        # day.  This avoids pooling future dates' statistics into today's
+        # normalized value and is the standard panel-finance treatment.
+        norm_cols = pk_cols_available + po_cols_available
+        all_feat = pd.concat([
+            df[["date"] + norm_cols]
+            for df in all_feat_dfs
+            if len(df) > 0
+        ], ignore_index=True)
+
+        date_stats: dict[str, pd.DataFrame] = {}
+        for col in norm_cols:
+            if col not in all_feat.columns:
+                continue
+            stats = all_feat.groupby("date")[col].agg(["mean", "std"])
+            stats["std"] = stats["std"].fillna(1.0).clip(lower=1e-8)
+            date_stats[col] = stats
+
+        for df in all_feat_dfs:
+            for col in norm_cols:
+                if col not in df.columns or col not in date_stats:
+                    continue
+                aligned_mean = df["date"].map(date_stats[col]["mean"])
+                aligned_std = df["date"].map(date_stats[col]["std"]).clip(lower=1e-8)
+                df[col] = (df[col] - aligned_mean) / aligned_std
 
         static_dim = len(static_cols_available)
         pk_dim = len(pk_cols_available)
@@ -986,7 +1127,8 @@ class FeaturePipeline:
             T_i = min(len(df), max_T)
 
             # Static: take first row values
-            static_arr[i] = df[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
+            if static_dim > 0:
+                static_arr[i] = df[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
 
             # Past known
             pk_arr[i, :T_i] = df[pk_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
@@ -996,14 +1138,17 @@ class FeaturePipeline:
 
             # Targets
             close = df[target_col].values[:T_i]
-            ret_1d = np.zeros(T_i, dtype=np.float32)
+            ret_1d = np.full(T_i, np.nan, dtype=np.float32)
             ret_1d[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-8)
-            y_dir_arr[i, :T_i] = (ret_1d > 0).astype(np.int64)
+            # Direction label with 0.3% noise threshold (3-class: up/flat/down)
+            y_dir_arr[i, :T_i] = np.where(
+                ret_1d > 0.003, 2, np.where(ret_1d < -0.003, 0, 1),
+            ).astype(np.int64)
             y_ret_arr[i, :T_i] = ret_1d
 
-            # 5-day realized volatility
-            for t in range(5, T_i):
-                y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))
+            # 5-day realized volatility (lagged: excludes current return)
+            for t in range(6, T_i):
+                y_vol_arr[i, t] = float(np.std(ret_1d[t - 5:t]))  # ret_1d[t-5:t] excludes ret_1d[t]
 
         return {
             "static_features": static_arr,

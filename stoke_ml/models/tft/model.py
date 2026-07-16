@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from stoke_ml.models.tft.config import TFTConfig
 from stoke_ml.models.tft.components import GRN
 from stoke_ml.models.tft.vsn import VariableSelectionNetwork
@@ -11,7 +12,7 @@ class TFTModel(nn.Module):
     """Temporal Fusion Transformer for panel stock prediction.
 
     Input: static features (B, S), past_known (B, T, P), past_observed (B, T, O)
-    Output: direction logits (B, 2), return % (B, 1), volatility (B, 1)
+    Output: direction logits (B, 3), return % (B, 1), volatility (B, 1)
     """
 
     def __init__(self, config: TFTConfig):
@@ -19,24 +20,36 @@ class TFTModel(nn.Module):
         self.config = config
         h = config.hidden_dim
 
-        # Variable Selection Networks (x3)
-        # Past known: each of the P features is a scalar variable (input_dim=1)
+        # Variable Selection Networks (x3) — skip when dim=0
         self.vsn_past = VariableSelectionNetwork(
             input_dim=1, hidden_dim=h,
             num_features=config.past_known_dim, dropout=config.dropout,
-        )
+        ) if config.past_known_dim > 0 else None
 
-        # Past observed: each of the O features is a scalar variable (input_dim=1)
         self.vsn_obs = VariableSelectionNetwork(
             input_dim=1, hidden_dim=h,
             num_features=config.past_observed_dim, dropout=config.dropout,
-        )
+        ) if config.past_observed_dim > 0 else None
 
-        # Static: all static features as one variable vector
-        self.vsn_static = VariableSelectionNetwork(
-            input_dim=config.static_dim, hidden_dim=h,
-            num_features=1, dropout=config.dropout,
-        ) if config.static_dim > 0 else None
+        # Static features are a flat vector (no per-feature selection needed).
+        # Simple Linear + GRN is equivalent and cheaper than VSN(num_features=1).
+        if config.static_dim > 0:
+            self.static_proj = nn.Linear(config.static_dim, h)
+            self.static_grn = GRN(
+                input_dim=h, hidden_dim=h, output_dim=h,
+                dropout=config.dropout,
+            )
+        else:
+            self.static_proj = None
+            self.static_grn = None
+
+        # LSTM input projection: concat past+observed VSN outputs, then project
+        if config.past_known_dim > 0 and config.past_observed_dim > 0:
+            self.lstm_input_proj = nn.Linear(2 * h, h)
+        elif config.past_known_dim > 0 or config.past_observed_dim > 0:
+            self.lstm_input_proj = nn.Linear(h, h)
+        else:
+            self.lstm_input_proj = None
 
         # LSTM Encoder
         self.lstm = nn.LSTM(
@@ -84,26 +97,39 @@ class TFTModel(nn.Module):
         past_observed: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, _ = past_known.shape
-        h = self.config.hidden_dim
 
         # VSN: treat each scalar feature as a separate variable
-        pk_vars = past_known.unsqueeze(-1)  # (B, T, P, 1)
-        po_vars = past_observed.unsqueeze(-1)  # (B, T, O, 1)
+        if self.vsn_past is not None:
+            pk_vars = past_known.unsqueeze(-1)  # (B, T, P, 1)
+            past_selected, _ = self.vsn_past(pk_vars)  # (B, T, h)
+        else:
+            past_selected = torch.zeros(B, T, self.config.hidden_dim, device=past_known.device, dtype=torch.float32)
 
-        past_selected, _ = self.vsn_past(pk_vars)  # (B, T, h)
-        obs_selected, _ = self.vsn_obs(po_vars)  # (B, T, h)
+        if self.vsn_obs is not None:
+            po_vars = past_observed.unsqueeze(-1)  # (B, T, O, 1)
+            obs_selected, _ = self.vsn_obs(po_vars)  # (B, T, h)
+        else:
+            obs_selected = torch.zeros(B, T, self.config.hidden_dim, device=past_observed.device, dtype=torch.float32)
 
-        # Combine past + observed into LSTM input
-        lstm_input = past_selected + obs_selected  # (B, T, h)
+        # Combine past + observed into LSTM input (concat then project)
+        if self.vsn_past is not None and self.vsn_obs is not None:
+            lstm_input = self.lstm_input_proj(
+                torch.cat([past_selected, obs_selected], dim=-1)
+            )
+        elif self.vsn_past is not None:
+            lstm_input = self.lstm_input_proj(past_selected)
+        elif self.vsn_obs is not None:
+            lstm_input = self.lstm_input_proj(obs_selected)
+        else:
+            lstm_input = torch.zeros(B, T, self.config.hidden_dim, device=past_known.device, dtype=torch.float32)
 
         # LSTM Encoder
         lstm_out, _ = self.lstm(lstm_input)  # (B, T, h)
 
         # Static enrichment
         if self.static_enrich_grn is not None and static_features is not None:
-            s_vars = static_features.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, S)
-            static_selected, _ = self.vsn_static(s_vars)  # (B, 1, h)
-            static_tiled = static_selected.expand(-1, T, -1)  # (B, T, h)
+            static_enc = self.static_grn(F.elu(self.static_proj(static_features)))  # (B, h)
+            static_tiled = static_enc.unsqueeze(1).expand(-1, T, -1)  # (B, T, h)
             lstm_out = self.static_enrich_grn(lstm_out, context=static_tiled)
 
         # Multi-Head Attention (self-attention across time)

@@ -48,10 +48,11 @@ class GRN(nn.Module):
             self.skip = nn.Linear(input_dim, output_dim)
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
-        eta1 = F.elu(self.fc1(x))
-        eta1 = self.dropout(eta1)
+        eta1 = self.fc1(x)
         if self.has_context and context is not None:
             eta1 = eta1 + self.context_fc(context)
+        eta1 = F.elu(eta1)
+        eta1 = self.dropout(eta1)
         eta2 = self.fc2(eta1)
         eta2 = self.dropout(eta2)
         gated = self.gate(eta1)

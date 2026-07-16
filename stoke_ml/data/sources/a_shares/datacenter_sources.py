@@ -44,23 +44,34 @@ class BlockTradeSource:
         self._client = EastMoneyClient(min_interval=min_interval)
 
     def fetch(self, code: str, page_size: int = 50) -> pd.DataFrame:
-        """Fetch recent block trade records for a stock.
+        """Fetch block trade records for a stock with pagination.
 
         Returns DataFrame with: date, deal_price, close_price,
         premium_pct (溢价率%), volume, amount, buyer, seller.
         """
-        raw = self._client.datacenter(
-            "RPT_DATA_BLOCKTRADE",
-            filter_str=f'(SECURITY_CODE="{code}")',
-            page_size=page_size,
-            sort_columns="TRADE_DATE",
-            sort_types="-1",
-        )
-        if not raw:
+        all_raw = []
+        page = 1
+        while True:
+            page_data = self._client.datacenter(
+                "RPT_DATA_BLOCKTRADE",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=page_size,
+                page_number=page,
+                sort_columns="TRADE_DATE",
+                sort_types="-1",
+            )
+            if not page_data:
+                break
+            all_raw.extend(page_data)
+            if len(page_data) < page_size:
+                break
+            page += 1
+
+        if not all_raw:
             return pd.DataFrame(columns=BLOCK_TRADE_COLS)
 
         rows = []
-        for r in raw:
+        for r in all_raw:
             close = float(r.get("CLOSE_PRICE") or 0)
             deal_price = float(r.get("DEAL_PRICE") or 0)
             premium = ((deal_price / close - 1) * 100) if close else 0
@@ -125,23 +136,34 @@ class ShareholderSource:
         self._client = EastMoneyClient(min_interval=min_interval)
 
     def fetch(self, code: str, page_size: int = 20) -> pd.DataFrame:
-        """Fetch recent shareholder count records.
+        """Fetch shareholder count records with pagination.
 
         Returns DataFrame with: date, holder_num, change_num(环比变化量),
         change_ratio(环比变化率%), avg_shares(户均持股).
         """
-        raw = self._client.datacenter(
-            "RPT_HOLDERNUMLATEST",
-            filter_str=f'(SECURITY_CODE="{code}")',
-            page_size=page_size,
-            sort_columns="END_DATE",
-            sort_types="-1",
-        )
-        if not raw:
+        all_raw = []
+        page = 1
+        while True:
+            page_data = self._client.datacenter(
+                "RPT_HOLDERNUMLATEST",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=page_size,
+                page_number=page,
+                sort_columns="END_DATE",
+                sort_types="-1",
+            )
+            if not page_data:
+                break
+            all_raw.extend(page_data)
+            if len(page_data) < page_size:
+                break
+            page += 1
+
+        if not all_raw:
             return pd.DataFrame(columns=SHAREHOLDER_COLS)
 
         rows = []
-        for r in raw:
+        for r in all_raw:
             rows.append({
                 "date": str(r.get("END_DATE", ""))[:10],
                 "stock_code": code,
@@ -201,20 +223,30 @@ class LockupExpirySource:
         self._client = EastMoneyClient(min_interval=min_interval)
 
     def fetch_history(self, code: str, page_size: int = 15) -> pd.DataFrame:
-        """Fetch historical lockup expiry records.
+        """Fetch historical lockup expiry records with pagination.
 
         Returns DataFrame with: date, free_type(解禁类型),
         free_shares(本次解禁,万股), able_shares(实际可流通,万股),
         free_ratio(占总股本比,小数×100=百分比).
         """
-        raw = self._client.datacenter(
-            "RPT_LIFT_STAGE",
-            filter_str=f'(SECURITY_CODE="{code}")',
-            page_size=page_size,
-            sort_columns="FREE_DATE",
-            sort_types="-1",
-        )
-        return self._parse_lockup(raw, code)
+        all_raw = []
+        page = 1
+        while True:
+            page_data = self._client.datacenter(
+                "RPT_LIFT_STAGE",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=page_size,
+                page_number=page,
+                sort_columns="FREE_DATE",
+                sort_types="-1",
+            )
+            if not page_data:
+                break
+            all_raw.extend(page_data)
+            if len(page_data) < page_size:
+                break
+            page += 1
+        return self._parse_lockup(all_raw, code)
 
     def fetch_upcoming(
         self, code: str, trade_date: Optional[str] = None,
@@ -233,18 +265,28 @@ class LockupExpirySource:
             datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=forward_days)
         ).strftime("%Y-%m-%d")
 
-        raw = self._client.datacenter(
-            "RPT_LIFT_STAGE",
-            filter_str=(
-                f'(SECURITY_CODE="{code}")'
-                f"(FREE_DATE>='{trade_date}')"
-                f"(FREE_DATE<='{end_date}')"
-            ),
-            page_size=page_size,
-            sort_columns="FREE_DATE",
-            sort_types="1",
-        )
-        return self._parse_lockup(raw, code)
+        all_raw = []
+        page = 1
+        while True:
+            page_data = self._client.datacenter(
+                "RPT_LIFT_STAGE",
+                filter_str=(
+                    f'(SECURITY_CODE="{code}")'
+                    f"(FREE_DATE>='{trade_date}')"
+                    f"(FREE_DATE<='{end_date}')"
+                ),
+                page_size=page_size,
+                page_number=page,
+                sort_columns="FREE_DATE",
+                sort_types="1",
+            )
+            if not page_data:
+                break
+            all_raw.extend(page_data)
+            if len(page_data) < page_size:
+                break
+            page += 1
+        return self._parse_lockup(all_raw, code)
 
     def _parse_lockup(self, raw: list[dict], code: str) -> pd.DataFrame:
         if not raw:
@@ -303,24 +345,35 @@ class DividendSource:
         self._client = EastMoneyClient(min_interval=min_interval)
 
     def fetch(self, code: str, page_size: int = 20) -> pd.DataFrame:
-        """Fetch dividend history for a stock.
+        """Fetch dividend history for a stock with pagination.
 
         Returns DataFrame with: date(ex-dividend date),
         bonus_rmb(每股派息税前), transfer_ratio(每10股转增),
         bonus_ratio(每10股送股), plan(进度).
         """
-        raw = self._client.datacenter(
-            "RPT_SHAREBONUS_DET",
-            filter_str=f'(SECURITY_CODE="{code}")',
-            page_size=page_size,
-            sort_columns="EX_DIVIDEND_DATE",
-            sort_types="-1",
-        )
-        if not raw:
+        all_raw = []
+        page = 1
+        while True:
+            page_data = self._client.datacenter(
+                "RPT_SHAREBONUS_DET",
+                filter_str=f'(SECURITY_CODE="{code}")',
+                page_size=page_size,
+                page_number=page,
+                sort_columns="EX_DIVIDEND_DATE",
+                sort_types="-1",
+            )
+            if not page_data:
+                break
+            all_raw.extend(page_data)
+            if len(page_data) < page_size:
+                break
+            page += 1
+
+        if not all_raw:
             return pd.DataFrame(columns=DIVIDEND_COLS)
 
         rows = []
-        for r in raw:
+        for r in all_raw:
             rows.append({
                 "date": str(r.get("EX_DIVIDEND_DATE", ""))[:10],
                 "stock_code": code,

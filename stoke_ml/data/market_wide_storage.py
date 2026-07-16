@@ -4,6 +4,7 @@ Partitions: data/a_shares/{data_type}/{year}/{month}/{stock_code}.parquet
 """
 import logging
 import os
+import tempfile
 
 import pandas as pd
 
@@ -40,9 +41,11 @@ class MarketWideStorage:
         return p
 
     def save(self, df: pd.DataFrame) -> None:
-        """Save per-stock market data partitioned by year/month/stock_code.
+        """Save per-stock market data, merging with existing files.
 
-        Expects columns: date, stock_code, plus type-specific fields.
+        Loads any existing partition file, concatenates new rows, drops
+        duplicates by (date, stock_code), and writes back atomically.
+        Thread-safe: uses temp file + atomic rename per partition.
         """
         if df.empty:
             return
@@ -58,9 +61,36 @@ class MarketWideStorage:
         for (year, month, code), group in df.groupby(["year", "month", "stock_code"]):
             out_dir = os.path.join(base, str(year), f"{month:02d}")
             os.makedirs(out_dir, exist_ok=True)
+            # Clean up stale tmp files from previous interrupted saves
+            for stale in os.listdir(out_dir):
+                if stale.startswith(".tmp_") and stale.endswith(".parquet"):
+                    try:
+                        os.unlink(os.path.join(out_dir, stale))
+                    except OSError:
+                        pass
             out_path = os.path.join(out_dir, f"{code}.parquet")
-            save_df = group.drop(columns=["year", "month"])
-            save_df.to_parquet(out_path, index=False)
+
+            new_rows = group.drop(columns=["year", "month"])
+            if os.path.isfile(out_path):
+                existing = pd.read_parquet(out_path)
+                new_rows = pd.concat([existing, new_rows], ignore_index=True)
+                new_rows["date"] = pd.to_datetime(new_rows["date"])
+                new_rows = new_rows.drop_duplicates(
+                    subset=["date", "stock_code"], keep="last",
+                )
+            # Atomic write: temp file + rename prevents partial writes
+            # and mitigates race conditions with concurrent readers
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".parquet", dir=out_dir, prefix=f".tmp_{code}_",
+            )
+            os.close(fd)
+            try:
+                new_rows.to_parquet(tmp_path, index=False)
+                os.replace(tmp_path, out_path)  # atomic on Windows + Unix
+            except Exception:
+                if os.path.isfile(tmp_path):
+                    os.unlink(tmp_path)
+                raise
 
     def load(
         self, stock_code: str, start_date: str, end_date: str
@@ -108,3 +138,31 @@ class MarketWideStorage:
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True).sort_values("date").reset_index(drop=True)
+
+    def load_date(self, date_str: str) -> pd.DataFrame | None:
+        """Load all stocks for a single date from partitioned storage.
+
+        Returns None if the partition directory doesn't exist, empty
+        DataFrame if no data matches the date, or the filtered DataFrame.
+        """
+        dt = pd.Timestamp(date_str)
+        base = self._base_dir()
+        part_dir = os.path.join(base, str(dt.year), f"{dt.month:02d}")
+        if not os.path.isdir(part_dir):
+            return None
+        frames = []
+        for f in os.listdir(part_dir):
+            if not f.endswith(".parquet"):
+                continue
+            try:
+                df = pd.read_parquet(os.path.join(part_dir, f))
+                mask = pd.to_datetime(df["date"]).dt.date == dt.date()
+                matched = df[mask]
+                if not matched.empty:
+                    frames.append(matched)
+            except Exception:
+                logger.debug("Failed to read %s/%s for date %s",
+                             self._data_type, f, date_str)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)

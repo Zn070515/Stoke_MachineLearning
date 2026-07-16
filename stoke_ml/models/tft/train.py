@@ -2,7 +2,7 @@ import logging
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from stoke_ml.models.tft.config import TFTConfig
 from stoke_ml.models.tft.model import TFTModel
@@ -28,7 +28,7 @@ def train_tft(
     model = TFTModel(config).to(device)
     if config.compile_model and device.type == "cuda":
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="default")
         except Exception:
             logger.warning("torch.compile failed, continuing without compilation")
 
@@ -40,7 +40,7 @@ def train_tft(
         model.parameters(), lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    scaler = GradScaler(enabled=config.use_amp and device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
     train_ds = PanelDataset(train_data, seq_len=config.seq_len)
     train_loader = DataLoader(
@@ -50,7 +50,10 @@ def train_tft(
         drop_last=True,
     )
 
-    total_steps = config.max_epochs * len(train_loader)
+    # total_steps counts optimizer steps (one per grad_accum_steps batches),
+    # not raw batches, so OneCycleLR's warmup/anneal spans the full training run.
+    steps_per_epoch = max(len(train_loader) // config.grad_accum_steps, 1)
+    total_steps = config.max_epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=config.learning_rate,
         total_steps=total_steps,
@@ -67,8 +70,10 @@ def train_tft(
         model.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
+        last_batch_idx = 0
 
         for batch_idx, (static, pk, po, y_dir, y_ret, y_vol) in enumerate(train_loader):
+            last_batch_idx = batch_idx
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -77,12 +82,19 @@ def train_tft(
             y_vol = y_vol.to(device)
 
             use_amp = config.use_amp and device.type == "cuda"
-            with autocast(enabled=use_amp):
+            with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
                 l_ce = ce_loss(pred_dir, y_dir)
-                l_ret = mse_loss(pred_ret.squeeze(-1), y_ret.squeeze(-1))
-                l_vol = mse_loss(pred_vol.squeeze(-1), y_vol.squeeze(-1))
+                l_ret = mse_loss(pred_ret.squeeze(-1), y_ret)
+                l_vol = mse_loss(pred_vol.squeeze(-1), y_vol)
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
+
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                logger.warning(
+                    "NaN/Inf loss at epoch %d batch %d — skipping update",
+                    epoch + 1, batch_idx,
+                )
+                continue
 
             total_loss = total_loss / config.grad_accum_steps
             scaler.scale(total_loss).backward()
@@ -98,6 +110,25 @@ def train_tft(
                 scheduler.step()
 
             epoch_loss += total_loss.item() * config.grad_accum_steps
+
+        # Apply trailing accumulated gradients (don't waste the last batches)
+        num_batches = last_batch_idx + 1
+        remaining = num_batches % config.grad_accum_steps
+        if remaining != 0:
+            scaler.unscale_(optimizer)
+            # Rescale gradients: each batch was divided by grad_accum_steps,
+            # but only |remaining| batches contributed — restore proper scale.
+            scale = config.grad_accum_steps / remaining
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.max_grad_norm,
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
 
         avg_loss = epoch_loss / max(len(train_loader), 1)
         history["train_loss"].append(avg_loss)

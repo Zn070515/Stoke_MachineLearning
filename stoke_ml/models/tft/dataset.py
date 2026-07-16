@@ -87,6 +87,6 @@ def panel_collate(batch: list) -> tuple:
     past_knowns = torch.stack([b[1] for b in batch])
     past_observeds = torch.stack([b[2] for b in batch])
     y_dirs = torch.stack([b[3] for b in batch])
-    y_rets = torch.stack([b[4] for b in batch]).unsqueeze(-1)
-    y_vols = torch.stack([b[5] for b in batch]).unsqueeze(-1)
+    y_rets = torch.stack([b[4] for b in batch])
+    y_vols = torch.stack([b[5] for b in batch])
     return statics, past_knowns, past_observeds, y_dirs, y_rets, y_vols
