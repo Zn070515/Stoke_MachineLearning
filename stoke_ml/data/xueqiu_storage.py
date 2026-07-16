@@ -133,17 +133,32 @@ class XueqiuStorage:
     def save_daily_sentiment(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
+        import tempfile
+
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
-        df["year"] = df["date"].dt.year
-        df["month"] = df["date"].dt.month
 
-        for (year, month, code), group in df.groupby(["year", "month", "stock_code"]):
-            out_dir = os.path.join(self._sentiment_base(), str(year), f"{month:02d}")
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"{code}.parquet")
-            save_df = group.drop(columns=["year", "month"])
-            save_df.to_parquet(out_path, index=False)
+        base = self._sentiment_base()
+        for code, group in df.groupby("stock_code"):
+            new_rows = group.drop(columns=["stock_code"]).sort_values("date")
+            out_path = os.path.join(base, f"{code}.parquet")
+            if os.path.isfile(out_path):
+                existing = pd.read_parquet(out_path)
+                existing["date"] = pd.to_datetime(existing["date"])
+                new_rows = pd.concat([existing, new_rows], ignore_index=True)
+            new_rows = new_rows.drop_duplicates(subset=["date"], keep="last")
+            new_rows = new_rows.sort_values("date")
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
+            )
+            os.close(fd)
+            try:
+                new_rows.to_parquet(tmp_path, index=False)
+                os.replace(tmp_path, out_path)
+            except Exception:
+                if os.path.isfile(tmp_path):
+                    os.unlink(tmp_path)
+                raise
 
     def load_daily_sentiment(
         self, stock_code: str, start_date: str, end_date: str

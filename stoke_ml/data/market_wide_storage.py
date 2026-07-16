@@ -41,11 +41,11 @@ class MarketWideStorage:
         return p
 
     def save(self, df: pd.DataFrame) -> None:
-        """Save per-stock market data, merging with existing files.
+        """Save per-stock market data to flat files, merging with existing.
 
-        Loads any existing partition file, concatenates new rows, drops
-        duplicates by (date, stock_code), and writes back atomically.
-        Thread-safe: uses temp file + atomic rename per partition.
+        Loads existing flat file, concatenates new rows, drops duplicates
+        by (date, stock_code), and writes back atomically.
+        Thread-safe: uses temp file + atomic rename per stock.
         """
         if df.empty:
             return
@@ -54,39 +54,24 @@ class MarketWideStorage:
         df = df.dropna(subset=["date"])
         if df.empty:
             return
-        df["year"] = df["date"].dt.year.astype(int)
-        df["month"] = df["date"].dt.month.astype(int)
 
         base = self._base_dir()
-        for (year, month, code), group in df.groupby(["year", "month", "stock_code"]):
-            out_dir = os.path.join(base, str(year), f"{month:02d}")
-            os.makedirs(out_dir, exist_ok=True)
-            # Clean up stale tmp files from previous interrupted saves
-            for stale in os.listdir(out_dir):
-                if stale.startswith(".tmp_") and stale.endswith(".parquet"):
-                    try:
-                        os.unlink(os.path.join(out_dir, stale))
-                    except OSError:
-                        pass
-            out_path = os.path.join(out_dir, f"{code}.parquet")
-
-            new_rows = group.drop(columns=["year", "month"])
+        for code, group in df.groupby("stock_code"):
+            new_rows = group.drop(columns=["stock_code"]).sort_values("date")
+            out_path = os.path.join(base, f"{code}.parquet")
             if os.path.isfile(out_path):
                 existing = pd.read_parquet(out_path)
+                existing["date"] = pd.to_datetime(existing["date"])
                 new_rows = pd.concat([existing, new_rows], ignore_index=True)
-                new_rows["date"] = pd.to_datetime(new_rows["date"])
-                new_rows = new_rows.drop_duplicates(
-                    subset=["date", "stock_code"], keep="last",
-                )
-            # Atomic write: temp file + rename prevents partial writes
-            # and mitigates race conditions with concurrent readers
+            new_rows = new_rows.drop_duplicates(subset=["date"], keep="last")
+            new_rows = new_rows.sort_values("date")
             fd, tmp_path = tempfile.mkstemp(
-                suffix=".parquet", dir=out_dir, prefix=f".tmp_{code}_",
+                suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
             )
             os.close(fd)
             try:
                 new_rows.to_parquet(tmp_path, index=False)
-                os.replace(tmp_path, out_path)  # atomic on Windows + Unix
+                os.replace(tmp_path, out_path)
             except Exception:
                 if os.path.isfile(tmp_path):
                     os.unlink(tmp_path)
