@@ -63,6 +63,10 @@ def main():
                         help="Use concurrent downloader")
     parser.add_argument("--workers", type=int, default=4,
                         help="Concurrent workers (default: 4)")
+    parser.add_argument("--sort", type=str, default="comment",
+                        choices=["publish", "comment"],
+                        help="Sort mode: publish (f-sort URL, deep history, CAPTCHA-protected) "
+                             "or comment (topic URL, lenient, ~1-2yr reach) (default: comment)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -85,13 +89,13 @@ def main():
 
     calendar = TradingCalendar("a_shares")
     guba_storage = GubaStorage(data_dir, calendar)
-    guba_source = GubaSource()
+    guba_source = GubaSource(sort=args.sort)
     analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer()
 
     mode_label = "concurrent" if args.concurrent else "sequential"
     logger.info(
-        "Downloading Guba posts for %d stocks (%s to %s, max_pages=%d, sleep=%.1fs, %s)",
-        len(codes), args.start, args.end, args.max_pages, args.sleep, mode_label,
+        "Downloading Guba posts for %d stocks (%s to %s, max_pages=%d, sort=%s, sleep=%.1fs, %s)",
+        len(codes), args.start, args.end, args.max_pages, args.sort, args.sleep, mode_label,
     )
 
     total_posts = 0
