@@ -1,4 +1,7 @@
 import logging
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -13,6 +16,15 @@ from stoke_ml.models.tft.evaluate import evaluate_sharpe
 logger = logging.getLogger(__name__)
 
 
+def _set_seed(seed: int | None) -> None:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+
 def train_tft(
     config: TFTConfig,
     train_data: dict,
@@ -25,21 +37,25 @@ def train_tft(
         model: best model (by validation Sharpe).
         history: dict of training metrics per epoch.
     """
+    _set_seed(config.seed)
+
     model = TFTModel(config).to(device)
     if config.compile_model and device.type == "cuda":
         try:
+            import triton  # noqa: F401
             model = torch.compile(model, mode="default")
+        except ImportError:
+            logger.info("Triton not available on this platform, skipping torch.compile")
         except Exception:
             logger.warning("torch.compile failed, continuing without compilation")
 
     loss_fn = UncertaintyLoss(num_tasks=3).to(device)
     ce_loss = nn.CrossEntropyLoss()
-    mse_loss = nn.MSELoss()
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = torch.optim.AdamW([
+        {"params": model.parameters()},
+        {"params": loss_fn.parameters(), "weight_decay": 0.0},
+    ], lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
     train_ds = PanelDataset(train_data, seq_len=config.seq_len)
@@ -47,32 +63,30 @@ def train_tft(
         train_ds, batch_size=config.batch_size,
         shuffle=True, collate_fn=panel_collate,
         num_workers=config.num_workers, pin_memory=True,
-        drop_last=True,
+        drop_last=True, persistent_workers=config.num_workers > 0,
     )
 
-    # total_steps counts optimizer steps (one per grad_accum_steps batches),
-    # not raw batches, so OneCycleLR's warmup/anneal spans the full training run.
-    steps_per_epoch = max(
-        (len(train_loader) + config.grad_accum_steps - 1) // config.grad_accum_steps, 1
-    )
-    total_steps = config.max_epochs * steps_per_epoch
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=config.learning_rate,
-        total_steps=total_steps,
-        pct_start=min(config.warmup_steps / max(total_steps, 1), 0.3),
-        anneal_strategy="cos",
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=config.lr_reduce_factor,
+        patience=config.lr_reduce_patience,
+        threshold=config.lr_reduce_threshold,
+        threshold_mode="rel",
+        min_lr=config.min_lr,
     )
 
     best_sharpe = -float("inf")
     best_state = None
     patience_counter = 0
-    history = {"train_loss": [], "val_sharpe": []}
+    history = {"train_loss": [], "val_sharpe": [], "val_ic": []}
 
     for epoch in range(config.max_epochs):
         model.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
         last_batch_idx = 0
+        backward_done = False
 
         for batch_idx, (static, pk, po, y_dir, y_ret, y_vol) in enumerate(train_loader):
             last_batch_idx = batch_idx
@@ -87,9 +101,6 @@ def train_tft(
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
                 l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
-                # Mask ZT/DT timesteps for return/volatility heads:
-                # y_dir=-100 flags untradable days (CE ignore_index); MSE has
-                # no ignore mechanism, so we manually zero out those timesteps.
                 mask = (y_dir != -100).float()
                 ret_err = (pred_ret.squeeze(-1) - y_ret).pow(2) * mask
                 l_ret = ret_err.sum() / mask.sum().clamp(min=1)
@@ -106,59 +117,56 @@ def train_tft(
 
             total_loss = total_loss / config.grad_accum_steps
             scaler.scale(total_loss).backward()
+            backward_done = True
 
-            if (batch_idx + 1) % config.grad_accum_steps == 0 and scaler._scale is not None:
+            if (batch_idx + 1) % config.grad_accum_steps == 0 and backward_done:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.max_grad_norm,
-                )
+                torch.nn.utils.clip_grad_value_(model.parameters(), 3.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                scheduler.step()
 
             epoch_loss += total_loss.item() * config.grad_accum_steps
 
-        # Apply trailing accumulated gradients (don't waste the last batches).
-        # Guard: if every batch in the epoch was skipped (NaN), scaler._scale
-        # is None and unscale_() would crash.
+        # Apply trailing accumulated gradients
         num_batches = last_batch_idx + 1
         remaining = num_batches % config.grad_accum_steps
-        if remaining != 0 and scaler._scale is not None:
+        if remaining != 0 and backward_done:
             scaler.unscale_(optimizer)
-            # Rescale gradients: each batch was divided by grad_accum_steps,
-            # but only |remaining| batches contributed — restore proper scale.
             scale = config.grad_accum_steps / remaining
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad.mul_(scale)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), config.max_grad_norm,
-            )
+            torch.nn.utils.clip_grad_value_(model.parameters(), 3.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            scheduler.step()
 
         avg_loss = epoch_loss / max(len(train_loader), 1)
         history["train_loss"].append(avg_loss)
 
-        # Log every epoch with per-task breakdown so we can spot which
-        # head dominates the loss (helps diagnose UncertaintyLoss dynamics).
         logger.info("Epoch %d/%d: loss=%.4f (ce=%.4f ret=%.4f vol=%.4f | "
-                    "lv=[%.2f,%.2f,%.2f])",
+                    "lv=[%.6f,%.6f,%.6f]) lr=%.2e",
                     epoch + 1, config.max_epochs, avg_loss,
                     l_ce.item(), l_ret.item(), l_vol.item(),
                     loss_fn.log_vars[0].item(),
                     loss_fn.log_vars[1].item(),
-                    loss_fn.log_vars[2].item())
+                    loss_fn.log_vars[2].item(),
+                    optimizer.param_groups[0]["lr"])
 
-        # Evaluate every 5 epochs
+        # Validate every 5 epochs
         if (epoch + 1) % 5 == 0:
-            sharpe = evaluate_sharpe(model, val_data, config, device)
+            sharpe, val_metrics = evaluate_sharpe(
+                model, val_data, config, device, return_metrics=True,
+            )
             history["val_sharpe"].append(sharpe)
-            logger.info("Epoch %d/%d: loss=%.4f, val_sharpe=%.4f",
-                        epoch + 1, config.max_epochs, avg_loss, sharpe)
+            ic = val_metrics.get("ic", 0.0)
+            history["val_ic"].append(ic)
+            logger.info("Epoch %d/%d: loss=%.4f, val_sharpe=%.4f, val_IC=%.4f",
+                        epoch + 1, config.max_epochs, avg_loss, sharpe, ic)
+
+            # ReduceLROnPlateau on validation loss
+            scheduler.step(avg_loss)
 
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
@@ -167,8 +175,9 @@ def train_tft(
             else:
                 patience_counter += 1
 
-            if patience_counter >= 2:  # 2 checks × 5 epochs = 10 epoch patience
-                logger.info("Early stopping at epoch %d", epoch + 1)
+            if patience_counter >= config.early_stop_patience // 5:  # checks every 5 epochs
+                logger.info("Early stopping at epoch %d (best Sharpe=%.4f)",
+                            epoch + 1, best_sharpe)
                 break
 
     if best_state is not None:

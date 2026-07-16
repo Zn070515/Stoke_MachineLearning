@@ -1341,6 +1341,13 @@ class FeaturePipeline:
         y_ret_arr = np.nan_to_num(y_ret_arr, nan=0.0, posinf=0.0, neginf=0.0)
         y_vol_arr = np.nan_to_num(y_vol_arr, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # NOTE: Targets are NOT scaled here.  Per-stock z-score normalization
+        # is applied in the training script (train_tft.py) using only training
+        # statistics, which avoids look-ahead bias and gives each stock equal
+        # weight regardless of its native return volatility.
+        # After per-stock z-scoring (μ=0, σ=1), the MSE baseline ≈ 1.0,
+        # which is naturally balanced with CE loss (~1.0).
+
         return {
             "static_features": static_arr,
             "past_known": pk_arr,

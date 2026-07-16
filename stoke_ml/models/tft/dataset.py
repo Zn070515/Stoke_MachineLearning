@@ -1,6 +1,5 @@
 import torch
 from torch.utils.data import Dataset
-import numpy as np
 
 
 class PanelDataset(Dataset):
@@ -9,8 +8,9 @@ class PanelDataset(Dataset):
     Pre-built tensor data organized as (N_stocks, T_total, D_features).
     Each __getitem__ returns a single stock's sequence window.
 
-    For panel training, the collate function groups same-date stocks
-    across different sequences — see panel_collate().
+    All numpy inputs are converted to tensors once in __init__ so that
+    __getitem__ is a pure indexing operation — no per-sample conversion
+    overhead.
     """
 
     def __init__(
@@ -19,17 +19,21 @@ class PanelDataset(Dataset):
         seq_len: int = 252,
         stride: int = 1,
     ):
-        self.static_features = data["static_features"]  # (N, S)
-        self.past_known = data["past_known"]  # (N, T, P)
-        self.past_observed = data["past_observed"]  # (N, T, O)
-        self.y_direction = data["y_direction"]  # (N, T)
-        self.y_return = data["y_return"]  # (N, T)
-        self.y_volatility = data["y_volatility"]  # (N, T)
-        self.dates = data.get("dates", None)
-        self.stock_codes = data.get("stock_codes", None)
-
         self.seq_len = seq_len
         self.stride = stride
+
+        def _to_tensor(arr, dtype):
+            if isinstance(arr, torch.Tensor):
+                return arr.clone().detach().to(dtype)
+            return torch.from_numpy(arr).to(dtype)
+
+        self.static_features = _to_tensor(data["static_features"], torch.float32)
+        self.past_known = _to_tensor(data["past_known"], torch.float32)
+        self.past_observed = _to_tensor(data["past_observed"], torch.float32)
+        self.y_direction = _to_tensor(data["y_direction"], torch.long)
+        self.y_return = _to_tensor(data["y_return"], torch.float32)
+        self.y_volatility = _to_tensor(data["y_volatility"], torch.float32)
+
         self.n_stocks = self.past_known.shape[0]
         self.n_timesteps = self.past_known.shape[1]
         self.n_windows = self.n_timesteps - seq_len
@@ -49,44 +53,23 @@ class PanelDataset(Dataset):
         start = window_idx
         end = start + self.seq_len
 
-        static = self.static_features[stock_idx]  # (S,)
-        pk = self.past_known[stock_idx, start:end]  # (T, P)
-        po = self.past_observed[stock_idx, start:end]  # (T, O)
-        y_dir = self.y_direction[stock_idx, end]  # target at t+1
-        y_ret = self.y_return[stock_idx, end]
-        y_vol = self.y_volatility[stock_idx, end]
-
-        # Convert to tensors (handle both np and torch inputs)
-        if not isinstance(static, torch.Tensor):
-            static = torch.from_numpy(np.asarray(static, dtype=np.float32))
-        else:
-            static = static.clone().detach().float()
-        if not isinstance(pk, torch.Tensor):
-            pk = torch.from_numpy(np.asarray(pk, dtype=np.float32))
-        if not isinstance(po, torch.Tensor):
-            po = torch.from_numpy(np.asarray(po, dtype=np.float32))
-        if isinstance(y_dir, torch.Tensor):
-            y_dir = y_dir.clone().detach().long()
-        else:
-            y_dir = torch.tensor(y_dir, dtype=torch.long)
-        if isinstance(y_ret, torch.Tensor):
-            y_ret = y_ret.clone().detach().float()
-        else:
-            y_ret = torch.tensor(y_ret, dtype=torch.float32)
-        if isinstance(y_vol, torch.Tensor):
-            y_vol = y_vol.clone().detach().float()
-        else:
-            y_vol = torch.tensor(y_vol, dtype=torch.float32)
-
-        return static, pk, po, y_dir, y_ret, y_vol
+        return (
+            self.static_features[stock_idx],
+            self.past_known[stock_idx, start:end],
+            self.past_observed[stock_idx, start:end],
+            self.y_direction[stock_idx, end],
+            self.y_return[stock_idx, end],
+            self.y_volatility[stock_idx, end],
+        )
 
 
 def panel_collate(batch: list) -> tuple:
     """Collate panel samples into batch tensors."""
-    statics = torch.stack([b[0] for b in batch])
-    past_knowns = torch.stack([b[1] for b in batch])
-    past_observeds = torch.stack([b[2] for b in batch])
-    y_dirs = torch.stack([b[3] for b in batch])
-    y_rets = torch.stack([b[4] for b in batch])
-    y_vols = torch.stack([b[5] for b in batch])
-    return statics, past_knowns, past_observeds, y_dirs, y_rets, y_vols
+    return (
+        torch.stack([b[0] for b in batch]),
+        torch.stack([b[1] for b in batch]),
+        torch.stack([b[2] for b in batch]),
+        torch.stack([b[3] for b in batch]),
+        torch.stack([b[4] for b in batch]),
+        torch.stack([b[5] for b in batch]),
+    )

@@ -250,7 +250,7 @@ def main():
     parser.add_argument("--max-folds", type=int, default=3,
                         help="Limit number of walk-forward folds (default: 3)")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
@@ -304,7 +304,7 @@ def main():
 
     # Build features
     fp = FeaturePipeline(
-        seq_len=252,
+        seq_len=60,
         use_sentiment=True, use_announcements=True,
         use_guba=True, use_comment=True, use_margin=True,
         use_northbound=True, use_dragon_tiger=True,
@@ -325,7 +325,7 @@ def main():
                 n_stocks, n_timesteps, dims)
 
     config = TFTConfig(
-        seq_len=252,
+        seq_len=60,
         static_dim=panel_data["static_features"].shape[1],
         past_known_dim=panel_data["past_known"].shape[2],
         past_observed_dim=panel_data["past_observed"].shape[2],
@@ -365,17 +365,30 @@ def main():
             "past_known": panel_data["past_known"][:, train_slice],
             "past_observed": panel_data["past_observed"][:, train_slice],
             "y_direction": panel_data["y_direction"][:, train_slice],
-            "y_return": panel_data["y_return"][:, train_slice],
-            "y_volatility": panel_data["y_volatility"][:, train_slice],
+            "y_return": panel_data["y_return"][:, train_slice].copy(),
+            "y_volatility": panel_data["y_volatility"][:, train_slice].copy(),
         }
         val_data = {
             "static_features": panel_data["static_features"],
             "past_known": panel_data["past_known"][:, val_slice],
             "past_observed": panel_data["past_observed"][:, val_slice],
             "y_direction": panel_data["y_direction"][:, val_slice],
-            "y_return": panel_data["y_return"][:, val_slice],
-            "y_volatility": panel_data["y_volatility"][:, val_slice],
+            "y_return": panel_data["y_return"][:, val_slice].copy(),
+            "y_volatility": panel_data["y_volatility"][:, val_slice].copy(),
         }
+
+        # Per-stock z-score normalization of regression targets.
+        # Different stocks have different return/vol distributions;
+        # normalising per-stock gives each stock equal weight in the MSE
+        # loss and keeps the MSE baseline ≈ 1.0 (balanced with CE ~1.0).
+        ret_mean = train_data["y_return"].mean(axis=1, keepdims=True)
+        ret_std = np.maximum(train_data["y_return"].std(axis=1, keepdims=True), 1e-8)
+        vol_mean = train_data["y_volatility"].mean(axis=1, keepdims=True)
+        vol_std = np.maximum(train_data["y_volatility"].std(axis=1, keepdims=True), 1e-8)
+        train_data["y_return"] = (train_data["y_return"] - ret_mean) / ret_std
+        train_data["y_volatility"] = (train_data["y_volatility"] - vol_mean) / vol_std
+        val_data["y_return"] = (val_data["y_return"] - ret_mean) / ret_std
+        val_data["y_volatility"] = (val_data["y_volatility"] - vol_mean) / vol_std
 
         logger.info("Fold %d/%d: train [%d:%d], val [%d:%d]",
                     fold, args.max_folds or "∞",

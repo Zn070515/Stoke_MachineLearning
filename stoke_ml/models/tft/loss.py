@@ -25,10 +25,10 @@ class UncertaintyLoss(nn.Module):
 
     def forward(self, task_losses: list[torch.Tensor]) -> torch.Tensor:
         assert len(task_losses) == self.num_tasks
-        # Clamp log_vars to keep exp(-log_var) in a stable range.
-        # ±5 allows task weights from ~0.007× to ~148×, which is plenty
-        # for multi-task balancing without fp16 overflow.
-        log_vars = torch.clamp(self.log_vars, -5.0, 5.0)
+        # Clamp log_vars for numerical stability: ±10 gives a precision
+        # range of ≈ 4.5 × 10⁻⁵ … 2.2 × 10⁴ (5 orders of magnitude),
+        # which is wide enough to handle 2500∶1 natural loss ratios.
+        log_vars = torch.clamp(self.log_vars, -10.0, 10.0)
         total = torch.tensor(0.0, device=log_vars.device, dtype=log_vars.dtype)
         for i, loss in enumerate(task_losses):
             precision = torch.exp(-log_vars[i])

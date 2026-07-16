@@ -13,8 +13,15 @@ to avoid DataFrame fragmentation (PerformanceWarning from frame.insert).
 """
 import pandas as pd
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 _WINDOWS = [5, 10, 20, 30, 60]
+
+# Pre-compute x = [0,1,...,59] and its moments once for all calls
+_X = {d: np.arange(d, dtype=np.float64) for d in _WINDOWS}
+_X_SX = {d: _X[d].sum() for d in _WINDOWS}
+_X_SXX = {d: (_X[d] * _X[d]).sum() for d in _WINDOWS}
+_X_DENOM = {d: d * _X_SXX[d] - _X_SX[d] * _X_SX[d] for d in _WINDOWS}
 
 
 class TechnicalIndicators:
@@ -213,17 +220,37 @@ def _price_features(open_, high, low, close):
 
 
 def _rolling_position(high, low, close):
-    """Rolling max/min/quantile/rank/RSV (Alpha158, 5 windows × 6 types)."""
+    """Rolling max/min/quantile/rank/RSV (Alpha158, 5 windows x 6 types).
+
+    Uses sliding_window_view to avoid .rolling().apply() — the rank and
+    quantile calls are the two heaviest per-stock ops in the Alpha158 set.
+    """
     out = {}
+    c = close.values.astype(np.float64)
+    h = high.values.astype(np.float64)
+    l = low.values.astype(np.float64)
+    def _pad(vals, d):
+        return np.pad(vals, (d - 1, 0), constant_values=np.nan)
     for d in _WINDOWS:
-        high_n = high.rolling(d).max()
-        low_n = low.rolling(d).min()
+        high_n = pd.Series(
+            _pad(np.max(sliding_window_view(h, d), axis=1), d),
+            index=high.index,
+        )
+        low_n = pd.Series(
+            _pad(np.min(sliding_window_view(l, d), axis=1), d),
+            index=low.index,
+        )
         out[f"max_{d}d"] = high_n / close
         out[f"min_{d}d"] = low_n / close
         out[f"qtlu_{d}d"] = close.rolling(d).quantile(0.8) / close
         out[f"qtld_{d}d"] = close.rolling(d).quantile(0.2) / close
-        out[f"rank_{d}d"] = close.rolling(d).apply(
-            lambda x: (x.iloc[-1] > x).mean(), raw=False
+
+        # Vectorized rank: for each window, fraction of values < last value.
+        win = sliding_window_view(c, d)  # (N-d+1, d)
+        rank_vals = (win[:, -1:] > win).mean(axis=1)  # (N-d+1,)
+        out[f"rank_{d}d"] = pd.Series(
+            np.pad(rank_vals, (d - 1, 0), constant_values=np.nan),
+            index=close.index,
         )
         out[f"rsv_{d}d"] = (close - low_n) / (high_n - low_n).replace(0, 1e-10)
     return out
@@ -243,51 +270,79 @@ def _rolling_corr(close, volume):
 
 
 def _rolling_trend(close, volume):
-    """Trend linearity & volume MA/STD (Alpha158, 5 windows × 5 types)."""
+    """Trend linearity & volume MA/STD (Alpha158, 5 windows x 5 types).
+
+    Linear-regression slope, R², and residual are computed with
+    sliding_window_view in a single vectorized pass — this replaces
+    three .rolling().apply() calls per window which were the #1
+    single-stock CPU bottleneck.
+    """
     out = {}
+    c = close.values.astype(np.float64)
+    v = volume.values.astype(np.float64)
     for d in _WINDOWS:
-        x = np.arange(d)
-        sx = x.sum()
-        sxx = (x * x).sum()
-        denom = d * sxx - sx * sx
+        x = _X[d]
+        sx = _X_SX[d]
+        denom = _X_DENOM[d]
 
-        def _slope(win):
-            sy = win.sum()
-            sxy = (x * win.values).sum()
-            return (d * sxy - sx * sy) / denom if denom != 0 else 0.0
+        # ── slope (beta) ──
+        c_win = sliding_window_view(c, d)  # (N-d+1, d)
+        sy = c_win.sum(axis=1)
+        sxy = (c_win * x).sum(axis=1)
+        slope = (d * sxy - sx * sy) / denom
+        slope_padded = np.pad(slope, (d - 1, 0), constant_values=np.nan)
+        out[f"beta_{d}d"] = pd.Series(
+            slope_padded, index=close.index,
+        ) / close.replace(0, 1e-10)
 
-        slope = close.rolling(d).apply(_slope, raw=False)
-        out[f"beta_{d}d"] = slope / close.replace(0, 1e-10)
+        # ── R² ──
+        y_mean = sy / d
+        sst = ((c_win - y_mean[:, None]) ** 2).sum(axis=1)
+        # sst=0 when all values equal → R²=1.0 (perfect fit to horizontal line)
+        intercept = (sy - slope * sx) / d
+        pred = slope[:, None] * x + intercept[:, None]
+        ssr = ((c_win - pred) ** 2).sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rsqr = np.where(
+                sst > 0,
+                1.0 - np.divide(ssr, sst, out=np.full_like(ssr, np.nan), where=sst > 0),
+                1.0,
+            )
+        out[f"rsqr_{d}d"] = pd.Series(
+            np.pad(rsqr, (d - 1, 0), constant_values=np.nan),
+            index=close.index,
+        )
 
-        def _rsqr(win):
-            y = win.values
-            sst = ((y - y.mean()) ** 2).sum()
-            if sst == 0:
-                return 1.0
-            slope_val = (d * (x * y).sum() - sx * y.sum()) / denom if denom != 0 else 0
-            intercept = (y.sum() - slope_val * sx) / d
-            pred = slope_val * x + intercept
-            ssr = ((y - pred) ** 2).sum()
-            return 1 - ssr / sst
+        # ── residual at last point ──
+        last_pred = slope * x[-1] + intercept  # a·(d-1) + b
+        last_y = c_win[:, -1]
+        resi = np.where(
+            last_y != 0,
+            np.divide(last_y - last_pred, last_y,
+                      out=np.full_like(last_y, np.nan), where=last_y != 0),
+            0.0,
+        )
+        out[f"resi_{d}d"] = pd.Series(
+            np.pad(resi, (d - 1, 0), constant_values=np.nan),
+            index=close.index,
+        )
 
-        out[f"rsqr_{d}d"] = close.rolling(d).apply(_rsqr, raw=False)
-
-        def _resi_std(win):
-            y = win.values
-            slope_val = (d * (x * y).sum() - sx * y.sum()) / denom if denom != 0 else 0
-            intercept = (y.sum() - slope_val * sx) / d
-            pred = slope_val * x + intercept
-            return (y[-1] - pred[-1]) / y[-1] if y[-1] != 0 else 0.0
-
-        out[f"resi_{d}d"] = close.rolling(d).apply(_resi_std, raw=False)
-
-        out[f"vma_{d}d"] = volume.rolling(d).mean() / volume.replace(0, 1e-10)
-        out[f"vstd_{d}d"] = volume.rolling(d).std() / volume.replace(0, 1e-10)
+        v_win = sliding_window_view(v, d)
+        vma = v_win.mean(axis=1)
+        vstd = v_win.std(axis=1)
+        out[f"vma_{d}d"] = pd.Series(
+            np.pad(vma, (d - 1, 0), constant_values=np.nan),
+            index=volume.index,
+        ) / volume.replace(0, 1e-10)
+        out[f"vstd_{d}d"] = pd.Series(
+            np.pad(vstd, (d - 1, 0), constant_values=np.nan),
+            index=volume.index,
+        ) / volume.replace(0, 1e-10)
     return out
 
 
 def _rolling_counts(close, volume):
-    """Up/down day counts & RSI-style sums (Alpha158, 5 windows × 6 types)."""
+    """Up/down day counts & RSI-style sums (Alpha158, 5 windows x 6 types)."""
     ret = close.diff()
     up = ret > 0
     down = ret < 0
@@ -311,21 +366,30 @@ def _rolling_counts(close, volume):
 
 
 def _rolling_aroon_vol(high, low, close, volume):
-    """Aroon & volume change stats (Alpha158, 5 windows × 6 types)."""
+    """Aroon & volume change stats (Alpha158, 5 windows x 6 types).
+
+    Uses sliding_window_view for imax/imin instead of .rolling().apply().
+    """
     vol_change = volume.diff()
     abs_ret = (close.diff() / close.shift(1).replace(0, 1e-10)).abs()
+    h = high.values.astype(np.float64)
+    l = low.values.astype(np.float64)
     out = {}
     for d in _WINDOWS:
-        def _aroon_up(win):
-            return np.argmax(win.values) / (len(win) - 1) if len(win) > 1 else 0.5
-        def _aroon_down(win):
-            return np.argmin(win.values) / (len(win) - 1) if len(win) > 1 else 0.5
-
-        imax = high.rolling(d).apply(_aroon_up, raw=False)
-        imin = low.rolling(d).apply(_aroon_down, raw=False)
-        out[f"imax_{d}d"] = imax
-        out[f"imin_{d}d"] = imin
-        out[f"imxd_{d}d"] = imax - imin
+        # imax: position of max in window / (d-1), vectorized
+        h_win = sliding_window_view(h, d)
+        imax_vals = np.argmax(h_win, axis=1).astype(np.float64) / (d - 1)
+        out[f"imax_{d}d"] = pd.Series(
+            np.pad(imax_vals, (d - 1, 0), constant_values=np.nan),
+            index=high.index,
+        )
+        l_win = sliding_window_view(l, d)
+        imin_vals = np.argmin(l_win, axis=1).astype(np.float64) / (d - 1)
+        out[f"imin_{d}d"] = pd.Series(
+            np.pad(imin_vals, (d - 1, 0), constant_values=np.nan),
+            index=low.index,
+        )
+        out[f"imxd_{d}d"] = out[f"imax_{d}d"] - out[f"imin_{d}d"]
 
         out[f"wvma_{d}d"] = (
             (abs_ret * volume).rolling(d).std()

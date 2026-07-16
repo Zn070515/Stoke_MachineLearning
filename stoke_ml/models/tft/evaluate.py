@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 from stoke_ml.models.tft.config import TFTConfig
 from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
@@ -26,7 +27,8 @@ def evaluate_sharpe(
     config: TFTConfig,
     device: torch.device,
     top_k: int = 20,
-) -> float:
+    return_metrics: bool = False,
+) -> float | tuple[float, dict]:
     """Time-varying top-K portfolio evaluation.
 
     For each validation day, ranks stocks by predicted return, selects
@@ -76,6 +78,25 @@ def evaluate_sharpe(
             portfolio_returns.append(ret)
 
     if not portfolio_returns:
+        if return_metrics:
+            return 0.0, {"ic": 0.0}
         return 0.0
     portfolio_daily = torch.tensor(portfolio_returns, dtype=torch.float32)
-    return compute_sharpe(portfolio_daily)
+    sharpe = compute_sharpe(portfolio_daily)
+
+    if not return_metrics:
+        return sharpe
+
+    # Compute Spearman rank IC (cross-sectional, per-day, then average)
+    daily_ics = []
+    for t in range(n_windows):
+        p = preds[:, t].numpy()
+        a = actuals[:, t].numpy()
+        mask = np.isfinite(p) & np.isfinite(a)
+        if mask.sum() >= 10:
+            ic, _ = spearmanr(p[mask], a[mask])
+            if np.isfinite(ic):
+                daily_ics.append(ic)
+    mean_ic = float(np.mean(daily_ics)) if daily_ics else 0.0
+
+    return sharpe, {"ic": mean_ic}
