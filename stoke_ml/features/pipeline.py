@@ -954,11 +954,12 @@ class FeaturePipeline:
                 ind_ret_df["date"] = pd.to_datetime(ind_ret_df["date"])
                 df["date"] = pd.to_datetime(df["date"])
                 df = df.merge(ind_ret_df, on="date", how="left")
+                df = df.copy()  # defragment after merge
                 # Stock vs industry excess return (computable before lag)
                 if "pct_change" in df.columns:
-                    df[["stock_vs_industry"]] = (
+                    df["stock_vs_industry"] = (
                         df["pct_change"] - df["ind_matched_return"].fillna(0.0)
-                    ).to_frame().astype(np.float32)
+                    ).astype(np.float32)
                 # PIT lag + fill for industry-matched columns
                 _batch_fill_shift(df, ["ind_matched_return", "stock_vs_industry"])
 
