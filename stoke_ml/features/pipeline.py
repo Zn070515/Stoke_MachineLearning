@@ -1170,6 +1170,24 @@ class FeaturePipeline:
             feats = add_calendar_features(feats)
             all_feat_dfs.append(feats)
 
+        # Align columns across all stocks — sparse data types (dragon_tiger,
+        # block_trade, lockup, etc.) may have data for some stocks but not
+        # others, producing different column sets. Missing columns get ZI fill.
+        if all_feat_dfs:
+            all_cols = set()
+            for df in all_feat_dfs:
+                all_cols.update(df.columns)
+            for i, df in enumerate(all_feat_dfs):
+                for col in all_cols - set(df.columns):
+                    if col.startswith("has_"):
+                        df[col] = False
+                    elif col == "date":
+                        continue
+                    elif col.endswith("_count") or col.endswith("_streak"):
+                        df[col] = 0
+                    else:
+                        df[col] = np.float32(0.0)
+
         # Find common max length
         lengths = [len(df) for df in all_feat_dfs]
         max_T = min(max(lengths), 3000)  # cap at ~12 years
@@ -1425,6 +1443,18 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
 
     skip = {"date", "stock_code"}
     available = [c for c in a.columns if c not in skip]
+    # Drop aux columns that collide with existing df columns (e.g. block_trade
+    # has 'volume'/'amount' which clash with K-line OHLCV). Colliding columns
+    # would cause pandas merge to create _x/_y suffixes, breaking downstream
+    # column name access.
+    df_cols = set(df.columns)
+    colliding = [c for c in available if c in df_cols]
+    if colliding:
+        available = [c for c in available if c not in df_cols]
+    # Drop non-numeric columns (e.g. 'buyer'/'seller' in block_trade) — they
+    # can't be ZI-filled or cast to float32.
+    available = [c for c in available
+                 if pd.api.types.is_numeric_dtype(a[c]) or c.startswith("has_")]
     if not available:
         return df
 

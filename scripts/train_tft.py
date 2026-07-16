@@ -118,6 +118,100 @@ def load_aux_data(
     except Exception:
         logger.warning("Fundamental data not available, skipping")
 
+    # --- Northbound ---
+    try:
+        nb_storage = MarketWideStorage(data_dir, "northbound")
+        for code in stock_list:
+            df = nb_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["northbound"] = df
+    except Exception:
+        logger.warning("Northbound data not available, skipping")
+
+    # --- Dragon Tiger ---
+    try:
+        dt_storage = MarketWideStorage(data_dir, "dragon_tiger")
+        for code in stock_list:
+            df = dt_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["dragon_tiger"] = df
+    except Exception:
+        logger.warning("Dragon Tiger data not available, skipping")
+
+    # --- ETF Flow (sector-level, aggregated to market-wide per date) ---
+    try:
+        from stoke_ml.data.etf_storage import ETFStorage
+        etf = ETFStorage(data_dir)
+        etf_base = os.path.join(data_dir, "a_shares", "etf_flow")
+        etf_frames = []
+        if os.path.isdir(etf_base):
+            for f in os.listdir(etf_base):
+                if f.startswith("sector_") and f.endswith(".parquet"):
+                    sector_df = pd.read_parquet(os.path.join(etf_base, f))
+                    etf_frames.append(sector_df)
+        if etf_frames:
+            etf_all = pd.concat(etf_frames, ignore_index=True)
+            etf_all["date"] = pd.to_datetime(etf_all["date"])
+            etf_agg = etf_all.groupby("date").agg(
+                etf_flow_sum=("etf_flow_sum", "sum"),
+                etf_amount_sum=("etf_amount_sum", "sum"),
+            ).reset_index()
+            for code in stock_list:
+                result[code]["etf_flow"] = etf_agg
+            logger.info("ETF flow aggregated from %d sector files", len(etf_frames))
+    except Exception:
+        logger.warning("ETF flow data not available, skipping")
+
+    # --- Capital Flow ---
+    try:
+        cf_storage = MarketWideStorage(data_dir, "capital_flow")
+        for code in stock_list:
+            df = cf_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["capital_flow"] = df
+    except Exception:
+        logger.warning("Capital flow data not available, skipping")
+
+    # --- Block Trade ---
+    try:
+        bt_storage = MarketWideStorage(data_dir, "block_trade")
+        for code in stock_list:
+            df = bt_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["block_trade"] = df
+    except Exception:
+        logger.warning("Block trade data not available, skipping")
+
+    # --- Shareholder ---
+    try:
+        sh_storage = MarketWideStorage(data_dir, "shareholder")
+        for code in stock_list:
+            df = sh_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["shareholder"] = df
+    except Exception:
+        logger.warning("Shareholder data not available, skipping")
+
+    # --- Lockup ---
+    try:
+        lu_storage = MarketWideStorage(data_dir, "lockup")
+        for code in stock_list:
+            df = lu_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["lockup"] = df
+    except Exception:
+        logger.warning("Lockup data not available, skipping")
+
+    # --- Dividend ---
+    try:
+        dv_storage = MarketWideStorage(data_dir, "dividend")
+        for code in stock_list:
+            df = dv_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["dividend"] = df
+    except Exception:
+        logger.warning("Dividend data not available, skipping")
+
     loaded = sum(1 for v in result.values() if v)
     logger.info("Aux data loaded for %d/%d stocks", loaded, len(stock_list))
     return result
@@ -191,11 +285,11 @@ def main():
     fp = FeaturePipeline(
         seq_len=252,
         use_sentiment=True, use_announcements=False,
-        use_guba=True, use_comment=False, use_margin=True,
-        use_northbound=False, use_dragon_tiger=False,
-        use_fundamental=True, use_etf_flow=False, use_xueqiu=True,
-        use_capital_flow=False, use_block_trade=False,
-        use_shareholder=False, use_lockup=False, use_dividend=False,
+        use_guba=True, use_comment=True, use_margin=True,
+        use_northbound=True, use_dragon_tiger=True,
+        use_fundamental=True, use_etf_flow=True, use_xueqiu=True,
+        use_capital_flow=True, use_block_trade=True,
+        use_shareholder=True, use_lockup=True, use_dividend=True,
         use_board=False, use_sector=False, use_concept=False,
     )
     panel_data = fp.build_panel_features(panel, aux_data=aux_data)
