@@ -250,7 +250,7 @@ def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
 
     ds = DataStorage(data_dir)
     ok: list[str] = []
-    n_neg, n_vol, n_nan = 0, 0, 0
+    n_neg, n_vol, n_nan, n_low, n_fwd = 0, 0, 0, 0, 0
     for code in stock_list:
         df = ds.load_daily(code, "2015-01-01", "2099-12-31")
         if df is None or df.empty:
@@ -262,16 +262,25 @@ def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
         if (close <= 0).any():
             n_neg += 1
             continue
+        if close.min() < 0.001:
+            n_low += 1
+            continue
         ret = np.diff(close) / (close[:-1] + 1e-8)
         if np.nanstd(ret) > 0.50:  # >50 % daily vol = data error
             n_vol += 1
             continue
+        if len(close) > 5:
+            fwd_ret = (close[5:] - close[:-5]) / (close[:-5] + 1e-8)
+            if np.nanmax(np.abs(fwd_ret)) > 10.0:
+                n_fwd += 1
+                continue
         ok.append(code)
-    if n_neg or n_vol or n_nan:
+    n_total = n_neg + n_vol + n_nan + n_low + n_fwd
+    if n_total:
         logger.warning(
             "Data quality: %d stocks filtered out "
-            "(negative prices=%d, extreme vol=%d, all NaN=%d) → %d kept",
-            n_neg + n_vol + n_nan, n_neg, n_vol, n_nan, len(ok),
+            "(negative=%d, hi_vol=%d, all_nan=%d, low_close=%d, extreme_fwd=%d) -> %d kept",
+            n_total, n_neg, n_vol, n_nan, n_low, n_fwd, len(ok),
         )
     return ok
 

@@ -39,6 +39,8 @@ def _compute_val_loss(
     """Quick val loss pass every epoch — drives ReduceLROnPlateau."""
     model.eval()
     total, n = 0.0, 0
+    nan_batches = 0
+    skipped_batches = 0
     with torch.no_grad():
         for static, pk, po, y_dir, y_ret, y_vol in val_loader:
             static = static.to(device)
@@ -49,13 +51,24 @@ def _compute_val_loss(
             y_vol = y_vol.to(device)
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
+                # Guard against model producing NaN (e.g. bad weights after
+                # training with corrupted data).
+                if torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any() or torch.isnan(pred_vol).any():
+                    nan_batches += 1
+                    continue
                 mask = (y_dir != -100).float()
+                # Entire batch has no valid labels (e.g. all positions are
+                # tail-padded for short-history stocks).  CrossEntropyLoss
+                # returns NaN when all targets are ignore_index, so skip.
+                if mask.sum() == 0:
+                    skipped_batches += 1
+                    continue
+                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
                 # AdjMSE for returns (sign-aware), MSE for volatility
                 l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
-                                 y_ret[mask > 0]) if mask.sum() > 1 else torch.tensor(0.0, device=device)
+                                 y_ret[mask > 0])
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
-                l_vol = vol_err.sum() / mask.sum().clamp(min=1)
+                l_vol = vol_err.sum() / mask.sum()
                 loss = loss_fn([l_ce, l_ret, l_vol])
                 if rank_ic_loss is not None and mask.sum() > 4:
                     valid_pred = pred_ret.squeeze(-1)[mask > 0]
@@ -63,10 +76,18 @@ def _compute_val_loss(
                     l_rankic = rank_ic_loss(valid_pred, valid_target)
                     if torch.isfinite(l_rankic):
                         loss = loss + rank_ic_weight * l_rankic
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                continue
             total += loss.item()
             n += 1
+    if nan_batches > 0 or skipped_batches > 0:
+        logger.warning(
+            "%d NaN + %d empty / %d total val batches",
+            nan_batches, skipped_batches, n + nan_batches + skipped_batches,
+        )
     model.train()
-    return total / max(n, 1)
+    return total / max(n, 1) if n > 0 else float("inf")
 
 
 def train_tft(
@@ -152,16 +173,15 @@ def train_tft(
 
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
                 mask = (y_dir != -100).float()
+                if mask.sum() == 0:
+                    continue
+                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
                 # AdjMSE: sign-aware loss — wrong-sign predictions cost 11× more
-                if mask.sum() > 1:
-                    l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
-                                     y_ret[mask > 0])
-                else:
-                    l_ret = torch.tensor(0.0, device=device)
+                l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
+                                 y_ret[mask > 0])
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
-                l_vol = vol_err.sum() / mask.sum().clamp(min=1)
+                l_vol = vol_err.sum() / mask.sum()
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
                 # RankICLoss: cross-sectional ranking objective (soft Spearman)
                 # applied across valid positions in the batch as a proxy for
