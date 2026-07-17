@@ -1195,7 +1195,7 @@ class FeaturePipeline:
         max_T = min(max(lengths), 3000)
 
         N_stocks = len(all_feat_dfs)
-        y_dir_arr = np.zeros((N_stocks, max_T), dtype=np.int64)
+        y_dir_arr = np.full((N_stocks, max_T), -100, dtype=np.int64)  # CE ignore_index
         y_ret_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         y_vol_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         stock_T = np.zeros(N_stocks, dtype=np.int32)
@@ -1220,10 +1220,13 @@ class FeaturePipeline:
                     (close_raw[horizon:] - close_raw[:T_i - horizon])
                     / (close_raw[:T_i - horizon] + 1e-8)
                 )
-            # Direction label with scaled noise threshold
-            y_dir_arr[i, :T_i] = np.where(
-                ret_fwd > dir_threshold, 2,
-                np.where(ret_fwd < -dir_threshold, 0, 1),
+            # Direction label with scaled noise threshold.
+            # Only label positions where forward return is valid
+            # (last `horizon` positions are NaN → stay -100 masked).
+            valid_len = max(0, T_i - horizon)
+            y_dir_arr[i, :valid_len] = np.where(
+                ret_fwd[:valid_len] > dir_threshold, 2,
+                np.where(ret_fwd[:valid_len] < -dir_threshold, 0, 1),
             ).astype(np.int64)
             y_ret_arr[i, :T_i] = ret_fwd
 

@@ -140,11 +140,9 @@ def train_tft(
         model.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
-        last_batch_idx = 0
-        backward_done = False
+        accum_count = 0  # actual backward steps counted (skip NaN)
 
         for batch_idx, (static, pk, po, y_dir, y_ret, y_vol) in enumerate(train_loader):
-            last_batch_idx = batch_idx
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -184,9 +182,9 @@ def train_tft(
 
             total_loss = total_loss / config.grad_accum_steps
             scaler.scale(total_loss).backward()
-            backward_done = True
+            accum_count += 1
 
-            if (batch_idx + 1) % config.grad_accum_steps == 0 and backward_done:
+            if accum_count % config.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
@@ -195,10 +193,9 @@ def train_tft(
 
             epoch_loss += total_loss.item() * config.grad_accum_steps
 
-        # Apply trailing accumulated gradients
-        num_batches = last_batch_idx + 1
-        remaining = num_batches % config.grad_accum_steps
-        if remaining != 0 and backward_done:
+        # Apply trailing accumulated gradients (from valid batches only)
+        remaining = accum_count % config.grad_accum_steps
+        if remaining != 0:
             scaler.unscale_(optimizer)
             scale = config.grad_accum_steps / remaining
             for p in model.parameters():
@@ -217,6 +214,7 @@ def train_tft(
         # this the scheduler never fires because train_loss always drops.
         val_loss = _compute_val_loss(
             model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
+            rank_ic_loss=rank_ic_loss, rank_ic_weight=rank_ic_weight,
         )
         history["val_loss"].append(val_loss)
         scheduler.step(val_loss)

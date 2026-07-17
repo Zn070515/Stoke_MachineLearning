@@ -53,7 +53,7 @@ class AdjMSELoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         squared = (pred - target) ** 2
-        same_sign = (pred * target) > 0
+        same_sign = (pred * target) >= 0
         weight = torch.where(
             same_sign,
             torch.full_like(squared, self.gamma),
