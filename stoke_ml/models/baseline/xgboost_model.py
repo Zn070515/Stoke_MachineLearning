@@ -1,10 +1,14 @@
-"""XGBoost baseline model for stock direction prediction."""
+"""XGBoost baseline model for stock direction prediction (3-class)."""
 import numpy as np
 import xgboost as xgb
 
 
 class XGBoostBaseline:
-    """XGBoost classifier for next-day price direction."""
+    """XGBoost classifier for next-day price direction.
+
+    Labels: 0=DOWN, 1=FLAT, 2=UP (consistent with TFT 3-class output).
+    Positions with label=-100 (limit-up/down masked) are filtered in fit().
+    """
 
     def __init__(
         self,
@@ -13,7 +17,6 @@ class XGBoostBaseline:
         learning_rate: float = 0.1,
         subsample: float = 0.8,
         colsample_bytree: float = 0.8,
-        scale_pos_weight: float | None = None,
     ):
         self._params = {
             "n_estimators": n_estimators,
@@ -21,25 +24,20 @@ class XGBoostBaseline:
             "learning_rate": learning_rate,
             "subsample": subsample,
             "colsample_bytree": colsample_bytree,
-            "objective": "binary:logistic",
-            "eval_metric": "logloss",
+            "objective": "multi:softmax",
+            "num_class": 3,
+            "eval_metric": "mlogloss",
             "random_state": 42,
             "verbosity": 0,
         }
-        if scale_pos_weight is not None:
-            self._params["scale_pos_weight"] = scale_pos_weight
         self._model: xgb.XGBClassifier | None = None
 
     def fit(self, X: np.ndarray, y: np.ndarray):
-        if self._params.get("scale_pos_weight") is None:
-            neg = np.sum(y == 0)
-            pos = np.sum(y == 1)
-            if pos > 0 and neg > 0:
-                self._params["scale_pos_weight"] = neg / pos
-            else:
-                self._params["scale_pos_weight"] = 1.0
+        mask = y != -100
+        X_clean = X[mask]
+        y_clean = y[mask].astype(int)
         self._model = xgb.XGBClassifier(**self._params)
-        self._model.fit(X, y, verbose=False)
+        self._model.fit(X_clean, y_clean, verbose=False)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
@@ -49,7 +47,7 @@ class XGBoostBaseline:
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self._model is None:
             raise RuntimeError("Model not trained. Call fit() first.")
-        return self._model.predict_proba(X)[:, 1]
+        return self._model.predict_proba(X)
 
     def save(self, path: str):
         if self._model is None:

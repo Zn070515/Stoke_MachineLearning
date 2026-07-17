@@ -73,7 +73,7 @@ def select_by_sfs(
         model = _make_model()
         model.fit(X_tr, y_tr)
         proba = model.predict_proba(X_va)
-        return roc_auc_score(y_va, proba)
+        return roc_auc_score(y_va, proba, multi_class="ovr")
 
     remaining = list(range(n_features))
     selected: list[int] = []
