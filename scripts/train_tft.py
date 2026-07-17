@@ -388,8 +388,8 @@ def main():
                 config.batch_size, config.learning_rate)
 
     # Purged walk-forward splits
-    train_len = 504
-    val_len = 63
+    train_len = 756
+    val_len = 126
     step = 63
     purge = config.seq_len  # must be >= seq_len to prevent context overlap
     all_sharpes = []

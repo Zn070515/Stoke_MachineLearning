@@ -130,7 +130,7 @@ def train_tft(
         min_lr=config.min_lr,
     )
 
-    best_sharpe = -float("inf")
+    best_val_loss = float("inf")
     best_state = None
     patience_counter = 0
     history = {"train_loss": [], "val_loss": [], "val_sharpe": [], "val_ic": []}
@@ -219,7 +219,16 @@ def train_tft(
         history["val_loss"].append(val_loss)
         scheduler.step(val_loss)
 
-        # Full metrics (Sharpe + IC) every 5 epochs for early stopping
+        # Save best model by val_loss (more stable than Sharpe with short
+        # validation windows — Sharpe has only ~12 non-overlapping samples).
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # Report Sharpe/IC every 5 epochs (informational only)
         if (epoch + 1) % 5 == 0:
             sharpe, val_metrics = evaluate_sharpe(
                 model, val_data, config, device,
@@ -233,22 +242,15 @@ def train_tft(
                         epoch + 1, config.max_epochs, avg_loss, val_loss,
                         sharpe, ic,
                         optimizer.param_groups[0]["lr"])
-
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= config.early_stop_patience // 5:
-                logger.info("Early stopping at epoch %d (best Sharpe=%.4f)",
-                            epoch + 1, best_sharpe)
-                break
         else:
             logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f lr=%.2e",
                         epoch + 1, config.max_epochs, avg_loss, val_loss,
                         optimizer.param_groups[0]["lr"])
+
+        if patience_counter >= config.early_stop_patience:
+            logger.info("Early stopping at epoch %d (best val_loss=%.4f)",
+                        epoch + 1, best_val_loss)
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)

@@ -5,10 +5,10 @@ from dataclasses import dataclass
 class TFTConfig:
     """TFT model hyperparameters. ~20M params with defaults below.
 
-    Training defaults follow Qlib/pytorch-forecasting best practices:
-    - ReduceLROnPlateau (not OneCycleLR) for financial time series
-    - clip_grad_value_ (not clip_grad_norm_) per Qlib standard
-    - Early stopping on validation Sharpe with IC as secondary metric
+    Training defaults:
+    - ReduceLROnPlateau on val_loss (not Sharpe — too few samples)
+    - Early stopping on val_loss plateau with IC as secondary metric
+    - Moderate regularization for financial data (dropout=0.20, wd=3e-4)
     """
 
     # Input dimensions
@@ -21,13 +21,14 @@ class TFTConfig:
     lstm_layers: int = 2
     attention_heads: int = 4
     grn_layers: int = 2
-    dropout: float = 0.10
+    dropout: float = 0.20
 
     # Training
     batch_size: int = 64
     grad_accum_steps: int = 4
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 3e-4
+    early_stop_patience: int = 10
     max_grad_norm: float = 0.1
     max_epochs: int = 200
 
@@ -36,9 +37,6 @@ class TFTConfig:
     lr_reduce_patience: int = 10
     lr_reduce_threshold: float = 1e-4
     min_lr: float = 1e-5
-
-    # Early stopping
-    early_stop_patience: int = 20  # epochs without improvement before stopping
 
     # Reproducibility
     seed: int | None = 42
