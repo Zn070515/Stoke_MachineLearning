@@ -95,8 +95,14 @@ def train_tft(
     train_data: dict,
     val_data: dict,
     device: torch.device,
+    raw_val_returns: np.ndarray | None = None,
 ) -> tuple[TFTModel, dict]:
     """Train TFT model with purged walk-forward fold.
+
+    Args:
+        raw_val_returns: (N_stocks, T_val) raw forward returns (percent).
+            Passed through to evaluate_sharpe so Sharpe/IC are computed
+            from real returns, not z-scored targets.
 
     Returns:
         model: best model (by validation Sharpe).
@@ -253,6 +259,7 @@ def train_tft(
             sharpe, val_metrics = evaluate_sharpe(
                 model, val_data, config, device,
                 return_metrics=True, horizon=config.horizon,
+                raw_returns=raw_val_returns,
             )
             history["val_sharpe"].append(sharpe)
             ic = val_metrics.get("ic", 0.0)

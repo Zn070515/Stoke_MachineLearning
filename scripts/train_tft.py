@@ -444,6 +444,9 @@ def main():
         vol_std = np.maximum(train_data["y_volatility"].std(axis=1, keepdims=True), 1e-8)
         train_data["y_return"] = (train_data["y_return"] - ret_mean) / ret_std
         train_data["y_volatility"] = (train_data["y_volatility"] - vol_mean) / vol_std
+        # Save raw returns BEFORE normalization — Sharpe/IC are meaningless
+        # when computed from z-scored targets.
+        raw_val_y_return = val_data["y_return"].copy()
         val_data["y_return"] = (val_data["y_return"] - ret_mean) / ret_std
         val_data["y_volatility"] = (val_data["y_volatility"] - vol_mean) / vol_std
         # Clip normalized targets to [-5, 5] — regime changes can make
@@ -457,7 +460,10 @@ def main():
                     train_start, train_end, val_start, val_end)
 
         t0 = time.time()
-        model, history = train_tft(config, train_data, val_data, device)
+        model, history = train_tft(
+            config, train_data, val_data, device,
+            raw_val_returns=raw_val_y_return,
+        )
         elapsed = time.time() - t0
 
         if history["val_sharpe"]:

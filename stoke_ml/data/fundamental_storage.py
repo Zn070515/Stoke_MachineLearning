@@ -98,17 +98,17 @@ class FundamentalStorage:
     def forward_fill_to_daily(
         self, stock_code: str, start_date: str, end_date: str,
         max_gap_days: int = 30,
-        interpolate: bool = True,
+        interpolate: bool = False,
     ) -> pd.DataFrame:
         """Load fundamentals and forward-fill to daily trading calendar.
 
         Uses disclose_date for forward-fill to prevent lookahead bias.
-        Optionally linearly interpolates between disclosure dates for
-        smoother transitions (better than step-function fill).
 
         Args:
             max_gap_days: Max days a value stays fresh after disclosure.
-            interpolate: If True, linear interpolate between data points.
+            interpolate: DEPRECATED — linear interpolation leaks future
+                filings into the past.  Kept for backward compat but
+                strongly discouraged.  Use forward-fill only.
         """
         raw = self.load(stock_code, "2010-01-01", end_date)
         if raw.empty:
@@ -143,7 +143,10 @@ class FundamentalStorage:
                 result.loc[mask, col] = val
 
             if interpolate:
-                # Linear interpolate between non-NaN values (smoother than step fill)
+                logger.warning(
+                    "Linear interpolation leaks future filings — "
+                    "consider interpolate=False for research use."
+                )
                 has_val = result[col].notna()
                 if has_val.sum() >= 2:
                     result[col] = result[col].interpolate(

@@ -40,12 +40,20 @@ def evaluate_sharpe(
     top_k: int = 20,
     horizon: int = 1,
     return_metrics: bool = False,
+    raw_returns: np.ndarray | None = None,
 ) -> float | tuple[float, dict]:
     """Time-varying top-K portfolio evaluation.
 
     For each validation day (subsampled by horizon to avoid overlap),
     ranks stocks by predicted return, selects top-K, and computes
     equal-weight portfolio return using non-overlapping forward returns.
+
+    Args:
+        raw_returns: (N_stocks, T_total) raw forward returns in percent.
+            If provided, used for Sharpe/IC computation instead of the
+            z-scored returns in val_data.  Without this, Sharpe is
+            computed on normalised returns and is NOT a valid financial
+            metric — only useful for model comparison, not P&L estimation.
     """
     model.eval()
     val_ds = PanelDataset(val_data, seq_len=config.seq_len)
@@ -70,22 +78,31 @@ def evaluate_sharpe(
         return 0.0
 
     preds = torch.cat(all_preds)
-    actuals = torch.cat(all_actuals)
     n_stocks = val_data["static_features"].shape[0]
     n_windows = val_ds.n_windows
-
-    # Reshape to (n_stocks, n_windows) for per-day stock ranking
     preds = preds.reshape(n_stocks, n_windows)
-    actuals = actuals.reshape(n_stocks, n_windows)
+
+    # Use raw returns for financial metrics when available; otherwise
+    # the z-scored targets produce a Sharpe that is only meaningful
+    # for model comparison, not strategy P&L.
+    if raw_returns is not None:
+        val_start = val_ds.n_timesteps
+        # Reconstruct the raw-return matrix matching preds shape.
+        # PanelDataset yields (stock, window) pairs predicting at
+        # position `window_idx + seq_len`.  Build that matrix from
+        # the raw_returns slice.
+        pass  # handled below via _build_raw_actuals
+
+    # Build raw-actuals matrix for the val window positions
+    if raw_returns is not None:
+        actuals = _build_raw_actuals(raw_returns, n_stocks, n_windows, config.seq_len)
+    else:
+        actuals = torch.cat(all_actuals).reshape(n_stocks, n_windows)
 
     k = min(top_k, n_stocks)
     if k == 0:
         return 0.0
 
-    # Subsample by horizon to avoid overlapping returns inflating Sharpe.
-    # When horizon=5, day t's return and day t+1's return share 4/5 days,
-    # which makes std artificially low. Striding by horizon gives independent
-    # observations.
     portfolio_returns = []
     for t in range(0, n_windows, horizon):
         _, top_idx = torch.topk(preds[:, t], k)
@@ -116,3 +133,23 @@ def evaluate_sharpe(
     mean_ic = float(np.mean(daily_ics)) if daily_ics else 0.0
 
     return sharpe, {"ic": mean_ic}
+
+
+def _build_raw_actuals(
+    raw_returns: np.ndarray,
+    n_stocks: int,
+    n_windows: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """Build (n_stocks, n_windows) matrix of raw forward returns.
+
+    PanelDataset returns (stock i, window w) → y_return at position
+    w + seq_len.  This reconstructs that mapping from the raw_returns
+    slice so Sharpe/IC are computed from real percentage returns.
+    """
+    actuals = np.zeros((n_stocks, n_windows), dtype=np.float32)
+    for w in range(n_windows):
+        t = w + seq_len  # prediction position in the val slice
+        if t < raw_returns.shape[1]:
+            actuals[:, w] = raw_returns[:, t]
+    return torch.from_numpy(actuals)
