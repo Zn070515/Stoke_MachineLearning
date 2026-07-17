@@ -46,8 +46,8 @@ class SimpleAttentionModel(nn.Module):
         self.eval()
         with torch.no_grad():
             logits = self.forward(x)
-            return torch.softmax(logits, dim=-1)[:, 1]
+            return torch.softmax(logits, dim=-1)
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         probs = self.predict_proba(x)
-        return (probs > 0.5).long()
+        return torch.argmax(probs, dim=-1)
