@@ -1,6 +1,6 @@
 import torch
 import pytest
-from stoke_ml.models.panel.components import GatedLinearUnit, GRN, TimeDistributed
+from stoke_ml.models.panel.components import GatedLinearUnit, GRN
 
 
 class TestGLU:

@@ -1,4 +1,4 @@
-"""Train TFT panel model on A-share stocks.
+"""Train VSN+xLSTM panel model on A-share stocks.
 
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 20 --epochs 10 --max-folds 1
@@ -286,7 +286,7 @@ def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train TFT panel model")
+    parser = argparse.ArgumentParser(description="Train VSN+xLSTM panel model")
     parser.add_argument("--stocks", type=int, default=500,
                         help="Limit to first N stocks (default: 500)")
     parser.add_argument("--stock-list", type=str, default=None,

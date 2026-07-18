@@ -9,7 +9,7 @@ from torch.amp import GradScaler, autocast
 
 from stoke_ml.models.panel.config import PanelConfig
 from stoke_ml.models.panel.model import PanelModel
-from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, RankICLoss
+from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from stoke_ml.models.panel.evaluate import evaluate_sharpe
@@ -34,8 +34,6 @@ def _compute_val_loss(
     loss_fn: UncertaintyLoss,
     device: torch.device,
     use_amp: bool,
-    rank_ic_loss: nn.Module | None = None,
-    rank_ic_weight: float = 0.0,
 ) -> float:
     """Quick val loss pass every epoch for best-model selection."""
     model.eval()
@@ -71,12 +69,6 @@ def _compute_val_loss(
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
                 l_vol = vol_err.sum() / mask.sum()
                 loss = loss_fn([l_ce, l_ret, l_vol])
-                if rank_ic_loss is not None and mask.sum() > 4:
-                    valid_pred = pred_ret.squeeze(-1)[mask > 0]
-                    valid_target = y_ret[mask > 0]
-                    l_rankic = rank_ic_loss(valid_pred, valid_target)
-                    if torch.isfinite(l_rankic):
-                        loss = loss + rank_ic_weight * l_rankic
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_batches += 1
                 continue
@@ -130,7 +122,7 @@ def train_panel(
     device: torch.device,
     raw_val_returns: np.ndarray | None = None,
 ) -> tuple[PanelModel, dict]:
-    """Train TFT model with purged walk-forward fold.
+    """Train VSN+xLSTM panel model with purged walk-forward fold.
 
     Args:
         raw_val_returns: (N_stocks, T_val) raw forward returns (percent).
@@ -156,8 +148,6 @@ def train_panel(
     loss_fn = UncertaintyLoss(num_tasks=3).to(device)
     ce_loss = nn.CrossEntropyLoss()
     ret_loss = AdjMSELoss(gamma=0.1)  # sign-aware: wrong-sign → 11× penalty
-    rank_ic_loss = RankICLoss(temperature=0.5)  # cross-sectional ranking objective
-    rank_ic_weight = 0.1  # small weight — ranking signal is complementary
 
     optimizer = torch.optim.AdamW([
         {"params": model.parameters()},
@@ -244,15 +234,6 @@ def train_panel(
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
                 l_vol = vol_err.sum() / mask.sum()
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
-                # RankICLoss: cross-sectional ranking objective (soft Spearman)
-                # applied across valid positions in the batch as a proxy for
-                # true date-level cross-section.
-                if mask.sum() > 4:
-                    valid_pred = pred_ret.squeeze(-1)[mask > 0]
-                    valid_target = y_ret[mask > 0]
-                    l_rankic = rank_ic_loss(valid_pred, valid_target)
-                    if torch.isfinite(l_rankic):
-                        total_loss = total_loss + rank_ic_weight * l_rankic
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 logger.warning(
@@ -309,7 +290,6 @@ def train_panel(
 
         val_loss = _compute_val_loss(
             model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
-            rank_ic_loss=rank_ic_loss, rank_ic_weight=rank_ic_weight,
         )
         history["val_loss"].append(val_loss)
 

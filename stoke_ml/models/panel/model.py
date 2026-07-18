@@ -160,9 +160,7 @@ class PanelModel(nn.Module):
                 B, self.config.xlstm_num_heads, -1,
             )
             zero_state = torch.zeros_like(h_init)
-            num_slstm = int(
-                self.config.xlstm_num_blocks * self.config.xlstm_slstm_ratio,
-            )
+            num_slstm = self.xlstm.num_slstm_blocks
             states = [
                 (h_init, zero_state.clone(), zero_state.clone(), zero_state.clone())
                 for _ in range(num_slstm)

@@ -66,14 +66,10 @@ class GRN(nn.Module):
 
 
 class GateAddNorm(nn.Module):
-    """GLU gating + residual add + LayerNorm — TFT's standard building block.
+    """GLU gating + residual add + LayerNorm.
 
-    Used at three locations in the canonical TFT:
-    1. Post-LSTM (encoder)
-    2. Post-attention
-    3. Post position-wise FFN
-
-    In the VSN+xLSTM architecture, used post-LSTM and post-static-enrichment.
+    Used in the VSN+xLSTM architecture post-xLSTM and optionally
+    post-static-enrichment.
     """
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1):
@@ -88,20 +84,3 @@ class GateAddNorm(nn.Module):
         return self.layer_norm(out + skip)
 
 
-class TimeDistributed(nn.Module):
-    """Apply a module independently to each time step.
-
-    Useful for static variable tiling: apply static context to every timestep.
-    """
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.module = module
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D)
-        B, T, D = x.shape
-        x_flat = x.reshape(B * T, D)
-        out = self.module(x_flat)
-        out = out.reshape(B, T, -1)
-        return out

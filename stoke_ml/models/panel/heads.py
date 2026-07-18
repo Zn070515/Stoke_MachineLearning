@@ -7,7 +7,7 @@ class DirectionHead(nn.Module):
     """3-class direction classifier with bottleneck + ELU for gradient stability.
 
     Head dropout higher than backbone dropout — output layers are the primary
-    overfitting site in financial TFT (gradient collapse research, 2024).
+    overfitting site in financial deep learning models (gradient collapse research, 2024).
     """
 
     def __init__(self, hidden_dim: int, num_classes: int = 3, dropout: float = 0.35):

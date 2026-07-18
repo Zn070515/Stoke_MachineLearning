@@ -1124,7 +1124,7 @@ class FeaturePipeline:
         aux_data: dict[str, dict[str, pd.DataFrame]] | None = None,
         horizon: int = 1,
     ) -> dict:
-        """Build panel-format features for TFT training from a multi-stock panel.
+        """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
         The input panel must have columns: date, stock_code, open, high, low,
         close, volume (plus any auxiliary feature columns already merged).
@@ -1230,11 +1230,13 @@ class FeaturePipeline:
             ).astype(np.int64)
             y_ret_arr[i, :T_i] = ret_fwd
 
-            # Backward-looking realized volatility (always 5-day for stability,
-            # independent of prediction horizon — volatility is a conditioning
-            # signal, not the prediction target itself).
+            # Backward-looking realized volatility from actual daily returns.
+            # Uses historical returns (close-to-close) — NOT forward returns —
+            # to avoid leaking future close prices into the volatility target.
+            # 5-day window for stability; independent of prediction horizon.
+            ret_hist = np.diff(close_raw) / (close_raw[:-1] + 1e-8)
             for t in range(6, T_i):
-                y_vol_arr[i, t] = float(np.std(ret_fwd[max(0, t-5):t]))
+                y_vol_arr[i, t] = float(np.std(ret_hist[max(0, t-5):t]))
 
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
@@ -1272,6 +1274,10 @@ class FeaturePipeline:
         static_cols_available = [c for c in _STATIC_FEATURE_COLS if c in first_df.columns]
         pk_cols_available = [c for c in _PAST_KNOWN_COLS if c in first_df.columns]
         po_cols_available = [c for c in _PAST_OBSERVED_COLS if c in first_df.columns]
+        # Dynamically include has_* flags (ZI-fill indicators) so the model
+        # can distinguish true zeros from "no data available" zeros.
+        has_cols = [c for c in first_df.columns if c.startswith("has_")]
+        po_cols_available += has_cols
 
         # Compute static features from first 20 days (zero look-ahead bias).
         # Stock-invariant characteristics — size, liquidity, risk, price tier.
@@ -1387,7 +1393,7 @@ class FeaturePipeline:
         }
 
 
-# ── TFT feature column definitions ──────────────────────────────────────
+# ── Panel model feature column definitions ──────────────────────────────────
 
 
 def _compute_static_quantiles(

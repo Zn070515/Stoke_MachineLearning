@@ -18,10 +18,10 @@ class PanelConfig:
     - Cosine LR schedule with warmup (transformer-training standard)
     """
 
-    # Input dimensions
-    static_dim: int = 30
-    past_known_dim: int = 250
-    past_observed_dim: int = 120
+    # Input dimensions (overridden at runtime from actual data)
+    static_dim: int = 4
+    past_known_dim: int = 221
+    past_observed_dim: int = 70
 
     # Core model
     hidden_dim: int = 128
@@ -58,7 +58,7 @@ class PanelConfig:
 
     # Output
     num_direction_classes: int = 3  # down / flat / up
-    horizon: int = 1
+    horizon: int = 5
 
     # Hardware
     use_amp: bool = False

@@ -233,6 +233,7 @@ class xLSTMBackbone(nn.Module):
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self._slstm_ratio = slstm_ratio
 
         blocks = []
         for i in range(num_blocks):
@@ -252,6 +253,16 @@ class xLSTMBackbone(nn.Module):
                     dropout=dropout,
                 ))
         self.blocks = nn.ModuleList(blocks)
+
+    @property
+    def num_slstm_blocks(self) -> int:
+        """Number of sLSTM blocks in the backbone."""
+        return int(len(self.blocks) * self._slstm_ratio)
+
+    @property
+    def num_mlstm_blocks(self) -> int:
+        """Number of mLSTM blocks in the backbone."""
+        return len(self.blocks) - self.num_slstm_blocks
 
     def forward(
         self,

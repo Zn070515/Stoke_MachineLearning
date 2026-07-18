@@ -86,15 +86,6 @@ def evaluate_sharpe(
     # the z-scored targets produce a Sharpe that is only meaningful
     # for model comparison, not strategy P&L.
     if raw_returns is not None:
-        val_start = val_ds.n_timesteps
-        # Reconstruct the raw-return matrix matching preds shape.
-        # PanelDataset yields (stock, window) pairs predicting at
-        # position `window_idx + seq_len`.  Build that matrix from
-        # the raw_returns slice.
-        pass  # handled below via _build_raw_actuals
-
-    # Build raw-actuals matrix for the val window positions
-    if raw_returns is not None:
         actuals = _build_raw_actuals(raw_returns, n_stocks, n_windows, config.seq_len)
     else:
         actuals = torch.cat(all_actuals).reshape(n_stocks, n_windows)

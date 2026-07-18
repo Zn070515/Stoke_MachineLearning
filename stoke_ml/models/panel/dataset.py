@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 
 
 class PanelDataset(Dataset):
-    """Panel dataset for TFT training.
+    """Panel dataset for VSN+xLSTM model training.
 
     Pre-built tensor data organized as (N_stocks, T_total, D_features).
     Each __getitem__ returns a single stock's sequence window.
