@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
-from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 
 
 def make_synthetic_data(n_stocks=10, n_days=100, seq_len=60):

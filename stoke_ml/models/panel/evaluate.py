@@ -3,8 +3,8 @@ import torch.nn as nn
 import numpy as np
 from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
-from stoke_ml.models.tft.config import TFTConfig
-from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
+from stoke_ml.models.panel.config import PanelConfig
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 
 
 def compute_sharpe(
@@ -35,7 +35,7 @@ def compute_sharpe(
 def evaluate_sharpe(
     model: nn.Module,
     val_data: dict,
-    config: TFTConfig,
+    config: PanelConfig,
     device: torch.device,
     top_k: int = 20,
     horizon: int = 1,
@@ -133,6 +133,23 @@ def evaluate_sharpe(
     mean_ic = float(np.mean(daily_ics)) if daily_ics else 0.0
 
     return sharpe, {"ic": mean_ic}
+
+
+def compute_prediction_diversity(predictions: np.ndarray) -> float:
+    """Prediction diversity: std(preds) / (|mean(preds)| + 1e-8).
+
+    FinFusion (2024) found this metric positively correlated with directional
+    accuracy while val_loss is anti-correlated (r=-0.46).  Low diversity
+    (< 0.1) after epoch 5 signals gradient collapse — the model is
+    producing near-constant predictions regardless of input.
+
+    Args:
+        predictions: 1-D array of predicted values (returns or logits).
+
+    Returns:
+        diversity ratio (higher = more diverse predictions, generally better).
+    """
+    return float(np.std(predictions) / (abs(np.mean(predictions)) + 1e-8))
 
 
 def _build_raw_actuals(

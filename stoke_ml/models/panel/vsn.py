@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-from stoke_ml.models.tft.components import GRN
+from stoke_ml.models.panel.components import GRN
 
 
 class VariableSelectionNetwork(nn.Module):

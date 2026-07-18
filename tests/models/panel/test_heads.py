@@ -1,5 +1,5 @@
 import torch
-from stoke_ml.models.tft.heads import DirectionHead, ReturnHead, VolatilityHead
+from stoke_ml.models.panel.heads import DirectionHead, ReturnHead, VolatilityHead
 
 
 class TestDirectionHead:

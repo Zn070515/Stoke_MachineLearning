@@ -1,22 +1,22 @@
 import torch
-from stoke_ml.models.tft import TFTConfig
-from stoke_ml.models.tft.model import TFTModel
+from stoke_ml.models.panel import PanelConfig
+from stoke_ml.models.panel.model import PanelModel
 
 
-class TestTFTModel:
+class TestPanelModel:
     @classmethod
     def setup_class(cls):
-        cls.config = TFTConfig(
+        cls.config = PanelConfig(
             static_dim=8,
             past_known_dim=24,
             past_observed_dim=12,
             hidden_dim=64,
-            lstm_layers=1,
-            attention_heads=2,
+            xlstm_num_blocks=1,
+            xlstm_num_heads=2,
             grn_layers=2,
             seq_len=60,
         )
-        cls.model = TFTModel(cls.config)
+        cls.model = PanelModel(cls.config)
 
     def test_forward_outputs(self):
         B, T = 4, 60

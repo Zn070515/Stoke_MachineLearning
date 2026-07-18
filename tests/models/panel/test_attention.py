@@ -1,5 +1,5 @@
 import torch
-from stoke_ml.models.tft.attention import InterpretableMultiHeadAttention
+from stoke_ml.models.panel.attention import InterpretableMultiHeadAttention
 
 
 class TestInterpretableMHA:

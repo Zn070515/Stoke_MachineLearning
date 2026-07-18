@@ -46,6 +46,7 @@ class GRN(nn.Module):
         self.residual = input_dim == output_dim
         if not self.residual:
             self.skip = nn.Linear(input_dim, output_dim)
+        self.layer_norm = nn.LayerNorm(output_dim)
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         eta1 = self.fc1(x)
@@ -61,7 +62,30 @@ class GRN(nn.Module):
             output = output + x
         else:
             output = output + self.skip(x)
-        return output
+        return self.layer_norm(output)
+
+
+class GateAddNorm(nn.Module):
+    """GLU gating + residual add + LayerNorm — TFT's standard building block.
+
+    Used at three locations in the canonical TFT:
+    1. Post-LSTM (encoder)
+    2. Post-attention
+    3. Post position-wise FFN
+
+    In the VSN+xLSTM architecture, used post-LSTM and post-static-enrichment.
+    """
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.glu = GatedLinearUnit(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        out = self.glu(x)
+        out = self.dropout(out)
+        return self.layer_norm(out + skip)
 
 
 class TimeDistributed(nn.Module):

@@ -99,9 +99,9 @@
 | 术语 | 含义 |
 |------|------|
 | seq_len | 回看窗口长度，**60 个交易日** |
-| target_horizon | 预测目标，XGBoost=1 (次日涨跌)，TFT=5 (5日涨跌) |
+| target_horizon | 预测目标，XGBoost=1 (次日涨跌)，Panel=5 (5日涨跌) |
 | flat_mode | XGBoost 模式：将 (60, n_features) 展平为 (60*n_features,) |
-| panel_mode | TFT 模式：保持 (N_stocks, T, D) 三维Panel结构，截面归一化 |
+| panel_mode | Panel 模式：保持 (N_stocks, T, D) 三维Panel结构，截面归一化 |
 | 技术指标 (technical) | MA/EMA/MACD/RSI/Bollinger/ATR/OBV/volume_ratio |
 | 趋势评分 (scoring) | 规则型 trend_level（0-6）/ buy_signal（0-5）/ bias |
 | 时序特征 (temporal) | 滞后项 lag(1/2/3/5/10/20) + 滚动统计 rolling(5/10/20/60) + 日历特征 |
@@ -120,22 +120,23 @@
 
 | 术语 | 含义 |
 |------|------|
-| TFT (Temporal Fusion Transformer) | 主力模型：Panel联合训练，多任务学习 (方向+涨跌幅+波动率)，RTX 4090 |
+| Panel Model (VSN + xLSTM) | 主力模型：Panel联合训练，多任务学习 (方向+涨跌幅+波动率)，RTX 4090 |
 | XGBoost baseline | 展平特征 + 梯度提升树，Phase 1 |
 | LSTM | 2层单向 LSTM + PyTorch Lightning，Phase 2 |
 | class_weight | 处理涨跌样本不均衡，自动计算 neg/pos |
 
-### TFT 架构组件
+### Panel Model 架构组件
 
 | 术语 | 含义 |
 |------|------|
 | VSN (Variable Selection Network) | 变量选择网络 — 在每个时间步对输入特征做软特征选择 (GRN + softmax) |
-| GRN (Gated Residual Network) | 门控残差网络 — TFT的基础构建块，ELU + GLU + 残差连接 + LayerNorm |
+| GRN (Gated Residual Network) | 门控残差网络 — 基础构建块，ELU + GLU + 残差连接 + LayerNorm |
 | GLU (Gated Linear Unit) | 门控线性单元 — `(X·W₁ + b₁) ⊙ σ(X·W₂ + b₂)`，控制信息流通 |
-| MHA (Interpretable Multi-Head Attention) | 可解释多头注意力 — 每个head共享value权重，保留时间维度的可解释性 |
-| Static Enrichment | 静态特征通过GRN编码后注入时序编码器 (c,h → LSTM初始状态 + c_c,c_h → GRN上下文) |
+| sLSTM (scalar LSTM) | 指数门控 + memory mixing，序列处理，适用于短序列金融数据 |
+| mLSTM (matrix LSTM) | 矩阵记忆 + 协方差更新，并行化处理全局模式 |
+| Static Encoder | 静态特征通过4个GRN编码为 c_e/c_h/c_vs 上下文向量，分别注入时序编码和特征选择 |
 
-### TFT 多任务输出
+### Panel Model 多任务输出
 
 | 任务 | 损失函数 | 说明 |
 |------|----------|------|
@@ -144,7 +145,7 @@
 | 波动率回归 | MSE | 未来horizon日波动率 (std of daily returns) |
 | 截面排序 | RankICLoss (T=0.5, weight=0.1) | 可微Spearman秩相关系数，soft-rank trick |
 
-### TFT 损失加权
+### Panel Model 损失加权
 
 | 术语 | 含义 |
 |------|------|
@@ -179,20 +180,20 @@
 | 术语 | 含义 |
 |------|------|
 | **MCC** (Matthews Correlation Coefficient) | 主要评估指标，适用于不平衡二分类 (XGBoost/LSTM) |
-| **IC** (Information Coefficient) | Spearman Rank IC — 截面排序能力，TFT的主要评估指标。每日计算 pred vs actual 的秩相关，取均值 |
+| **IC** (Information Coefficient) | Spearman Rank IC — 截面排序能力，Panel Model的主要评估指标。每日计算 pred vs actual 的秩相关，取均值 |
 | **RankICLoss** | 可微Spearman秩相关损失，soft-rank trick：pairwise diff → sigmoid → Pearson corr |
-| 方向分类 (3类) | TFT: 下跌(0) / 横盘(1) / 上涨(2)，阈值 ±0.003×√horizon |
+| 方向分类 (3类) | Panel: 下跌(0) / 横盘(1) / 上涨(2)，阈值 ±0.003×√horizon |
 | Walk-Forward 验证 | 固定窗口滑动验证，严格时序拆分，**绝不打乱** |
-| Purged Walk-Forward | TFT: 504天训练 / 63天验证 / 63天步长 + seq_len purge gap |
+| Purged Walk-Forward | Panel: 504天训练 / 63天验证 / 63天步长 + seq_len purge gap |
 | Sharpe Ratio | 年化夏普 = (期均收益/期收益标准差) × √(252/horizon)，评估时 stride=horizon 避免回报重叠 |
 | Max Drawdown | 最大回撤 |
 | Win Rate | 胜率 = 正收益交易占比 |
 | Profit Factor | 盈亏比 = 总盈利/总亏损 |
-| Top-K Portfolio | TFT评估方法：每日按预测收益排序选top-K (默认20)，等权组合，逐日再平衡 |
+| Top-K Portfolio | Panel评估方法：每日按预测收益排序选top-K (默认20)，等权组合，逐日再平衡 |
 
 **Walk-Forward 参数**: 
 - XGBoost/LSTM: 2年训练 / 3月验证 / 3月步长
-- TFT: 504天训练 / 63天验证 / 63天步长 / 60天purge
+- Panel: 504天训练 / 63天验证 / 63天步长 / 60天purge
 
 ---
 
@@ -221,11 +222,11 @@
 | 常量 | 值 | 位置 |
 |------|-----|------|
 | seq_len | 60 | config.yaml → features.seq_len |
-| target_horizon | 1 (XGBoost), 5 (TFT default) | config.yaml / TFTConfig.horizon |
-| TFT hidden_dim | 128 | TFTConfig.hidden_dim |
-| TFT attention_heads | 4 | TFTConfig.attention_heads |
-| TFT batch_size | 256 (RTX 4090) | TFTConfig.batch_size |
-| TFT lr_reduce_patience | 10 | TFTConfig.lr_reduce_patience |
+| target_horizon | 1 (XGBoost), 5 (Panel default) | config.yaml / PanelConfig.horizon |
+| Panel hidden_dim | 128 | PanelConfig.hidden_dim |
+| Panel xlstm_num_blocks | 3 | PanelConfig.xlstm_num_blocks |
+| Panel batch_size | 256 (RTX 4090) | PanelConfig.batch_size |
+| Panel lr_warmup_epochs | 5 | PanelConfig.lr_warmup_epochs |
 | 情感正面阈值 | > 0.2 | news_nlp.py |
 | 情感负面阈值 | < -0.2 | news_nlp.py |
 | 涨跌幅限制 | ±11% | cleaner.py (含容差) |

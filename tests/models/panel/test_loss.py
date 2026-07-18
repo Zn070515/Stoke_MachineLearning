@@ -1,5 +1,5 @@
 import torch
-from stoke_ml.models.tft.loss import UncertaintyLoss
+from stoke_ml.models.panel.loss import UncertaintyLoss
 
 
 class TestUncertaintyLoss:

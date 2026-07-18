@@ -1,12 +1,10 @@
-"""Panel-mode vs single-stock training benchmark.
+"""Train TFT panel model on A-share stocks.
 
-Compares XGBoost performance with and without cross-sectional normalization
-on the same stocks, date ranges, and model parameters.
-
-PANEL mode:  PanelBuilder → build_features_from_panel(cross_sectional=True)
-SINGLE mode: per-stock FeaturePipeline (no cross-sectional normalization)
+Usage:
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 20 --epochs 10 --max-folds 1
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stock-list 600519,000001,000858
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --no-aux  # skip auxiliary data for quick test
 """
-
 import argparse
 import logging
 import os
@@ -16,13 +14,12 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import torch
 
 from stoke_ml.config import load_config
-from stoke_ml.data.storage import DataStorage
-from stoke_ml.data.panel_builder import PanelBuilder
 from stoke_ml.features.pipeline import FeaturePipeline
-from stoke_ml.evaluation.metrics import compute_classification_metrics
-from stoke_ml.models.baseline.xgboost_model import XGBoostBaseline
+from stoke_ml.models.panel import PanelConfig
+from stoke_ml.models.panel.train import train_panel
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -30,312 +27,458 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _trading_date_splits(dates, train_years=2, val_months=3, step_months=3):
-    """Generate (train_start, train_end, val_start, val_end) date tuples."""
-    unique_dates = sorted(pd.DatetimeIndex(dates).unique())
-    n = len(unique_dates)
-    train_days = train_years * 252
-    val_days = val_months * 21
-    step_days = step_months * 21
-
-    start = 0
-    while True:
-        train_end = start + train_days
-        val_end = train_end + val_days
-        if val_end > n:
-            break
-        if train_end - start >= 200:
-            yield (
-                unique_dates[start],
-                unique_dates[train_end - 1],
-                unique_dates[train_end],
-                unique_dates[val_end - 1],
-            )
-        start += step_days
+def _discover_stocks(data_dir: str, limit: int | None = None) -> list[str]:
+    daily_dir = os.path.join(data_dir, "a_shares", "daily")
+    if not os.path.isdir(daily_dir):
+        return []
+    stocks = sorted(
+        f.replace(".parquet", "")
+        for f in os.listdir(daily_dir) if f.endswith(".parquet")
+    )
+    return stocks[:limit] if limit else stocks
 
 
-def _build_single_features(codes, date_start, date_end, storage, pipeline):
-    """Build per-stock features for the full date range.
+def load_aux_data(
+    stock_list: list[str],
+    data_dir: str,
+    start_date: str,
+    end_date: str,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """Load auxiliary data (sentiment, guba, margin, etc.) per stock.
 
-    Returns lists of (X, y, sample_dates) tuples — one per stock.
-    Sample dates track the prediction date after dropna, so downstream
-    code can split by date without leakage.
+    Returns: {stock_code: {"sentiment": df, "guba": df, ...}}
+    Only loads data types that exist on disk.
     """
-    results = []
-    for code in codes:
-        df = storage.load_daily(code, date_start, date_end)
-        if df.empty or len(df) < 120:
+    from stoke_ml.data.news_storage import NewsStorage
+    from stoke_ml.data.guba_storage import GubaStorage
+    from stoke_ml.data.xueqiu_storage import XueqiuStorage
+    from stoke_ml.data.market_wide_storage import MarketWideStorage
+    from stoke_ml.data.fundamental_storage import FundamentalStorage
+    from stoke_ml.data.comment_storage import CommentStorage
+
+    result: dict[str, dict[str, pd.DataFrame]] = {c: {} for c in stock_list}
+
+    # --- Sentiment (news) ---
+    try:
+        ns = NewsStorage(data_dir)
+        for code in stock_list:
+            df = ns.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["sentiment"] = df
+    except Exception:
+        logger.warning("Sentiment data not available, skipping")
+
+    # --- Announcements ---
+    try:
+        from stoke_ml.data.announcement_storage import AnnouncementStorage
+        a_store = AnnouncementStorage(data_dir)
+        for code in stock_list:
+            df = a_store.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["announcement"] = df
+    except Exception:
+        logger.warning("Announcement data not available, skipping")
+
+    # --- Guba ---
+    try:
+        gs = GubaStorage(data_dir)
+        for code in stock_list:
+            df = gs.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["guba"] = df
+    except Exception:
+        logger.warning("Guba data not available, skipping")
+
+    # --- Xueqiu ---
+    try:
+        xs = XueqiuStorage(data_dir)
+        for code in stock_list:
+            df = xs.load_daily_sentiment(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["xueqiu"] = df
+    except Exception:
+        logger.warning("Xueqiu data not available, skipping")
+
+    # --- Comment ---
+    try:
+        cs = CommentStorage(data_dir)
+        for code in stock_list:
+            df = cs.build_features(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["comment"] = df
+    except Exception:
+        logger.warning("Comment data not available, skipping")
+
+    # --- Margin ---
+    try:
+        margin_storage = MarketWideStorage(data_dir, "margin")
+        for code in stock_list:
+            df = margin_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["margin"] = df
+    except Exception:
+        logger.warning("Margin data not available, skipping")
+
+    # --- Fundamental ---
+    try:
+        fs = FundamentalStorage(data_dir)
+        for code in stock_list:
+            df = fs.load(code, "2010-01-01", end_date)
+            if df is not None and not df.empty:
+                result[code]["fundamental"] = df
+    except Exception:
+        logger.warning("Fundamental data not available, skipping")
+
+    # --- Northbound ---
+    try:
+        nb_storage = MarketWideStorage(data_dir, "northbound")
+        for code in stock_list:
+            df = nb_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["northbound"] = df
+    except Exception:
+        logger.warning("Northbound data not available, skipping")
+
+    # --- Dragon Tiger ---
+    try:
+        dt_storage = MarketWideStorage(data_dir, "dragon_tiger")
+        for code in stock_list:
+            df = dt_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["dragon_tiger"] = df
+    except Exception:
+        logger.warning("Dragon Tiger data not available, skipping")
+
+    # --- ETF Flow (sector-level, aggregated to market-wide per date) ---
+    try:
+        from stoke_ml.data.etf_storage import ETFStorage
+        etf = ETFStorage(data_dir)
+        etf_base = os.path.join(data_dir, "a_shares", "etf_flow")
+        etf_frames = []
+        if os.path.isdir(etf_base):
+            for f in os.listdir(etf_base):
+                if f.startswith("sector_") and f.endswith(".parquet"):
+                    sector_df = pd.read_parquet(os.path.join(etf_base, f))
+                    etf_frames.append(sector_df)
+        if etf_frames:
+            etf_all = pd.concat(etf_frames, ignore_index=True)
+            etf_all["date"] = pd.to_datetime(etf_all["date"])
+            etf_agg = etf_all.groupby("date").agg(
+                etf_flow_sum=("etf_flow_sum", "sum"),
+                etf_amount_sum=("etf_amount_sum", "sum"),
+            ).reset_index()
+            for code in stock_list:
+                result[code]["etf_flow"] = etf_agg
+            logger.info("ETF flow aggregated from %d sector files", len(etf_frames))
+    except Exception:
+        logger.warning("ETF flow data not available, skipping")
+
+    # --- Capital Flow ---
+    try:
+        cf_storage = MarketWideStorage(data_dir, "capital_flow")
+        for code in stock_list:
+            df = cf_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["capital_flow"] = df
+    except Exception:
+        logger.warning("Capital flow data not available, skipping")
+
+    # --- Block Trade ---
+    try:
+        bt_storage = MarketWideStorage(data_dir, "block_trade")
+        for code in stock_list:
+            df = bt_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["block_trade"] = df
+    except Exception:
+        logger.warning("Block trade data not available, skipping")
+
+    # --- Shareholder ---
+    try:
+        sh_storage = MarketWideStorage(data_dir, "shareholder")
+        for code in stock_list:
+            df = sh_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["shareholder"] = df
+    except Exception:
+        logger.warning("Shareholder data not available, skipping")
+
+    # --- Lockup ---
+    try:
+        lu_storage = MarketWideStorage(data_dir, "lockup")
+        for code in stock_list:
+            df = lu_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["lockup"] = df
+    except Exception:
+        logger.warning("Lockup data not available, skipping")
+
+    # --- Dividend ---
+    try:
+        dv_storage = MarketWideStorage(data_dir, "dividend")
+        for code in stock_list:
+            df = dv_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["dividend"] = df
+    except Exception:
+        logger.warning("Dividend data not available, skipping")
+
+    # --- Valuation (daily PE/PB/PS/PCF from Baostock) ---
+    try:
+        val_storage = MarketWideStorage(data_dir, "valuation")
+        for code in stock_list:
+            df = val_storage.load(code, start_date, end_date)
+            if df is not None and not df.empty:
+                result[code]["valuation"] = df
+    except Exception:
+        logger.warning("Valuation data not available, skipping")
+
+    loaded = sum(1 for v in result.values() if v)
+    logger.info("Aux data loaded for %d/%d stocks", loaded, len(stock_list))
+    return result
+
+
+def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
+    """Filter out stocks with corrupted price data.
+
+    Checks: close > 0, daily-return std < 50 %, no obviously bogus prices.
+    Returns only the codes that pass all checks.
+    """
+    import pandas as pd
+    import numpy as np
+    from stoke_ml.data.storage import DataStorage
+
+    ds = DataStorage(data_dir)
+    ok: list[str] = []
+    n_neg, n_vol, n_nan, n_low, n_fwd = 0, 0, 0, 0, 0
+    for code in stock_list:
+        df = ds.load_daily(code, "2015-01-01", "2099-12-31")
+        if df is None or df.empty:
             continue
-
-        # Run feature engineering to get dates
-        feats = pipeline._engineer_features(df)
-        if feats.empty:
+        close = df["close"].values
+        if np.isnan(close).all():
+            n_nan += 1
             continue
-
-        # Track dates through dropna (same as _create_sequences)
-        drop_cols = ["date", "stock_code", "sector", "size_proxy"]
-        feat_df = feats.drop(columns=[c for c in drop_cols if c in feats.columns])
-        valid_mask = feat_df.notna().all(axis=1)
-        feat_df = feat_df.dropna()
-        valid_dates = feats.loc[valid_mask.values, "date"].values
-
-        target_col = "close"
-        close = feat_df[target_col].values
-        horizon = pipeline.horizon
-        seq_len = pipeline.seq_len
-
-        if len(close) < seq_len + horizon + 10:
+        if (close <= 0).any():
+            n_neg += 1
             continue
-
-        target = (close[horizon:] > close[:-horizon]).astype(int)
-        price_cols = ["open", "high", "low", "close", "amount"]
-        X_cols = [c for c in feat_df.columns if c not in price_cols]
-        X_data = feat_df[X_cols].values.astype(np.float32)
-
-        n_samples = len(X_data) - seq_len - horizon + 1
-        if n_samples <= 0:
+        if close.min() < 0.001:
+            n_low += 1
             continue
-
-        if pipeline.flat_mode:
-            X = np.array(
-                [X_data[i : i + seq_len].flatten() for i in range(n_samples)],
-                dtype=np.float32,
-            )
-        else:
-            X = np.array(
-                [X_data[i : i + seq_len] for i in range(n_samples)],
-                dtype=np.float32,
-            )
-
-        y = target[seq_len - 1 : seq_len - 1 + n_samples]
-
-        # sample i predicts price change ending at valid_dates[seq_len-1+i+horizon]
-        sample_dates = pd.DatetimeIndex(
-            valid_dates[seq_len - 1 + horizon : seq_len - 1 + horizon + n_samples]
+        ret = np.diff(close) / (close[:-1] + 1e-8)
+        if np.nanstd(ret) > 0.50:  # >50 % daily vol = data error
+            n_vol += 1
+            continue
+        if len(close) > 5:
+            fwd_ret = (close[5:] - close[:-5]) / (close[:-5] + 1e-8)
+            if np.nanmax(np.abs(fwd_ret)) > 10.0:
+                n_fwd += 1
+                continue
+        ok.append(code)
+    n_total = n_neg + n_vol + n_nan + n_low + n_fwd
+    if n_total:
+        logger.warning(
+            "Data quality: %d stocks filtered out "
+            "(negative=%d, hi_vol=%d, all_nan=%d, low_close=%d, extreme_fwd=%d) -> %d kept",
+            n_total, n_neg, n_vol, n_nan, n_low, n_fwd, len(ok),
         )
-
-        results.append((X, y, sample_dates, code))
-
-    return results
+    return ok
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Panel vs single-stock training benchmark"
-    )
-    parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--stocks", type=int, default=50)
-    parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--mode", choices=["panel", "single", "both"], default="both")
-    parser.add_argument("--seq-len", type=int, default=5)
-    parser.add_argument("--max-folds", type=int, default=8,
-                        help="Limit number of folds (default: 8)")
+    parser = argparse.ArgumentParser(description="Train TFT panel model")
+    parser.add_argument("--stocks", type=int, default=500,
+                        help="Limit to first N stocks (default: 500)")
+    parser.add_argument("--stock-list", type=str, default=None,
+                        help="Comma-separated stock codes")
+    parser.add_argument("--start", type=str, default="2015-01-01")
+    parser.add_argument("--end", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--max-folds", type=int, default=3,
+                        help="Limit number of walk-forward folds (default: 3)")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--horizon", type=int, default=5,
+                        help="Forward return horizon in days (1/5/20)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile")
+    parser.add_argument("--no-aux", action="store_true",
+                        help="Skip auxiliary data loading (faster startup)")
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    if args.end is None:
+        args.end = datetime.now().strftime("%Y-%m-%d")
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
+
+    cfg = load_config()
     data_dir = cfg.project.data_dir
-    storage = DataStorage(data_dir)
 
-    # ---- Stock selection ----
-    codes = sorted([
-        f.replace(".parquet", "")
-        for f in os.listdir(os.path.join(data_dir, "a_shares", "daily"))
-        if f.endswith(".parquet")
-    ])
-    if args.stocks and args.stocks < len(codes):
-        step = max(len(codes) // args.stocks, 1)
-        codes = [codes[i * step] for i in range(args.stocks)]
+    if args.stock_list:
+        stock_list = [c.strip() for c in args.stock_list.split(",")]
+    else:
+        stock_list = _discover_stocks(data_dir, args.stocks)
 
-    logger.info("Using %d stocks: %s ... %s", len(codes), codes[:3], codes[-3:])
-
-    # ---- Pipeline (technical-only for clean comparison) ----
-    pipeline = FeaturePipeline(
-        seq_len=args.seq_len,
-        horizon=cfg.features.target_horizon,
-        flat_mode=True,
-        use_technical=cfg.features.technical_indicators,
-        use_scoring=cfg.features.rule_based_scoring,
-        use_temporal=cfg.features.temporal_features,
-        use_sentiment=False, use_announcements=False,
-        use_guba=False, use_comment=False, use_xueqiu=False,
-        use_margin=False, use_northbound=False,
-        use_dragon_tiger=False, use_fundamental=False,
-        use_etf_flow=False, use_interaction=False,
-    )
-
-    model_params = dict(cfg.model.params)
-    date_start = cfg.markets.a_shares.start_date
-    date_end = datetime.now().strftime("%Y-%m-%d")
-
-    # ---- Date-based folds ----
-    panel_dates = pd.DatetimeIndex(
-        pd.date_range(date_start, date_end, freq="B")
-    )
-    all_folds = list(_trading_date_splits(
-        panel_dates,
-        train_years=cfg.training.validation.train_years,
-        val_months=cfg.training.validation.val_months,
-    ))
-    folds = all_folds[: args.max_folds]
-    logger.info("Folds: %d (of %d total)", len(folds), len(all_folds))
-
-    all_results = []
-
-    # ==================================================================
-    # PANEL mode
-    # ==================================================================
-    if args.mode in ("panel", "both"):
-        logger.info("=== PANEL MODE (cross-sectional normalization) ===")
-        t0 = time.time()
-
-        pb = PanelBuilder(data_dir)
-        panel = pb.build(codes, date_start, date_end, min_rows_per_stock=100)
-        logger.info("Panel: %d stocks × %d rows",
-                     panel["stock_code"].nunique(), len(panel))
-
-        for fold_idx, (tr_s, tr_e, va_s, va_e) in enumerate(folds):
-            train_panel = panel[
-                (panel["date"] >= pd.Timestamp(tr_s))
-                & (panel["date"] <= pd.Timestamp(tr_e))
-            ]
-            val_panel = panel[
-                (panel["date"] >= pd.Timestamp(va_s))
-                & (panel["date"] <= pd.Timestamp(va_e))
-            ]
-
-            if train_panel.empty or val_panel.empty:
-                continue
-
-            X_train, y_train, _, _ = pipeline.build_features_from_panel(
-                train_panel, cross_sectional=True,
-            )
-            X_val, y_val, _, _ = pipeline.build_features_from_panel(
-                val_panel, cross_sectional=True,
-            )
-
-            if len(X_train) < 100 or len(X_val) < 10:
-                continue
-
-            model = XGBoostBaseline(**model_params)
-            model.fit(X_train, y_train)
-            preds = model.predict(X_val)
-            metrics = compute_classification_metrics(y_val, preds)
-
-            logger.info(
-                "  Fold %d [%s→%s | %s→%s]: MCC=%.4f Acc=%.4f "
-                "n_train=%d n_val=%d",
-                fold_idx, str(tr_s)[:10], str(tr_e)[:10],
-                str(va_s)[:10], str(va_e)[:10],
-                metrics["mcc"], metrics["accuracy"],
-                len(X_train), len(X_val),
-            )
-            all_results.append({
-                "mode": "panel", "fold": fold_idx, **metrics,
-            })
-
-        logger.info("Panel mode: %.0fs", time.time() - t0)
-
-    # ==================================================================
-    # SINGLE mode
-    # ==================================================================
-    if args.mode in ("single", "both"):
-        logger.info("=== SINGLE MODE (no cross-sectional normalization) ===")
-        t0 = time.time()
-
-        # Build features ONCE for full range, track dates per sample
-        stock_data = _build_single_features(
-            codes, date_start, date_end, storage, pipeline,
-        )
-        logger.info("Built features for %d stocks", len(stock_data))
-
-        for fold_idx, (tr_s, tr_e, va_s, va_e) in enumerate(folds):
-            X_train_parts, y_train_parts = [], []
-            X_val_parts, y_val_parts = [], []
-
-            tr_s_ts = pd.Timestamp(tr_s)
-            tr_e_ts = pd.Timestamp(tr_e)
-            va_s_ts = pd.Timestamp(va_s)
-            va_e_ts = pd.Timestamp(va_e)
-
-            for X_all, y_all, sample_dates, code in stock_data:
-                train_mask = (sample_dates >= tr_s_ts) & (sample_dates <= tr_e_ts)
-                val_mask = (sample_dates >= va_s_ts) & (sample_dates <= va_e_ts)
-
-                if train_mask.sum() >= 50:
-                    X_train_parts.append(X_all[train_mask])
-                    y_train_parts.append(y_all[train_mask])
-                if val_mask.sum() >= 5:
-                    X_val_parts.append(X_all[val_mask])
-                    y_val_parts.append(y_all[val_mask])
-
-            if not X_train_parts or not X_val_parts:
-                continue
-
-            X_train = np.concatenate(X_train_parts, axis=0)
-            y_train = np.concatenate(y_train_parts, axis=0)
-            X_val = np.concatenate(X_val_parts, axis=0)
-            y_val = np.concatenate(y_val_parts, axis=0)
-
-            model = XGBoostBaseline(**model_params)
-            model.fit(X_train, y_train)
-            preds = model.predict(X_val)
-            metrics = compute_classification_metrics(y_val, preds)
-
-            logger.info(
-                "  Fold %d [%s→%s | %s→%s]: MCC=%.4f Acc=%.4f "
-                "n_train=%d n_val=%d",
-                fold_idx, str(tr_s)[:10], str(tr_e)[:10],
-                str(va_s)[:10], str(va_e)[:10],
-                metrics["mcc"], metrics["accuracy"],
-                len(X_train), len(X_val),
-            )
-            all_results.append({
-                "mode": "single", "fold": fold_idx, **metrics,
-            })
-
-        logger.info("Single mode: %.0fs", time.time() - t0)
-
-    # ==================================================================
-    # Comparison
-    # ==================================================================
-    if not all_results:
-        logger.error("No results — check data availability")
+    if not stock_list:
+        logger.error("No stocks found")
         sys.exit(1)
 
-    results_df = pd.DataFrame(all_results)
-    summary = results_df.groupby("mode")["mcc"].agg(["mean", "std", "count"])
-    logger.info("\n%s", "=" * 60)
-    logger.info("PANEL vs SINGLE (%d stocks, %d folds)", len(codes), len(folds))
-    logger.info("%s", "=" * 60)
-    logger.info("\n%s", summary.to_string())
+    # Data quality filter — remove stocks with corrupted prices before
+    # they can distort the training signal.
+    stock_list = _filter_quality(stock_list, data_dir)
+    if len(stock_list) < 20:
+        logger.error("Too few stocks pass quality filter (%d)", len(stock_list))
+        sys.exit(1)
 
-    modes_present = results_df["mode"].unique()
-    if "panel" in modes_present and "single" in modes_present:
-        panel_mcc = results_df[results_df["mode"] == "panel"]["mcc"]
-        single_mcc = results_df[results_df["mode"] == "single"]["mcc"]
-        delta = panel_mcc.mean() - single_mcc.mean()
-        logger.info(
-            "\nDelta MCC (panel - single): %+.4f  (panel=%.4f, single=%.4f)",
-            delta, panel_mcc.mean(), single_mcc.mean(),
+    logger.info("Loading K-line data for %d stocks from %s to %s...",
+                len(stock_list), args.start, args.end)
+
+    from stoke_ml.data.storage import DataStorage
+    ds = DataStorage(data_dir)
+    frames = []
+    for code in stock_list:
+        df = ds.load_daily(code, args.start, args.end)
+        if df is not None and not df.empty:
+            df["stock_code"] = code
+            frames.append(df)
+    if not frames:
+        logger.error("No data loaded for any stock")
+        sys.exit(1)
+
+    panel = pd.concat(frames, ignore_index=True)
+    logger.info("Panel shape: %s", panel.shape)
+
+    # Load auxiliary data (unless --no-aux)
+    aux_data = None
+    if not args.no_aux:
+        logger.info("Loading auxiliary data...")
+        t_aux = time.time()
+        aux_data = load_aux_data(stock_list, data_dir, args.start, args.end)
+        logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
+
+    # Build features
+    fp = FeaturePipeline(
+        seq_len=60,
+        use_sentiment=True, use_announcements=True,
+        use_guba=True, use_comment=True, use_margin=True,
+        use_northbound=True, use_dragon_tiger=True,
+        use_fundamental=True, use_etf_flow=True, use_xueqiu=True,
+        use_capital_flow=True, use_block_trade=True,
+        use_shareholder=True, use_lockup=True, use_dividend=True,
+        use_valuation=True,
+        use_board=False, use_sector=False, use_concept=False,
+    )
+    panel_data = fp.build_panel_features(panel, aux_data=aux_data, horizon=args.horizon)
+
+    n_stocks = panel_data["static_features"].shape[0]
+    n_timesteps = panel_data["past_known"].shape[1]
+    dims = f"S={panel_data['static_features'].shape[1]} " \
+           f"PK={panel_data['past_known'].shape[2]} " \
+           f"PO={panel_data['past_observed'].shape[2]}"
+    logger.info("Panel data: %d stocks × %d timesteps  dims: %s  horizon=%d",
+                n_stocks, n_timesteps, dims, args.horizon)
+
+    config = PanelConfig(
+        seq_len=60,
+        static_dim=panel_data["static_features"].shape[1],
+        past_known_dim=panel_data["past_known"].shape[2],
+        past_observed_dim=panel_data["past_observed"].shape[2],
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        max_epochs=args.epochs,
+        compile_model=not args.no_compile,
+        num_workers=8,
+        horizon=args.horizon,
+    )
+    logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e",
+                config.hidden_dim, config.xlstm_num_blocks, config.xlstm_num_heads,
+                config.batch_size, config.learning_rate)
+
+    # Purged walk-forward splits
+    train_len = 756
+    val_len = 126
+    step = 63
+    purge = config.seq_len  # must be >= seq_len to prevent context overlap
+    all_sharpes = []
+
+    fold = 0
+    train_start = 0
+    while train_start + train_len + purge + val_len < n_timesteps:
+        if args.max_folds and fold >= args.max_folds:
+            break
+        fold += 1
+        train_end = train_start + train_len
+        val_start = train_end + purge
+        val_end = min(val_start + val_len, n_timesteps)
+
+        train_slice = slice(train_start, train_end)
+        val_context_start = max(0, val_start - config.seq_len)
+        val_slice = slice(val_context_start, val_end)
+
+        train_data = {
+            "static_features": panel_data["static_features"],
+            "past_known": panel_data["past_known"][:, train_slice],
+            "past_observed": panel_data["past_observed"][:, train_slice],
+            "y_direction": panel_data["y_direction"][:, train_slice],
+            "y_return": panel_data["y_return"][:, train_slice].copy(),
+            "y_volatility": panel_data["y_volatility"][:, train_slice].copy(),
+        }
+        val_data = {
+            "static_features": panel_data["static_features"],
+            "past_known": panel_data["past_known"][:, val_slice],
+            "past_observed": panel_data["past_observed"][:, val_slice],
+            "y_direction": panel_data["y_direction"][:, val_slice],
+            "y_return": panel_data["y_return"][:, val_slice].copy(),
+            "y_volatility": panel_data["y_volatility"][:, val_slice].copy(),
+        }
+
+        # Per-stock z-score normalization of regression targets.
+        # Different stocks have different return/vol distributions;
+        # normalising per-stock gives each stock equal weight in the MSE
+        # loss and keeps the MSE baseline ≈ 1.0 (balanced with CE ~1.0).
+        ret_mean = train_data["y_return"].mean(axis=1, keepdims=True)
+        ret_std = np.maximum(train_data["y_return"].std(axis=1, keepdims=True), 1e-8)
+        vol_mean = train_data["y_volatility"].mean(axis=1, keepdims=True)
+        vol_std = np.maximum(train_data["y_volatility"].std(axis=1, keepdims=True), 1e-8)
+        train_data["y_return"] = (train_data["y_return"] - ret_mean) / ret_std
+        train_data["y_volatility"] = (train_data["y_volatility"] - vol_mean) / vol_std
+        # Save raw returns BEFORE normalization — Sharpe/IC are meaningless
+        # when computed from z-scored targets.
+        raw_val_y_return = val_data["y_return"].copy()
+        val_data["y_return"] = (val_data["y_return"] - ret_mean) / ret_std
+        val_data["y_volatility"] = (val_data["y_volatility"] - vol_mean) / vol_std
+        # Clip normalized targets to [-5, 5] — regime changes can make
+        # validation returns several sigma larger than training, which
+        # would otherwise dominate the loss and destabilise training.
+        np.clip(val_data["y_return"], -5.0, 5.0, out=val_data["y_return"])
+        np.clip(val_data["y_volatility"], -5.0, 5.0, out=val_data["y_volatility"])
+
+        logger.info("Fold %d/%d: train [%d:%d], val [%d:%d]",
+                    fold, args.max_folds or "∞",
+                    train_start, train_end, val_start, val_end)
+
+        t0 = time.time()
+        model, history = train_panel(
+            config, train_data, val_data, device,
+            raw_val_returns=raw_val_y_return,
         )
+        elapsed = time.time() - t0
 
-        pivot = results_df.pivot_table(
-            index="fold", columns="mode", values="mcc", aggfunc="mean"
-        )
-        if "panel" in pivot.columns and "single" in pivot.columns:
-            pivot["delta"] = pivot["panel"] - pivot["single"]
-            logger.info("\nPer-fold delta (panel - single):")
-            for fold, row in pivot.iterrows():
-                logger.info(
-                    "  Fold %d: panel=%.4f single=%.4f delta=%+.4f",
-                    fold, row["panel"], row["single"], row["delta"],
-                )
+        if history["val_sharpe"]:
+            best_sharpe = max(history["val_sharpe"])
+            all_sharpes.append(best_sharpe)
+            logger.info("  Fold %d best Sharpe: %.4f (%.1fs)", fold, best_sharpe, elapsed)
+        else:
+            logger.warning("  Fold %d: no valid Sharpe (%.1fs)", fold, elapsed)
 
-    output_dir = args.output or cfg.project.model_dir
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, "panel_vs_single.csv")
-    results_df.to_csv(out_path, index=False)
-    logger.info("\nSaved to %s", out_path)
+        train_start += step
+
+    if all_sharpes:
+        logger.info("Mean Sharpe across %d folds: %.4f", len(all_sharpes), np.mean(all_sharpes))
+    else:
+        logger.warning("No valid folds completed")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 import torch
-from stoke_ml.models.tft.vsn import VariableSelectionNetwork
+from stoke_ml.models.panel.vsn import VariableSelectionNetwork
 
 
 class TestVSN:

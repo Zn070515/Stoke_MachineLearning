@@ -1,9 +1,9 @@
 import torch
 import numpy as np
-from stoke_ml.models.tft import TFTConfig
-from stoke_ml.models.tft.model import TFTModel
-from stoke_ml.models.tft.loss import UncertaintyLoss
-from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
+from stoke_ml.models.panel import PanelConfig
+from stoke_ml.models.panel.model import PanelModel
+from stoke_ml.models.panel.loss import UncertaintyLoss
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from torch.utils.data import DataLoader
 import torch.nn as nn
 
@@ -32,14 +32,14 @@ class TestIntegration:
         data = make_synthetic_panel(n_stocks=20, n_timesteps=300, seq_len=60)
         device = torch.device("cpu")
 
-        config = TFTConfig(
+        config = PanelConfig(
             static_dim=8, past_known_dim=20, past_observed_dim=12,
-            hidden_dim=32, lstm_layers=1, attention_heads=2,
+            hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
             grn_layers=1, seq_len=60, dropout=0.0,
             compile_model=False, batch_size=8,
             max_epochs=2, num_workers=0,
         )
-        model = TFTModel(config).to(device)
+        model = PanelModel(config).to(device)
         loss_fn = UncertaintyLoss(num_tasks=3).to(device)
         ce = nn.CrossEntropyLoss()
         mse = nn.MSELoss()
@@ -76,15 +76,15 @@ class TestIntegration:
 
     def test_checkpoint_save_load(self):
         """Verify model can be saved and loaded with identical outputs."""
-        config = TFTConfig(
+        config = PanelConfig(
             static_dim=8, past_known_dim=20, past_observed_dim=12,
-            hidden_dim=32, lstm_layers=1, attention_heads=2,
+            hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
             grn_layers=1, seq_len=60, compile_model=False,
         )
-        model = TFTModel(config)
+        model = PanelModel(config)
         state = {k: v.clone() for k, v in model.state_dict().items()}
 
-        model2 = TFTModel(config)
+        model2 = PanelModel(config)
         model2.load_state_dict(state)
 
         model.eval()

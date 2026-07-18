@@ -7,11 +7,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 
-from stoke_ml.models.tft.config import TFTConfig
-from stoke_ml.models.tft.model import TFTModel
-from stoke_ml.models.tft.loss import UncertaintyLoss, AdjMSELoss, RankICLoss
-from stoke_ml.models.tft.dataset import PanelDataset, panel_collate
-from stoke_ml.models.tft.evaluate import evaluate_sharpe
+from stoke_ml.models.panel.config import PanelConfig
+from stoke_ml.models.panel.model import PanelModel
+from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, RankICLoss
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from stoke_ml.models.panel.evaluate import evaluate_sharpe
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ def _compute_val_loss(
     rank_ic_loss: nn.Module | None = None,
     rank_ic_weight: float = 0.0,
 ) -> float:
-    """Quick val loss pass every epoch — drives ReduceLROnPlateau."""
+    """Quick val loss pass every epoch for best-model selection."""
     model.eval()
     total, n = 0.0, 0
     nan_batches = 0
@@ -90,13 +91,45 @@ def _compute_val_loss(
     return total / max(n, 1) if n > 0 else float("inf")
 
 
-def train_tft(
-    config: TFTConfig,
+def _log_gradient_norms(model: nn.Module, epoch: int) -> None:
+    """Log per-layer-gradient norms — detects gradient collapse.
+
+    Collapse signal: output head norms < 0.1 × encoder norms AND decreasing.
+    """
+    head_patterns = ("direction_head", "return_head", "volatility_head")
+    encoder_norms, head_norms = [], []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        gnorm = param.grad.norm().item()
+        if any(p in name for p in head_patterns):
+            head_norms.append(gnorm)
+        else:
+            encoder_norms.append(gnorm)
+
+    enc_avg = sum(encoder_norms) / max(len(encoder_norms), 1)
+    head_avg = sum(head_norms) / max(len(head_norms), 1)
+    ratio = head_avg / max(enc_avg, 1e-12)
+
+    logger.info("Epoch %d grad norms: encoder=%.6f head=%.6f ratio=%.3f",
+                epoch, enc_avg, head_avg, ratio)
+
+    if ratio < 0.1 and epoch > 3:
+        logger.warning(
+            "Possible gradient collapse: head/encoder gradient ratio=%.3f < 0.1."
+            " Heads may be underfitting. Consider increasing head_grad_clip "
+            "or decreasing backbone_grad_clip.",
+            ratio,
+        )
+
+
+def train_panel(
+    config: PanelConfig,
     train_data: dict,
     val_data: dict,
     device: torch.device,
     raw_val_returns: np.ndarray | None = None,
-) -> tuple[TFTModel, dict]:
+) -> tuple[PanelModel, dict]:
     """Train TFT model with purged walk-forward fold.
 
     Args:
@@ -110,7 +143,7 @@ def train_tft(
     """
     _set_seed(config.seed)
 
-    model = TFTModel(config).to(device)
+    model = PanelModel(config).to(device)
     if config.compile_model and device.type == "cuda":
         try:
             import triton  # noqa: F401
@@ -147,15 +180,37 @@ def train_tft(
         num_workers=0, pin_memory=False,
     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    # Cosine annealing with linear warmup — transformer-training standard.
+    # Warmup prevents early-epoch gradient spikes; cosine decay gives smooth
+    # convergence to a low final lr.
+    # Epoch-based scheduling: scheduler.step() is called once per epoch.
+    warmup = LinearLR(
         optimizer,
-        mode="min",
-        factor=config.lr_reduce_factor,
-        patience=config.lr_reduce_patience,
-        threshold=config.lr_reduce_threshold,
-        threshold_mode="rel",
-        min_lr=config.min_lr,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=config.lr_warmup_epochs,
     )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=config.max_epochs - config.lr_warmup_epochs,
+        eta_min=config.min_lr,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[config.lr_warmup_epochs],
+    )
+
+    # Per-layer param groups for stratified gradient clipping
+    head_param_names = {"direction_head", "return_head", "volatility_head"}
+    head_params = [
+        p for n, p in model.named_parameters()
+        if any(head_n in n for head_n in head_param_names)
+    ]
+    backbone_params = [
+        p for n, p in model.named_parameters()
+        if not any(head_n in n for head_n in head_param_names)
+    ]
 
     best_val_loss = float("inf")
     best_state = None
@@ -212,7 +267,16 @@ def train_tft(
 
             if accum_count % config.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # Stratified gradient clipping: heads get looser bounds
+                # to prevent gradient collapse (FinFusion 2024 finding).
+                if backbone_params:
+                    torch.nn.utils.clip_grad_norm_(
+                        backbone_params, config.backbone_grad_clip,
+                    )
+                if head_params:
+                    torch.nn.utils.clip_grad_norm_(
+                        head_params, config.head_grad_clip,
+                    )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -224,10 +288,14 @@ def train_tft(
         if remaining != 0:
             scaler.unscale_(optimizer)
             scale = config.grad_accum_steps / remaining
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(scale)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            for pg in optimizer.param_groups:
+                for p in pg["params"]:
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+            if backbone_params:
+                torch.nn.utils.clip_grad_norm_(backbone_params, config.backbone_grad_clip)
+            if head_params:
+                torch.nn.utils.clip_grad_norm_(head_params, config.head_grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -235,15 +303,18 @@ def train_tft(
         avg_loss = epoch_loss / max(len(train_loader), 1)
         history["train_loss"].append(avg_loss)
 
-        # Compute validation loss EVERY epoch (drives ReduceLROnPlateau).
-        # pytorch-forecasting monitors val_loss, not train_loss — without
-        # this the scheduler never fires because train_loss always drops.
+        # Gradient-flow monitoring (expensive — enable for debugging collapse)
+        if config.log_gradient_flow:
+            _log_gradient_norms(model, epoch + 1)
+
         val_loss = _compute_val_loss(
             model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
             rank_ic_loss=rank_ic_loss, rank_ic_weight=rank_ic_weight,
         )
         history["val_loss"].append(val_loss)
-        scheduler.step(val_loss)
+
+        # Cosine annealing steps every epoch (no-val-metric variant)
+        scheduler.step()
 
         # Save best model by val_loss (more stable than Sharpe with short
         # validation windows — Sharpe has only ~12 non-overlapping samples).

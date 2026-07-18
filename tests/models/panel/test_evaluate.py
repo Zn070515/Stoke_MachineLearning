@@ -1,5 +1,5 @@
 import torch
-from stoke_ml.models.tft.evaluate import compute_sharpe
+from stoke_ml.models.panel.evaluate import compute_sharpe
 
 
 class TestSharpe:
