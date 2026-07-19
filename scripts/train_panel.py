@@ -300,6 +300,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--horizon", type=int, default=5,
                         help="Forward return horizon in days (1/5/20)")
+    parser.add_argument("--hidden-dim", type=int, default=128,
+                        help="Model hidden dimension (default: 128)")
+    parser.add_argument("--xlstm-blocks", type=int, default=3,
+                        help="Number of xLSTM blocks (default: 3)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
@@ -385,6 +389,8 @@ def main():
         static_dim=panel_data["static_features"].shape[1],
         past_known_dim=panel_data["past_known"].shape[2],
         past_observed_dim=panel_data["past_observed"].shape[2],
+        hidden_dim=args.hidden_dim,
+        xlstm_num_blocks=args.xlstm_blocks,
         batch_size=args.batch_size,
         learning_rate=args.lr,
         max_epochs=args.epochs,
