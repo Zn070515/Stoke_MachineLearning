@@ -17,7 +17,7 @@ class GatedLinearUnit(nn.Module):
 
 
 class GRN(nn.Module):
-    """Gated Residual Network — TFT's core nonlinear block.
+    """Gated Residual Network — core nonlinear block with context injection.
 
     Args:
         input_dim: input feature dimension.

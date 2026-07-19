@@ -12,7 +12,7 @@ from stoke_ml.models.panel.model import PanelModel
 from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
-from stoke_ml.models.panel.evaluate import evaluate_sharpe
+from stoke_ml.models.panel.evaluate import evaluate_portfolio
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ def train_panel(
 
     Args:
         raw_val_returns: (N_stocks, T_val) raw forward returns (percent).
-            Passed through to evaluate_sharpe so Sharpe/IC are computed
+            Passed through to evaluate_portfolio so Sharpe/IC are computed
             from real returns, not z-scored targets.
 
     Returns:
@@ -305,30 +305,27 @@ def train_panel(
         else:
             patience_counter += 1
 
-        # Report Sharpe/IC every 5 epochs (informational only)
+        # Report evaluation every 5 epochs
         if (epoch + 1) % 5 == 0:
-            sharpe, val_metrics = evaluate_sharpe(
+            m = evaluate_portfolio(
                 model, val_data, config, device,
-                return_metrics=True, horizon=config.horizon,
-                raw_returns=raw_val_returns,
+                horizon=config.horizon, raw_returns=raw_val_returns,
             )
-            history["val_sharpe"].append(sharpe)
-            ic = val_metrics.get("ic", 0.0)
-            history["val_ic"].append(ic)
-            # Store full metrics for final report (only latest per fold)
+            ls_sharpe = m["ls_sharpe"]
+            ic_mean = m["ic_mean"]
+            history["val_sharpe"].append(ls_sharpe)
+            history["val_ic"].append(ic_mean)
             history.setdefault("val_metrics", [])
-            history["val_metrics"].append(val_metrics)
-            logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f "
-                        "sharpe=%.4f sortino=%.4f calmar=%.4f "
-                        "maxDD=%.3f PF=%.2f IC=%.4f lr=%.2e",
-                        epoch + 1, config.max_epochs, avg_loss, val_loss,
-                        sharpe,
-                        val_metrics.get("sortino", 0.0),
-                        val_metrics.get("calmar", 0.0),
-                        val_metrics.get("max_drawdown", 0.0),
-                        val_metrics.get("profit_factor", 0.0),
-                        ic,
-                        optimizer.param_groups[0]["lr"])
+            history["val_metrics"].append(m)
+            logger.info(
+                "Epoch %d/%d: loss=%.4f val_loss=%.4f "
+                "IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
+                "Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
+                epoch + 1, config.max_epochs, avg_loss, val_loss,
+                ic_mean, m["ic_ir"],
+                ls_sharpe, m["ls_sharpe_lo"], m["ls_sharpe_hi"],
+                m["long_sharpe"], m["q5mq1_ret"] * 10000,
+                optimizer.param_groups[0]["lr"])
         else:
             logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f lr=%.2e",
                         epoch + 1, config.max_epochs, avg_loss, val_loss,

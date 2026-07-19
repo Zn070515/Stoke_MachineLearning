@@ -1175,11 +1175,11 @@ class FeaturePipeline:
                 board_df=stock_aux.get("board"),
                 sector_df=stock_aux.get("sector"),
                 concept_df=stock_aux.get("concept"),
-                skip_temporal=True,  # TFT LSTM learns temporal patterns natively
+                skip_temporal=True,  # xLSTM learns temporal patterns natively
             )
             # Calendar features are normally added by the temporal path;
-            # we still want them when skip_temporal=True (TFT benefits from
-            # day-of-week/month/quarter signals for seasonality).
+            # we still want them when skip_temporal=True (panel model benefits
+            # from day-of-week/month/quarter signals for seasonality).
             feats = add_calendar_features(feats)
             # Defragment after many df["col"] = ... assignments in merge methods.
             # Without this, pandas emits PerformanceWarning and slows down
@@ -1341,28 +1341,28 @@ class FeaturePipeline:
             # Past observed
             po_arr[i, :T_i] = df_sorted[po_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
 
-        # ── Limit-up/down bias correction ──
+        # ── Limit-up/down bias correction (horizon=1 only) ──
         # On days where a stock hits limit-up, positive returns are
         # untradable — you cannot enter a buy position.  On limit-down
         # days, negative returns are untradable.  Both should be ignored
         # during training so the model does not learn fake alpha.
-        # Uses return-threshold heuristic (|ret| > 9.5%) as universal
-        # fallback — works even without board features enabled.
+        # This correction only applies to single-day returns (horizon=1):
+        # limit-up/down is a one-day phenomenon; multi-day returns can
+        # easily exceed 9.5 % without any untradable day.
         # Reference: ml-quant-trading bias.py (see docs/research-findings.md §6.9).
-        LIMIT_THRESHOLD = 0.095
-        T_max = y_dir_arr.shape[1]
-        for i in range(N_stocks):
-            T_i = int(stock_T[i])
-            if T_i < 2:
-                continue
-            ret = y_ret_arr[i, :T_i]
-            # ZT day: return ≈ +9.5% or higher → masked if UP label (class 2)
-            zt_mask = (ret > LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 2)
-            # DT day: return ≈ -9.5% or lower → masked if DOWN label (class 0)
-            dt_mask = (ret < -LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 0)
-            full_mask = np.zeros(T_max, dtype=bool)
-            full_mask[:T_i] = zt_mask | dt_mask
-            y_dir_arr[i, full_mask] = -100  # PyTorch CE ignore_index
+        if horizon == 1:
+            LIMIT_THRESHOLD = 0.095
+            T_max = y_dir_arr.shape[1]
+            for i in range(N_stocks):
+                T_i = int(stock_T[i])
+                if T_i < 2:
+                    continue
+                ret = y_ret_arr[i, :T_i]
+                zt_mask = (ret > LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 2)
+                dt_mask = (ret < -LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 0)
+                full_mask = np.zeros(T_max, dtype=bool)
+                full_mask[:T_i] = zt_mask | dt_mask
+                y_dir_arr[i, full_mask] = -100  # PyTorch CE ignore_index
 
         # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
         # Alpha158 factors can produce Inf from near-zero divisors (e.g.

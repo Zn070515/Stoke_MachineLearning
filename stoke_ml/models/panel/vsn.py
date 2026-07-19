@@ -32,7 +32,10 @@ class VariableSelectionNetwork(nn.Module):
 
         # Scale initialization by 1/sqrt(num_features) so that the weighted
         # sum over features has roughly unit variance regardless of N.
-        init_scale = (num_features ** -0.5) if num_features > 0 else 1.0
+        # Floor at 0.1 prevents near-zero VSN output in early epochs when
+        # N is large (200+ features) — below 0.1, the GRN bias term
+        # dominates and the model spends many epochs just scaling up.
+        init_scale = max(num_features ** -0.5, 0.1) if num_features > 0 else 1.0
 
         if input_dim == 1:
             # Scalar path — memory efficient

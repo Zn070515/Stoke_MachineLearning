@@ -13,7 +13,7 @@ def make_synthetic_panel(n_stocks=20, n_timesteps=300, seq_len=60):
     static = np.random.randn(n_stocks, 8).astype(np.float32)
     pk = np.random.randn(n_stocks, n_timesteps, 20).astype(np.float32)
     po = np.random.randn(n_stocks, n_timesteps, 12).astype(np.float32)
-    y_dir = np.random.randint(0, 2, (n_stocks, n_timesteps)).astype(np.int64)
+    y_dir = np.random.randint(0, 3, (n_stocks, n_timesteps)).astype(np.int64)
     y_ret = (np.random.randn(n_stocks, n_timesteps) * 0.02).astype(np.float32)
     y_vol = np.abs(np.random.randn(n_stocks, n_timesteps) * 0.01).astype(np.float32)
     return {

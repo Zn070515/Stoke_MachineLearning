@@ -57,14 +57,11 @@ class PanelModel(nn.Module):
             self.static_vs_context = GRN(
                 input_dim=h, hidden_dim=h, output_dim=h, dropout=config.dropout,
             )
-            # Project c_h to sLSTM initial state shape (B, num_heads, head_dim)
-            self.c_h_proj = nn.Linear(h, h)
         else:
             self.static_proj = None
             self.static_enrich_context = None
             self.static_hidden_context = None
             self.static_vs_context = None
-            self.c_h_proj = None
 
         # ── xLSTM backbone (replaces LSTM + Attention + post_attn_GRN) ──
         self.xlstm = xLSTMBackbone(
@@ -74,6 +71,15 @@ class PanelModel(nn.Module):
             num_heads=config.xlstm_num_heads,
             dropout=config.dropout,
         )
+        # Per-block c_h projections: each sLSTM block gets its own
+        # initial state, derived from xLSTMBackbone.num_slstm_blocks
+        # so the count never diverges from the actual block layout.
+        if config.static_dim > 0:
+            self.c_h_projections = nn.ModuleList([
+                nn.Linear(h, h) for _ in range(self.xlstm.num_slstm_blocks)
+            ])
+        else:
+            self.c_h_projections = nn.ModuleList()
 
         # VSN output → xLSTM input projection
         n_vsn = (1 if config.past_known_dim > 0 else 0) + (1 if config.past_observed_dim > 0 else 0)
@@ -154,17 +160,15 @@ class PanelModel(nn.Module):
             feat = torch.zeros(B, T, h, device=device)
 
         # ── 3. xLSTM backbone ──
-        # Build initial states from c_h for each sLSTM block
-        if c_h is not None:
-            h_init = self.c_h_proj(c_h).reshape(
-                B, self.config.xlstm_num_heads, -1,
-            )
-            zero_state = torch.zeros_like(h_init)
-            num_slstm = self.xlstm.num_slstm_blocks
-            states = [
-                (h_init, zero_state.clone(), zero_state.clone(), zero_state.clone())
-                for _ in range(num_slstm)
-            ]
+        # Per-block initial states from c_h: each sLSTM block gets its own
+        # learned projection so blocks can specialise.
+        if c_h is not None and len(self.c_h_projections) > 0:
+            num_heads = self.config.xlstm_num_heads
+            states = []
+            for proj in self.c_h_projections:
+                h_init = proj(c_h).reshape(B, num_heads, -1)
+                zero = torch.zeros_like(h_init)
+                states.append((h_init, zero.clone(), zero.clone(), zero.clone()))
         else:
             states = None
         xlstm_out, _ = self.xlstm(feat, states=states)  # (B, T, h)

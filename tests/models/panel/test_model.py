@@ -8,7 +8,7 @@ class TestPanelModel:
     def setup_class(cls):
         cls.config = PanelConfig(
             static_dim=8,
-            past_known_dim=24,
+            past_known_dim=65,   # > 64 triggers VSN chunking (2+ chunks)
             past_observed_dim=12,
             hidden_dim=64,
             xlstm_num_blocks=1,

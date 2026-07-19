@@ -408,6 +408,7 @@ def main():
     step = 63
     purge = config.seq_len  # must be >= seq_len to prevent context overlap
     all_sharpes = []
+    fold_histories = []
 
     fold = 0
     train_start = 0
@@ -473,16 +474,34 @@ def main():
         elapsed = time.time() - t0
 
         if history["val_sharpe"]:
-            best_sharpe = max(history["val_sharpe"])
-            all_sharpes.append(best_sharpe)
-            logger.info("  Fold %d best Sharpe: %.4f (%.1fs)", fold, best_sharpe, elapsed)
+            best_ls = max(history["val_sharpe"])
+            if history.get("val_metrics"):
+                last = history["val_metrics"][-1]
+            else:
+                last = {}
+            all_sharpes.append(best_ls)
+            fold_histories.append(history)
+            logger.info(
+                "  Fold %d: best LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
+                "Long_Sharpe=%.2f Q5-Q1=%.1fbp EW_Sharpe=%.2f (%.1fs)",
+                fold, best_ls,
+                last.get("ic_mean", 0), last.get("ic_ir", 0),
+                last.get("long_sharpe", 0),
+                last.get("q5mq1_ret", 0) * 10000,
+                last.get("ew_sharpe", 0),
+                elapsed,
+            )
         else:
-            logger.warning("  Fold %d: no valid Sharpe (%.1fs)", fold, elapsed)
+            logger.warning("  Fold %d: no valid metrics (%.1fs)", fold, elapsed)
 
         train_start += step
 
     if all_sharpes:
-        logger.info("Mean Sharpe across %d folds: %.4f", len(all_sharpes), np.mean(all_sharpes))
+        logger.info("=== %d-Fold Summary ===", len(all_sharpes))
+        logger.info("LS_Sharpe mean: %.2f ± %.2f", np.mean(all_sharpes), np.std(all_sharpes))
+        all_ics = [h["val_ic"][-1] for h in fold_histories if h.get("val_ic")]
+        if all_ics:
+            logger.info("IC mean: %.4f ± %.4f", np.mean(all_ics), np.std(all_ics))
     else:
         logger.warning("No valid folds completed")
 

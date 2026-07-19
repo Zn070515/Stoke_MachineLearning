@@ -88,6 +88,9 @@ class sLSTMBlock(nn.Module):
             n = torch.zeros(B, self.num_heads, self.head_dim, device=device)
             m = torch.zeros(B, self.num_heads, self.head_dim, device=device)
 
+        LOG_GATE_MIN = -10.0
+        LOG_GATE_MAX = 10.0
+
         outputs = []
         for t in range(T):
             x_t = x[:, t, :]  # (B, D)
@@ -95,32 +98,28 @@ class sLSTMBlock(nn.Module):
             W_in = self.W(torch.cat([x_t, h_flat], dim=-1))  # (B, 4*D)
             W_in = W_in.reshape(B, self.num_heads, 4 * self.head_dim)
 
-            i_raw, f_raw, z, o = W_in.chunk(4, dim=-1)  # each (B, H, d_h)
-            # Exponential gating with stabilization
-            i = torch.exp(self._stabilize(i_raw, m))
-            f = torch.sigmoid(f_raw)
-            z = torch.tanh(z)
-            o = torch.sigmoid(o)
+            i_raw, f_raw, z_raw, o_raw = W_in.chunk(4, dim=-1)
 
-            # Cell state update
-            c = f * c + i * z
-            # Normalizer: per-element forget + input accumulation
-            n = f * n + i
-            # Stabilizer: track max raw logit (log-space), detached from graph
-            m = torch.max(m, i_raw).detach()
+            # Stabilized exponential gating (NX-AI aligned: m before exp)
+            log_i = torch.clamp(i_raw, LOG_GATE_MIN, LOG_GATE_MAX)
+            log_f_plus_m = m + torch.clamp(F.logsigmoid(f_raw), LOG_GATE_MIN, 0.0)
 
+            m_new = torch.maximum(log_i, log_f_plus_m)
+            i_gate = torch.exp(log_i - m_new).clamp(max=1.0)
+            f_gate = torch.exp(log_f_plus_m - m_new).clamp(max=1.0)
+
+            c = f_gate * c + i_gate * torch.tanh(z_raw)
+            n = f_gate * n + i_gate
+            o = torch.sigmoid(o_raw)
             h = o * (c / n.clamp(min=1e-8))
+            m = m_new.detach()
+
             outputs.append(h.reshape(B, 1, D))
 
         out = torch.cat(outputs, dim=1)  # (B, T, D)
         out = self.out_proj(out)
         out = self.norm(out.transpose(1, 2)).transpose(1, 2)
         return out, (h, c, n, m)
-
-    @staticmethod
-    def _stabilize(log_gate: torch.Tensor, stabilizer: torch.Tensor) -> torch.Tensor:
-        return log_gate - stabilizer.detach()
-
 
 class mLSTMBlock(nn.Module):
     """Matrix LSTM block with covariance memory update.

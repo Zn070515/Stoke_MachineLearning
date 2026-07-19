@@ -30,9 +30,9 @@ class DirectionHead(nn.Module):
 class ReturnHead(nn.Module):
     """Return % regressor with bottleneck for gradient stability.
 
-    Predicts next-day return as a scalar.  Bottleneck layer + ELU gives
-    the head enough nonlinearity to decode complex temporal representations
-    without the extreme gradient variance of a single linear layer.
+    Predicts forward return over `horizon` days as a scalar.  Bottleneck layer
+    + ELU gives the head enough nonlinearity to decode complex temporal
+    representations without the extreme gradient variance of a single linear layer.
     """
 
     def __init__(self, hidden_dim: int, dropout: float = 0.35):

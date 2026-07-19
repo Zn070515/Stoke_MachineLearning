@@ -16,11 +16,9 @@ class PanelDataset(Dataset):
     def __init__(
         self,
         data: dict,
-        seq_len: int = 252,
-        stride: int = 1,
+        seq_len: int = 60,
     ):
         self.seq_len = seq_len
-        self.stride = stride
 
         def _to_tensor(arr, dtype):
             if isinstance(arr, torch.Tensor):
