@@ -62,7 +62,7 @@ def _compute_val_loss(
                 if mask.sum() == 0:
                     skipped_batches += 1
                     continue
-                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
+                l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
                 # AdjMSE for returns (sign-aware), MSE for volatility
                 l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
                                  y_ret[mask > 0])
@@ -227,7 +227,7 @@ def train_panel(
                 mask = (y_dir != -100).float()
                 if mask.sum() == 0:
                     continue
-                l_ce = ce_loss(torch.clamp(pred_dir, -10, 10), y_dir)
+                l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
                 # AdjMSE: sign-aware loss — wrong-sign predictions cost 11× more
                 l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
                                  y_ret[mask > 0])
@@ -315,10 +315,19 @@ def train_panel(
             history["val_sharpe"].append(sharpe)
             ic = val_metrics.get("ic", 0.0)
             history["val_ic"].append(ic)
+            # Store full metrics for final report (only latest per fold)
+            history.setdefault("val_metrics", [])
+            history["val_metrics"].append(val_metrics)
             logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f "
-                        "sharpe=%.4f IC=%.4f lr=%.2e",
+                        "sharpe=%.4f sortino=%.4f calmar=%.4f "
+                        "maxDD=%.3f PF=%.2f IC=%.4f lr=%.2e",
                         epoch + 1, config.max_epochs, avg_loss, val_loss,
-                        sharpe, ic,
+                        sharpe,
+                        val_metrics.get("sortino", 0.0),
+                        val_metrics.get("calmar", 0.0),
+                        val_metrics.get("max_drawdown", 0.0),
+                        val_metrics.get("profit_factor", 0.0),
+                        ic,
                         optimizer.param_groups[0]["lr"])
         else:
             logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f lr=%.2e",

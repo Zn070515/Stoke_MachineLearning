@@ -27,9 +27,74 @@ def compute_sharpe(
         return 0.0
     sharpe = mean / std
     if annualize:
-        # ~252/horizon non-overlapping periods per year
         sharpe *= np.sqrt(252 / horizon)
     return float(sharpe)
+
+
+def compute_sortino(
+    daily_returns: torch.Tensor,
+    annualize: bool = True,
+    horizon: int = 1,
+    target: float = 0.0,
+) -> float:
+    """Sortino ratio — uses only downside deviation (returns < target)."""
+    if len(daily_returns) < 2:
+        return 0.0
+    mean = daily_returns.mean().item()
+    downside = daily_returns[daily_returns < target]
+    if len(downside) < 2:
+        return float("inf") if mean > target else 0.0
+    down_std = downside.std().item()
+    if down_std < 1e-8:
+        return 0.0
+    sortino = (mean - target) / down_std
+    if annualize:
+        sortino *= np.sqrt(252 / horizon)
+    return float(sortino)
+
+
+def compute_max_drawdown(equity_curve: torch.Tensor) -> float:
+    """Maximum drawdown from peak — worst peak-to-trough decline (as positive fraction)."""
+    if len(equity_curve) < 2:
+        return 0.0
+    peak = torch.cummax(equity_curve, dim=0).values
+    drawdowns = (peak - equity_curve) / (peak + 1e-8)
+    return float(drawdowns.max().item())
+
+
+def compute_calmar(
+    daily_returns: torch.Tensor,
+    annualize: bool = True,
+    horizon: int = 1,
+) -> float:
+    """Calmar ratio = annualized return / max drawdown."""
+    if len(daily_returns) < 2:
+        return 0.0
+    equity = torch.cat([torch.tensor([1.0]), 1.0 + daily_returns]).cumprod(0)
+    mdd = compute_max_drawdown(equity)
+    if mdd < 1e-8:
+        return 0.0
+    mean = daily_returns.mean().item()
+    periods_per_year = 252 / horizon
+    ann_return = mean * periods_per_year
+    return float(ann_return / mdd)
+
+
+def compute_profit_factor(daily_returns: torch.Tensor) -> float:
+    """Profit factor = gross profit / gross loss (absolute value)."""
+    profits = daily_returns[daily_returns > 0].sum().item()
+    losses = abs(daily_returns[daily_returns < 0].sum().item())
+    if losses < 1e-8:
+        return float("inf") if profits > 0 else 0.0
+    return float(profits / losses)
+
+
+def compute_equity_curve(
+    daily_returns: torch.Tensor,
+    initial_capital: float = 1.0,
+) -> torch.Tensor:
+    """Cumulative equity curve from period returns."""
+    return torch.cat([torch.tensor([initial_capital]), 1.0 + daily_returns]).cumprod(0)
 
 
 def evaluate_sharpe(
@@ -64,7 +129,7 @@ def evaluate_sharpe(
     )
 
     all_preds = []
-    all_actuals = []
+    all_actuals = [] if raw_returns is None else None
     with torch.no_grad():
         for static, pk, po, _, y_ret, _ in val_loader:
             static = static.to(device)
@@ -72,7 +137,8 @@ def evaluate_sharpe(
             po = po.to(device)
             _, pred_ret, _ = model(static, pk, po)
             all_preds.append(pred_ret.cpu().squeeze(-1))
-            all_actuals.append(y_ret.cpu())
+            if all_actuals is not None:
+                all_actuals.append(y_ret.cpu())
 
     if not all_preds:
         return 0.0
@@ -123,7 +189,19 @@ def evaluate_sharpe(
                 daily_ics.append(ic)
     mean_ic = float(np.mean(daily_ics)) if daily_ics else 0.0
 
-    return sharpe, {"ic": mean_ic}
+    # Full financial metrics panel
+    p_ret = torch.tensor(portfolio_returns, dtype=torch.float32)
+    equity = compute_equity_curve(p_ret)
+    metrics = {
+        "sharpe": sharpe,
+        "sortino": compute_sortino(p_ret, horizon=horizon),
+        "calmar": compute_calmar(p_ret, horizon=horizon),
+        "max_drawdown": compute_max_drawdown(equity),
+        "profit_factor": compute_profit_factor(p_ret),
+        "ic": mean_ic,
+        "n_periods": len(portfolio_returns),
+    }
+    return sharpe, metrics
 
 
 def compute_prediction_diversity(predictions: np.ndarray) -> float:
@@ -152,12 +230,10 @@ def _build_raw_actuals(
     """Build (n_stocks, n_windows) matrix of raw forward returns.
 
     PanelDataset returns (stock i, window w) → y_return at position
-    w + seq_len.  This reconstructs that mapping from the raw_returns
-    slice so Sharpe/IC are computed from real percentage returns.
+    w + seq_len.  Vectorized slice instead of per-window Python loop.
     """
+    end = min(seq_len + n_windows, raw_returns.shape[1])
+    n_valid = end - seq_len
     actuals = np.zeros((n_stocks, n_windows), dtype=np.float32)
-    for w in range(n_windows):
-        t = w + seq_len  # prediction position in the val slice
-        if t < raw_returns.shape[1]:
-            actuals[:, w] = raw_returns[:, t]
+    actuals[:, :n_valid] = raw_returns[:, seq_len:end]
     return torch.from_numpy(actuals)
