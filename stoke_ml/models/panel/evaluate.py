@@ -250,11 +250,10 @@ def evaluate_portfolio(
         actuals = _build_raw_actuals(raw_returns, n_stocks, n_windows, config.seq_len)
     else:
         logger.warning(
-            "evaluate_portfolio called without raw_returns — "
-            "financial metrics computed from z-scored targets "
-            "are NOT interpretable. Pass raw_returns= for real metrics."
+            "evaluate_portfolio called without raw_returns - "
+            "returning empty result. Pass raw_returns= for real metrics."
         )
-        actuals = preds  # fallback: z-scored, financial metrics invalid
+        return _empty_result()
 
     preds_np = preds.numpy()
     actuals_np = actuals.numpy()
@@ -404,6 +403,12 @@ def _build_raw_actuals(
 ) -> torch.Tensor:
     end = min(seq_len + n_windows, raw_returns.shape[1])
     n_valid = end - seq_len
+    if n_valid < n_windows:
+        logger.warning(
+            "_build_raw_actuals: raw_returns has %d cols, need %d — "
+            "%d trailing columns zero-filled. Sharpe/IC may be deflated.",
+            raw_returns.shape[1], seq_len + n_windows, n_windows - n_valid,
+        )
     actuals = np.zeros((n_stocks, n_windows), dtype=np.float32)
     actuals[:, :n_valid] = raw_returns[:, seq_len:end]
     return torch.from_numpy(actuals)

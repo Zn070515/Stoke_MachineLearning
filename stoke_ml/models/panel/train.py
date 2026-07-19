@@ -205,7 +205,7 @@ def train_panel(
     best_val_loss = float("inf")
     best_state = None
     patience_counter = 0
-    history = {"train_loss": [], "val_loss": [], "val_sharpe": [], "val_ic": []}
+    history = {"train_loss": [], "val_loss": [], "val_ls_sharpe": [], "val_ic": []}
     use_amp = config.use_amp and device.type == "cuda"
 
     for epoch in range(config.max_epochs):
@@ -313,7 +313,7 @@ def train_panel(
             )
             ls_sharpe = m["ls_sharpe"]
             ic_mean = m["ic_mean"]
-            history["val_sharpe"].append(ls_sharpe)
+            history["val_ls_sharpe"].append(ls_sharpe)
             history["val_ic"].append(ic_mean)
             history.setdefault("val_metrics", [])
             history["val_metrics"].append(m)

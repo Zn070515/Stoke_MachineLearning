@@ -104,7 +104,7 @@ class sLSTMBlock(nn.Module):
             log_i = torch.clamp(i_raw, LOG_GATE_MIN, LOG_GATE_MAX)
             log_f_plus_m = m + torch.clamp(F.logsigmoid(f_raw), LOG_GATE_MIN, 0.0)
 
-            m_new = torch.maximum(log_i, log_f_plus_m)
+            m_new = torch.maximum(m, torch.maximum(log_i, log_f_plus_m))
             i_gate = torch.exp(log_i - m_new).clamp(max=1.0)
             f_gate = torch.exp(log_f_plus_m - m_new).clamp(max=1.0)
 

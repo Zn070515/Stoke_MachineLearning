@@ -473,8 +473,8 @@ def main():
         )
         elapsed = time.time() - t0
 
-        if history["val_sharpe"]:
-            best_ls = max(history["val_sharpe"])
+        if history["val_ls_sharpe"]:
+            best_ls = max(history["val_ls_sharpe"])
             if history.get("val_metrics"):
                 last = history["val_metrics"][-1]
             else:
