@@ -19,6 +19,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.comment_storage import CommentStorage
+from stoke_ml.data.download_resume import skip_completed_stocks
 from stoke_ml.data.sources.a_shares.comment_source import CommentSource
 
 logging.basicConfig(
@@ -50,6 +51,8 @@ def main():
                         help="Also download per-stock 30-day history")
     parser.add_argument("--sleep", type=float, default=0.3,
                         help="Seconds between per-stock API calls")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Re-download all stocks (ignore existing files)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -88,6 +91,15 @@ def main():
     if not codes:
         logger.error("No stock codes found.")
         sys.exit(1)
+
+    # Resume: skip stocks that already have comment history data
+    comment_dir = os.path.join(data_dir, "a_shares", "comment_sentiment")
+    if not args.no_resume:
+        codes, _n_skipped = skip_completed_stocks(comment_dir, codes)
+
+    if not codes:
+        logger.info("All stocks already have comment history. Nothing to do.")
+        return
 
     logger.info("Downloading 30-day comment history for %d stocks...", len(codes))
     success = 0

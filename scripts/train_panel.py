@@ -1,7 +1,7 @@
 """Train VSN+xLSTM panel model on A-share stocks.
 
 Usage:
-  PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 20 --epochs 10 --max-folds 1
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --epochs 30 --max-folds 1
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stock-list 600519,000001,000858
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --no-aux  # skip auxiliary data for quick test
 """
@@ -68,14 +68,37 @@ def load_aux_data(
     except Exception:
         logger.warning("Sentiment data not available, skipping")
 
-    # --- Announcements ---
+    # --- Announcements (CNINFO PDF body sentiment preferred, EastMoney fallback) ---
     try:
-        from stoke_ml.data.announcement_storage import AnnouncementStorage
-        a_store = AnnouncementStorage(data_dir)
-        for code in stock_list:
-            df = a_store.load_daily_sentiment(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["announcement"] = df
+        cninfo_dir = os.path.join(data_dir, "a_shares", "cninfo_announcements", "sentiment")
+        em_loaded = False
+        if os.path.isdir(cninfo_dir):
+            for code in stock_list:
+                path = os.path.join(cninfo_dir, f"{code}.parquet")
+                if os.path.isfile(path):
+                    df = pd.read_parquet(path)
+                    df["date"] = pd.to_datetime(df["date"])
+                    if start_date:
+                        df = df[df["date"] >= pd.Timestamp(start_date)]
+                    if end_date:
+                        df = df[df["date"] <= pd.Timestamp(end_date)]
+                    if not df.empty:
+                        result[code]["announcement"] = df.sort_values("date").reset_index(drop=True)
+            cninfo_count = sum(1 for c in result if "announcement" in result[c])
+            if cninfo_count > 0:
+                logger.info("CNINFO announcements loaded for %d stocks", cninfo_count)
+                em_loaded = True
+
+        # Fallback: EastMoney for stocks without CNINFO data
+        if not em_loaded or len([c for c in stock_list if "announcement" not in result.get(c, {})]) > 0:
+            from stoke_ml.data.announcement_storage import AnnouncementStorage
+            a_store = AnnouncementStorage(data_dir)
+            for code in stock_list:
+                if "announcement" in result.get(code, {}):
+                    continue
+                df = a_store.load_daily_sentiment(code, start_date, end_date)
+                if df is not None and not df.empty:
+                    result[code]["announcement"] = df
     except Exception:
         logger.warning("Announcement data not available, skipping")
 
@@ -285,6 +308,80 @@ def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
     return ok
 
 
+def _cross_sectional_normalize(
+    y_arr: np.ndarray,
+    mask_arr: np.ndarray,
+    min_stocks: int = 5,
+) -> np.ndarray:
+    """Z-score normalize returns across stocks within each date.
+
+    Preserves cross-sectional ordering while giving each date's return
+    distribution zero mean and unit variance.  Dates with too few valid
+    stocks are left unchanged.
+
+    Returns a new array (does not mutate input).
+    """
+    y_out = y_arr.copy()
+    n_stocks, n_dates = y_arr.shape
+    for t in range(n_dates):
+        valid = mask_arr[:, t] if mask_arr is not None else np.ones(n_stocks, dtype=bool)
+        if valid.sum() < min_stocks:
+            continue
+        vals = y_arr[valid, t]
+        mean_t = float(np.nanmean(vals))
+        std_t = max(float(np.nanstd(vals)), 1e-8)
+        y_out[valid, t] = (y_arr[valid, t] - mean_t) / std_t
+    return y_out
+
+
+def _augment_sequence(
+    pk: np.ndarray,
+    po: np.ndarray,
+    noise_std: float = 0.01,
+    mask_prob: float = 0.05,
+    feat_dropout: float = 0.02,
+    rng: np.random.RandomState | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lightweight time-series augmentation for financial data.
+
+    Three independent augmentations:
+    1. Gaussian noise ~ N(0, noise_std) — improves robustness
+    2. Time masking — zero out random contiguous segments (simulates missing data)
+    3. Feature dropout — zero out random feature dimensions
+
+    All augmentations are conservative (small magnitudes) to avoid
+    distorting the financial signal.
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    pk_aug = pk.copy()
+    po_aug = po.copy()
+
+    # 1. Gaussian noise (per-element, independent)
+    if noise_std > 0:
+        pk_aug += rng.randn(*pk.shape).astype(np.float32) * noise_std
+        po_aug += rng.randn(*po.shape).astype(np.float32) * noise_std
+
+    # 2. Time masking: zero out a random contiguous block of length 1-5
+    if mask_prob > 0 and pk.shape[1] >= 3:
+        T = pk.shape[1]
+        mask_len = rng.randint(1, min(6, T // 2 + 1))
+        if rng.random() < mask_prob:
+            start = rng.randint(0, T - mask_len)
+            pk_aug[:, start:start + mask_len, :] = 0.0
+            po_aug[:, start:start + mask_len, :] = 0.0
+
+    # 3. Feature dropout: zero out random feature dimensions
+    if feat_dropout > 0:
+        for arr in [pk_aug, po_aug]:
+            if arr.shape[2] > 0:
+                mask = rng.random(arr.shape[2]) < feat_dropout
+                arr[:, :, mask] = 0.0
+
+    return pk_aug, po_aug
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train VSN+xLSTM panel model")
     parser.add_argument("--stocks", type=int, default=500,
@@ -293,21 +390,32 @@ def main():
                         help="Comma-separated stock codes")
     parser.add_argument("--start", type=str, default="2015-01-01")
     parser.add_argument("--end", type=str, default=None)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--max-folds", type=int, default=3,
                         help="Limit number of walk-forward folds (default: 3)")
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--horizon", type=int, default=5,
                         help="Forward return horizon in days (1/5/20)")
     parser.add_argument("--hidden-dim", type=int, default=128,
                         help="Model hidden dimension (default: 128)")
-    parser.add_argument("--xlstm-blocks", type=int, default=3,
-                        help="Number of xLSTM blocks (default: 3)")
+    parser.add_argument("--xlstm-blocks", type=int, default=2,
+                        help="Number of xLSTM blocks (default: 2)")
+    parser.add_argument("--rank-weight", type=float, default=0.1,
+                        help="Ranking loss weight (0=disable, default: 0.1)")
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Disable time-series data augmentation")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
                         help="Skip auxiliary data loading (faster startup)")
+    parser.add_argument("--minute", action="store_true",
+                        help="Use minute-frequency K-line data instead of daily")
+    parser.add_argument("--minute-frequency", type=str, default="60",
+                        choices=["5", "15", "30", "60"],
+                        help="Bar frequency for minute mode (default: 60)")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Override seq_len (default: 60 daily, 64 minute)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -322,6 +430,11 @@ def main():
 
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
+    elif args.minute:
+        from stoke_ml.data.minute_storage import MinuteStorage
+        stock_list = MinuteStorage(data_dir).list_stocks(args.minute_frequency)
+        if args.stocks:
+            stock_list = stock_list[:args.stocks]
     else:
         stock_list = _discover_stocks(data_dir, args.stocks)
 
@@ -329,27 +442,44 @@ def main():
         logger.error("No stocks found")
         sys.exit(1)
 
-    # Data quality filter — remove stocks with corrupted prices before
-    # they can distort the training signal.
-    stock_list = _filter_quality(stock_list, data_dir)
-    if len(stock_list) < 20:
-        logger.error("Too few stocks pass quality filter (%d)", len(stock_list))
-        sys.exit(1)
+    # Data quality filter (daily only — minute data validated at download time)
+    if not args.minute:
+        stock_list = _filter_quality(stock_list, data_dir)
+        if len(stock_list) < 20:
+            logger.error("Too few stocks pass quality filter (%d)", len(stock_list))
+            sys.exit(1)
 
     logger.info("Loading K-line data for %d stocks from %s to %s...",
                 len(stock_list), args.start, args.end)
 
-    from stoke_ml.data.storage import DataStorage
-    ds = DataStorage(data_dir)
-    frames = []
-    for code in stock_list:
-        df = ds.load_daily(code, args.start, args.end)
-        if df is not None and not df.empty:
-            df["stock_code"] = code
-            frames.append(df)
-    if not frames:
-        logger.error("No data loaded for any stock")
-        sys.exit(1)
+    if args.minute:
+        from stoke_ml.data.minute_storage import MinuteStorage
+        ms = MinuteStorage(data_dir)
+        frames = []
+        for code in stock_list:
+            df = ms.load(code, args.start, args.end, args.minute_frequency)
+            if df is not None and not df.empty:
+                df["date"] = pd.to_datetime(df["datetime"]).dt.date
+                df["stock_code"] = code
+                frames.append(df)
+        if not frames:
+            logger.error("No minute data loaded for any stock — run download_minute.py first")
+            sys.exit(1)
+        logger.info("Minute mode: %d stocks @ %s-min, %d available in storage",
+                    len(frames), args.minute_frequency,
+                    len(ms.list_stocks(args.minute_frequency)))
+    else:
+        from stoke_ml.data.storage import DataStorage
+        ds = DataStorage(data_dir)
+        frames = []
+        for code in stock_list:
+            df = ds.load_daily(code, args.start, args.end)
+            if df is not None and not df.empty:
+                df["stock_code"] = code
+                frames.append(df)
+        if not frames:
+            logger.error("No data loaded for any stock")
+            sys.exit(1)
 
     panel = pd.concat(frames, ignore_index=True)
     logger.info("Panel shape: %s", panel.shape)
@@ -363,8 +493,10 @@ def main():
         logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
 
     # Build features
+    seq_len = args.seq_len or (64 if args.minute else 60)
     fp = FeaturePipeline(
-        seq_len=60,
+        seq_len=seq_len,
+        minute_mode=args.minute,
         use_sentiment=True, use_announcements=True,
         use_guba=True, use_comment=True, use_margin=True,
         use_northbound=True, use_dragon_tiger=True,
@@ -385,7 +517,7 @@ def main():
                 n_stocks, n_timesteps, dims, args.horizon)
 
     config = PanelConfig(
-        seq_len=60,
+        seq_len=seq_len,
         static_dim=panel_data["static_features"].shape[1],
         past_known_dim=panel_data["past_known"].shape[2],
         past_observed_dim=panel_data["past_observed"].shape[2],
@@ -395,21 +527,28 @@ def main():
         learning_rate=args.lr,
         max_epochs=args.epochs,
         compile_model=not args.no_compile,
-        num_workers=8,
+        num_workers=0,
         horizon=args.horizon,
+        rank_loss_weight=args.rank_weight,
     )
-    logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e",
+    logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e rank_w=%.2f",
                 config.hidden_dim, config.xlstm_num_blocks, config.xlstm_num_heads,
-                config.batch_size, config.learning_rate)
+                config.batch_size, config.learning_rate, config.rank_loss_weight)
 
     # Purged walk-forward splits
-    train_len = 756
-    val_len = 126
-    step = 63
-    purge = config.seq_len  # must be >= seq_len to prevent context overlap
+    if args.minute:
+        train_len = 1500   # ~375 trading days at 4 bars/day
+        val_len = 250      # ~62 trading days
+        step = 125          # ~31 trading days
+    else:
+        train_len = 756    # ~3 years daily
+        val_len = 126      # ~6 months daily
+        step = 63          # ~3 months daily
+    purge = config.seq_len
     all_sharpes = []
     fold_histories = []
 
+    rng = np.random.RandomState(42)
     fold = 0
     train_start = 0
     while train_start + train_len + purge + val_len < n_timesteps:
@@ -424,6 +563,11 @@ def main():
         val_context_start = max(0, val_start - config.seq_len)
         val_slice = slice(val_context_start, val_end)
 
+        # Build a validity mask: position (i,t) is valid if y_direction != -100
+        # (i.e. not tail-padded and not limit-up/down masked).
+        train_mask = panel_data["y_direction"][:, train_slice] != -100
+        val_mask = panel_data["y_direction"][:, val_slice] != -100
+
         train_data = {
             "static_features": panel_data["static_features"],
             "past_known": panel_data["past_known"][:, train_slice],
@@ -431,6 +575,7 @@ def main():
             "y_direction": panel_data["y_direction"][:, train_slice],
             "y_return": panel_data["y_return"][:, train_slice].copy(),
             "y_volatility": panel_data["y_volatility"][:, train_slice].copy(),
+            "date_indices": panel_data["date_indices"][:, train_slice].copy(),
         }
         val_data = {
             "static_features": panel_data["static_features"],
@@ -439,28 +584,44 @@ def main():
             "y_direction": panel_data["y_direction"][:, val_slice],
             "y_return": panel_data["y_return"][:, val_slice].copy(),
             "y_volatility": panel_data["y_volatility"][:, val_slice].copy(),
+            "date_indices": panel_data["date_indices"][:, val_slice].copy(),
         }
 
-        # Per-stock z-score normalization of regression targets.
-        # Different stocks have different return/vol distributions;
-        # normalising per-stock gives each stock equal weight in the MSE
-        # loss and keeps the MSE baseline ≈ 1.0 (balanced with CE ~1.0).
-        ret_mean = train_data["y_return"].mean(axis=1, keepdims=True)
-        ret_std = np.maximum(train_data["y_return"].std(axis=1, keepdims=True), 1e-8)
-        vol_mean = train_data["y_volatility"].mean(axis=1, keepdims=True)
-        vol_std = np.maximum(train_data["y_volatility"].std(axis=1, keepdims=True), 1e-8)
-        train_data["y_return"] = (train_data["y_return"] - ret_mean) / ret_std
-        train_data["y_volatility"] = (train_data["y_volatility"] - vol_mean) / vol_std
-        # Save raw returns BEFORE normalization — Sharpe/IC are meaningless
-        # when computed from z-scored targets.
+        # Cross-sectional z-score normalization per date.
+        # Preserves relative ordering across stocks (unlike per-stock norm)
+        # so ranking losses and IC evaluation work on consistent scales.
+        train_data["y_return"] = _cross_sectional_normalize(
+            train_data["y_return"], train_mask,
+        )
+        train_data["y_volatility"] = _cross_sectional_normalize(
+            train_data["y_volatility"], train_mask,
+        )
+        # Save raw returns BEFORE normalization for portfolio evaluation.
         raw_val_y_return = val_data["y_return"].copy()
-        val_data["y_return"] = (val_data["y_return"] - ret_mean) / ret_std
-        val_data["y_volatility"] = (val_data["y_volatility"] - vol_mean) / vol_std
-        # Clip normalized targets to [-5, 5] — regime changes can make
-        # validation returns several sigma larger than training, which
-        # would otherwise dominate the loss and destabilise training.
+        val_data["y_return"] = _cross_sectional_normalize(
+            val_data["y_return"], val_mask,
+        )
+        val_data["y_volatility"] = _cross_sectional_normalize(
+            val_data["y_volatility"], val_mask,
+        )
+        # Clip normalized targets to [-5, 5].
         np.clip(val_data["y_return"], -5.0, 5.0, out=val_data["y_return"])
         np.clip(val_data["y_volatility"], -5.0, 5.0, out=val_data["y_volatility"])
+
+        # Time-series data augmentation on training data.
+        # Each stock's sequence gets independent noise/masking/dropout
+        # — increases effective dataset size and improves robustness.
+        if not args.no_augment:
+            pk_aug, po_aug = _augment_sequence(
+                train_data["past_known"],
+                train_data["past_observed"],
+                noise_std=0.005,
+                mask_prob=0.03,
+                feat_dropout=0.01,
+                rng=rng,
+            )
+            train_data["past_known"] = pk_aug
+            train_data["past_observed"] = po_aug
 
         logger.info("Fold %d/%d: train [%d:%d], val [%d:%d]",
                     fold, args.max_folds or "∞",

@@ -66,18 +66,19 @@ class NewsSentimentAnalyzer:
     3. Financial lexicon fallback (CPU)
     """
 
-    def __init__(self):
+    def __init__(self, force_lexicon: bool = False):
         self._loaded = False
         self._model_name = "lexicon"
         self._pipe = None
         self._device = "cpu"
         self._use_finbert = False
+        self._force_lexicon = force_lexicon
 
     def _ensure_loaded(self):
         if self._loaded:
             return
 
-        if self._try_finbert():
+        if not self._force_lexicon and self._try_finbert():
             self._loaded = True
             logger.info("Sentiment: %s (%s)", self._model_name, self._device)
         else:

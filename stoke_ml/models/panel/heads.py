@@ -15,11 +15,6 @@ class DirectionHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.fc2 = nn.Linear(hidden_dim // 2, num_classes)
-        # Extreme small init: prevent early-epoch gradient explosion on output layer
-        nn.init.normal_(self.fc1.weight, std=1e-4)
-        nn.init.normal_(self.fc2.weight, std=1e-4)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         last = x[:, -1, :]
@@ -40,10 +35,6 @@ class ReturnHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.fc2 = nn.Linear(hidden_dim // 2, 1)
-        nn.init.normal_(self.fc1.weight, std=1e-4)
-        nn.init.normal_(self.fc2.weight, std=1e-4)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         last = x[:, -1, :]
@@ -63,9 +54,6 @@ class VolatilityHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.fc2 = nn.Linear(hidden_dim // 2, 1)
-        nn.init.normal_(self.fc1.weight, std=1e-4)
-        nn.init.normal_(self.fc2.weight, std=1e-4)
-        nn.init.zeros_(self.fc1.bias)
         # Bias ≈ softplus^{-1}(0.02) so initial pred ≈ 0.02 (typical daily vol)
         nn.init.constant_(self.fc2.bias, -3.9)
 

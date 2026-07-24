@@ -30,24 +30,29 @@ class VariableSelectionNetwork(nn.Module):
         self.input_dim = input_dim
         weight_hidden = max(hidden_dim // 4, 8)
 
-        # Scale initialization by 1/sqrt(num_features) so that the weighted
-        # sum over features has roughly unit variance regardless of N.
-        # Floor at 0.1 prevents near-zero VSN output in early epochs when
-        # N is large (200+ features) — below 0.1, the GRN bias term
-        # dominates and the model spends many epochs just scaling up.
-        init_scale = max(num_features ** -0.5, 0.1) if num_features > 0 else 1.0
+        # Scale initialization so the weighted sum over N features has
+        # roughly unit variance regardless of N_features.
+        #
+        # With softmax weights ≈ 1/N at init and z-scored features x_i ~ N(0,1):
+        #   combined_j = Σ_i (x_i * e_{i,j} * w_i)
+        #   std(combined_j) = std(embedding) / sqrt(N_features)
+        # → std(embedding) = target_std * sqrt(N_features)
+        #
+        # Target 0.3 for unit-ish input to downstream GRN LayerNorm.
+        target_vsn_std = 0.3
+        emb_std = target_vsn_std * (num_features ** 0.5) if num_features > 0 else 0.3
 
         if input_dim == 1:
             # Scalar path — memory efficient
             self.weight_basis = nn.Parameter(
-                torch.randn(num_features, weight_hidden) * 0.02 * init_scale
+                torch.randn(num_features, weight_hidden) * emb_std
             )
             self.weight_bias = nn.Parameter(
                 torch.zeros(num_features, weight_hidden)
             )
             self.weight_out = nn.Linear(weight_hidden, 1)
             self.feat_emb = nn.Parameter(
-                torch.randn(num_features, hidden_dim) * 0.02 * init_scale
+                torch.randn(num_features, hidden_dim) * emb_std
             )
         else:
             # Dense path for non-scalar inputs
@@ -99,7 +104,7 @@ class VariableSelectionNetwork(nn.Module):
 
         # Size each chunk so its intermediate fits within ~1 GB.
         # (B * T * C * H * 4) ≤ 1 GB  →  C ≤ 1GB / (B*T*H*4)
-        max_chunk_bytes = 1 * 1024 ** 3
+        max_chunk_bytes = 512 * 1024 ** 2  # 512 MB (safer under fragmentation)
         elem_bytes = 4
         max_chunk = max(1, max_chunk_bytes // (B * T * H * elem_bytes))
         chunk_size = min(max_chunk, 64)

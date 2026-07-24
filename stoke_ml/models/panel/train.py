@@ -1,5 +1,6 @@
 import logging
 import random
+import warnings
 
 import numpy as np
 import torch
@@ -9,12 +10,21 @@ from torch.amp import GradScaler, autocast
 
 from stoke_ml.models.panel.config import PanelConfig
 from stoke_ml.models.panel.model import PanelModel
-from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss
-from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
+from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, PairwiseRankingLoss
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateGroupedSampler
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from stoke_ml.models.panel.evaluate import evaluate_portfolio
 
 logger = logging.getLogger(__name__)
+
+# SequentialLR emits a spurious warning on first step() — the internal
+# _step_count check fires before any optimizer.step() is registered,
+# even though our gradient-accumulation loop has already stepped the
+# optimizer multiple times.  This is a known PyTorch issue (#118894).
+warnings.filterwarnings(
+    "ignore",
+    message="Detected call of .*lr_scheduler.step.* before .*optimizer.step",
+)
 
 
 def _set_seed(seed: int | None) -> None:
@@ -34,14 +44,14 @@ def _compute_val_loss(
     loss_fn: UncertaintyLoss,
     device: torch.device,
     use_amp: bool,
-) -> float:
-    """Quick val loss pass every epoch for best-model selection."""
+) -> tuple[float, float, float, float]:
     model.eval()
-    total, n = 0.0, 0
+    total, ce_sum, ret_sum, vol_sum, n = 0.0, 0.0, 0.0, 0.0, 0
     nan_batches = 0
     skipped_batches = 0
     with torch.no_grad():
-        for static, pk, po, y_dir, y_ret, y_vol in val_loader:
+        for batch in val_loader:
+            static, pk, po, y_dir, y_ret, y_vol, _date_idx = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -50,20 +60,14 @@ def _compute_val_loss(
             y_vol = y_vol.to(device)
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                # Guard against model producing NaN (e.g. bad weights after
-                # training with corrupted data).
                 if torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any() or torch.isnan(pred_vol).any():
                     nan_batches += 1
                     continue
                 mask = (y_dir != -100).float()
-                # Entire batch has no valid labels (e.g. all positions are
-                # tail-padded for short-history stocks).  CrossEntropyLoss
-                # returns NaN when all targets are ignore_index, so skip.
                 if mask.sum() == 0:
                     skipped_batches += 1
                     continue
                 l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
-                # AdjMSE for returns (sign-aware), MSE for volatility
                 l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
                                  y_ret[mask > 0])
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
@@ -73,6 +77,9 @@ def _compute_val_loss(
                 nan_batches += 1
                 continue
             total += loss.item()
+            ce_sum += l_ce.item()
+            ret_sum += l_ret.item()
+            vol_sum += l_vol.item()
             n += 1
     if nan_batches > 0 or skipped_batches > 0:
         logger.warning(
@@ -80,14 +87,12 @@ def _compute_val_loss(
             nan_batches, skipped_batches, n + nan_batches + skipped_batches,
         )
     model.train()
-    return total / max(n, 1) if n > 0 else float("inf")
+    if n == 0:
+        return float("inf"), float("inf"), float("inf"), float("inf")
+    return total / n, ce_sum / n, ret_sum / n, vol_sum / n
 
 
 def _log_gradient_norms(model: nn.Module, epoch: int) -> None:
-    """Log per-layer-gradient norms — detects gradient collapse.
-
-    Collapse signal: output head norms < 0.1 × encoder norms AND decreasing.
-    """
     head_patterns = ("direction_head", "return_head", "volatility_head")
     encoder_norms, head_norms = [], []
     for name, param in model.named_parameters():
@@ -122,17 +127,6 @@ def train_panel(
     device: torch.device,
     raw_val_returns: np.ndarray | None = None,
 ) -> tuple[PanelModel, dict]:
-    """Train VSN+xLSTM panel model with purged walk-forward fold.
-
-    Args:
-        raw_val_returns: (N_stocks, T_val) raw forward returns (percent).
-            Passed through to evaluate_portfolio so Sharpe/IC are computed
-            from real returns, not z-scored targets.
-
-    Returns:
-        model: best model (by validation Sharpe).
-        history: dict of training metrics per epoch.
-    """
     _set_seed(config.seed)
 
     model = PanelModel(config).to(device)
@@ -147,7 +141,8 @@ def train_panel(
 
     loss_fn = UncertaintyLoss(num_tasks=3).to(device)
     ce_loss = nn.CrossEntropyLoss()
-    ret_loss = AdjMSELoss(gamma=0.1)  # sign-aware: wrong-sign → 11× penalty
+    ret_loss = AdjMSELoss(gamma=0.1)
+    rank_loss = PairwiseRankingLoss(margin=0.0, tau=0.1)
 
     optimizer = torch.optim.AdamW([
         {"params": model.parameters()},
@@ -156,11 +151,12 @@ def train_panel(
     scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
     train_ds = PanelDataset(train_data, seq_len=config.seq_len)
+    train_sampler = DateGroupedSampler(train_ds.n_stocks, train_ds.n_windows)
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
-        shuffle=True, collate_fn=panel_collate,
+        sampler=train_sampler, collate_fn=panel_collate,
         num_workers=config.num_workers, pin_memory=True,
-        drop_last=True, persistent_workers=config.num_workers > 0,
+        drop_last=False, persistent_workers=config.num_workers > 0,
     )
 
     val_ds = PanelDataset(val_data, seq_len=config.seq_len)
@@ -170,10 +166,6 @@ def train_panel(
         num_workers=0, pin_memory=False,
     )
 
-    # Cosine annealing with linear warmup — transformer-training standard.
-    # Warmup prevents early-epoch gradient spikes; cosine decay gives smooth
-    # convergence to a low final lr.
-    # Epoch-based scheduling: scheduler.step() is called once per epoch.
     warmup = LinearLR(
         optimizer,
         start_factor=0.01,
@@ -182,7 +174,7 @@ def train_panel(
     )
     cosine = CosineAnnealingLR(
         optimizer,
-        T_max=config.max_epochs - config.lr_warmup_epochs,
+        T_max=max(1, config.max_epochs - config.lr_warmup_epochs),
         eta_min=config.min_lr,
     )
     scheduler = SequentialLR(
@@ -191,7 +183,6 @@ def train_panel(
         milestones=[config.lr_warmup_epochs],
     )
 
-    # Per-layer param groups for stratified gradient clipping
     head_param_names = {"direction_head", "return_head", "volatility_head"}
     head_params = [
         p for n, p in model.named_parameters()
@@ -211,16 +202,19 @@ def train_panel(
     for epoch in range(config.max_epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_rank_loss = 0.0
         optimizer.zero_grad()
-        accum_count = 0  # actual backward steps counted (skip NaN)
+        accum_count = 0
 
-        for batch_idx, (static, pk, po, y_dir, y_ret, y_vol) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            static, pk, po, y_dir, y_ret, y_vol, date_idx = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
             y_dir = y_dir.to(device)
             y_ret = y_ret.to(device)
             y_vol = y_vol.to(device)
+            date_idx = date_idx.to(device)
 
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
@@ -228,12 +222,21 @@ def train_panel(
                 if mask.sum() == 0:
                     continue
                 l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
-                # AdjMSE: sign-aware loss — wrong-sign predictions cost 11× more
                 l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
                                  y_ret[mask > 0])
                 vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
                 l_vol = vol_err.sum() / mask.sum()
+
+                # Pairwise ranking loss — directly optimises for cross-sectional
+                # ordering (the same signal IC and Sharpe evaluate on).
+                l_rank = rank_loss(
+                    pred_ret.squeeze(-1), y_ret,
+                    mask.squeeze(-1) if mask.dim() > 1 else mask,
+                    date_idx,
+                )
+
                 total_loss = loss_fn([l_ce, l_ret, l_vol])
+                total_loss = total_loss + config.rank_loss_weight * l_rank
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 logger.warning(
@@ -248,8 +251,6 @@ def train_panel(
 
             if accum_count % config.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
-                # Stratified gradient clipping: heads get looser bounds
-                # to prevent gradient collapse (FinFusion 2024 finding).
                 if backbone_params:
                     torch.nn.utils.clip_grad_norm_(
                         backbone_params, config.backbone_grad_clip,
@@ -263,8 +264,9 @@ def train_panel(
                 optimizer.zero_grad()
 
             epoch_loss += total_loss.item() * config.grad_accum_steps
+            epoch_rank_loss += l_rank.item()
 
-        # Apply trailing accumulated gradients (from valid batches only)
+        # Apply trailing accumulated gradients
         remaining = accum_count % config.grad_accum_steps
         if remaining != 0:
             scaler.unscale_(optimizer)
@@ -281,23 +283,22 @@ def train_panel(
             scaler.update()
             optimizer.zero_grad()
 
-        avg_loss = epoch_loss / max(len(train_loader), 1)
+        n_batches = max(len(train_loader), 1)
+        avg_loss = epoch_loss / n_batches
         history["train_loss"].append(avg_loss)
 
-        # Gradient-flow monitoring (expensive — enable for debugging collapse)
         if config.log_gradient_flow:
             _log_gradient_norms(model, epoch + 1)
 
-        val_loss = _compute_val_loss(
+        val_loss, v_ce, v_ret, v_vol = _compute_val_loss(
             model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
         )
         history["val_loss"].append(val_loss)
 
-        # Cosine annealing steps every epoch (no-val-metric variant)
+        # Step scheduler AFTER optimizer updates (PyTorch >=1.1 requirement).
+        # Called here at epoch end since this is an epoch-level scheduler.
         scheduler.step()
 
-        # Save best model by val_loss (more stable than Sharpe with short
-        # validation windows — Sharpe has only ~12 non-overlapping samples).
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -305,8 +306,10 @@ def train_panel(
         else:
             patience_counter += 1
 
-        # Report evaluation every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        eval_start = 5
+        do_eval = ((epoch + 1) >= eval_start and (epoch + 1) % 5 == 0)
+
+        if do_eval:
             m = evaluate_portfolio(
                 model, val_data, config, device,
                 horizon=config.horizon, raw_returns=raw_val_returns,
@@ -318,17 +321,21 @@ def train_panel(
             history.setdefault("val_metrics", [])
             history["val_metrics"].append(m)
             logger.info(
-                "Epoch %d/%d: loss=%.4f val_loss=%.4f "
+                "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.3f) rank=%.6f "
                 "IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
                 "Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
                 epoch + 1, config.max_epochs, avg_loss, val_loss,
+                v_ce, v_ret, v_vol,
+                epoch_rank_loss / n_batches,
                 ic_mean, m["ic_ir"],
                 ls_sharpe, m["ls_sharpe_lo"], m["ls_sharpe_hi"],
                 m["long_sharpe"], m["q5mq1_ret"] * 10000,
                 optimizer.param_groups[0]["lr"])
         else:
-            logger.info("Epoch %d/%d: loss=%.4f val_loss=%.4f lr=%.2e",
+            logger.info("Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.3f) rank=%.6f lr=%.2e",
                         epoch + 1, config.max_epochs, avg_loss, val_loss,
+                        v_ce, v_ret, v_vol,
+                        epoch_rank_loss / n_batches,
                         optimizer.param_groups[0]["lr"])
 
         if patience_counter >= config.early_stop_patience:

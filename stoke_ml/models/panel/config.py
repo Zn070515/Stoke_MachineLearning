@@ -61,9 +61,12 @@ class PanelConfig:
     horizon: int = 5
 
     # Hardware
-    use_amp: bool = False
+    use_amp: bool = True
     compile_model: bool = True
-    num_workers: int = 8
+    num_workers: int = 0  # 0 = main-process loading (avoids Windows shared-memory error 1455)
+
+    # Ranking loss weight (0 = disabled, 0.1–0.5 recommended)
+    rank_loss_weight: float = 0.1
 
     # Diagnostics (expensive — enable for debugging gradient collapse)
     log_gradient_flow: bool = False

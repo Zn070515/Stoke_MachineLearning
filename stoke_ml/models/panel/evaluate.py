@@ -231,7 +231,8 @@ def evaluate_portfolio(
 
     all_preds = []
     with torch.no_grad():
-        for static, pk, po, _, _y_ret, _ in val_loader:
+        for batch in val_loader:
+            static, pk, po, _, _y_ret, _, _date_idx = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)

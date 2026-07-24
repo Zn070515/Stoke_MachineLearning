@@ -15,9 +15,10 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.download_resume import skip_completed_stocks, skip_completed_years
 from stoke_ml.data.market_wide_storage import MarketWideStorage
-from stoke_ml.data.sources.a_shares.margin_source import MarginTradingSource
 from stoke_ml.data.sources.a_shares.dragon_tiger_source import DragonTigerSource
+from stoke_ml.data.sources.a_shares.margin_source import MarginTradingSource
 from stoke_ml.data.sources.a_shares.northbound_source import NorthboundSource
 
 logging.basicConfig(
@@ -56,6 +57,8 @@ def main():
                         help="Use concurrent downloader")
     parser.add_argument("--workers", type=int, default=4,
                         help="Concurrent workers (default: 4)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Re-download all years/stocks (ignore existing files)")
     args = parser.parse_args()
 
     if args.end is None:
@@ -98,8 +101,15 @@ def main():
             # Fetch year-by-year with incremental saves to survive interruptions
             start_dt = pd.Timestamp(args.start).date()
             end_dt = pd.Timestamp(args.end).date()
+            years = list(range(start_dt.year, end_dt.year + 1))
+            if not args.no_resume:
+                a_shares_dir = os.path.join(data_dir, "a_shares")
+                years, _skipped = skip_completed_years(a_shares_dir, years, storage_type)
+            if not years:
+                logger.info("  margin: all years already downloaded, skipping")
+                continue
             all_frames = []
-            for year in range(start_dt.year, end_dt.year + 1):
+            for year in years:
                 y_start = f"{year}-01-01"
                 y_end = f"{min(year, end_dt.year)}-12-31"
                 if year == start_dt.year:
@@ -153,7 +163,16 @@ def main():
                 if not stock_codes:
                     logger.error("No stock codes found. Run download_data.py first.")
                     sys.exit(1)
-                logger.info("  northbound: loaded %d stock codes from disk", len(stock_codes))
+                # Resume: skip stocks that already have northbound data
+                if not args.no_resume:
+                    northbound_dir = os.path.join(data_dir, "a_shares", "northbound")
+                    stock_codes, _skipped = skip_completed_stocks(
+                        northbound_dir, stock_codes,
+                    )
+                if not stock_codes:
+                    logger.info("  northbound: all stocks already downloaded, skipping")
+                    continue
+                logger.info("  northbound: %d stocks to download", len(stock_codes))
             if stock_codes and args.concurrent:
                 from stoke_ml.crawler.rate_limiter import RateLimiter
                 from stoke_ml.crawler.concurrent import ConcurrentDownloader

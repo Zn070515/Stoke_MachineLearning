@@ -39,6 +39,9 @@ umap-learn>=0.5
 hdbscan>=0.8
 sentence-transformers>=2.2
 
+# PDF parsing (CNINFO announcement source)
+PyMuPDF>=1.23
+
 # Config & monitoring
 hydra-core>=1.3
 omegaconf>=2.3

@@ -123,7 +123,7 @@ def main():
         logger.info("Topic modeler: min_topic_size=%d, embedding=%s",
                      tm.min_topic_size, tm.embedding_model)
 
-    analyzer = NewsSentimentAnalyzer()
+    analyzer = NewsSentimentAnalyzer(force_lexicon=True)
 
     # ---- Fit topic modeler on all posts ----------------------------------
     if tm is not None and tm._enabled:

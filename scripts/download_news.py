@@ -18,10 +18,11 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.storage import DataStorage
-from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.download_resume import skip_completed_stocks
+from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.sources.a_shares.news_pipeline import NewsPipeline
+from stoke_ml.data.storage import DataStorage
 from stoke_ml.features.news_nlp import (
     NewsSentimentAnalyzer,
     compute_raw_sentiment,
@@ -67,6 +68,8 @@ def main():
                         help="Start date filter YYYY-MM-DD")
     parser.add_argument("--end", type=str, default=None,
                         help="End date filter YYYY-MM-DD")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Re-download all stocks (ignore existing files)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -84,6 +87,19 @@ def main():
         logger.error("No stock codes found. Run download_data.py first.")
         sys.exit(1)
 
+    # Resume: skip stocks whose raw data already covers start_date
+    raw_dir = os.path.join(data_dir, "a_shares", "news_raw")
+    if not args.no_resume:
+        codes, _n_skipped = skip_completed_stocks(
+            raw_dir, codes, start_date=args.start,
+        )
+    elif not os.path.isdir(raw_dir):
+        os.makedirs(raw_dir, exist_ok=True)
+
+    if not codes:
+        logger.info("All stocks already downloaded. Nothing to do.")
+        sys.exit(0)
+
     # Select sources
     if args.source == "all":
         active_sources = None  # pipeline uses all available
@@ -93,7 +109,7 @@ def main():
     calendar = TradingCalendar("a_shares")
     news_storage = NewsStorage(data_dir, calendar)
     news_pipeline = NewsPipeline(active_sources=active_sources)
-    analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer()
+    analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer(force_lexicon=True)
 
     source_label = args.source if args.source != "all" else "sina+xueqiu+ths"
     mode_label = "concurrent" if args.concurrent else "sequential"
@@ -110,7 +126,7 @@ def main():
         from stoke_ml.crawler.concurrent import ConcurrentDownloader
 
         rate_limiter = RateLimiter(
-            base_delay_sec=args.sleep,
+            base_delay_sec=0,
             daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
         )
         downloader = ConcurrentDownloader(

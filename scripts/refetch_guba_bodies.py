@@ -327,7 +327,7 @@ def main():
         )
 
     guba_storage = GubaStorage(data_dir)
-    analyzer = NewsSentimentAnalyzer()
+    analyzer = NewsSentimentAnalyzer(force_lexicon=True)
 
     total_fetched = 0
 

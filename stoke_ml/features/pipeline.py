@@ -175,6 +175,7 @@ class FeaturePipeline:
         use_concept: bool = False,
         use_macro: bool = True,
         use_industry: bool = True,
+        minute_mode: bool = False,
         feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
         preprocessing_config: dict | str | None = None,
@@ -208,6 +209,7 @@ class FeaturePipeline:
         self.use_concept = use_concept
         self.use_macro = use_macro
         self.use_industry = use_industry
+        self.minute_mode = minute_mode
         self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
         self._preprocessing_config = preprocessing_config
@@ -217,6 +219,7 @@ class FeaturePipeline:
         self._warned_missing: set[str] = set()
         self._macro_cache: pd.DataFrame | None = None
         self._industry_cache: pd.DataFrame | None = None
+        self._intraday = None
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
         self._interaction = InteractionFeatures()
@@ -475,6 +478,12 @@ class FeaturePipeline:
             df = self._scorer.score(df)
 
         df = self._add_microstructure(df)
+
+        if self.minute_mode:
+            if self._intraday is None:
+                from stoke_ml.features.minute_technical import MinuteIntradayFeatures
+                self._intraday = MinuteIntradayFeatures()
+            df = self._intraday.compute_all(df)
 
         if self.use_interaction:
             df = self._interaction.compute_all(df)
@@ -1292,7 +1301,8 @@ class FeaturePipeline:
         # a feature's value is expressed relative to the cross-section that
         # day.  This avoids pooling future dates' statistics into today's
         # normalized value and is the standard panel-finance treatment.
-        norm_cols = pk_cols_available + po_cols_available
+        norm_cols = [c for c in pk_cols_available + po_cols_available
+                     if c not in _CS_NORM_SKIP_COLS]
         all_feat = pd.concat([
             df[["date"] + norm_cols]
             for df in all_feat_dfs
@@ -1383,6 +1393,25 @@ class FeaturePipeline:
         # After per-stock z-scoring (μ=0, σ=1), the MSE baseline ≈ 1.0,
         # which is naturally balanced with CE loss (~1.0).
 
+        # Per-stock date indices — maps each time step to its absolute
+        # position in the global trading calendar so that PairwiseRankingLoss
+        # can group samples from the same calendar date.
+        all_dates: list[str] = []
+        for df in all_feat_dfs:
+            if "date" in df.columns:
+                all_dates.extend(df["date"].astype(str).tolist())
+        unique_dates = sorted(set(all_dates))
+        date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+        date_idx_arr = np.zeros((N_stocks, max_T), dtype=np.int32)
+        for i, df in enumerate(all_feat_dfs):
+            T_i = min(len(df), max_T)
+            if "date" in df.columns:
+                for t in range(T_i):
+                    d = str(df["date"].iloc[t])
+                    date_idx_arr[i, t] = date_to_idx.get(d, t)
+            else:
+                date_idx_arr[i, :T_i] = np.arange(T_i, dtype=np.int32)
+
         return {
             "static_features": static_arr,
             "past_known": pk_arr,
@@ -1390,6 +1419,7 @@ class FeaturePipeline:
             "y_direction": y_dir_arr,
             "y_return": y_ret_arr,
             "y_volatility": y_vol_arr,
+            "date_indices": date_idx_arr,
         }
 
 
@@ -1458,12 +1488,28 @@ def _compute_static_quantiles(
         for i, df in enumerate(all_feat_dfs):
             df["price_level_quantile"] = price_map.get(codes[i], 0.5)
 
+    # Per-stock raw return statistics — lets the model learn to re-scale
+    # z-scored predictions back to raw return space for cross-sectional ranking.
+    if "daily_ret_vol" in needed or "daily_ret_mean" in needed:
+        for i, df in enumerate(all_feat_dfs):
+            if len(df) > 0 and "close" in df.columns:
+                c = df["close"].values.astype(np.float64)
+                ret = np.diff(c) / (c[:-1] + 1e-8)
+                ret = ret[np.isfinite(ret)]
+                df["daily_ret_vol"] = float(np.std(ret)) if len(ret) > 1 else 0.0
+                df["daily_ret_mean"] = float(np.mean(ret)) if len(ret) > 0 else 0.0
+            else:
+                df["daily_ret_vol"] = 0.0
+                df["daily_ret_mean"] = 0.0
+
 
 _STATIC_FEATURE_COLS = [
     "market_cap_quantile",       # size proxy (avg close first 20d)
     "liquidity_quantile",        # dollar-volume proxy (avg volume×close first 20d)
     "volatility_quantile",       # risk profile (log-return std first 20d)
     "price_level_quantile",      # nominal price tier (avg close)
+    "daily_ret_vol",             # per-stock daily return volatility (raw scale)
+    "daily_ret_mean",            # per-stock mean daily return (raw scale)
 ]
 
 # Alpha158 rolling-window factor name generator.
@@ -1534,12 +1580,25 @@ _PAST_KNOWN_COLS = [
     "limit_up_count_5d", "limit_up_count_20d",
     # Calendar
     "day_of_week", "day_of_month", "month", "quarter",
+    # Intraday (minute mode)
+    "minutes_from_open", "minutes_to_close", "is_am_session", "is_pm_session",
+    "session_progress", "bar_of_day", "opening_imbalance",
+    "session_high_position",
     # Fundamental (forward-filled quarterly)
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
     # Valuation (Baostock daily PE/PB/PS/PCF)
     "pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm",
 ] + _alpha158_factor_names()
+
+# Features that are stock-invariant (same value for every stock on a given date).
+# Cross-sectional z-score normalization would divide by near-zero std, producing
+# saturated ±10.0 values with no signal. Skip them.
+_CS_NORM_SKIP_COLS = frozenset({
+    "minutes_from_open", "minutes_to_close", "is_am_session", "is_pm_session",
+    "session_progress", "bar_of_day",
+    "day_of_week", "day_of_month", "month", "quarter",
+})
 
 _PAST_OBSERVED_COLS = [
     # Sentiment (news)
@@ -1555,6 +1614,7 @@ _PAST_OBSERVED_COLS = [
     "comment_score", "comment_attention", "comment_institution", "comment_trend",
     # Announcement
     "ann_sentiment_mean", "ann_sentiment_std",
+    "ann_count", "ann_positive_ratio", "ann_negative_ratio", "has_announce",
     # Margin
     "margin_balance", "margin_buy", "short_balance", "margin_net",
     # Northbound

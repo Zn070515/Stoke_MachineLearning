@@ -1,10 +1,16 @@
 """North-bound capital / Stock Connect (北向资金) data via AKShare."""
 import logging
+import socket
 import time
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# AKShare internally calls requests.get() without a timeout parameter,
+# which causes TCP connections to hang indefinitely when EastMoney
+# rate-limits. Setting a global socket timeout prevents this.
+socket.setdefaulttimeout(15)
 
 NB_COLS = [
     "date", "stock_code", "north_hold_shares", "north_hold_value",
@@ -40,18 +46,27 @@ class NorthboundSource:
             return pd.DataFrame()
 
         frames = []
-        for code in stock_codes:
-            try:
-                df = ak.stock_hsgt_individual_em(symbol=code)
-                if df is not None and not df.empty:
-                    df = self._normalize(df)
-                    df["stock_code"] = str(code).replace(".0", "").zfill(6)
-                    if "date" in df.columns:
-                        df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
-                    if not df.empty:
-                        frames.append(df)
-            except Exception:
-                pass
+        for i, code in enumerate(stock_codes):
+            df = None
+            for attempt in range(2):
+                try:
+                    df = ak.stock_hsgt_individual_em(symbol=code)
+                    break
+                except (TypeError, ValueError, KeyError):
+                    break  # AKShare internal bug — retry won't help
+                except Exception:
+                    if attempt < 1:
+                        time.sleep(1)
+            if df is not None and not df.empty:
+                df = self._normalize(df)
+                df["stock_code"] = str(code).replace(".0", "").zfill(6)
+                if "date" in df.columns:
+                    df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+                if not df.empty:
+                    frames.append(df)
+            if len(stock_codes) > 25 and (i + 1) % 25 == 0:
+                logger.info("  northbound %d/%d done, %d with data",
+                            i + 1, len(stock_codes), len(frames))
             time.sleep(sleep)
 
         if not frames:

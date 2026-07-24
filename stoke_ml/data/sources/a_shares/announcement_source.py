@@ -79,25 +79,19 @@ class AnnouncementSource:
             y_begin = f"{year}-01-01"
             y_end = f"{year}-12-31" if year < end_year else end_date
 
-            # Get first page to determine total
+            time.sleep(0.05)
+
             items, total = self._fetch_page(stock_code, y_begin, y_end, page=1)
             all_items.extend(items)
 
-            # If more pages needed, fetch them
-            total_pages = min((total + 99) // 100, 10)  # cap at 10 pages
-            for page in range(2, total_pages + 1):
-                more_items, _ = self._fetch_page(stock_code, y_begin, y_end, page=page)
-                if not more_items:
-                    break
-                all_items.extend(more_items)
-                time.sleep(0.3)  # light rate limit
-
-            if items:
-                logger.debug(
-                    "%s %d: %d announcements (total %d)",
-                    stock_code, year, len(items), total,
-                )
-            time.sleep(0.5)  # rate limit between years
+            if total > 100:
+                total_pages = min((total + 99) // 100, 10)
+                for page in range(2, total_pages + 1):
+                    time.sleep(0.05)
+                    more_items, _ = self._fetch_page(stock_code, y_begin, y_end, page=page)
+                    if not more_items:
+                        break
+                    all_items.extend(more_items)
 
         if not all_items:
             return pd.DataFrame(columns=["date", "title", "notice_type", "url"])

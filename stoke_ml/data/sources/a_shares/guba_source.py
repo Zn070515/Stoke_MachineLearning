@@ -302,9 +302,11 @@ class GubaSource:
         """Fetch the full text of a single post from its detail page.
 
         Returns the post body text, or empty string on failure.
+        Uses a shorter timeout than list pages since detail pages either
+        return fast (success) or fast (WAF block) — never need 20s.
         """
         url = GUBA_DETAIL_URL.format(code=stock_code, post_id=post_id)
-        resp = _fetch_with_retry(url)
+        resp = _fetch_with_retry(url, timeout=8)
 
         if resp is None:
             logger.debug(
@@ -420,7 +422,7 @@ class GubaSource:
 
             # Polite delay between page requests
             if page < max_pages:
-                time.sleep(PAGE_DELAY)
+                time.sleep(self.page_delay)
 
         if not all_pages:
             return _empty_df()
@@ -436,7 +438,10 @@ class GubaSource:
             df = df.sort_values("_date_sort", ascending=False)
             df = df.drop(columns=["_date_sort"])
 
-        # Fetch bodies concurrently (5 threads, ~5x speedup)
+        # Fetch bodies concurrently.  First probe a sample of 50 posts
+        # to estimate body availability; if 0% have extractable body text,
+        # skip the remaining detail requests (WAF blocks are consistent
+        # per-session).
         if fetch_bodies and not df.empty:
             needs_body = df["body"].str.strip().eq("")
             need_count = needs_body.sum()
@@ -447,20 +452,52 @@ class GubaSource:
                 )
                 indices = df[needs_body].index.tolist()
                 post_ids = [str(df.at[i, "post_id"]) for i in indices]
-                bodies_result = [""] * len(indices)
-                with ThreadPoolExecutor(max_workers=10) as pool:
+
+                # Probe: fetch first 50 to gauge body coverage
+                probe_n = min(50, len(post_ids))
+                probe_ids = post_ids[:probe_n]
+                probe_results = [""] * probe_n
+                with ThreadPoolExecutor(max_workers=4) as pool:
                     futures = {
                         pool.submit(self._fetch_post_body, stock_code, pid): j
-                        for j, pid in enumerate(post_ids)
+                        for j, pid in enumerate(probe_ids)
                     }
                     for fut in as_completed(futures):
                         j = futures[fut]
                         try:
-                            bodies_result[j] = fut.result() or ""
+                            probe_results[j] = fut.result() or ""
                         except Exception:
-                            bodies_result[j] = ""
-                for j, idx in enumerate(indices):
-                    if bodies_result[j]:
-                        df.at[idx, "body"] = bodies_result[j]
+                            pass
+                probe_hits = sum(1 for b in probe_results if b)
+                for j in range(probe_n):
+                    if probe_results[j]:
+                        df.at[indices[j], "body"] = probe_results[j]
+
+                if probe_hits == 0 and len(post_ids) > probe_n:
+                    logger.info("  0/%d bodies found, skipping remaining %d",
+                                probe_n, len(post_ids) - probe_n)
+                elif len(post_ids) > probe_n:
+                    # Fetch remainder in batches of 200 to avoid burst
+                    remaining_ids = post_ids[probe_n:]
+                    batch_size = 200
+                    for batch_start in range(0, len(remaining_ids), batch_size):
+                        batch = remaining_ids[batch_start:batch_start + batch_size]
+                        batch_results = [""] * len(batch)
+                        with ThreadPoolExecutor(max_workers=4) as pool:
+                            futures = {
+                                pool.submit(self._fetch_post_body, stock_code, pid): j
+                                for j, pid in enumerate(batch)
+                            }
+                            for fut in as_completed(futures):
+                                j = futures[fut]
+                                try:
+                                    batch_results[j] = fut.result() or ""
+                                except Exception:
+                                    pass
+                        for j, pid in enumerate(batch):
+                            if batch_results[j]:
+                                df.at[indices[probe_n + batch_start + j], "body"] = batch_results[j]
+                        if batch_start + batch_size < len(remaining_ids):
+                            time.sleep(0.5)  # pause between batches
 
         return df.reset_index(drop=True)

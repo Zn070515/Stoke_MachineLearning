@@ -165,6 +165,9 @@ def _save_browser_state(context: "BrowserContext") -> None:
 class XueqiuNewsSource:
     """Fetch stock discussions from Xueqiu via Playwright."""
 
+    _stock_count = 0
+    _BROWSER_RESTART_EVERY = 50
+
     def fetch_news(
         self,
         stock_code: str,
@@ -172,12 +175,26 @@ class XueqiuNewsSource:
         end_date: str | None = None,
         max_pages: int = 3,
     ) -> pd.DataFrame:
-        global _waf_solved
+        global _waf_solved, _browser, _context
 
         symbol = _build_symbol(stock_code)
         end_dt = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
         start_dt = pd.Timestamp(start_date) if start_date else end_dt - pd.Timedelta(days=30)
         max_pages = min(max_pages, 50)
+
+        XueqiuNewsSource._stock_count += 1
+        if (
+            XueqiuNewsSource._stock_count > 1
+            and XueqiuNewsSource._stock_count % XueqiuNewsSource._BROWSER_RESTART_EVERY == 0
+        ):
+            logger.info("Periodic browser restart (stock #%d)", XueqiuNewsSource._stock_count)
+            _browser = None
+            _context = None
+            _waf_solved = False
+            try:
+                os.remove(_STATE_FILE)
+            except OSError:
+                pass
 
         try:
             context = _ensure_context()
@@ -188,12 +205,9 @@ class XueqiuNewsSource:
         page = None
         try:
             page = context.new_page()
+            page.set_default_timeout(15000)
 
-            waf_solved = _waf_solved
-            target_url = (
-                f"{_BASE_URL}/S/{symbol}" if not waf_solved
-                else _BASE_URL + "/"
-            )
+            target_url = f"{_BASE_URL}/S/{symbol}"
 
             try:
                 page.goto(
@@ -201,7 +215,7 @@ class XueqiuNewsSource:
                     timeout=_GOTO_TIMEOUT_MS,
                     wait_until="domcontentloaded",
                 )
-                if not waf_solved:
+                if not _waf_solved:
                     try:
                         page.wait_for_load_state("networkidle", timeout=8000)
                     except Exception:
@@ -215,21 +229,11 @@ class XueqiuNewsSource:
                     except Exception:
                         pass
                     _waf_solved = True
-                    _save_browser_state(context)
                     logger.debug("WAF solved via %s", symbol)
+                _save_browser_state(context)
             except Exception as e:
-                logger.debug("goto failed for %s: %s", stock_code, e)
-                if waf_solved:
-                    try:
-                        page.goto(
-                            f"{_BASE_URL}/S/{symbol}",
-                            timeout=_GOTO_TIMEOUT_MS,
-                            wait_until="domcontentloaded",
-                        )
-                    except Exception:
-                        pass
-                    _waf_solved = True
-                    _save_browser_state(context)
+                logger.debug("goto %s failed: %s", stock_code, e)
+                _waf_solved = False
 
             collected: list[dict] = []
             for waf_round in range(3):
@@ -350,7 +354,6 @@ class XueqiuNewsSource:
             msg = str(e)
             if "closed" in msg.lower() or "connection" in msg.lower():
                 logger.warning("Browser closed for %s, will restart", stock_code)
-                global _browser, _context
                 _browser = None
                 _context = None
                 _waf_solved = False

@@ -17,6 +17,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.download_resume import skip_completed_stocks
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.sources.a_shares.guba_source import GubaSource
 from stoke_ml.features.news_nlp import (
@@ -67,6 +68,14 @@ def main():
                         choices=["publish", "comment"],
                         help="Sort mode: publish (f-sort URL, deep history, CAPTCHA-protected) "
                              "or comment (topic URL, lenient, ~1-2yr reach) (default: comment)")
+    parser.add_argument("--no-bodies", action="store_true",
+                        help="Skip fetching post body text (fast: only list pages, ~20 req/stock)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Re-download all stocks (ignore existing files)")
+    parser.add_argument("--shard", type=str, default=None,
+                        help="Shard spec: k/N (e.g. 0/4 processes first quarter of stocks)")
+    parser.add_argument("--page-delay", type=float, default=None,
+                        help="Seconds between list-page requests (default: 1.0 comment, 2.0 publish)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -87,52 +96,37 @@ def main():
         logger.error("No stock codes found. Run download_data.py first.")
         sys.exit(1)
 
+    if args.shard:
+        k, n = args.shard.split("/")
+        k, n = int(k), int(n)
+        codes = [c for i, c in enumerate(codes) if i % n == k]
+        shard_label = f" [shard {k}/{n}]"
+    else:
+        shard_label = ""
+
     calendar = TradingCalendar("a_shares")
     guba_storage = GubaStorage(data_dir, calendar)
-    guba_source = GubaSource(sort=args.sort)
-    analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer()
+    guba_source = GubaSource(sort=args.sort, page_delay=args.page_delay)
+    analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer(force_lexicon=True)
 
     mode_label = "concurrent" if args.concurrent else "sequential"
     logger.info(
-        "Downloading Guba posts for %d stocks (%s to %s, max_pages=%d, sort=%s, sleep=%.1fs, %s)",
-        len(codes), args.start, args.end, args.max_pages, args.sort, args.sleep, mode_label,
+        "Downloading Guba posts for %d stocks (%s to %s, max_pages=%d, sort=%s, sleep=%.1fs, %s)%s",
+        len(codes), args.start, args.end, args.max_pages, args.sort, args.sleep, mode_label, shard_label,
     )
 
     total_posts = 0
     success, fail, empty, skipped = 0, 0, 0, 0
 
-    # Resume: only skip stocks whose raw data already covers back to start_date.
-    # If the existing file only has recent posts (from a shallow earlier run),
-    # delete it and re-download with full depth.
-    import pandas as pd
-    start_ts = pd.Timestamp(args.start)
-    pending = []
-    for code in codes:
-        raw_path = os.path.join(data_dir, "a_shares", "guba_raw", f"{code}.parquet")
-        if os.path.exists(raw_path):
-            try:
-                existing = pd.read_parquet(raw_path)
-                if not existing.empty and "date" in existing.columns:
-                    existing_dates = pd.to_datetime(existing["date"], errors="coerce")
-                    oldest = existing_dates.min()
-                    if pd.notna(oldest) and oldest <= start_ts:
-                        skipped += 1
-                        continue
-                logger.info("  %s: existing data incomplete (oldest=%s < %s), re-downloading",
-                            code,
-                            str(existing_dates.min().date()) if not existing_dates.empty and pd.notna(existing_dates.min()) else "N/A",
-                            args.start)
-                os.remove(raw_path)
-            except Exception:
-                logger.debug("  %s: could not read existing file, re-downloading", code)
-                try:
-                    os.remove(raw_path)
-                except Exception:
-                    pass
-        pending.append(code)
-    if skipped:
-        logger.info("Skipping %d stocks with complete data, %d remaining", skipped, len(pending))
-    codes = pending
+    # Resume: skip stocks whose raw data already covers start_date
+    if not args.no_resume:
+        codes, skipped = skip_completed_stocks(
+            os.path.join(data_dir, "a_shares", "guba_raw"),
+            codes,
+            start_date=args.start,
+        )
+    else:
+        skipped = 0
 
     # Shared save function used by both paths
     def _save_stock(code: str, df: pd.DataFrame) -> int:
@@ -172,7 +166,7 @@ def main():
                     start_date=args.start,
                     end_date=args.end,
                     max_pages=args.max_pages,
-                    fetch_bodies=True,
+                    fetch_bodies=not args.no_bodies,
                 )
                 if not args.skip_sentiment and not df.empty:
                     df = compute_raw_sentiment(df, analyzer)
@@ -213,7 +207,7 @@ def main():
                     start_date=args.start,
                     end_date=args.end,
                     max_pages=args.max_pages,
-                    fetch_bodies=True,
+                    fetch_bodies=not args.no_bodies,
                 )
             except Exception as e:
                 logger.error("  %s: fetch failed: %s", code, e)

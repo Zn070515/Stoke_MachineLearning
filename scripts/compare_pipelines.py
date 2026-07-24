@@ -53,7 +53,7 @@ def main():
     cfg = load_config()
     data_dir = cfg.project.data_dir
     calendar = TradingCalendar("a_shares")
-    analyzer = NewsSentimentAnalyzer()
+    analyzer = NewsSentimentAnalyzer(force_lexicon=True)
 
     pp_cfg = cfg.get("preprocessing", {})
     pp = PreprocessingPipeline.from_config(pp_cfg)

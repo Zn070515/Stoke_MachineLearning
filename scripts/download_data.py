@@ -29,7 +29,7 @@ def get_stock_codes(indices: list[str] | None = None) -> list[str]:
 
     codes = set()
     for symbol in indices:
-        name = { "000300": "CSI 300", "000905": "CSI 500" }.get(symbol, symbol)
+        name = {"000300": "CSI 300", "000905": "CSI 500"}.get(symbol, symbol)
         try:
             df = ak.index_stock_cons_csindex(symbol=symbol)
             new_codes = set(df["成分券代码"].tolist())
@@ -39,6 +39,30 @@ def get_stock_codes(indices: list[str] | None = None) -> list[str]:
             logger.error("Failed to fetch %s: %s", name, e)
 
     return sorted(codes)
+
+
+def get_all_a_share_codes() -> list[str]:
+    """Fetch ALL A-share stock codes via AKShare stock_info_a_code_name."""
+    logger.info("Fetching full A-share stock list (may take ~5s)...")
+    df = ak.stock_info_a_code_name()
+    codes = sorted(df["code"].tolist())
+    logger.info("Total A-share stocks: %d", len(codes))
+    return codes
+
+
+def filter_existing(codes: list[str], data_dir: str) -> tuple[list[str], set[str]]:
+    """Filter out stocks already on disk. Returns (to_download, already_have)."""
+    daily_dir = os.path.join(data_dir, "a_shares", "daily")
+    if not os.path.isdir(daily_dir):
+        return codes, set()
+
+    existing = set()
+    for f in os.listdir(daily_dir):
+        if f.endswith(".parquet"):
+            existing.add(f.replace(".parquet", ""))
+
+    to_download = [c for c in codes if c not in existing]
+    return to_download, existing
 
 
 def main():
@@ -54,6 +78,10 @@ def main():
                         help="Seconds between stocks (default: 1.5)")
     parser.add_argument("--indices", type=str, default=None,
                         help="Comma-separated AKShare index symbols")
+    parser.add_argument("--all", action="store_true", dest="all_stocks",
+                        help="Download ALL A-shares (~5500 stocks)")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip stocks already in data/a_shares/daily/")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -65,6 +93,8 @@ def main():
 
     if args.stocks:
         codes = [c.strip() for c in args.stocks.split(",")]
+    elif args.all_stocks:
+        codes = get_all_a_share_codes()
     elif args.indices:
         codes = get_stock_codes(args.indices.split(","))
     else:
@@ -74,8 +104,15 @@ def main():
         logger.error("No stock codes to download.")
         sys.exit(1)
 
+    n_skipped = 0
+    if args.skip_existing:
+        codes, existing = filter_existing(codes, cfg.project.data_dir)
+        n_skipped = len(existing)
+        logger.info("Skipping %d already-downloaded stocks, %d to download",
+                     n_skipped, len(codes))
+
     logger.info("Downloading %d stocks from %s to %s", len(codes), start_date, end_date)
-    success, fail, skip = 0, 0, 0
+    success, fail = 0, 0
 
     for i, code in enumerate(codes):
         if i > 0:
@@ -96,7 +133,7 @@ def main():
                      dates.max().strftime("%Y-%m-%d"))
         success += 1
 
-    logger.info("Done: %d success, %d fail, %d skip", success, fail, skip)
+    logger.info("Done: %d success, %d fail, %d skip", success, fail, n_skipped)
 
 
 if __name__ == "__main__":
