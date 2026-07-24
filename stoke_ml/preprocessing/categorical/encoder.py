@@ -68,7 +68,7 @@ class ConceptBlockEncoder(PreprocessingStep):
         )
         return self
 
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    def transform(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         if df.empty:
             return df
         df = df.copy()
@@ -136,6 +136,7 @@ class ConceptBlockEncoder(PreprocessingStep):
             df["board_count"] = (
                 df.groupby(["date", "stock_code"])["board_name"]
                 .transform("size")
+                .fillna(0)
                 .astype(np.int16)
             )
 

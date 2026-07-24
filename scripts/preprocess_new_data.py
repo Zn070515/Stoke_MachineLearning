@@ -159,6 +159,9 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
             raw = source.load(code, args.start, args.end)
             if raw.empty:
                 continue
+            # Inject stock_code when missing or all-NaN (data quality fix)
+            if "stock_code" not in raw.columns or raw["stock_code"].isna().all():
+                raw["stock_code"] = code
             # Load K-line daily data for market-cap context features
             daily_data = None
             try:
@@ -189,6 +192,8 @@ def _process_board(chain, stock_list, data_dir, args):
         for code in stock_list:
             pdf = pool_storage.load(code, args.start, args.end)
             if not pdf.empty:
+                if "stock_code" not in pdf.columns or pdf["stock_code"].isna().all():
+                    pdf["stock_code"] = code
                 frames.append(pdf)
         if frames:
             pools[pool_name] = pd.concat(frames, ignore_index=True)
@@ -251,7 +256,7 @@ def _process_board(chain, stock_list, data_dir, args):
                 dest.save(processed)
                 total += len(processed)
         except Exception:
-            logger.debug("board preprocessing failed for %s", code, exc_info=True)
+            logger.warning("board preprocessing failed for %s", code, exc_info=True)
 
     logger.info("  board: %d rows saved (%.1fs)", total, time.time() - t0)
 
