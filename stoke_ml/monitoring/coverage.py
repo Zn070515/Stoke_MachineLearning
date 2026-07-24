@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 _SOURCE_DIRS = {
     "sentiment": "sentiment",
     "guba": "guba_sentiment",
-    "xueqiu": "xueqiu_sentiment",
     "comment": "comment_sentiment",
     "announcement": "announcement_sentiment",
 }
@@ -29,8 +28,6 @@ _SOURCE_STD_COLS = {
                   "positive_ratio", "negative_ratio", "has_news"],
     "guba": ["guba_sentiment_mean", "guba_sentiment_std", "guba_post_count",
              "guba_positive_ratio", "guba_negative_ratio", "has_guba_post"],
-    "xueqiu": ["xueqiu_sentiment_mean", "xueqiu_sentiment_std", "xueqiu_post_count",
-               "xueqiu_positive_ratio", "xueqiu_negative_ratio", "has_xueqiu_post"],
 }
 
 
@@ -162,7 +159,6 @@ class CoverageMonitor:
         candidates = {
             "sentiment": "sentiment_mean",
             "guba": "guba_sentiment_mean",
-            "xueqiu": "xueqiu_sentiment_mean",
         }
         col = candidates.get(source)
         return col if col and col in df.columns else None

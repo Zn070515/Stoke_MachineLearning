@@ -25,7 +25,6 @@ from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.fundamental_storage import FundamentalStorage
 from stoke_ml.data.etf_storage import ETFStorage
 from stoke_ml.data.stock_sector_mapper import StockSectorMapper
-from stoke_ml.data.xueqiu_storage import XueqiuStorage
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.features.pipeline import FeaturePipeline
@@ -46,8 +45,6 @@ def _load_aux_data(code, date_start, date_end, data_dir):
     result = {}
     for key, loader in [
         ("sentiment", lambda: NewsStorage(data_dir).load_daily_sentiment(
-            code, date_start, date_end)),
-        ("xueqiu", lambda: XueqiuStorage(data_dir).load_daily_sentiment(
             code, date_start, date_end)),
         ("guba", lambda: GubaStorage(data_dir).load_daily_sentiment(
             code, date_start, date_end)),
@@ -91,7 +88,6 @@ def _build_features(df, aux, cfg, use_new_preprocessing, pp):
         use_announcements=False,
         use_guba=True,
         use_comment=False,
-        use_xueqiu=True,
         use_margin=False,
         use_northbound=False,
         use_dragon_tiger=False,
@@ -105,7 +101,6 @@ def _build_features(df, aux, cfg, use_new_preprocessing, pp):
     X, y, _ = pipeline.build_features(
         df,
         sentiment_df=aux.get("sentiment"),
-        xueqiu_df=aux.get("xueqiu"),
         guba_df=aux.get("guba"),
         comment_df=aux.get("comment"),
         margin_df=aux.get("margin"),

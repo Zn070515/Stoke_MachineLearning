@@ -21,7 +21,6 @@ from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.stock_sector_mapper import StockSectorMapper
-from stoke_ml.data.xueqiu_storage import XueqiuStorage
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.evaluation.splitter import WalkForwardSplitter
@@ -149,7 +148,7 @@ def main():
         use_scoring=cfg.features.rule_based_scoring,
         use_temporal=cfg.features.temporal_features,
         use_sentiment=True, use_announcements=False,
-        use_guba=True, use_comment=False, use_xueqiu=True,
+        use_guba=True, use_comment=False,
         use_margin=False, use_northbound=False,
         use_dragon_tiger=False, use_fundamental=False,
         use_etf_flow=False, use_interaction=False,
@@ -180,8 +179,6 @@ def main():
         for key, loader_fn in [
             ("sentiment", lambda c=code: _safe_load(
                 NewsStorage(data_dir).load_daily_sentiment, c, date_start, date_end)),
-            ("xueqiu", lambda c=code: _safe_load(
-                XueqiuStorage(data_dir).load_daily_sentiment, c, date_start, date_end)),
             ("guba", lambda c=code: _safe_load(
                 GubaStorage(data_dir).load_daily_sentiment, c, date_start, date_end)),
         ]:
@@ -195,7 +192,7 @@ def main():
         try:
             X, y_abs, _, dates = pipeline.build_features(
                 df, sentiment_df=aux.get("sentiment"),
-                guba_df=aux.get("guba"), xueqiu_df=aux.get("xueqiu"),
+                guba_df=aux.get("guba"),
                 return_dates=True,
             )
         except Exception as e:

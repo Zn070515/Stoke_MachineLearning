@@ -16,8 +16,6 @@ data/a_shares/
 ├── news_sentiment/{year}/{month}/{stock}.parquet 日聚合新闻情感
 ├── guba_raw/{stock}.parquet                     股吧原始帖 (已弃用, body覆盖率14.3%)
 ├── guba_sentiment/{year}/{month}/{stock}.parquet 股吧日聚合情感
-├── xueqiu_raw/{stock}.parquet                   雪球论坛原始帖 (245 stocks, 66,044 posts)
-├── xueqiu_sentiment/{year}/{month}/{stock}.parquet 雪球日聚合情感
 ├── comment/{year}/{month}/{stock}.parquet       AKShare市场评论分
 ├── dragon_tiger/{year}/{month}/{stock}.parquet  龙虎榜数据
 ├── margin/{year}/{month}/{stock}.parquet        融资融券数据
@@ -82,13 +80,10 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_data.py
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --source all --max-pages 5
 ```
 
-### 论坛情感 (雪球/Guba)
+### 论坛情感 (Guba)
 
 ```bash
-# 雪球论坛 (Playwright绕过WAF, Guba替代方案)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py --max-pages 20
-
-# 股吧 (已弃用 — body被WAF拦截, 仅保留历史数据)
+# 股吧 (词典情感 fallback — body被WAF拦截)
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_guba.py --max-pages 10
 ```
 
@@ -153,7 +148,6 @@ FeaturePipeline 支持 **14个辅助维度** (全部左连接 + ZI填充 + PIT l
 | sentiment (新闻) | `use_sentiment` | 6 | 中 | 东方财富+新浪+同花顺 |
 | guba (论坛) | `use_guba` | 6 | 高(post)/低(body) | 东财股吧 |
 | comment (评论) | `use_comment` | 5 | 中 | AKShare |
-| xueqiu (论坛) | `use_xueqiu` | 6 | 中 | 雪球 (Playwright) |
 | announcement (公告) | `use_announcements` | 6 | 低 | AKShare |
 | margin (融资融券) | `use_margin` | 4 | 高 | AKShare |
 | northbound (北向) | `use_northbound` | 2 | 中 | AKShare |

@@ -40,7 +40,7 @@ class RobustScaler(PreprocessingStep):
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         skip = {"is_limit_up", "is_limit_down", "is_neutral",
                 "is_bull", "is_bear", "has_news", "has_guba_post",
-                "has_xueqiu_post", "has_announce", "has_comment",
+                "has_announce", "has_comment",
                 "date_day", "date_month", "date_weekday"}
         skip |= {c for c in df.columns if c.startswith("has_gap_")}
         for c in df.columns:

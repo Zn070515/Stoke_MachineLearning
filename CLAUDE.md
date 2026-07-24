@@ -26,9 +26,6 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_guba.py --max-pages 10
 # Download AKShare comment sentiment (5184 stocks)
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_comment.py
 
-# Download Xueqiu forum posts (Guba alternative, Playwright required)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_xueqiu.py --max-pages 20
-
 # Download market data (margin/northbound/dragon_tiger)
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_market_data.py --type all
 
@@ -81,7 +78,6 @@ Each source implements `AShareSourceBase` and has a `SOURCE_NAME` string. Circui
 - `DataStorage` — K-line, `daily/{year}/{month}/{stock}.parquet` (also flat `daily/{code}.parquet`)
 - `NewsStorage` — news articles (3-source aggregation via `NewsPipeline`)
 - `GubaStorage` — forum posts, dedup by `post_id`, columns: `guba_sentiment_mean/std/count/positive_ratio/negative_ratio/has_guba_post` (body coverage: 14.3%, detail page blocked)
-- `XueqiuStorage` — Xueqiu forum posts (Guba alternative), Playwright WAF bypass, columns: `xueqiu_sentiment_mean/std/count/positive_ratio/negative_ratio/has_xueqiu_post`
 - `CommentStorage` — AKShare comment ratings, `build_features()` returns daily ZI-filled features
 - `AnnouncementStorage` — company announcements + sentiment
 - `MarketWideStorage` — dragon_tiger/margin/northbound, partitioned `{type}/{year}/{month}/{stock}.parquet`
@@ -106,7 +102,6 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
 | sentiment (news) | `use_sentiment` | 6 | medium |
 | guba (forum) | `use_guba` | 6 | high (posts), low (body) |
 | comment (ratings) | `use_comment` | 5 | medium |
-| xueqiu (forum) | `use_xueqiu` | 6 | medium (Playwright) |
 | announcement | `use_announcements` | 6 | low |
 | margin trading | `use_margin` | 4 | high |
 | northbound | `use_northbound` | 2 | medium |
@@ -174,8 +169,7 @@ Key settings: `features.seq_len=60`, `features.target_horizon=1`, `training.vali
 
 | Issue | Status |
 |---|---|
-| Guba post bodies unavailable (detail page SPA, WAF-blocked) | Replaced by Xueqiu forum source |
-| Xueqiu news source (Cloudflare WAF) | Resolved — Playwright bypass works, used as forum data
+| Guba post bodies unavailable (detail page SPA, WAF-blocked) | Using lexicon-based sentiment fallback for body text |
 | ALL config dimension explosion (24,300 features) | Use +sentiment instead |
 | FinBERT first load needs network or pre-cached model | Use `HF_ENDPOINT=https://hf-mirror.com` |
 | Ablation Δ CIs cross zero (need >100 stocks or stronger signal) | Active research |

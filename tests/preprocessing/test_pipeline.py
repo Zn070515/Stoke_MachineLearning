@@ -113,10 +113,10 @@ class TestPreprocessingPipeline:
 
     def test_multiple_chains(self):
         pp = PreprocessingPipeline()
-        pp.register_chain("xueqiu", PreprocessingChain(
-            [BipolarClassifier()], name="xueqiu"
+        pp.register_chain("news", PreprocessingChain(
+            [BipolarClassifier()], name="news"
         ))
         pp.register_chain("guba", PreprocessingChain(
             [BipolarClassifier()], name="guba"
         ))
-        assert set(pp.list_chains()) == {"guba", "xueqiu"}
+        assert set(pp.list_chains()) == {"guba", "news"}

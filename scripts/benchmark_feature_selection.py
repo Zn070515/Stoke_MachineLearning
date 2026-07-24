@@ -28,7 +28,6 @@ from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.fundamental_storage import FundamentalStorage
 from stoke_ml.data.etf_storage import ETFStorage
 from stoke_ml.data.stock_sector_mapper import StockSectorMapper
-from stoke_ml.data.xueqiu_storage import XueqiuStorage
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.features.pipeline import FeaturePipeline
@@ -56,13 +55,6 @@ def _load_aux_data(code, date_start, date_end, data_dir):
         )
     except Exception:
         sentiment = empty
-
-    try:
-        xueqiu = XueqiuStorage(data_dir).load_daily_sentiment(
-            code, date_start, date_end
-        )
-    except Exception:
-        xueqiu = empty
 
     try:
         guba = GubaStorage(data_dir).load_daily_sentiment(
@@ -114,7 +106,6 @@ def _load_aux_data(code, date_start, date_end, data_dir):
 
     return {
         "sentiment": sentiment if not sentiment.empty else None,
-        "xueqiu": xueqiu if not xueqiu.empty else None,
         "guba": guba if not guba.empty else None,
         "comment": comment if not comment.empty else None,
         "margin": margin if not margin.empty else None,
@@ -141,7 +132,6 @@ def _build_features_for_config(df, aux, cfg_name, cfg):
         use_announcements=cfg_name in ("all", "all_mi", "all_mi_sfs"),
         use_guba=cfg_name in ("all", "all_mi", "all_mi_sfs"),
         use_comment=cfg_name in ("all", "all_mi", "all_mi_sfs"),
-        use_xueqiu=cfg_name in ("all", "all_mi", "all_mi_sfs"),
         use_margin=cfg_name in ("all", "all_mi", "all_mi_sfs"),
         use_northbound=cfg_name in ("all", "all_mi", "all_mi_sfs"),
         use_dragon_tiger=cfg_name in ("all", "all_mi", "all_mi_sfs"),
@@ -153,7 +143,6 @@ def _build_features_for_config(df, aux, cfg_name, cfg):
     X, y, _ = pipeline.build_features(
         df,
         sentiment_df=aux.get("sentiment"),
-        xueqiu_df=aux.get("xueqiu"),
         guba_df=aux.get("guba"),
         comment_df=aux.get("comment"),
         margin_df=aux.get("margin"),

@@ -1,6 +1,6 @@
 """PreprocessingPipeline: orchestration engine for preprocessing chains.
 
-Chains are registered per source (e.g. 'xueqiu', 'news') and can be run
+Chains are registered per source (e.g. 'news', 'guba') and can be run
 independently.  The pipeline is configuration-driven and compatible with
 both the existing FeaturePipeline and a future backtesting system.
 """
@@ -21,8 +21,8 @@ class PreprocessingPipeline:
 
     Usage:
         pp = PreprocessingPipeline()
-        pp.register_chain("xueqiu", text_chain)
-        clean = pp.run("xueqiu", raw_posts, stock_code="000001")
+        pp.register_chain("news", text_chain)
+        clean = pp.run("news", raw_articles, stock_code="000001")
     """
 
     def __init__(self):

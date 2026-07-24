@@ -51,7 +51,6 @@ def load_aux_data(
     """
     from stoke_ml.data.news_storage import NewsStorage
     from stoke_ml.data.guba_storage import GubaStorage
-    from stoke_ml.data.xueqiu_storage import XueqiuStorage
     from stoke_ml.data.market_wide_storage import MarketWideStorage
     from stoke_ml.data.fundamental_storage import FundamentalStorage
     from stoke_ml.data.comment_storage import CommentStorage
@@ -111,16 +110,6 @@ def load_aux_data(
                 result[code]["guba"] = df
     except Exception:
         logger.warning("Guba data not available, skipping")
-
-    # --- Xueqiu ---
-    try:
-        xs = XueqiuStorage(data_dir)
-        for code in stock_list:
-            df = xs.load_daily_sentiment(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["xueqiu"] = df
-    except Exception:
-        logger.warning("Xueqiu data not available, skipping")
 
     # --- Comment ---
     try:
@@ -500,7 +489,7 @@ def main():
         use_sentiment=True, use_announcements=True,
         use_guba=True, use_comment=True, use_margin=True,
         use_northbound=True, use_dragon_tiger=True,
-        use_fundamental=True, use_etf_flow=True, use_xueqiu=True,
+        use_fundamental=True, use_etf_flow=True,
         use_capital_flow=True, use_block_trade=True,
         use_shareholder=True, use_lockup=True, use_dividend=True,
         use_valuation=True,

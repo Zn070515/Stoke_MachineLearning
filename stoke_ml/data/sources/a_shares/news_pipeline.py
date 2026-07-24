@@ -1,7 +1,4 @@
-"""Multi-source news pipeline aggregating Sina and THS news.
-
-Xueqiu is currently blocked by Cloudflare WAF and skipped by default.
-"""
+"""Multi-source news pipeline aggregating Sina and THS news."""
 import logging
 
 import pandas as pd
@@ -11,8 +8,6 @@ from stoke_ml.data.sources.a_shares.ths_source import THSNewsSource
 
 logger = logging.getLogger(__name__)
 
-# Xueqiu removed from defaults — Cloudflare WAF blocks both Playwright
-# and curl_cffi impersonation as of 2026-06.
 SOURCE_MAP = {
     "sina": SinaNewsSource,
     "ths": THSNewsSource,

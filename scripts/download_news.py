@@ -4,7 +4,7 @@ Usage:
   python scripts/download_news.py                              # all stocks, all sources
   python scripts/download_news.py --stocks 000001,600519       # specific stocks
   python scripts/download_news.py --source sina                # single source
-  python scripts/download_news.py --source xueqiu,ths,sina     # selected sources
+  python scripts/download_news.py --source ths,sina       # selected sources
   python scripts/download_news.py --max-pages 5 --sleep 1      # deeper, faster
   python scripts/download_news.py --concurrent                 # parallel download
   python scripts/download_news.py --skip-sentiment             # raw only
@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--stocks", type=str, default=None,
                         help="Comma-separated stock codes (default: all on disk)")
     parser.add_argument("--source", type=str, default="all",
-                        help="News source(s): sina, xueqiu, ths, all (default: all)")
+                        help="News source(s): sina, ths, all (default: all)")
     parser.add_argument("--max-pages", type=int, default=20,
                         help="Pages per stock per source (default: 20)")
     parser.add_argument("--sleep", type=float, default=None,
@@ -111,7 +111,7 @@ def main():
     news_pipeline = NewsPipeline(active_sources=active_sources)
     analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer(force_lexicon=True)
 
-    source_label = args.source if args.source != "all" else "sina+xueqiu+ths"
+    source_label = args.source if args.source != "all" else "sina+ths"
     mode_label = "concurrent" if args.concurrent else "sequential"
     logger.info(
         "Downloading news for %d stocks (sources=%s, max_pages=%d, sleep=%.1fs, %s)",

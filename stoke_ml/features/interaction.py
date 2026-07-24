@@ -13,7 +13,6 @@ import pandas as pd
 _SENTIMENT_PAIRS = [
     ("sentiment_mean", "news"),
     ("guba_sentiment_mean", "guba"),
-    ("xueqiu_sentiment_mean", "xueqiu"),
     ("ann_sentiment_mean", "ann"),
 ]
 

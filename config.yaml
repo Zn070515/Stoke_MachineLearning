@@ -88,7 +88,6 @@ evaluation:
 # News source configuration
 news_sources:
   sina: true
-  xueqiu: true
   ths: true
 
 # Market data types to download

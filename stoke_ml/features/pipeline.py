@@ -52,11 +52,6 @@ COMMENT_COLS = [
     "comment_trend", "has_comment",
 ]
 
-XUEQIU_COLS = [
-    "xueqiu_sentiment_mean", "xueqiu_sentiment_std", "xueqiu_post_count",
-    "xueqiu_positive_ratio", "xueqiu_negative_ratio", "has_xueqiu_post",
-]
-
 FUNDAMENTAL_COLS = [
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
@@ -162,7 +157,6 @@ class FeaturePipeline:
         use_fundamental: bool = True,
         use_valuation: bool = True,
         use_etf_flow: bool = True,
-        use_xueqiu: bool = True,
         use_interaction: bool = True,
         use_feature_selection: bool = False,
         use_capital_flow: bool = False,
@@ -196,7 +190,6 @@ class FeaturePipeline:
         self.use_fundamental = use_fundamental
         self.use_valuation = use_valuation
         self.use_etf_flow = use_etf_flow
-        self.use_xueqiu = use_xueqiu
         self.use_interaction = use_interaction
         self.use_feature_selection = use_feature_selection
         self.use_capital_flow = use_capital_flow
@@ -282,7 +275,6 @@ class FeaturePipeline:
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
-        xueqiu_df: pd.DataFrame | None = None,
         capital_flow_df: pd.DataFrame | None = None,
         block_trade_df: pd.DataFrame | None = None,
         shareholder_df: pd.DataFrame | None = None,
@@ -303,7 +295,7 @@ class FeaturePipeline:
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
-            announcement_df, guba_df, comment_df, xueqiu_df,
+            announcement_df, guba_df, comment_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
             macro_df=macro_df, industry_df=industry_df,
@@ -424,7 +416,6 @@ class FeaturePipeline:
         announcement_df: pd.DataFrame | None = None,
         guba_df: pd.DataFrame | None = None,
         comment_df: pd.DataFrame | None = None,
-        xueqiu_df: pd.DataFrame | None = None,
         capital_flow_df: pd.DataFrame | None = None,
         block_trade_df: pd.DataFrame | None = None,
         shareholder_df: pd.DataFrame | None = None,
@@ -453,7 +444,6 @@ class FeaturePipeline:
         df = self._merge_etf_flow(df, etf_flow_df)
         df = self._merge_guba(df, guba_df)
         df = self._merge_comment(df, comment_df)
-        df = self._merge_xueqiu(df, xueqiu_df)
 
         # New multi-shape preprocessing
         df = self._merge_capital_flow(df, capital_flow_df)
@@ -506,7 +496,6 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, ETF_FLOW_COLS)
             temporal_cols += _active_cols(df, GUBA_COLS)
             temporal_cols += _active_cols(df, COMMENT_COLS)
-            temporal_cols += _active_cols(df, XUEQIU_COLS)
             # New multi-shape columns (dynamic — pick up whatever was merged)
             temporal_cols += _active_cols(df, FLOW_COLS)
             temporal_cols += _active_cols(df, BLOCK_TRADE_COLS)
@@ -764,25 +753,6 @@ class FeaturePipeline:
         # Guard: ensure has_comment exists (may be absent in sparse comment data)
         if "has_comment" not in df.columns:
             df["has_comment"] = df.get("comment_score", pd.Series(dtype=float)).notna()
-        return df
-
-    def _merge_xueqiu(self, df: pd.DataFrame,
-                      xueqiu_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_xueqiu:
-            return df
-        if xueqiu_df is None or xueqiu_df.empty:
-            self._warn_if_missing("xueqiu")
-            return df
-        x = xueqiu_df.copy()
-        x["date"] = pd.to_datetime(x["date"])
-        available = [c for c in XUEQIU_COLS if c in x.columns]
-        extra = [c for c in x.columns
-                 if c not in XUEQIU_COLS and c not in ("date", "stock_code")
-                 and not c.startswith("has_")]
-        if not available and not extra:
-            return df
-        df = df.merge(x[["date"] + available + extra], on="date", how="left")
-        _batch_fill_shift(df, available + extra)
         return df
 
     # ── Multi-shape preprocessing merge methods ──────────────────────
@@ -1142,7 +1112,7 @@ class FeaturePipeline:
             panel: multi-stock DataFrame with columns date, stock_code, OHLCV.
             target_col: column name for close price.
             aux_data: optional dict stock_code → {aux_type: DataFrame}.
-                      aux_type keys: "sentiment", "guba", "xueqiu", "comment",
+                      aux_type keys: "sentiment", "guba", "comment",
                       "announcement", "margin", "northbound", "dragon_tiger",
                       "fundamental", "etf_flow", "capital_flow", "block_trade",
                       "shareholder", "lockup", "dividend", "board", "sector", "concept".
@@ -1167,7 +1137,6 @@ class FeaturePipeline:
                 df_stock,
                 sentiment_df=stock_aux.get("sentiment"),
                 guba_df=stock_aux.get("guba"),
-                xueqiu_df=stock_aux.get("xueqiu"),
                 comment_df=stock_aux.get("comment"),
                 announcement_df=stock_aux.get("announcement"),
                 margin_df=stock_aux.get("margin"),
@@ -1607,9 +1576,6 @@ _PAST_OBSERVED_COLS = [
     # Guba
     "guba_sentiment_mean", "guba_sentiment_std",
     "guba_positive_ratio", "guba_negative_ratio", "guba_post_count",
-    # Xueqiu
-    "xueqiu_sentiment_mean", "xueqiu_sentiment_std",
-    "xueqiu_positive_ratio", "xueqiu_negative_ratio", "xueqiu_post_count",
     # Comment
     "comment_score", "comment_attention", "comment_institution", "comment_trend",
     # Announcement

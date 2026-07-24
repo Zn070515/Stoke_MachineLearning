@@ -157,7 +157,7 @@ def main():
         use_scoring=cfg.features.rule_based_scoring,
         use_temporal=cfg.features.temporal_features,
         use_sentiment=False, use_announcements=False,
-        use_guba=False, use_comment=False, use_xueqiu=False,
+        use_guba=False, use_comment=False,
         use_margin=False, use_northbound=False,
         use_dragon_tiger=False, use_fundamental=False,
         use_etf_flow=False, use_interaction=False,

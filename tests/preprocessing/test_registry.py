@@ -22,7 +22,7 @@ class TestFeatureDefinition:
             name="bipolar_sent",
             display_name="牛熊净情感",
             category="text_sentiment",
-            source="xueqiu",
+            source="guba",
             dtype="float32",
             value_range=(-1.0, 1.0),
             parents=["sentiment_title"],
@@ -30,17 +30,17 @@ class TestFeatureDefinition:
             step_version="1.0.0",
             baseline_stats={"mean": 0.05, "std": 0.3},
             calibration_date="2026-01-01",
-            tags=["ablation=xueqiu", "lag=1", "window=daily"],
+            tags=["ablation=guba", "lag=1", "window=daily"],
         )
         assert fd.value_range == (-1.0, 1.0)
-        assert "ablation=xueqiu" in fd.tags
+        assert "ablation=guba" in fd.tags
         assert len(fd.parents) == 1
 
     def test_to_dict_roundtrip(self):
         fd = FeatureDefinition(
             name="agreement",
             category="text_sentiment",
-            source="xueqiu",
+            source="guba",
             step_version="1.0.0",
         )
         d = fd.to_dict()
@@ -72,10 +72,10 @@ class TestFeatureRegistry:
 
     def test_get_by_group_tag(self):
         reg = FeatureRegistry()
-        reg.register(FeatureDefinition(name="f1", category="text", tags=["ablation=xueqiu", "lag=1"]))
+        reg.register(FeatureDefinition(name="f1", category="text", tags=["ablation=guba", "lag=1"]))
         reg.register(FeatureDefinition(name="f2", category="text", tags=["ablation=guba", "lag=1"]))
-        reg.register(FeatureDefinition(name="f3", category="numeric", tags=["ablation=xueqiu", "scaled"]))
-        xq = reg.get_by_group("ablation=xueqiu")
+        reg.register(FeatureDefinition(name="f3", category="numeric", tags=["ablation=guba", "scaled"]))
+        xq = reg.get_by_group("ablation=guba")
         assert sorted(xq) == ["f1", "f3"]
 
     def test_get_by_group_no_match(self):
@@ -85,10 +85,10 @@ class TestFeatureRegistry:
 
     def test_get_by_source(self):
         reg = FeatureRegistry()
-        reg.register(FeatureDefinition(name="f1", category="text", source="xueqiu"))
+        reg.register(FeatureDefinition(name="f1", category="text", source="guba"))
         reg.register(FeatureDefinition(name="f2", category="text", source="guba"))
-        reg.register(FeatureDefinition(name="f3", category="text", source="xueqiu"))
-        assert sorted(reg.get_by_source("xueqiu")) == ["f1", "f3"]
+        reg.register(FeatureDefinition(name="f3", category="text", source="guba"))
+        assert sorted(reg.get_by_source("guba")) == ["f1", "f3"]
 
     def test_validate_matrix_passes_for_matching_columns(self):
         reg = FeatureRegistry()
@@ -110,8 +110,8 @@ class TestFeatureRegistry:
         reg = FeatureRegistry()
         reg.register(FeatureDefinition(
             name="bipolar_sent", category="text_sentiment",
-            source="xueqiu", step_version="1.0.0",
-            value_range=(-1.0, 1.0), tags=["ablation=xueqiu"],
+            source="guba", step_version="1.0.0",
+            value_range=(-1.0, 1.0), tags=["ablation=guba"],
         ))
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "test_registry.json"
@@ -120,7 +120,7 @@ class TestFeatureRegistry:
             fd = reg2.get("bipolar_sent")
             assert fd is not None
             assert fd.value_range == (-1.0, 1.0)
-            assert "ablation=xueqiu" in fd.tags
+            assert "ablation=guba" in fd.tags
 
     def test_load_nonexistent_returns_empty(self):
         reg = FeatureRegistry.load("/tmp/nonexistent_registry_12345.json")
@@ -144,12 +144,12 @@ class TestFeatureRegistry:
         reg = FeatureRegistry()
         reg.register(FeatureDefinition(
             name="bipolar_sent", category="text_sentiment",
-            source="xueqiu", parents=["sentiment_title"],
+            source="guba", parents=["sentiment_title"],
             transformations=["bipolar_classify"],
         ))
         lineage = reg.export_lineage("json")
         data = json.loads(lineage)
-        assert data["bipolar_sent"]["source"] == "xueqiu"
+        assert data["bipolar_sent"]["source"] == "guba"
         assert "sentiment_title" in data["bipolar_sent"]["parents"]
 
     def test_check_drift_detects_large_shift(self):

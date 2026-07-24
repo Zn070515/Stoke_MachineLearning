@@ -17,7 +17,7 @@ class TestFullPipelineSmoke:
     """Run the full text + numeric chains on synthetic realistic data."""
 
     def test_text_chain_realistic(self):
-        """Simulate Xueqiu silver data: 500 posts over 2 years."""
+        """Simulate Guba silver data: 500 posts over 2 years."""
         rng = np.random.RandomState(42)
         n = 500
         dates = pd.date_range("2024-01-01", "2026-06-30", freq="D")
@@ -34,9 +34,9 @@ class TestFullPipelineSmoke:
             TimeDecayWeighter(halflife_days=7),
             DailyAggregator(windows=(3, 5, 10)),
         ], name="text_full")
-        pp.register_chain("xueqiu", chain)
+        pp.register_chain("guba", chain)
 
-        result = pp.run("xueqiu", df)
+        result = pp.run("guba", df)
 
         # Assert daily output
         assert "bipolar_sent" in result.columns

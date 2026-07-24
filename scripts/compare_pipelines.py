@@ -178,7 +178,7 @@ def _train_compare(code, gold_new, gold_legacy, source):
             use_guba=(source == "guba"),
             use_comment=False, use_margin=False, use_northbound=False,
             use_dragon_tiger=False, use_announcements=False,
-            use_fundamental=False, use_etf_flow=False, use_xueqiu=False,
+            use_fundamental=False, use_etf_flow=False,
         )
         X, y, _ = fp.build_features(ohlcv, **kwargs)
         if len(X) == 0:
