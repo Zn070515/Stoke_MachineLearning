@@ -26,6 +26,7 @@ build_panel_features(all_dfs):
   ... (existing cross-sectional normalization) ...
   [NEW] Cross-sectional fundamental features — sector-relative valuation,
         leverage warning (sector percentile), valuation composite z-score
+  [NEW] Feature selection — IC → correlation dedup → importance (per fold)
 ```
 
 Column lists replaced with dynamic discovery — code auto-detects available columns
@@ -39,8 +40,23 @@ touching `_PAST_KNOWN_COLS` / `_PAST_OBSERVED_COLS`.
 | PK (past known) | 221 | ~241 (+20 fundamental refined) |
 | PO base (past observed) | 32 | ~137 (+70 broad + ~35 emotion refined) |
 | PO temporal | 0 | ~200-270 (base × ~2.5 transform factor) |
+| Feature selection | - | Reduces PO ~30-40% (85→55, 340→~220) |
 | Dynamic has_* | ~16 | ~80+ (auto-generated per PO column) |
-| **Total** | **~253** | **~580** |
+| **Total (pre-selection)** | **~253** | **~580** |
+| **Total (post-selection)** | **~253** | **~400-450** |
+
+### Research Foundation
+
+Key findings from literature and open-source practice that inform this design:
+
+| Finding | Source | Implication for this design |
+|---------|--------|----------------------------|
+| 18,000 raw signals → Sharpe 1.02; curated signals → Sharpe 1.73-2.75 | [ScienceDirect 2025](https://www.sciencedirect.com/science/article/abs/pii/S0304405X25001461) | "精加工" approach is essential; raw column dump is counterproductive |
+| A-share VIF reaches 716.26; Lasso superior to CPCA for multicollinearity | [Mathematics 2025](https://www.mdpi.com/2227-7390/13/1/9) | Broad expansion needs Lasso pruning; correlation dedup is mandatory |
+| Multi-stage selection (IC→correlation→ML) achieves IC=0.065, 72% improvement | [Factor-Research 2025](https://github.com/mbrennan5/Factor-Research) | Add dedicated feature selection module (Module E) |
+| A-share consistently important factors: price changes, EPS, net assets, excess returns | [Mathematics 2025](https://www.mdpi.com/2227-7390/13/1/9) | Prioritize these factor families in refinement |
+| Alpha158 + community extensions validated across LightGBM, Transformer, RL | [Qlib ecosystem](https://github.com/microsoft/qlib) | Our Alpha158 base is solid; focus on PO-side innovation |
+| Dual-head (regression+classification) improves robustness | [IEEE 2025](https://ieeexplore.ieee.org/document/11206981) | Already implemented in VSN+xLSTM (direction+return+vol heads) |
 
 ---
 
@@ -114,6 +130,17 @@ discovery. Columns from each stock's engineered DataFrame are automatically
 classified as PK (from technical/scoring/temporal/fundamental modules) or
 PO (from merge methods). The `has_*` auto-generation is extended to cover all
 new PO columns.
+
+### 2.9 Multicollinearity Risk
+
+Broad expansion introduces ~70 new columns from correlated sources. A-share data
+is known to have severe multicollinearity (VIF up to 716). Mitigations:
+- Capital flow columns (main/mid/small/large net, their ratios) are mechanically
+  correlated — Module E's correlation filter will deduplicate.
+- Board market state columns (`market_state_*`) are one-hot encoded from a single
+  categorical variable — the `market_state_normal` column is dropped as baseline.
+- Industry ranking momentum columns at 4 horizons (5/20/60/252d) are
+  geometrically correlated — Module E will retain only the most predictive horizon.
 
 ---
 
@@ -268,14 +295,62 @@ Columns are auto-classified by prefix/name pattern:
 
 ---
 
-## 6. Integration Points
+## 6. Module E: Feature Selection Pipeline
 
-### 6.1 pipeline.py: Merge method expansion
+**Motivation:** Broad expansion + temporal transform pushes feature count past 500.
+The Factor-Research project demonstrated that multi-stage selection (IC →
+correlation → ML importance) achieves 72% improvement over linear baseline,
+and the ScienceDirect study showed raw signal dumps underperform curated signals.
+
+This module runs **once per fold** after `build_panel_features`, producing a
+feature mask that the training loop respects.
+
+### 6.1 Selection stages
+
+| Stage | Method | Threshold | Purpose |
+|-------|--------|-----------|---------|
+| IC Filter | \|Spearman RankIC\| > 0.01 | Keep if mean IC over last 252 days exceeds 0.01 | Remove zero-signal junk |
+| Correlation Dedup | Spearman ρ < 0.85 within block | Greedy: sort by IC, keep if corr with any kept feature < 0.85 | Remove redundant features |
+| Gradient Importance | LightGBM gain > 1st percentile | Train quick LightGBM, discard bottom 1% by gain | Final noise removal |
+
+### 6.2 Blocked correlation dedup
+
+Correlation filtering is applied within **feature blocks** (groups of naturally
+correlated features), not globally. This prevents accidentally removing the only
+representative of an important signal:
+
+| Block | Features | Max retained |
+|-------|----------|--------------|
+| Capital flow nets | main/mid/small/large/super net | 3 |
+| Capital flow ratios | main/mid/small/large/super ratio | 3 |
+| Sector momentum | momentum_5d/20d/60d/252d | 2 |
+| Board market state | market_state_* (one-hot) | All (one-hot, not redundant) |
+| Valuation | pe_ttm, pb_mrq, ps_ttm, pcf_ttm | 3 |
+| Sentiment | news_sent_*, guba_sent_* | 6 |
+| Temporal transforms | Same base column across windows | 2 per base |
+| Alpha158 rolling | Same stat across 5 windows | 3 per stat |
+
+### 6.3 Implementation
+
+- Lightweight, runs on CPU in < 30 seconds for 500 stocks
+- Feature mask is a boolean array, indexed by column name
+- Mask is applied before feeding data to VSN (columns not in mask are dropped
+  from PK/PO tensors)
+- Re-computed per fold to allow time-varying feature relevance
+- Logged: how many features survived each stage, top 20 by IC
+
+---
+
+---
+
+## 7. Integration Points
+
+### 7.1 pipeline.py: Merge method expansion
 
 Each `_merge_*` method's `suffix_cols` parameter gets the full column list from
 section 2. No logic change — just passing more column names.
 
-### 6.2 pipeline.py: _engineer_features insertion
+### 7.2 pipeline.py: _engineer_features insertion
 
 ```python
 def _engineer_features(self, df, ...):
@@ -298,12 +373,14 @@ def _engineer_features(self, df, ...):
     # ... existing temporal (lag + calendar) ...
 ```
 
-### 6.3 pipeline.py: Dynamic column discovery + cross-sectional features
+### 7.3 pipeline.py: Dynamic column discovery + cross-sectional features
 
 In `build_panel_features`:
 1. After assembling all stock DataFrames, compute cross-sectional fundamental
    features (sector-relative valuation, leverage warning).
-2. Replace hardcoded `_PAST_KNOWN_COLS` / `_PAST_OBSERVED_COLS` with dynamic
+2. Run feature selection (IC → correlation dedup → importance) producing a
+   feature mask respected by downstream consumers.
+3. Replace hardcoded `_PAST_KNOWN_COLS` / `_PAST_OBSERVED_COLS` with dynamic
    discovery.
 
 ```python
@@ -315,22 +392,24 @@ In `build_panel_features`:
 Column classification via prefix registry in each module (e.g., `EmotionRefiner`
 registers its output column prefixes).
 
-### 6.4 FeaturePipeline constructor flags
+### 7.4 FeaturePipeline constructor flags
 
 New optional flags defaulting to True:
 - `use_emotion_refine: bool = True`
 - `use_fundamental_refine: bool = True`
 - `use_temporal_stats: bool = True`
+- `use_feature_selection: bool = True`
 
 ---
 
-## 7. File Changes
+## 8. File Changes
 
 | File | Action | Scope |
 |------|--------|-------|
 | `stoke_ml/features/emotion.py` | **New** | `EmotionRefiner` class |
 | `stoke_ml/features/fundamental.py` | **New** | `FundamentalRefiner` class |
 | `stoke_ml/features/transform.py` | **New** | `TemporalTransformer` class |
+| `stoke_ml/features/selector.py` | **New** | `FeatureSelector` class (IC→correlation→importance) |
 | `stoke_ml/features/pipeline.py` | Modify | Merge method column expansion, insertion points, dynamic column discovery, new constructor flags |
 | `stoke_ml/features/__init__.py` | Modify | Export new classes (if needed) |
 
@@ -338,12 +417,15 @@ No changes to training scripts, model architecture, or data storage.
 
 ---
 
-## 8. Risk Mitigation
+## 9. Risk Mitigation
 
 | Risk | Mitigation |
 |------|-----------|
-| Column explosion → overfitting | VSN does per-feature gating; at ~580 dims this is within known working range |
+| Column explosion → overfitting | VSN does per-feature gating; Module E selection reduces ~580→~400; within known working range |
+| Multicollinearity from broad expansion (VIF up to 716 in A-share literature) | Blocked correlation dedup in Module E; Lasso-based pruning; greedy IC-sorted selection |
+| Feature selection "over-selects" | Per-fold recomputation; conservative thresholds (ρ<0.85, IC>0.01); survive-all for one-hot blocks |
 | Sparse data columns creating NaN floods | `has_*` flags for every PO column; ZI fill handles sparsity |
-| Piotroski F-score needs CFO (cash flow from ops) | Fallback to quality_composite if CFO unavailable |
+| Piotroski F-score needs CFO (cash flow from ops) | Fallback to quality_composite if CFO unavailable; skip individual F-score components that can't be computed |
 | Sector-relative valuation needs sector mapping | Use `industry_ranking_processed/sector_code` already in data |
 | Temporal transform multiplies columns → memory | Only apply to PO columns, not PK; use sliding_window_view for speed |
+| Selection is IC-leaking if computed on val period | Compute IC and LightGBM importance on training fold only; apply mask to val/test |
