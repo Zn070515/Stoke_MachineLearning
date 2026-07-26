@@ -162,14 +162,14 @@ class FeaturePipeline:
         use_etf_flow: bool = True,
         use_interaction: bool = True,
         use_feature_selection: bool = False,
-        use_capital_flow: bool = False,
-        use_block_trade: bool = False,
-        use_shareholder: bool = False,
-        use_lockup: bool = False,
-        use_dividend: bool = False,
-        use_board: bool = False,
-        use_sector: bool = False,
-        use_concept: bool = False,
+        use_capital_flow: bool = True,
+        use_block_trade: bool = True,
+        use_shareholder: bool = True,
+        use_lockup: bool = True,
+        use_dividend: bool = True,
+        use_board: bool = True,
+        use_sector: bool = True,
+        use_concept: bool = True,
         use_macro: bool = True,
         use_industry: bool = True,
         minute_mode: bool = False,
@@ -325,6 +325,88 @@ class FeaturePipeline:
             X = selector.fit_transform(X, y)
 
         return X, y, aligned_close
+
+    def engineer_features(
+        self,
+        df: pd.DataFrame,
+        sentiment_df: pd.DataFrame | None = None,
+        margin_df: pd.DataFrame | None = None,
+        northbound_df: pd.DataFrame | None = None,
+        dragon_tiger_df: pd.DataFrame | None = None,
+        fundamental_df: pd.DataFrame | None = None,
+        valuation_df: pd.DataFrame | None = None,
+        etf_flow_df: pd.DataFrame | None = None,
+        announcement_df: pd.DataFrame | None = None,
+        guba_df: pd.DataFrame | None = None,
+        comment_df: pd.DataFrame | None = None,
+        capital_flow_df: pd.DataFrame | None = None,
+        block_trade_df: pd.DataFrame | None = None,
+        shareholder_df: pd.DataFrame | None = None,
+        lockup_df: pd.DataFrame | None = None,
+        dividend_df: pd.DataFrame | None = None,
+        board_df: pd.DataFrame | None = None,
+        sector_df: pd.DataFrame | None = None,
+        concept_df: pd.DataFrame | None = None,
+        macro_df: pd.DataFrame | None = None,
+        industry_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Engineer features for a single stock, returning the full DataFrame.
+
+        Unlike ``build_features``, this does NOT slice into (X, y) sequences.
+        It returns the raw engineered daily DataFrame suitable for saving to
+        parquet and later fast loading.
+        """
+        return self._engineer_features(
+            df, sentiment_df, margin_df, northbound_df,
+            dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
+            announcement_df, guba_df, comment_df,
+            capital_flow_df, block_trade_df, shareholder_df,
+            lockup_df, dividend_df, board_df, sector_df, concept_df,
+            macro_df=macro_df, industry_df=industry_df,
+        )
+
+    def save_features(
+        self,
+        output_path: str,
+        df: pd.DataFrame,
+        sentiment_df: pd.DataFrame | None = None,
+        margin_df: pd.DataFrame | None = None,
+        northbound_df: pd.DataFrame | None = None,
+        dragon_tiger_df: pd.DataFrame | None = None,
+        fundamental_df: pd.DataFrame | None = None,
+        valuation_df: pd.DataFrame | None = None,
+        etf_flow_df: pd.DataFrame | None = None,
+        announcement_df: pd.DataFrame | None = None,
+        guba_df: pd.DataFrame | None = None,
+        comment_df: pd.DataFrame | None = None,
+        capital_flow_df: pd.DataFrame | None = None,
+        block_trade_df: pd.DataFrame | None = None,
+        shareholder_df: pd.DataFrame | None = None,
+        lockup_df: pd.DataFrame | None = None,
+        dividend_df: pd.DataFrame | None = None,
+        board_df: pd.DataFrame | None = None,
+        sector_df: pd.DataFrame | None = None,
+        concept_df: pd.DataFrame | None = None,
+        macro_df: pd.DataFrame | None = None,
+        industry_df: pd.DataFrame | None = None,
+    ) -> str:
+        """Engineer features and save to parquet. Returns output_path."""
+        feats = self._engineer_features(
+            df, sentiment_df, margin_df, northbound_df,
+            dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
+            announcement_df, guba_df, comment_df,
+            capital_flow_df, block_trade_df, shareholder_df,
+            lockup_df, dividend_df, board_df, sector_df, concept_df,
+            macro_df=macro_df, industry_df=industry_df,
+        )
+        feats.to_parquet(output_path, index=False, compression="lz4")
+        return output_path
+
+    @staticmethod
+    def load_features(path: str) -> pd.DataFrame:
+        """Load pre-built engineered features from parquet."""
+        import pandas as _pd
+        return _pd.read_parquet(path)
 
     def build_features_from_panel(
         self,

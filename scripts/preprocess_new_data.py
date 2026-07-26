@@ -140,8 +140,11 @@ def main():
 def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     """Process standard per-stock data: load → transform → save.
 
-    Passes K-line data as ``daily_data`` kwarg so that market-cap
-    normalization and amount-ratio features can activate downstream.
+    Passes K-line data as ``close_prices`` + ``trading_dates`` so that
+    EventToDaily can forward-fill to daily and activate price-dependent
+    features (dual-concentration, MCap normalization, etc.).
+    ``daily_data`` is also passed for block_trade amount_ratio which
+    accesses it separately via **kwargs.
     """
     logger.info("=== %s: %d stocks (%s to %s) ===",
                 dtype, len(stock_list), args.start, args.end)
@@ -150,8 +153,13 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     output_key = args.save_to or f"{storage_key}_processed"
     dest = MarketWideStorage(data_dir, output_key)
 
+    from stoke_ml.data.calendar import TradingCalendar
     from stoke_ml.data.storage import DataStorage
     ds = DataStorage(data_dir)
+    calendar = TradingCalendar("a_shares")
+    trading_dates = pd.DatetimeIndex(
+        calendar.get_trading_days(args.start, args.end)
+    )
 
     total = 0
     for code in stock_list:
@@ -168,9 +176,16 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
             daily_data = None
             try:
                 daily_data = ds.load_daily(code, args.start, args.end)
+                if not daily_data.empty and "stock_code" not in daily_data.columns:
+                    daily_data["stock_code"] = code
             except Exception:
                 pass
-            processed = chain.fit_transform(raw, daily_data=daily_data)
+            processed = chain.fit_transform(
+                raw,
+                daily_data=daily_data,
+                close_prices=daily_data,
+                trading_dates=trading_dates,
+            )
             if not processed.empty:
                 dest.save(processed)
                 total += len(processed)

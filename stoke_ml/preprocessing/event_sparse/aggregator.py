@@ -130,13 +130,16 @@ class EventToDaily(PreprocessingStep):
 
         # Price impact (if close_prices available)
         if close_prices is not None and "premium_pct_wavg" in grouped.columns:
+            if "stock_code" not in close_prices.columns:
+                close_prices = close_prices.copy()
+                close_prices["stock_code"] = df["stock_code"].iloc[0]
             grouped = grouped.merge(
-                close_prices, on=["date", "stock_code"], how="left", suffixes=("", "_cp")
+                close_prices[["date", "stock_code", "close"]],
+                on=["date", "stock_code"], how="left",
             )
-            close_col = "close" if "close" in grouped.columns else "close_cp"
-            if close_col in grouped.columns:
+            if "close" in grouped.columns:
                 grouped["permanent_impact"] = (
-                    grouped.groupby("stock_code")[close_col]
+                    grouped.groupby("stock_code")["close"]
                     .pct_change()
                     .fillna(0)
                     .astype(np.float32)
@@ -144,8 +147,6 @@ class EventToDaily(PreprocessingStep):
                 grouped["temporary_impact"] = (
                     grouped["premium_pct_wavg"] - grouped["permanent_impact"]
                 ).astype(np.float32)
-                if close_col == "close_cp":
-                    grouped.drop(columns=["close_cp"], inplace=True)
 
         # Deep discount flag
         if "premium_pct_mean" in grouped.columns:
@@ -232,6 +233,9 @@ class EventToDaily(PreprocessingStep):
 
         # Dual-concentration signal (needs close prices from close_prices param)
         if close_prices is not None:
+            if "stock_code" not in close_prices.columns:
+                close_prices = close_prices.copy()
+                close_prices["stock_code"] = df["stock_code"].iloc[0]
             cp = close_prices[["date", "stock_code", "close"]].copy()
             df = df.merge(cp, on=["date", "stock_code"], how="left")
             if "close" in df.columns and "change_ratio" in df.columns:
@@ -292,6 +296,9 @@ class EventToDaily(PreprocessingStep):
 
             # Market-cap-normalized unlock impact (free_ratio × close)
             if close_prices is not None:
+                if "stock_code" not in close_prices.columns:
+                    close_prices = close_prices.copy()
+                    close_prices["stock_code"] = df["stock_code"].iloc[0]
                 cp = close_prices[["date", "stock_code", "close"]].copy()
                 upcoming = upcoming.merge(cp, on=["date", "stock_code"], how="left")
                 if "close" in upcoming.columns:
@@ -323,13 +330,16 @@ class EventToDaily(PreprocessingStep):
 
         # Historical lockup return
         if not hist.empty and close_prices is not None:
+            if "stock_code" not in close_prices.columns:
+                close_prices = close_prices.copy()
+                close_prices["stock_code"] = df["stock_code"].iloc[0]
             hist = hist.merge(
-                close_prices, on=["date", "stock_code"], how="left", suffixes=("", "_cp")
+                close_prices[["date", "stock_code", "close"]],
+                on=["date", "stock_code"], how="left",
             )
-            close_col = "close" if "close" in hist.columns else "close_cp"
-            if close_col in hist.columns:
+            if "close" in hist.columns:
                 hist["unlock_return_30d"] = (
-                    hist.groupby("stock_code")[close_col]
+                    hist.groupby("stock_code")["close"]
                     .transform(lambda s: s.shift(-30) / s - 1)
                     .fillna(0)
                     .astype(np.float32)
@@ -363,6 +373,9 @@ class EventToDaily(PreprocessingStep):
 
         # Merge close prices for yield computation
         if close_prices is not None and "bonus_rmb" in df.columns:
+            if "stock_code" not in close_prices.columns:
+                close_prices = close_prices.copy()
+                close_prices["stock_code"] = df["stock_code"].iloc[0]
             df = df.merge(
                 close_prices[["date", "stock_code", "close"]],
                 on=["date", "stock_code"],
@@ -436,8 +449,7 @@ class EventToDaily(PreprocessingStep):
         def _fill_group(grp):
             grp = grp.set_index("date").sort_index()
             grp = grp.reindex(trading_dates)
-            cols = [c for c in grp.columns if c not in ("stock_code",)]
-            grp[cols] = grp[cols].ffill(limit=max_ffill)
+            grp = grp.ffill(limit=max_ffill)
             return grp
 
         result = (
@@ -446,6 +458,8 @@ class EventToDaily(PreprocessingStep):
             .reset_index()
             .rename(columns={"index": "date"})
         )
+        # groupby strips stock_code from data columns — restore from original
+        result["stock_code"] = df["stock_code"].iloc[0]
         return result
 
 
