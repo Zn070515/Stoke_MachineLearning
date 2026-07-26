@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--event-type", type=str, default=None,
                         choices=["block_trade", "shareholder", "lockup", "dividend"],
                         help="Specific event type when --type=event")
-    parser.add_argument("--start", type=str, default="2015-01-01",
+    parser.add_argument("--start", type=str, default="2000-01-01",
                         help="Start date YYYY-MM-DD")
     parser.add_argument("--end", type=str, default=None,
                         help="End date YYYY-MM-DD")
