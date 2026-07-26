@@ -29,6 +29,37 @@ class EventToDaily(PreprocessingStep):
         forward_fill_max: max consecutive days to forward-fill before ZI.
     """
 
+    # Per-event-type column groups for event-time feature generation.
+    # {prefix}_days_since, {prefix}_count_20d, {prefix}_intensity_20d,
+    # {prefix}_last_direction are appended to the output.
+    _EVENT_TIME_SPEC: dict[str, dict] = {
+        "block_trade": {
+            "prefix": "bt",
+            "trigger_cols": ["trade_count", "premium_pct_wavg", "total_amount"],
+            "primary_col": "premium_pct_wavg",
+            "intensity_cols": ["trade_count", "total_amount", "premium_pct_wavg"],
+        },
+        "shareholder": {
+            "prefix": "sh",
+            "trigger_cols": ["HN_z", "change_ratio", "PCRC"],
+            "primary_col": "HN_z",
+            "intensity_cols": ["HN_z", "change_ratio", "PCRC"],
+        },
+        "lockup": {
+            "prefix": "lu",
+            "trigger_cols": ["unlock_pressure", "unlock_pressure_mcap",
+                             "unlock_count_upcoming"],
+            "primary_col": "unlock_pressure",
+            "intensity_cols": ["unlock_pressure", "unlock_pressure_mcap"],
+        },
+        "dividend": {
+            "prefix": "dv",
+            "trigger_cols": ["dividend_yield", "effective_yield", "bonus_rmb"],
+            "primary_col": "dividend_yield",
+            "intensity_cols": ["dividend_yield", "effective_yield"],
+        },
+    }
+
     def __init__(
         self,
         event_type: str,
@@ -118,9 +149,12 @@ class EventToDaily(PreprocessingStep):
             ).fillna(grouped.get("premium_pct_mean", 0)).astype(np.float32)
             grouped.drop(columns=["premium_pct_wavg_sum"], inplace=True)
 
+        # Snapshot raw event dates before ffill (for event-time features)
+        raw_dates = pd.DatetimeIndex(grouped["date"].unique()) if not grouped.empty else None
+
         # Fill to daily calendar
         if trading_dates is not None and not grouped.empty:
-            grouped = self._fill_to_daily(grouped, trading_dates, max_ffill=5)
+            grouped = self._fill_to_daily(grouped, trading_dates, max_ffill=self.forward_fill_max)
 
         # 6-day amount volatility
         if "total_amount" in grouped.columns:
@@ -130,9 +164,7 @@ class EventToDaily(PreprocessingStep):
 
         # Price impact (if close_prices available)
         if close_prices is not None and "premium_pct_wavg" in grouped.columns:
-            if "stock_code" not in close_prices.columns:
-                close_prices = close_prices.copy()
-                close_prices["stock_code"] = df["stock_code"].iloc[0]
+            close_prices = self._ensure_stock_code(close_prices, df)
             grouped = grouped.merge(
                 close_prices[["date", "stock_code", "close"]],
                 on=["date", "stock_code"], how="left",
@@ -177,6 +209,7 @@ class EventToDaily(PreprocessingStep):
         if "_weighted" in df.columns:
             df.drop(columns=["_weighted"], inplace=True)
 
+        grouped = self._add_event_time_features(grouped, raw_event_dates=raw_dates)
         return grouped
 
     # ── shareholder ────────────────────────────────────────────────────
@@ -227,15 +260,16 @@ class EventToDaily(PreprocessingStep):
                 .astype(np.float32)
             )
 
+        # Snapshot raw event dates before ffill
+        raw_dates = pd.DatetimeIndex(df["date"].unique()) if not df.empty else None
+
         # Forward-fill to daily
         if trading_dates is not None:
-            df = self._fill_to_daily(df, trading_dates, max_ffill=90)
+            df = self._fill_to_daily(df, trading_dates, max_ffill=self.forward_fill_max)
 
         # Dual-concentration signal (needs close prices from close_prices param)
         if close_prices is not None:
-            if "stock_code" not in close_prices.columns:
-                close_prices = close_prices.copy()
-                close_prices["stock_code"] = df["stock_code"].iloc[0]
+            close_prices = self._ensure_stock_code(close_prices, df)
             cp = close_prices[["date", "stock_code", "close"]].copy()
             df = df.merge(cp, on=["date", "stock_code"], how="left")
             if "close" in df.columns and "change_ratio" in df.columns:
@@ -247,6 +281,7 @@ class EventToDaily(PreprocessingStep):
                     (df["close"] < sma60) & (df["change_ratio"] < 0)
                 ).astype(np.int8)
 
+        df = self._add_event_time_features(df, raw_event_dates=raw_dates)
         return df
 
     # ── lockup ─────────────────────────────────────────────────────────
@@ -296,9 +331,7 @@ class EventToDaily(PreprocessingStep):
 
             # Market-cap-normalized unlock impact (free_ratio × close)
             if close_prices is not None:
-                if "stock_code" not in close_prices.columns:
-                    close_prices = close_prices.copy()
-                    close_prices["stock_code"] = df["stock_code"].iloc[0]
+                close_prices = self._ensure_stock_code(close_prices, df)
                 cp = close_prices[["date", "stock_code", "close"]].copy()
                 upcoming = upcoming.merge(cp, on=["date", "stock_code"], how="left")
                 if "close" in upcoming.columns:
@@ -330,9 +363,7 @@ class EventToDaily(PreprocessingStep):
 
         # Historical lockup return
         if not hist.empty and close_prices is not None:
-            if "stock_code" not in close_prices.columns:
-                close_prices = close_prices.copy()
-                close_prices["stock_code"] = df["stock_code"].iloc[0]
+            close_prices = self._ensure_stock_code(close_prices, df)
             hist = hist.merge(
                 close_prices[["date", "stock_code", "close"]],
                 on=["date", "stock_code"], how="left",
@@ -354,9 +385,14 @@ class EventToDaily(PreprocessingStep):
             return df
 
         result = pd.concat(result_parts, ignore_index=True)
-        if trading_dates is not None:
-            result = self._fill_to_daily(result, trading_dates, max_ffill=5)
 
+        # Snapshot raw event dates before ffill
+        raw_dates = pd.DatetimeIndex(result["date"].unique()) if not result.empty else None
+
+        if trading_dates is not None:
+            result = self._fill_to_daily(result, trading_dates, max_ffill=self.forward_fill_max)
+
+        result = self._add_event_time_features(result, raw_event_dates=raw_dates)
         return result
 
     # ── dividend ───────────────────────────────────────────────────────
@@ -373,9 +409,7 @@ class EventToDaily(PreprocessingStep):
 
         # Merge close prices for yield computation
         if close_prices is not None and "bonus_rmb" in df.columns:
-            if "stock_code" not in close_prices.columns:
-                close_prices = close_prices.copy()
-                close_prices["stock_code"] = df["stock_code"].iloc[0]
+            close_prices = self._ensure_stock_code(close_prices, df)
             df = df.merge(
                 close_prices[["date", "stock_code", "close"]],
                 on=["date", "stock_code"],
@@ -388,9 +422,12 @@ class EventToDaily(PreprocessingStep):
         elif "bonus_rmb" in df.columns:
             df["dividend_yield"] = df["bonus_rmb"].astype(np.float32)
 
+        # Snapshot raw event dates before ffill
+        raw_dates = pd.DatetimeIndex(df["date"].unique()) if not df.empty else None
+
         # Forward-fill to daily
         if trading_dates is not None:
-            df = self._fill_to_daily(df, trading_dates, max_ffill=30)
+            df = self._fill_to_daily(df, trading_dates, max_ffill=self.forward_fill_max)
 
         # Effective yield with exponential decay (vectorized per group)
         if "dividend_yield" in df.columns:
@@ -435,16 +472,134 @@ class EventToDaily(PreprocessingStep):
                 .astype(np.float32)
             )
 
+        df = self._add_event_time_features(df, raw_event_dates=raw_dates)
         return df
 
     # ── helpers ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _ensure_stock_code(close_prices: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+        """Return *close_prices* with a ``stock_code`` column, copying if needed.
+
+        Callers must reassign the return value — it may be a copy or the
+        original, depending on whether ``stock_code`` was already present.
+        """
+        if "stock_code" not in close_prices.columns:
+            close_prices = close_prices.copy()
+            close_prices["stock_code"] = df["stock_code"].iloc[0]
+        return close_prices
+
+    def _add_event_time_features(
+        self, df: pd.DataFrame, *, raw_event_dates: "pd.DatetimeIndex | None" = None,
+    ) -> pd.DataFrame:
+        """Append event-time features for sparse event columns.
+
+        For each event type, computes (where *prefix* is e.g. bt/sh/lu/dv):
+
+        - ``{prefix}_days_since`` — trading days since last event
+        - ``{prefix}_count_20d`` — number of event days in past 20 trading days
+        - ``{prefix}_intensity_20d`` — sum of intensity columns over past 20 days
+        - ``{prefix}_last_direction`` — sign of primary column's last non-zero value
+
+        *raw_event_dates* must be passed when calling after ``_fill_to_daily``
+        to avoid treating ffill'd rows as real events.  Pass the unique
+        event dates from the pre-ffill aggregated DataFrame.
+        """
+        spec = self._EVENT_TIME_SPEC.get(self.event_type)
+        if spec is None or df.empty:
+            return df
+
+        prefix = spec["prefix"]
+        intensity_cols = [c for c in spec["intensity_cols"] if c in df.columns]
+        primary_col = spec["primary_col"] if spec["primary_col"] in df.columns else None
+
+        n = len(df)
+        if n == 0:
+            return df
+
+        # Build event mask from raw event dates (pre-ffill), falling back
+        # to scanning trigger columns for non-zero values.
+        event_mask = np.zeros(n, dtype=bool)
+        if raw_event_dates is not None and len(raw_event_dates) > 0:
+            df_dates = pd.DatetimeIndex(df["date"].values)
+            for ed in raw_event_dates:
+                idx = df_dates.get_indexer([ed], method="nearest")
+                if idx[0] >= 0:
+                    event_mask[idx[0]] = True
+        else:
+            trigger_cols = [c for c in spec["trigger_cols"] if c in df.columns]
+            if not trigger_cols:
+                return df
+            for col in trigger_cols:
+                col_vals = df[col].values
+                event_mask |= (~np.isnan(col_vals)) & (np.abs(col_vals) > 1e-12)
+
+        # 1. Days since last event
+        days_since = np.full(n, -1, dtype=np.int16)
+        last_event = -1
+        for i in range(n):
+            if event_mask[i]:
+                last_event = i
+            if last_event >= 0:
+                days_since[i] = i - last_event
+        df[f"{prefix}_days_since"] = days_since.astype(np.int16)
+
+        # 2. Event count in past 20 trading days
+        count_20d = np.zeros(n, dtype=np.int16)
+        for i in range(n):
+            start = max(0, i - 19)
+            count_20d[i] = int(event_mask[start:i + 1].sum())
+        df[f"{prefix}_count_20d"] = count_20d
+
+        # 3. Intensity: sum of intensity column values on EVENT DAYS ONLY
+        # over past 20 trading days.  Uses raw event dates to avoid
+        # double-counting ffill'd values.
+        intensity_20d = np.zeros(n, dtype=np.float32)
+        for col in intensity_cols:
+            vals = np.nan_to_num(df[col].values.astype(np.float64), nan=0.0)
+            # Zero out non-event rows to only count event-day contributions
+            event_vals = vals.copy()
+            event_vals[~event_mask] = 0.0
+            cumsum = np.cumsum(np.abs(event_vals))
+            for i in range(n):
+                start = max(0, i - 19)
+                intensity_20d[i] += cumsum[i] - (cumsum[start - 1] if start > 0 else 0)
+        df[f"{prefix}_intensity_20d"] = intensity_20d.astype(np.float32)
+
+        # 4. Last direction: sign of primary column's most recent non-zero value
+        if primary_col is not None:
+            prim_vals = df[primary_col].values.astype(np.float64)
+            last_direction = np.zeros(n, dtype=np.int8)
+            last_val = 0.0
+            for i in range(n):
+                v = prim_vals[i]
+                if not np.isnan(v) and abs(v) > 1e-12:
+                    last_val = v
+                if abs(last_val) > 1e-12:
+                    last_direction[i] = 1 if last_val > 0 else -1
+            df[f"{prefix}_last_direction"] = last_direction
+
+        return df
+
     def _fill_to_daily(
         self, df: pd.DataFrame, trading_dates: pd.DatetimeIndex, max_ffill: int
     ) -> pd.DataFrame:
-        """Reindex each stock to trading calendar, forward-fill up to max_ffill."""
+        """Reindex each stock to trading calendar, forward-fill up to max_ffill.
+
+        Precondition: *df* must contain data for exactly ONE stock.
+        ``stock_code`` is restored from ``df["stock_code"].iloc[0]`` after
+        ``groupby`` strips it — this is correct only under the single-stock
+        invariant enforced by ``EventToDaily.transform`` (called per-stock
+        from ``preprocess_new_data.py``).
+        """
         if df.empty or "stock_code" not in df.columns:
             return df
+        codes = df["stock_code"].unique()
+        if len(codes) > 1:
+            raise ValueError(
+                f"_fill_to_daily expects single-stock DataFrame, "
+                f"got {len(codes)}: {list(codes[:5])}"
+            )
 
         def _fill_group(grp):
             grp = grp.set_index("date").sort_index()

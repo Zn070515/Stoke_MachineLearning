@@ -162,22 +162,44 @@ preprocessing:
   event:
     block_trade:
       decay_halflife_days: 90
-      forward_fill_max: 5
+      forward_fill_max: 30
+      persistence_mode: "ffill"          # "ffill" | "decay" | "zi" (decay TBD Phase 2)
+      event_time_features: true          # compute days_since/count/intensity/direction
+      persistence_halflife:              # per-column half-life overrides (TBD Phase 2)
+        premium_pct_wavg: 10
+        permanent_impact: 20
+        temporary_impact: 5
       short_gap_max: 5
       medium_gap_max: 60
     shareholder:
       decay_halflife_days: 90
-      forward_fill_max: 5
+      forward_fill_max: 90
+      persistence_mode: "ffill"
+      event_time_features: true
+      persistence_halflife:
+        HN_z: 45
+        PCRC: 45
+        change_ratio: 45
       short_gap_max: 5
       medium_gap_max: 60
     lockup:
       decay_halflife_days: 180
-      forward_fill_max: 5
+      forward_fill_max: 90
+      persistence_mode: "ffill"
+      event_time_features: true
+      persistence_halflife:
+        unlock_pressure: 60
+        unlock_pressure_mcap: 60
       short_gap_max: 5
       medium_gap_max: 60
     dividend:
       decay_halflife_days: 365
-      forward_fill_max: 5
+      forward_fill_max: 30
+      persistence_mode: "ffill"
+      event_time_features: true
+      persistence_halflife:
+        dividend_yield: 20
+        effective_yield: 20
       short_gap_max: 5
       medium_gap_max: 60
 
