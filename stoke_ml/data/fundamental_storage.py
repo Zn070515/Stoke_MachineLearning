@@ -42,7 +42,7 @@ class FundamentalStorage:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{code}.parquet")
             save_df = group.drop(columns=["year", "quarter"])
-            save_df.to_parquet(out_path, index=False)
+            save_df.to_parquet(out_path, index=False, compression='lz4')
 
     def load(
         self, stock_code: str, start_date: str, end_date: str

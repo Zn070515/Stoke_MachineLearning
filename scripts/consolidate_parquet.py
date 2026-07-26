@@ -90,7 +90,7 @@ def consolidate_category(base_dir: str, category: str, min_file_size_kb: float =
                 merged = merged.sort_values("date")
 
             out_path = os.path.join(out_dir, f"{code}.parquet")
-            merged.to_parquet(out_path, index=False)
+            merged.to_parquet(out_path, index=False, compression='lz4')
             stats[code] = (len(files), os.path.getsize(out_path))
         except Exception as e:
             logger.warning("Failed to consolidate %s/%s: %s", category, code, e)

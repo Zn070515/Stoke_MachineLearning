@@ -28,7 +28,7 @@ class AnnouncementStorage:
     def save_raw(self, stock_code: str, df: pd.DataFrame) -> str:
         """Save raw announcements to {code}.parquet."""
         path = os.path.join(self._base, f"{stock_code}.parquet")
-        df.to_parquet(path, index=False)
+        df.to_parquet(path, index=False, compression='lz4')
         return path
 
     def load_raw(self, stock_code: str) -> pd.DataFrame:
@@ -76,7 +76,7 @@ class AnnouncementStorage:
             out_dir = os.path.join(self._base, "sentiment")
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{stock_code}.parquet")
-            daily.to_parquet(out_path, index=False)
+            daily.to_parquet(out_path, index=False, compression='lz4')
 
         return daily
 

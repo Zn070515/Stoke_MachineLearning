@@ -213,6 +213,7 @@ class EventToDaily(PreprocessingStep):
             df["consecutive_quarter_decline"] = (
                 df.groupby("stock_code")["change_ratio"]
                 .transform(_consecutive_neg)
+                .fillna(0)
                 .astype(np.int16)
             )
 

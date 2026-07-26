@@ -33,5 +33,9 @@ models/checkpoints/
 # wandb
 wandb/
 
+# Logs
+logs/
+*.log
+
 lightning_logs/models/
 lightning_logs/

@@ -79,7 +79,7 @@ class GubaStorage:
             combined = combined.drop_duplicates(subset=["post_id"])
 
         combined = combined.sort_values("date", ascending=False)
-        combined.to_parquet(path, index=False)
+        combined.to_parquet(path, index=False, compression='lz4')
 
     def load_raw(self, stock_code: str) -> pd.DataFrame:
         path = os.path.join(self._raw_dir(), f"{stock_code}.parquet")
@@ -118,7 +118,7 @@ class GubaStorage:
         else:
             combined = combined.drop_duplicates(subset=["post_id"])
         combined = combined.sort_values("aligned_date", ascending=False)
-        combined.to_parquet(path, index=False)
+        combined.to_parquet(path, index=False, compression='lz4')
 
     def load_silver(self, stock_code: str) -> pd.DataFrame:
         path = os.path.join(self._silver_dir(), f"{stock_code}.parquet")
@@ -183,11 +183,13 @@ class GubaStorage:
 
         base = self._sentiment_base()
         for code, group in df.groupby("stock_code"):
-            new_rows = group.drop(columns=["stock_code"]).sort_values("date")
+            new_rows = group.sort_values("date")
             out_path = os.path.join(base, f"{code}.parquet")
             if os.path.isfile(out_path):
                 existing = pd.read_parquet(out_path)
                 existing["date"] = pd.to_datetime(existing["date"])
+                if "stock_code" not in existing.columns:
+                    existing["stock_code"] = code
                 new_rows = pd.concat([existing, new_rows], ignore_index=True)
             new_rows = new_rows.drop_duplicates(subset=["date"], keep="last")
             new_rows = new_rows.sort_values("date")
@@ -196,7 +198,7 @@ class GubaStorage:
             )
             os.close(fd)
             try:
-                new_rows.to_parquet(tmp_path, index=False)
+                new_rows.to_parquet(tmp_path, index=False, compression='lz4')
                 os.replace(tmp_path, out_path)
             except Exception:
                 if os.path.isfile(tmp_path):

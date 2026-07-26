@@ -159,9 +159,11 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
             raw = source.load(code, args.start, args.end)
             if raw.empty:
                 continue
-            # Inject stock_code when missing or all-NaN (data quality fix)
-            if "stock_code" not in raw.columns or raw["stock_code"].isna().all():
+            # Inject stock_code when missing or any NaN (data quality fix)
+            if "stock_code" not in raw.columns:
                 raw["stock_code"] = code
+            elif raw["stock_code"].isna().any():
+                raw["stock_code"] = raw["stock_code"].fillna(code)
             # Load K-line daily data for market-cap context features
             daily_data = None
             try:
@@ -200,17 +202,16 @@ def _process_board(chain, stock_list, data_dir, args):
         else:
             logger.warning("No %s pool data found for %s–%s", pool_name, args.start, args.end)
 
-    # Load sentiment if available
+    # Load sentiment if available (single market-level time series, not per-stock)
     sentiment = None
     try:
-        sent_storage = MarketWideStorage(data_dir, "limit_up_sentiment")
-        frames = []
-        for code in stock_list:
-            sdf = sent_storage.load(code, args.start, args.end)
-            if not sdf.empty:
-                frames.append(sdf)
-        if frames:
-            sentiment = pd.concat(frames, ignore_index=True)
+        sent_path = os.path.join(data_dir, "a_shares", "limit_up_sentiment", "sentiment.parquet")
+        if os.path.isfile(sent_path):
+            sentiment = pd.read_parquet(sent_path)
+            if "date" in sentiment.columns:
+                sentiment["date"] = pd.to_datetime(sentiment["date"])
+        if sentiment is not None and not sentiment.empty:
+            logger.info("Loaded limit_up_sentiment: %d rows", len(sentiment))
     except Exception:
         logger.warning("Failed to load limit_up_sentiment", exc_info=True)
 
@@ -266,34 +267,59 @@ def _process_sector(chain, stock_list, data_dir, args):
     logger.info("=== sector: %d stocks ===", len(stock_list))
     t0 = time.time()
 
-    # Load industry ranking (market-wide, not per-stock)
-    import json
-    ir_storage = MarketWideStorage(data_dir, "industry_ranking")
-    ir_frames = []
-    for code in stock_list:
-        ir_df = ir_storage.load(code, args.start, args.end)
-        if not ir_df.empty:
-            ir_frames.append(ir_df)
-    if not ir_frames:
-        logger.warning("No industry_ranking data found for %s–%s", args.start, args.end)
+    # Load industry ranking from single market-wide parquet
+    ir_path = os.path.join(data_dir, "a_shares", "industry_ranking.parquet")
+    if not os.path.exists(ir_path):
+        logger.warning(
+            "No industry_ranking.parquet found — run download_industry_ranking.py first"
+        )
         return
-    industry_ranking = pd.concat(ir_frames, ignore_index=True)
+    industry_ranking = pd.read_parquet(ir_path)
+    if "date" in industry_ranking.columns:
+        industry_ranking["date"] = pd.to_datetime(
+            industry_ranking["date"], errors="coerce"
+        )
+    # Date filter
+    start_ts = pd.Timestamp(args.start)
+    end_ts = pd.Timestamp(args.end)
+    industry_ranking = industry_ranking[
+        (industry_ranking["date"] >= start_ts)
+        & (industry_ranking["date"] <= end_ts)
+    ]
+    if industry_ranking.empty:
+        logger.warning("industry_ranking empty for %s–%s", args.start, args.end)
+        return
+    logger.info(
+        "  Loaded industry_ranking: %d rows, %d sectors, %d dates",
+        len(industry_ranking),
+        industry_ranking["sector_code"].nunique() if "sector_code" in industry_ranking.columns else 0,
+        industry_ranking["date"].nunique(),
+    )
 
-    # Load sector map from cache CSV
-    sector_map = {}
+    # Build sector_map: stock_code → sector_code (from cache CSV + naming map)
     cache_path = os.path.join(data_dir, "a_shares", "stock_sector_cache.csv")
-    if os.path.exists(cache_path):
-        sector_df = pd.read_csv(cache_path, dtype=str)
-        sector_map = dict(zip(sector_df["stock_code"], sector_df["sector"]))
-    else:
+    if not os.path.exists(cache_path):
         logger.warning("No stock_sector_cache.csv found — sector preprocessing skipped")
         return
+    sector_df = pd.read_csv(cache_path, dtype=str)
+    # Build sector_name → sector_code mapping from industry_ranking
+    if "sector_name" in industry_ranking.columns and "sector_code" in industry_ranking.columns:
+        name_to_code = (
+            industry_ranking.groupby("sector_name")["sector_code"]
+            .first().to_dict()
+        )
+    else:
+        name_to_code = {}
+    sector_map = {}
+    for _, row in sector_df.iterrows():
+        code = name_to_code.get(row["sector"], row["sector"])
+        sector_map[row["stock_code"]] = code
 
     from stoke_ml.data.storage import DataStorage
     ds = DataStorage(data_dir)
     dest = MarketWideStorage(data_dir, args.save_to or "industry_ranking_processed")
     total = 0
-    for code in stock_list:
+    for i, code in enumerate(stock_list):
         try:
             base = ds.load_daily(code, args.start, args.end)
             if base.empty:
@@ -304,6 +330,9 @@ def _process_sector(chain, stock_list, data_dir, args):
             if not processed.empty:
                 dest.save(processed)
                 total += len(processed)
+            if (i + 1) % 500 == 0:
+                logger.info("  sector progress: %d/%d stocks, %d rows",
+                            i + 1, len(stock_list), total)
         except Exception:
             logger.debug("sector preprocessing failed for %s", code, exc_info=True)
 

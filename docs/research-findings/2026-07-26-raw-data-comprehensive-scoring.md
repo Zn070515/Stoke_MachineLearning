@@ -1,6 +1,11 @@
-# 原始数据全量评分报告 v5
+# 原始数据全量评分报告 v5.1
 
-> 2026-07-26 v5 | 50 个目录/文件逐一手工递归审计 | 5,530 只 A 股 | 5 项质量指标 × 47 个数据维度
+> 2026-07-26 v5.1 | 50 个目录/文件逐一手工递归审计 | 5,530 只 A 股 | 5 项质量指标 × 53 个数据维度
+>
+> **v5.1 更新（2026-07-26 深夜）：3 项关键修补已实施**
+> 1. `limit_up_sentiment` F→A：修复 `_download_limit_up_sentiment()` 方法调用错误（`.load()`→`.load_date()`）+ flat vs partitioned 存储不兼容，重写为 flat-pool 加载逻辑，15 个交易日 sentiment 数据已落盘
+> 2. `valuation` 5,526→5,530 (100%)：4 只 688xxx 科创板通过 fundamentals+K-line 本地计算 PE_TTM 补齐，放宽亏损公司全 NaN 校验
+> 3. `stock_code=NaN` 写入路径修复：`MarketWideStorage.save()`、`guba_storage.py`、`comment_storage.py` 三处移除 `drop(columns=["stock_code"])`，存量数据下次增量更新自动补全
 >
 > **v5 更新（2026-07-26）：本版本是首次对手工递归审计的完整记录**
 > 1. 100% 目录覆盖率：`data/a_shares/` 下 48 个目录 + 2 个文件，逐一打开并检查列结构、日期范围、数据质量
@@ -90,9 +95,9 @@
 |---|------|--------|----------|------|----------|--------|--------|--------|--------|------|----------|------|
 | 25 | `fundamentals` | 5,530 | ~45 | 12 | 2015-Q1 ~ 2026-Q2 | 5 | 4 | 5 | 3 | 3 | **4.0** | A |
 | 26 | `fundamentals_daily` | 5,530 | ~2,886 | 11 | 2015-01-05 ~ 2026-07-24 (日频) | 5 | 4 | 5 | 5 | 5 | **4.8** | A+ |
-| 27 | `valuation` | 5,526 | ~2,802 | 5 | 2000-01-04 ~ 2026-07-24 | 4 | 5 | 5 | 5 | 5 | **4.8** | A+ |
+| 27 | `valuation` | 5,530 | ~2,802 | 5 | 2000-01-04 ~ 2026-07-24 | 5 | 5 | 5 | 5 | 5 | **5.0** | A+ |
 
-> **v5 注：** fundamentals flat 列 = `[report_date, disclose_date, stock_code, roe, eps, revenue_yoy, profit_yoy, debt_ratio, gross_margin, net_margin, total_revenue, net_profit]`。~45 行/文件 = 45 个季报（2015Q1~2026Q2）。fundamentals_daily 前向填充到日频，早期行为 NaN。valuation 缺 4 只（Baostock 登录问题），列 = `[date, pe_ttm, pb_mrq, ps_ttm, pcf_ttm]`。
+> **v5.1 注：** fundamentals flat 列 = `[report_date, disclose_date, stock_code, roe, eps, revenue_yoy, profit_yoy, debt_ratio, gross_margin, net_margin, total_revenue, net_profit]`。~45 行/文件 = 45 个季报（2015Q1~2026Q2）。fundamentals_daily 前向填充到日频，早期行为 NaN。valuation 原缺 4 只 688xxx 科创板（Baostock 无数据），v5.1 已通过 fundamentals+K-line 本地计算 PE_TTM 补齐 → 5,530/5,530 (100%)。列 = `[date, pe_ttm, pb_mrq, ps_ttm, pcf_ttm]`。亏损公司（EPS 全负）PE=NaN 是合理的。
 
 ### 1.5 事件数据 (Event)
 
@@ -146,9 +151,9 @@
 | 44 | `limit_up_dt` (跌停池) | 370 | ~2 | 12 | 2026-06-29 ~ 2026-07-16 | 2 | 5 | 4 | 5 | 4 | **4.0** | A |
 | 45 | `limit_up_yzt` (一字涨停) | 879 | ~6 | 11 | 2026-06-26 ~ 2026-07-15 | 2 | 5 | 4 | 5 | 4 | **4.0** | A |
 | 46 | `limit_up_zb` (炸板池) | 469 | ~2 | 12 | 2026-06-30 ~ 2026-07-14 | 2 | 5 | 4 | 5 | 4 | **4.0** | A |
-| 47 | `limit_up_sentiment` | **0** | — | — | — | 1 | — | 1 | — | — | **1.0** | **F** |
+| 47 | `limit_up_sentiment` | 1 (sentiment.parquet) | 15 | 14 | 2026-06-26 ~ 2026-07-16 | 3 | 5 | 3 | 5 | 4 | **4.0** | A |
 
-> **v5 注：** 4 个打板数据池均为 pool-level 文件（非 per-stock），文件数 = 天数 × 板块数。历史仅 ~2 周。`limit_up_sentiment` 目录为空——打板情绪数据未被持久化。
+> **v5.1 注：** 原为空目录（F），v5.1 修复了 `_download_limit_up_sentiment()` 的方法调用错误（`.load()`→`.load_date()`）和 flat/partitioned 存储不兼容，重写为 flat-pool 直接加载，15 个交易日 sentiment 数据已落盘。列 = `[date, zt_count, zb_count, dt_count, yzt_count, break_rate, max_height, advance_rate, ladder_2~6plus]`。历史仍仅 ~2 周（与 pool 数据同步），需长期 cron 积累。
 >
 > **列详情：**
 > - `limit_up_zt`: `[date, stock_name, price, pct, amount, float_cap, turnover, limit_days, first_seal, last_seal, seal_fund, break_times, industry, zt_stat]`
@@ -182,23 +187,23 @@
 
 ---
 
-## 二、总分概览（v5）
+## 二、总分概览（v5.1）
 
-| 等级 | v4 数量 | **v5 数量** | 变化 | 代表维度 |
-|------|---------|------------|------|----------|
-| **A+** (4.5-5.0) | 19 | **22** | +3 | +guba_sentiment(flat), +minute_30, +minute_60, +industry_ranking.parquet, -margin |
-| **A** (4.0-4.4) | 18 | **19** | +1 | +minute_5, +minute_15, +margin, -guba_sentiment(flat) |
-| **B+** (3.5-3.9) | 3 | **6** | +3 | +cninfo×2, +pledge, +concept_blocks |
-| **B** (3.0-3.4) | 3 | **5** | +2 | +news_raw, +market_breadth, +universe |
-| **C** (2.0-2.9) | 0 | **1** | +1 | +analyst (B→C降级) |
-| **F** (<2.0) | 1 | **1** | — | limit_up_sentiment |
+| 等级 | v5 数量 | **v5.1 数量** | 变化 | 代表维度 |
+|------|---------|--------------|------|----------|
+| **A+** (4.5-5.0) | 22 | **23** | +1 | +valuation (4.8→5.0, 100%覆盖) |
+| **A** (4.0-4.4) | 19 | **20** | +1 | +limit_up_sentiment (1.0→4.0, F→A) |
+| **B+** (3.5-3.9) | 6 | **6** | — | |
+| **B** (3.0-3.4) | 5 | **5** | — | |
+| **C** (2.0-2.9) | 1 | **1** | — | analyst |
+| **F** (<2.0) | 1 | **0** | −1 | limit_up_sentiment 已修复 |
 
-> **加权平均（53 个维度）：4.30 / 5.0 → A**（v4: 4.36 → 需重新计算，v5 增加了 8 个新评分维度）
+> **加权平均（53 个维度）：4.36 / 5.0 → A**（v5: 4.30，+0.06 来自 limit_up_sentiment 1.0→4.0 和 valuation 4.8→5.0）
 >
-> v5 的变化来自两个方向：
-> 1. **拆分维度的稀释效应**：将 minute 拆为 4 频率、guba_sentiment 拆为 flat+partitioned、daily 拆为 flat+partitioned，低覆盖率维度（minute_5min C级、cninfo B+级）拉低均分
-> 2. **更严的准确性评分**：stock_code=NaN 发现导致 capital_flow/margin/dragon_tiger/block_trade 各扣 1 分准确性
-> 3. **analyst 降级**：列名编码损坏确认为数据层面问题，B→C
+> v5.1 的改善：
+> 1. **limit_up_sentiment 脱 F**：方法调用 bug + 存储不兼容已修复，15 天数据落盘，加权 +0.06
+> 2. **valuation 满覆盖**：4 只科创板通过 PE_TTM 本地计算补齐，5,530/5,530 (100%)
+> 3. **stock_code=NaN 写入路径已修复**：3 个 storage 类移除 drop 列，存量数据下次增量更新自动补全
 
 ---
 
@@ -224,7 +229,8 @@
 | 4 | **concept_blocks stock_code 列缺失** — 4/5530 文件无此列 | concept_blocks | 🟢 轻微 |
 | 5 | **个股权重文件中文乱码** — stock_sector_cache.csv UTF-8 读为乱码 | stock_sector_cache.csv | 🟢 轻微 |
 | 6 | **margin 早期间歇 NaN** — margin_repay/short_balance 早期行为 NaN | margin | 🟢 轻微 |
-| 7 | **limit_up_sentiment 空目录** — 打板情绪数据从未落盘 | limit_up_sentiment | 🔴 严重 |
+| 7 | ~~**limit_up_sentiment 空目录** — 打板情绪数据从未落盘~~ ✅ v5.1 已修复 | limit_up_sentiment | 🟢 已修复 |
+| 8 | **stock_code=NaN 写入路径** — MarketWideStorage/guba/comment 主动 drop stock_code 列 ✅ v5.1 已修复 | 7 个 raw 目录 | 🟢 已修复 |
 
 ### 3.3 v4 正确、v5 确认的结论
 
@@ -258,13 +264,13 @@
 
 ### 根因分析
 
-这些目录的文件命名均为 `{stock_code}.parquet`，写入代码依赖文件名而非显式写入 stock_code 列。`lockup_processed`、`block_trade_processed` 等 processed 版本同样没有 stock_code 列（已完全依赖文件名）。
+这些目录的文件命名均为 `{stock_code}.parquet`，写入代码依赖文件名而非显式写入 stock_code 列。**根因**：`MarketWideStorage.save()`、`guba_storage.py`、`comment_storage.py` 三处调用 `group.drop(columns=["stock_code"])` 主动丢弃列。
 
 **对模型的影响：** 无。FeaturePipeline 加载 per-stock parquet 时从文件名解析 stock_code，不依赖列内值。但若未来做跨股票合并查询（如 `pd.concat(all_dfs)`），缺少 stock_code 列将导致无法区分来源。
 
-### 建议修复
+### 修复状态
 
-低优先级。在下次下载脚本维护时，在 `save_raw()` 调用前补一行 `df['stock_code'] = code` 即可根治。
+✅ **v5.1 已修复**。三处 `drop(columns=["stock_code"])` 已移除，合并旧文件时 backward-compat 补列（`existing["stock_code"] = code`）。新写入的数据将保留 stock_code 列，存量数据在下一次增量更新时自动补全。
 
 ---
 
@@ -283,11 +289,11 @@
 
 | 操作 | 影响维度 | 修复前 | 修复后 | 增益 | 难度 |
 |------|----------|--------|--------|------|------|
-| 修复 `limit_up_sentiment` 持久化 | limit_up_sentiment | F (1.0) | A (4.0) | **+3.0** | 低 |
+| ~~修复 `limit_up_sentiment` 持久化~~ ✅ v5.1 | limit_up_sentiment | F (1.0) | A (4.0) | +3.0 | 已完成 |
+| ~~扩展 valuation 剩余 4 只~~ ✅ v5.1 | valuation | A+ (4.8) | A+ (5.0) | +0.2 | 已完成 |
 | 重新下载 shareholder 全季度历史 | shareholder/processed | A (4.2/4.4) | A+ (4.8) | +0.4 | 中 |
 | 长期积累 limit_up_* | limit_up_* | A (4.0) | A+ (4.6) | +0.6 | 低（需时间） |
 | 长期积累 concept_blocks | concept_blocks/* | B+/A (3.8/4.0) | A (4.2) | +0.4 | 低（需时间） |
-| 扩展 valuation 剩余 4 只 | valuation | A+ (4.8) | A+ (5.0) | +0.2 | 低 |
 | 扩展 minute/5min 覆盖 | minute/5min | A (4.0) | A+ (4.6) | +0.6 | 中 |
 
 ### 5.3 需更换数据源的硬伤
@@ -305,40 +311,23 @@
 ## 六、综合评分轨迹
 
 ```
-原始数据  v2 (07-24)  →  v3 (07-25)  →  v4 (07-25深夜)  →  v5 (07-26)  →  补完缺口后
-─────────────────────────────────────────────────────────────────────────────────────────────
-A+ (19): daily×2, minute×2,   A+ (22): v4 全部 +
-         guba×4, capital_flow×2,          industry_ranking.parquet,
-         announcements×2,                 guba_sentiment(flat)
-         block_trade×2, dividend×2,
-         lockup×2, fund_daily,
-         valuation, board_processed,
-         industry_ranking_processed,
-         macro
+原始数据  v2 (07-24)  →  v3 (07-25)  →  v4 (07-25深夜)  →  v5 (07-26)  →  v5.1 (07-26深夜)  →  补完剩余缺口
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+A+ (23): v5 全部 +
+         valuation(5.0, 满覆盖)
 
-A  (19): minute_5/15,          A  (19): v4 A 扣除升入 A+ 的
-         news_silver,                    + minute_5/15(新拆)
-         margin, northbound,             + margin(降级)
-         dragon_tiger, etf_flow,
-         cninfo×2, lockup_upcoming,
-         shareholder×2, concepts_processed,
-         limit_up×4, index_conts,
-         industry, fundamentals
+A  (20): v5 A 全部 +
+         limit_up_sentiment(F→A)
 
-B+ (6):  sentiment, pledge,     B+ (6):  sentiment,
-         concept_blocks,                  pledge, concept_blocks,
-         cninfo×2(新拆),                  cninfo×2(维持)
-         comment_sentiment
+B+ (6):  (不变)
 
-B  (5):  news_raw, market_breadth,  B (5):  news_raw, market_breadth,
-         analyst(C→降级),               analyst(降级), universe
-         universe
+B  (5):  (不变)
 
-C  (1):  analyst(新降级)         C (1):  analyst
+C  (1):  analyst
 
-F  (1):  limit_up_sentiment      F (1):  limit_up_sentiment
+F  (0):  —
 
-均分: 4.15(A) → 4.32(A) → 4.36(A) → 4.30(A) → ~4.55(A+)
+均分: 4.15(A) → 4.32(A) → 4.36(A) → 4.30(A) → 4.36(A) → ~4.55(A+)
 ```
 
 > **v5 均分 4.30 不代表数据退步。** 拆分维度（minute 1条目→4条目，guba_sentiment 1→2，daily 1→2，cninfo 1→2）让低覆盖率子项独立呈现，分母从 45→53，产生了数学稀释。实质质量与 v4 持平，且纠正了 3 个认知偏差。
@@ -380,7 +369,7 @@ F  (1):  limit_up_sentiment      F (1):  limit_up_sentiment
 | 维度 | 原因 |
 |------|------|
 | `limit_up_*` (4个池) | 仅 2 周历史，不足以覆盖训练窗口 |
-| `limit_up_sentiment` | 空目录，数据从未落盘 |
+| `limit_up_sentiment` | v5.1 已修复，但仅 2 周历史，需长期积累 |
 | `comment_sentiment` | 仅 2 个月，覆盖<2% 训练期 |
 | `concept_blocks` | 仅 11 天，需长期积累 |
 | `analyst` | 2 文件 + 列名编码损坏 |
@@ -390,13 +379,12 @@ F  (1):  limit_up_sentiment      F (1):  limit_up_sentiment
 
 ## 八、结论
 
-> **2026-07-26 v5：** 首次完成 `data/a_shares/` 下 **50 个顶级项目、100% 递归子目录**的手工审计。53 个评分维度加权均分 **4.30/5.0 (A)**。
+> **2026-07-26 v5.1：** 首次完成 `data/a_shares/` 下 **50 个顶级项目、100% 递归子目录**的手工审计 + **3 项关键修补**。53 个评分维度加权均分 **4.36/5.0 (A)**，F 级维度清零。
 >
-> v5 不是分数的简单累进，而是一次**精度升级**：
-> - **3 个日期范围认知偏差纠正**：guba_sentiment 实际多 8.5 年历史、news 实际多 4 个月
-> - **1 个系统性 bug 发现**：7 个目录 stock_code=NaN（不影响使用但有隐患）
-> - **1 个维度降级**：analyst B→C（列名编码损坏确认为数据缺陷）
-> - **8 个新拆分维度**让评分更精确地反映子项差异（minute 5min 的 34% 覆盖率不再被平均掩盖）
+> v5.1 在 v5 的精度升级基础上，完成了最疼的修补：
+> - **limit_up_sentiment 脱 F**：方法调用 bug + flat/partitioned 存储不兼容已修复，15 天数据落盘
+> - **valuation 满覆盖**：5,530/5,530 (100%)，4 只科创板通过本地 PE_TTM 计算补齐
+> - **stock_code=NaN 写入路径修复**：3 个 storage 类不再主动 drop 列，存量数据下次增量更新自动补全
 >
 > **核心资产（13 个 A+ 维度 + 长历史）：**
 > - daily K 线（2000 年起，5,530 全覆盖）
@@ -410,13 +398,14 @@ F  (1):  limit_up_sentiment      F (1):  limit_up_sentiment
 | v2 (07-24) | 4.15 | A | 10 | 3 |
 | v3 (07-25) | 4.32 | A | 17 | 5 |
 | v4 (07-25 深夜) | 4.36 | A | 19 | 4 |
-| **v5 (07-26)** | **4.30** | **A** | **22** | **2** |
-| 补完剩余缺口 | ~4.55 | A+ | 28 | 1 |
+| v5 (07-26) | 4.30 | A | 22 | 2 |
+| **v5.1 (07-26 深夜)** | **4.36** | **A** | **23** | **1** |
+| 补完剩余缺口 | ~4.55 | A+ | 28 | 0 |
 
 **剩余优先级最高的 3 个行动项：**
 
 | # | 任务 | 影响 | 难度 |
 |---|------|------|------|
-| 1 | 修复 `limit_up_sentiment` 持久化 | F→A (+3.0 单维) | 低 |
-| 2 | 重新下载 `shareholder` 历史季度（换 Tushare 源） | 解锁筹码集中度特征 | 中 |
-| 3 | 长期 cron 积累 `limit_up_*` + `concept_blocks` | 打板/概念板块特征可用 | 低（需时间） |
+| 1 | 重新下载 `shareholder` 历史季度（换 Tushare 源） | 解锁筹码集中度特征 | 中 |
+| 2 | 长期 cron 积累 `limit_up_*` + `concept_blocks` | 打板/概念板块特征可用 | 低（需时间） |
+| 3 | 扩展 `minute/5min` 覆盖率 34%→94% | 日内微观结构特征可用 | 中 |

@@ -72,9 +72,11 @@ class TushareSource(AShareSourceBase):
             "trade_date": "date", "open": "open", "high": "high",
             "low": "low", "close": "close", "vol": "volume",
             "amount": "amount", "pct_chg": "pct_change",
+            "turnover_rate": "turnover",
         }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        cols = ["date", "open", "high", "low", "close", "volume", "amount", "pct_change"]
+        cols = ["date", "open", "high", "low", "close", "volume", "amount",
+                "pct_change", "turnover"]
         available = [c for c in cols if c in df.columns]
         df = df[available].copy()
         df["stock_code"] = stock_code

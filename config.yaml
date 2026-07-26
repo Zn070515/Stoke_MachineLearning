@@ -9,7 +9,7 @@ markets:
   a_shares:
     enabled: true
     stock_universe: [csi300, csi500]
-    start_date: "2015-01-01"
+    start_date: "2000-01-01"
   us:
     enabled: false
     stock_universe: [sp500]

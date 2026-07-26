@@ -23,7 +23,7 @@ class DataStorage:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{code}.parquet")
             save_df = group.drop(columns=["year", "month"])
-            save_df.to_parquet(out_path, index=False)
+            save_df.to_parquet(out_path, index=False, compression='lz4')
 
     def load_daily(
         self, stock_code: str, start_date: str, end_date: str,

@@ -386,60 +386,99 @@ def _download_limit_up_pool(pool, storage_key, data_dir, args):
     source.close()
 
 
+def _load_pool_flat(pool_dir: str) -> dict[str, pd.DataFrame]:
+    """Load all flat per-stock pool files and index by date.
+
+    Pool data is stored as flat files (e.g. limit_up_zt/000001.parquet),
+    not year/month partitions. Returns dict[date_str, DataFrame].
+    """
+    if not os.path.isdir(pool_dir):
+        return {}
+    frames = []
+    for f in os.listdir(pool_dir):
+        if not f.endswith(".parquet"):
+            continue
+        try:
+            df = pd.read_parquet(os.path.join(pool_dir, f))
+            if "date" in df.columns and not df.empty:
+                df["date"] = pd.to_datetime(df["date"])
+                frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return {}
+    all_data = pd.concat(frames, ignore_index=True)
+    return {
+        d.strftime("%Y-%m-%d"): grp.drop(columns=["date"])
+        for d, grp in all_data.groupby(all_data["date"].dt.date)
+    }
+
+
 def _download_limit_up_sentiment(data_dir, args):
     logger.info("=== limit_up_sentiment: %s to %s ===", args.start, args.end)
     t0 = time.time()
 
-    # Load pool data from disk instead of re-fetching via API.
-    # Pool downloads (_download_limit_up_pool) run first, so data is cached.
-    pool_keys = ["limit_up_zt", "limit_up_zb", "limit_up_dt", "limit_up_yzt"]
-    pool_storages = {k: MarketWideStorage(data_dir, k) for k in pool_keys}
+    # Load all pool flat files into memory, indexed by date.
+    pool_dirs = {
+        "zt": os.path.join(data_dir, "a_shares", "limit_up_zt"),
+        "zb": os.path.join(data_dir, "a_shares", "limit_up_zb"),
+        "dt": os.path.join(data_dir, "a_shares", "limit_up_dt"),
+        "yzt": os.path.join(data_dir, "a_shares", "limit_up_yzt"),
+    }
+    logger.info("  limit_up_sentiment: loading pool flat files...")
+    pool_by_date = {}
+    for key, pdir in pool_dirs.items():
+        pool_by_date[key] = _load_pool_flat(pdir)
+        logger.info("  limit_up_sentiment: loaded %s → %d dates", key,
+                    len(pool_by_date[key]))
 
+    # Determine which dates have all 4 pools with non-empty data.
+    all_pool_dates = set(pool_by_date["zt"].keys()) & \
+        set(pool_by_date["zb"].keys()) & \
+        set(pool_by_date["dt"].keys()) & \
+        set(pool_by_date["yzt"].keys())
+
+    # Check existing sentiment dates to avoid recomputing.
     existing_dates: set[str] = set()
-    sentiment_storage = MarketWideStorage(data_dir, "limit_up_sentiment")
-    base = os.path.join(data_dir, "a_shares", "limit_up_sentiment")
-    if os.path.isdir(base):
-        for root, _dirs, files in os.walk(base):
-            for f in files:
-                if f.endswith(".parquet"):
-                    try:
-                        df = pd.read_parquet(os.path.join(root, f), columns=["date"])
-                        for d in pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"):
-                            existing_dates.add(d)
-                    except Exception:
-                        pass
+    sentiment_base = os.path.join(data_dir, "a_shares", "limit_up_sentiment")
+    if os.path.isdir(sentiment_base):
+        for f in os.listdir(sentiment_base):
+            if f.endswith(".parquet"):
+                try:
+                    df = pd.read_parquet(
+                        os.path.join(sentiment_base, f), columns=["date"],
+                    )
+                    for d in pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"):
+                        existing_dates.add(d)
+                except Exception:
+                    pass
 
     calendar = TradingCalendar("a_shares")
-    all_dates = calendar.get_trading_days(args.start, args.end)
-    dates_to_fetch = [
-        d for d in all_dates
-        if d.strftime("%Y-%m-%d") not in existing_dates
-    ]
+    target_dates = {
+        d.strftime("%Y-%m-%d")
+        for d in calendar.get_trading_days(args.start, args.end)
+    }
+    dates_to_compute = sorted(
+        (target_dates & all_pool_dates) - existing_dates,
+    )
 
-    if not dates_to_fetch:
-        n_cached = len(all_dates)
-        logger.info("  limit_up_sentiment: all %d days cached, skipping", n_cached)
+    if not dates_to_compute:
+        logger.info("  limit_up_sentiment: all %d days cached or no pool data, skipping",
+                    len(target_dates & all_pool_dates))
         return
 
-    n_cached = len(all_dates) - len(dates_to_fetch)
-    logger.info("  limit_up_sentiment: %d/%d days cached, %d to compute",
-                n_cached, len(all_dates), len(dates_to_fetch))
+    n_total = len(target_dates)
+    n_available = len(target_dates & all_pool_dates)
+    n_cached = n_available - len(dates_to_compute)
+    logger.info("  limit_up_sentiment: %d total dates, %d have pools, %d cached, %d to compute",
+                n_total, n_available, n_cached, len(dates_to_compute))
 
     rows = []
-    for d in dates_to_fetch:
-        date_str = d.strftime("%Y-%m-%d")
-        try:
-            zt_df = pool_storages["limit_up_zt"].load(date_str)
-            zb_df = pool_storages["limit_up_zb"].load(date_str)
-            dt_df = pool_storages["limit_up_dt"].load(date_str)
-            yzt_df = pool_storages["limit_up_yzt"].load(date_str)
-        except Exception:
-            logger.debug("limit_up_sentiment: pool data missing for %s", date_str)
-            continue
-
-        if zt_df is None or zb_df is None or dt_df is None or yzt_df is None:
-            logger.debug("limit_up_sentiment: pool data missing for %s", date_str)
-            continue
+    for date_str in dates_to_compute:
+        zt_df = pool_by_date["zt"].get(date_str, pd.DataFrame())
+        zb_df = pool_by_date["zb"].get(date_str, pd.DataFrame())
+        dt_df = pool_by_date["dt"].get(date_str, pd.DataFrame())
+        yzt_df = pool_by_date["yzt"].get(date_str, pd.DataFrame())
 
         rows.append(LimitUpSource.compute_sentiment(
             date_str, zt_df, zb_df, dt_df, yzt_df,
@@ -448,8 +487,19 @@ def _download_limit_up_sentiment(data_dir, args):
     if rows:
         df = pd.DataFrame(rows, columns=SENTIMENT_COLS)
         df["date"] = pd.to_datetime(df["date"])
-        sentiment_storage.save(df)
-        logger.info("  limit_up_sentiment: %d new rows saved (%.1fs)",
+        # Sentiment is a daily time-series (not per-stock), save as a single
+        # flat file.  MarketWideStorage expects a stock_code column for
+        # per-stock partitioning and would raise KeyError here.
+        os.makedirs(sentiment_base, exist_ok=True)
+        out_path = os.path.join(sentiment_base, "sentiment.parquet")
+        if os.path.isfile(out_path):
+            existing = pd.read_parquet(out_path)
+            existing["date"] = pd.to_datetime(existing["date"])
+            df = pd.concat([existing, df], ignore_index=True)
+            df = df.drop_duplicates(subset=["date"], keep="last")
+        df = df.sort_values("date")
+        df.to_parquet(out_path, index=False, compression="lz4")
+        logger.info("  limit_up_sentiment: %d rows saved (%.1fs)",
                     len(df), time.time() - t0)
     else:
         logger.info("  limit_up_sentiment: no new data in range")

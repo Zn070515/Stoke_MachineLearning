@@ -2,13 +2,14 @@
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
-from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
@@ -41,26 +42,38 @@ BLOCK_COOLDOWN = 90  # seconds to wait when rate-limited
 BLOCK_PAGE_MIN_LEN = 5000  # pages shorter than this are likely redirects/blocked
 EMPTY_COLUMNS = ["date", "time", "title", "body", "post_id", "url"]
 
+# Thread-local httpx client with connection pooling + HTTP/2 multiplexing.
+# curl_cffi was ~210ms/req (fresh TLS per call); httpx HTTP/2 is ~55ms/req.
+_local = threading.local()
+
+
+def _get_http_client(timeout: float = 20.0) -> httpx.Client:
+    """Return a per-thread httpx.Client with HTTP/2 and connection pooling."""
+    if not hasattr(_local, "client"):
+        _local.client = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(timeout),
+            headers=HEADERS,
+            limits=httpx.Limits(max_keepalive_connections=30, max_connections=100),
+        )
+    return _local.client
+
 
 def _empty_df() -> pd.DataFrame:
     """Return an empty DataFrame with the standard Guba columns."""
     return pd.DataFrame(columns=EMPTY_COLUMNS)
 
 
-def _fetch_with_retry(url: str, timeout: int = 20) -> requests.Response | None:
-    """GET a URL with retry logic.
+def _fetch_with_retry(url: str, timeout: float = 20) -> httpx.Response | None:
+    """GET a URL with retry logic using per-thread httpx HTTP/2 client.
 
     Returns the Response on success, or None after exhausting retries.
     """
     last_error = None
+    client = _get_http_client(timeout)
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.get(
-                url,
-                headers=HEADERS,
-                impersonate="chrome146",
-                timeout=timeout,
-            )
+            resp = client.get(url)
             if resp.status_code == 200:
                 return resp
             logger.debug(
@@ -347,6 +360,67 @@ class GubaSource:
 
         return ""
 
+    @staticmethod
+    def _filter_page(df_page: pd.DataFrame, start_date: str | None,
+                     end_date: str | None) -> tuple[pd.DataFrame, bool]:
+        """Filter a page by date range.
+
+        Returns (filtered_df, too_old) where too_old=True means subsequent
+        pages should be skipped because they'll only contain older posts.
+        """
+        raw_size = len(df_page)
+        too_old = False
+
+        if df_page["date"].str.strip().eq("").all():
+            return df_page, too_old
+
+        df_page["date_parsed"] = pd.to_datetime(
+            df_page["date"], errors="coerce"
+        )
+
+        if start_date:
+            start_ts = pd.Timestamp(start_date)
+            valid_dates = df_page["date_parsed"].dropna()
+            if not valid_dates.empty and valid_dates.max() < start_ts:
+                too_old = True
+
+            df_page = df_page[df_page["date_parsed"] >= start_ts]
+
+        if end_date:
+            end_ts = pd.Timestamp(end_date)
+            df_page = df_page[df_page["date_parsed"] <= end_ts]
+
+        df_page = df_page.drop(columns=["date_parsed"])
+        return df_page, too_old
+
+    def _fetch_pages_parallel(
+        self, stock_code: str, pages: list[int],
+        pool: ThreadPoolExecutor | None = None,
+    ) -> dict[int, pd.DataFrame]:
+        """Fetch multiple list pages concurrently. Returns {page: df}."""
+        results: dict[int, pd.DataFrame] = {}
+        if not pages:
+            return results
+
+        year = datetime.now().year
+        _pool = pool or ThreadPoolExecutor(max_workers=len(pages))
+        try:
+            futures = {
+                _pool.submit(self._fetch_list_page, stock_code, p, year): p
+                for p in pages
+            }
+            for fut in as_completed(futures):
+                p = futures[fut]
+                try:
+                    df_p, _ = fut.result()
+                except Exception:
+                    df_p = _empty_df()
+                results[p] = df_p
+        finally:
+            if pool is None:
+                _pool.shutdown(wait=False)
+        return results
+
     def fetch_posts(
         self,
         stock_code: str,
@@ -357,10 +431,13 @@ class GubaSource:
     ) -> pd.DataFrame:
         """Fetch Guba forum posts for a stock.
 
+        Fetches pages in concurrent batches to maximize network throughput.
+        Page 1 is probed first; remaining pages are fetched in parallel
+        batches and then processed in page-number order.
+
         Args:
             stock_code: 6-digit A-share code.
-            start_date: YYYY-MM-DD filter (inclusive). Posts older than this
-                are excluded and trigger early termination.
+            start_date: YYYY-MM-DD filter (inclusive).
             end_date: YYYY-MM-DD filter (inclusive).
             max_pages: Maximum pages to fetch (~80 posts/page).
             fetch_bodies: If True, fetch full post body from detail pages.
@@ -368,63 +445,57 @@ class GubaSource:
         Returns:
             DataFrame with columns: date, time, title, body, post_id, url.
         """
-        all_pages = []
-        year_hint = datetime.now().year
+        # --- Phase 1: probe page 1 ---
+        df_page1, _ = self._fetch_list_page(
+            stock_code, 1, datetime.now().year,
+        )
+        if df_page1.empty:
+            return _empty_df()
 
-        for page in range(1, max_pages + 1):
-            df_page, year_hint = self._fetch_list_page(stock_code, page, year_hint)
-            if df_page.empty:
-                if page == 1:
-                    # First page empty means no data at all for this stock
+        all_pages: list[pd.DataFrame] = []
+        df_filt, too_old = self._filter_page(df_page1, start_date, end_date)
+        if not df_filt.empty:
+            all_pages.append(df_filt)
+        if too_old or len(df_page1) < 40:
+            return pd.concat(all_pages, ignore_index=True) if all_pages else _empty_df()
+
+        # Persistent pool reused across all batches AND body fetching
+        # to eliminate per-batch thread creation/destruction overhead.
+        POOL_WORKERS = 40
+        BATCH = 20
+        pool = ThreadPoolExecutor(max_workers=POOL_WORKERS)
+
+        # --- Phase 2: fetch remaining pages in concurrent batches ---
+        page = 2
+        while page <= max_pages:
+            batch_pages = list(range(page, min(page + BATCH, max_pages + 1)))
+            page_results = self._fetch_pages_parallel(stock_code, batch_pages, pool=pool)
+
+            stopped = False
+            for p in sorted(page_results):
+                df_page = page_results[p]
+                if df_page.empty:
+                    stopped = True
                     break
-                # Later pages empty means end of pagination
+
+                raw_size = len(df_page)
+                df_filt, too_old = self._filter_page(df_page, start_date, end_date)
+                if too_old:
+                    stopped = True
+                    break
+                if not df_filt.empty:
+                    all_pages.append(df_filt)
+                if raw_size < 40:
+                    stopped = True
+                    break
+
+            if stopped:
                 break
 
-            # Capture raw page size before any date filtering so the
-            # pagination-termination check is not fooled by filtered-out rows.
-            raw_page_size = len(df_page)
-
-            # Filter by date range before adding to keep memory low
-            if not df_page["date"].str.strip().eq("").all():
-                df_page["date_parsed"] = pd.to_datetime(
-                    df_page["date"], errors="coerce"
-                )
-
-                if start_date:
-                    start_ts = pd.Timestamp(start_date)
-                    # Stop if the newest post on this page is before start_date
-                    valid_dates = df_page["date_parsed"].dropna()
-                    if not valid_dates.empty:
-                        newest = valid_dates.max()
-                        if newest < start_ts:
-                            # This page and beyond are too old
-                            break
-
-                    df_page = df_page[df_page["date_parsed"] >= start_ts]
-
-                if end_date:
-                    end_ts = pd.Timestamp(end_date)
-                    df_page = df_page[df_page["date_parsed"] <= end_ts]
-
-                df_page = df_page.drop(columns=["date_parsed"])
-            else:
-                # All dates empty — keep the page but can't filter
-                pass
-
-            if not df_page.empty:
-                all_pages.append(df_page)
-
-            # Stop pagination when the raw (unfiltered) page is sparse —
-            # this means we've exhausted the available posts regardless of
-            # how many rows the date filter kept.
-            if raw_page_size < 40 and page > 1:
-                break
-
-            # Polite delay between page requests
-            if page < max_pages:
-                time.sleep(self.page_delay)
+            page += BATCH
 
         if not all_pages:
+            pool.shutdown(wait=False)
             return _empty_df()
 
         df = pd.concat(all_pages, ignore_index=True)
@@ -438,10 +509,9 @@ class GubaSource:
             df = df.sort_values("_date_sort", ascending=False)
             df = df.drop(columns=["_date_sort"])
 
-        # Fetch bodies concurrently.  First probe a sample of 50 posts
-        # to estimate body availability; if 0% have extractable body text,
-        # skip the remaining detail requests (WAF blocks are consistent
-        # per-session).
+        # Fetch bodies using the persistent pool.
+        # Probe a sample of 50 posts first; if 0% have extractable body
+        # text, skip the remaining detail requests.
         if fetch_bodies and not df.empty:
             needs_body = df["body"].str.strip().eq("")
             need_count = needs_body.sum()
@@ -457,17 +527,16 @@ class GubaSource:
                 probe_n = min(50, len(post_ids))
                 probe_ids = post_ids[:probe_n]
                 probe_results = [""] * probe_n
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    futures = {
-                        pool.submit(self._fetch_post_body, stock_code, pid): j
-                        for j, pid in enumerate(probe_ids)
-                    }
-                    for fut in as_completed(futures):
-                        j = futures[fut]
-                        try:
-                            probe_results[j] = fut.result() or ""
-                        except Exception:
-                            pass
+                probe_futures = {
+                    pool.submit(self._fetch_post_body, stock_code, pid): j
+                    for j, pid in enumerate(probe_ids)
+                }
+                for fut in as_completed(probe_futures):
+                    j = probe_futures[fut]
+                    try:
+                        probe_results[j] = fut.result() or ""
+                    except Exception:
+                        pass
                 probe_hits = sum(1 for b in probe_results if b)
                 for j in range(probe_n):
                     if probe_results[j]:
@@ -477,27 +546,26 @@ class GubaSource:
                     logger.info("  0/%d bodies found, skipping remaining %d",
                                 probe_n, len(post_ids) - probe_n)
                 elif len(post_ids) > probe_n:
-                    # Fetch remainder in batches of 200 to avoid burst
                     remaining_ids = post_ids[probe_n:]
                     batch_size = 200
                     for batch_start in range(0, len(remaining_ids), batch_size):
                         batch = remaining_ids[batch_start:batch_start + batch_size]
                         batch_results = [""] * len(batch)
-                        with ThreadPoolExecutor(max_workers=4) as pool:
-                            futures = {
-                                pool.submit(self._fetch_post_body, stock_code, pid): j
-                                for j, pid in enumerate(batch)
-                            }
-                            for fut in as_completed(futures):
-                                j = futures[fut]
-                                try:
-                                    batch_results[j] = fut.result() or ""
-                                except Exception:
-                                    pass
+                        batch_futures = {
+                            pool.submit(self._fetch_post_body, stock_code, pid): j
+                            for j, pid in enumerate(batch)
+                        }
+                        for fut in as_completed(batch_futures):
+                            j = batch_futures[fut]
+                            try:
+                                batch_results[j] = fut.result() or ""
+                            except Exception:
+                                pass
                         for j, pid in enumerate(batch):
                             if batch_results[j]:
                                 df.at[indices[probe_n + batch_start + j], "body"] = batch_results[j]
                         if batch_start + batch_size < len(remaining_ids):
-                            time.sleep(0.5)  # pause between batches
+                            time.sleep(0.5)
 
+        pool.shutdown(wait=False)
         return df.reset_index(drop=True)

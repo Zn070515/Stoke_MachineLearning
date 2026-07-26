@@ -196,7 +196,7 @@ def process_stock(code, raw_dir, guba_storage, analyzer, min_coverage):
     if fetched > 0:
         df = compute_raw_sentiment(df, analyzer)
         with _fetch_lock:
-            df.to_parquet(raw_path, index=False)
+            df.to_parquet(raw_path, index=False, compression='lz4')
         logger.info("  %s: fetched %d bodies, saved", code, fetched)
 
         # Regenerate silver and gold (these have their own thread safety)
@@ -254,7 +254,7 @@ def process_stock_playwright(code, raw_dir, guba_storage, analyzer, min_coverage
     if fetched > 0:
         df = compute_raw_sentiment(df, analyzer)
         with _fetch_lock:
-            df.to_parquet(raw_path, index=False)
+            df.to_parquet(raw_path, index=False, compression='lz4')
         logger.info("  %s: fetched %d bodies, saved", code, fetched)
 
         # Regenerate silver and gold

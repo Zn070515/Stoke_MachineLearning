@@ -39,6 +39,7 @@ class AKShareSource(AShareSourceBase):
         "日期": "date", "开盘": "open", "最高": "high",
         "最低": "low", "收盘": "close", "成交量": "volume",
         "成交额": "amount", "涨跌幅": "pct_change",
+        "振幅": "amplitude", "换手率": "turnover",
     }
 
     def _normalize(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
@@ -47,13 +48,16 @@ class AKShareSource(AShareSourceBase):
             df = df.rename(columns={
                 k: v for k, v in self.CN_COL_MAP.items() if k in df.columns
             })
-        cols = ["date", "open", "high", "low", "close", "volume", "amount"]
+        cols = ["date", "open", "high", "low", "close", "volume", "amount",
+                "turnover", "amplitude"]
         keep = [c for c in cols if c in df.columns]
         df = df[keep].copy()
-        for col in ["open", "high", "low", "close", "volume", "amount"]:
+        for col in ["open", "high", "low", "close", "volume", "amount",
+                     "turnover", "amplitude"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["pct_change"] = 0.0
+        if "pct_change" not in df.columns:
+            df["pct_change"] = 0.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df

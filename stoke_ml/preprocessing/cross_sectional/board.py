@@ -283,7 +283,7 @@ class BoardBroadcaster(PreprocessingStep):
         if "date" not in sent.columns:
             return df
         sent["date"] = pd.to_datetime(sent["date"], errors="coerce")
-        expected = ["break_rate", "advance_rate", "max_board_height"]
+        expected = ["break_rate", "advance_rate", "max_height"]
         available = [c for c in expected if c in sent.columns]
         if not available:
             return df

@@ -48,7 +48,7 @@ class CommentStorage:
         cols = ["date", "stock_code"] + [
             c for c in COMMENT_COLS if c in df.columns
         ]
-        df[cols].to_parquet(path, index=False)
+        df[cols].to_parquet(path, index=False, compression='lz4')
         logger.info("Saved comment snapshot: %d stocks (%s)", len(df), date_str)
 
     def load_latest_snapshot(self) -> pd.DataFrame:
@@ -73,11 +73,13 @@ class CommentStorage:
 
         base = self._base_dir()
         for code, group in df.groupby("stock_code"):
-            new_rows = group.drop(columns=["stock_code"]).sort_values("date")
+            new_rows = group.sort_values("date")
             out_path = os.path.join(base, f"{code}.parquet")
             if os.path.isfile(out_path):
                 existing = pd.read_parquet(out_path)
                 existing["date"] = pd.to_datetime(existing["date"])
+                if "stock_code" not in existing.columns:
+                    existing["stock_code"] = code
                 new_rows = pd.concat([existing, new_rows], ignore_index=True)
             new_rows = new_rows.drop_duplicates(subset=["date"], keep="last")
             new_rows = new_rows.sort_values("date")
@@ -86,7 +88,7 @@ class CommentStorage:
             )
             os.close(fd)
             try:
-                new_rows.to_parquet(tmp_path, index=False)
+                new_rows.to_parquet(tmp_path, index=False, compression='lz4')
                 os.replace(tmp_path, out_path)
             except Exception:
                 if os.path.isfile(tmp_path):

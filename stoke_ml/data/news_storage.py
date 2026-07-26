@@ -65,7 +65,7 @@ class NewsStorage:
         combined = combined.drop_duplicates(subset=["title", "date"])
         combined = combined.drop(columns=["_dedup_score"])
         combined = combined.sort_values("date", ascending=False)
-        combined.to_parquet(path, index=False)
+        combined.to_parquet(path, index=False, compression='lz4')
 
     def load_raw_news(self, stock_code: str) -> pd.DataFrame:
         path = os.path.join(self._raw_dir(), f"{stock_code}.parquet")
@@ -95,7 +95,7 @@ class NewsStorage:
         combined["date"] = pd.to_datetime(combined["date"])
         combined = combined.drop_duplicates(subset=["title", "aligned_date"])
         combined = combined.sort_values("aligned_date", ascending=False)
-        combined.to_parquet(path, index=False)
+        combined.to_parquet(path, index=False, compression='lz4')
 
     def load_silver_news(self, stock_code: str) -> pd.DataFrame:
         path = os.path.join(self._silver_dir(), f"{stock_code}.parquet")
@@ -163,7 +163,7 @@ class NewsStorage:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{code}.parquet")
             save_df = group.drop(columns=["year", "month"])
-            save_df.to_parquet(out_path, index=False)
+            save_df.to_parquet(out_path, index=False, compression='lz4')
 
     def load_daily_sentiment(
         self, stock_code: str, start_date: str, end_date: str

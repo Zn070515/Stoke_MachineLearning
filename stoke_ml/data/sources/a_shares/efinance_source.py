@@ -131,12 +131,14 @@ class EfinanceSource(AShareSourceBase):
         return pd.DataFrame()
 
     def _normalize(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        cols = ["date", "open", "high", "low", "close", "volume", "amount", "pct_change"]
+        cols = ["date", "open", "high", "low", "close", "volume", "amount",
+                "pct_change", "turnover", "amplitude"]
         for c in cols:
             if c not in df.columns:
                 df[c] = None
         df = df[cols].copy()
-        for col in ["open", "high", "low", "close", "volume", "amount", "pct_change"]:
+        for col in ["open", "high", "low", "close", "volume", "amount",
+                     "pct_change", "turnover", "amplitude"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         df["stock_code"] = stock_code

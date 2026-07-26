@@ -74,8 +74,8 @@ def main():
                         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--stocks", type=str, default=None,
                         help="Comma-separated stock codes (default: from config universe)")
-    parser.add_argument("--sleep", type=float, default=1.5,
-                        help="Seconds between stocks (default: 1.5)")
+    parser.add_argument("--sleep", type=float, default=0.0,
+                        help="Seconds between stocks (default: 0)")
     parser.add_argument("--indices", type=str, default=None,
                         help="Comma-separated AKShare index symbols")
     parser.add_argument("--all", action="store_true", dest="all_stocks",

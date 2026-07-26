@@ -297,7 +297,10 @@ class SectorBroadcaster(PreprocessingStep):
             ).astype(np.float32)
             return grp
 
+        # pandas >=3.0 drops groupby key columns from apply() results
+        date_series = df["date"].copy()
         df = df.groupby("date", group_keys=False).apply(_residualize_date)
+        df["date"] = date_series
         df.drop(columns=["mkt_return"], inplace=True)
         return df
 

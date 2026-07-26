@@ -42,8 +42,8 @@ class BaostockSource(AShareSourceBase):
             rs = bs.query_history_k_data_plus(
                 bs_code,
                 "date,open,high,low,close,volume,amount,pctChg",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
+                start_date=start_date,
+                end_date=end_date,
                 frequency="d",
                 adjustflag="2",
             )

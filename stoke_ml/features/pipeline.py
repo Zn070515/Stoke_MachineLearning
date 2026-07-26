@@ -11,8 +11,11 @@ from stoke_ml.features.technical import TechnicalIndicators
 from stoke_ml.features.scoring import TrendScorer
 from stoke_ml.features.interaction import InteractionFeatures
 from stoke_ml.features.temporal import (
-    add_lag_features, add_rolling_features, add_calendar_features,
+    add_lag_features, add_calendar_features,
 )
+from stoke_ml.features.transform import TemporalTransformer
+from stoke_ml.features.emotion import EmotionRefiner
+from stoke_ml.features.fundamental import FundamentalRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +104,7 @@ DIVIDEND_COLS = [
 BOARD_COLS = [
     "is_zt", "is_zb", "is_dt", "is_yzt",
     "consecutive_zt", "board_height_20d", "seal_strength", "seal_success",
-    "net_zt_proportion", "break_rate", "advance_rate", "max_board_height",
+    "net_zt_proportion", "break_rate", "advance_rate", "max_height",
 ]
 
 SECTOR_COLS = [
@@ -173,6 +176,10 @@ class FeaturePipeline:
         feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
         preprocessing_config: dict | str | None = None,
+        # Feature engineering v2
+        use_emotion_refine: bool = True,
+        use_fundamental_refine: bool = True,
+        use_temporal_stats: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -216,6 +223,12 @@ class FeaturePipeline:
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
         self._interaction = InteractionFeatures()
+        self.use_emotion_refine = use_emotion_refine
+        self.use_fundamental_refine = use_fundamental_refine
+        self.use_temporal_stats = use_temporal_stats
+        self._temporal_transformer = TemporalTransformer() if use_temporal_stats else None
+        self._emotion_refiner = EmotionRefiner() if use_emotion_refine else None
+        self._fundamental_refiner = FundamentalRefiner() if use_fundamental_refine else None
 
     def _warn_if_missing(self, key: str) -> None:
         """Emit one-time debug log when use_*=True but no data was passed.
@@ -434,34 +447,7 @@ class FeaturePipeline:
         if self.use_new_preprocessing and self.preprocessing:
             df = self.preprocessing.run("numeric", df)
 
-        df = self._merge_sentiment(df, sentiment_df)
-        df = self._merge_announcements(df, announcement_df)
-        df = self._merge_margin(df, margin_df)
-        df = self._merge_northbound(df, northbound_df)
-        df = self._merge_dragon_tiger(df, dragon_tiger_df)
-        df = self._merge_fundamental(df, fundamental_df)
-        df = self._merge_valuation(df, valuation_df)
-        df = self._merge_etf_flow(df, etf_flow_df)
-        df = self._merge_guba(df, guba_df)
-        df = self._merge_comment(df, comment_df)
-
-        # New multi-shape preprocessing
-        df = self._merge_capital_flow(df, capital_flow_df)
-        df = self._merge_block_trade(df, block_trade_df)
-        df = self._merge_shareholder(df, shareholder_df)
-        df = self._merge_lockup(df, lockup_df)
-        df = self._merge_dividend(df, dividend_df)
-        df = self._merge_board(df, board_df)
-        df = self._merge_sector(df, sector_df)
-        df = self._merge_concept(df, concept_df)
-        df = self._merge_macro(df, macro_df)
-        df = self._merge_industry(df, industry_df)
-
-        # Defragment after ~17 merge calls — each merge adds new columns,
-        # and subsequent df["col"] assignments on fragmented frames trigger
-        # PerformanceWarning from pandas.
-        df = df.copy()
-
+        # 1. Technical indicators + scoring + microstructure (no aux dependency)
         if self.use_technical:
             df = self._ti.compute_all(df)
         if self.use_scoring:
@@ -478,6 +464,44 @@ class FeaturePipeline:
         if self.use_interaction:
             df = self._interaction.compute_all(df)
 
+        # 2. Merge aux DataFrames (expanded PO columns)
+        df = self._merge_sentiment(df, sentiment_df)
+        df = self._merge_announcements(df, announcement_df)
+        df = self._merge_margin(df, margin_df)
+        df = self._merge_northbound(df, northbound_df)
+        df = self._merge_dragon_tiger(df, dragon_tiger_df)
+        df = self._merge_fundamental(df, fundamental_df)
+        df = self._merge_valuation(df, valuation_df)
+        df = self._merge_etf_flow(df, etf_flow_df)
+        df = self._merge_guba(df, guba_df)
+        df = self._merge_comment(df, comment_df)
+        df = self._merge_capital_flow(df, capital_flow_df)
+        df = self._merge_block_trade(df, block_trade_df)
+        df = self._merge_shareholder(df, shareholder_df)
+        df = self._merge_lockup(df, lockup_df)
+        df = self._merge_dividend(df, dividend_df)
+        df = self._merge_board(df, board_df)
+        df = self._merge_sector(df, sector_df)
+        df = self._merge_concept(df, concept_df)
+        df = self._merge_macro(df, macro_df)
+        df = self._merge_industry(df, industry_df)
+
+        # Defragment after merge calls
+        df = df.copy()
+
+        # 3. Emotion refinement (news + guba sentiment features)
+        if self._emotion_refiner is not None:
+            df = self._emotion_refiner.refine(df)
+
+        # 4. Per-stock fundamental refinement (quality, stability, valuation, trends)
+        if self._fundamental_refiner is not None:
+            df = self._fundamental_refiner.refine(df)
+
+        # 5. Temporal statistics on PO columns (replaces add_rolling_features)
+        if self._temporal_transformer is not None:
+            df = self._temporal_transformer.transform(df)
+
+        # 6. Lag features + calendar (PO rolling handled by TemporalTransformer)
         if self.use_temporal and not skip_temporal:
             temporal_cols = list(TEMPORAL_BASE_COLS)
             temporal_cols += _active_cols(df, [
@@ -496,7 +520,6 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, ETF_FLOW_COLS)
             temporal_cols += _active_cols(df, GUBA_COLS)
             temporal_cols += _active_cols(df, COMMENT_COLS)
-            # New multi-shape columns (dynamic — pick up whatever was merged)
             temporal_cols += _active_cols(df, FLOW_COLS)
             temporal_cols += _active_cols(df, BLOCK_TRADE_COLS)
             temporal_cols += _active_cols(df, SHAREHOLDER_COLS)
@@ -507,7 +530,7 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, CONCEPT_COLS)
             temporal_cols += _active_cols(df, MACRO_COLS)
             temporal_cols += _active_cols(df, INDUSTRY_COLS)
-            # Dynamic columns: concept momentum, board momentum, sector momentum
+            # Dynamic PO columns
             temporal_cols += _active_cols(df, [
                 c for c in df.columns
                 if c.startswith("momentum_") or c.startswith("concept_momentum_")
@@ -515,15 +538,32 @@ class FeaturePipeline:
                 or c.startswith("seal_type_") or c.startswith("market_state_")
                 or c.startswith("cb_")
             ])
-            # New text features from DailyAggregator (any source prefix)
+            # Text features from preprocessing chains
             temporal_cols += _active_cols(df, [
                 c for c in df.columns
                 if c.endswith("_bipolar_sent") or c.endswith("_agreement")
                 or c.endswith("_attention") or c.endswith("_weighted_sent")
                 or c in ("bipolar_sent", "agreement", "attention", "weighted_sent")
             ])
+            # Emotion refinement outputs
+            temporal_cols += _active_cols(df, [
+                c for c in df.columns
+                if c.startswith("news_") or c.startswith("guba_")
+                or c in (
+                    "news_guba_divergence", "news_guba_ratio",
+                    "total_attention", "cross_source_agreement", "retail_panic",
+                )
+            ])
+            # Fundamental refinement outputs
+            temporal_cols += _active_cols(df, [
+                c for c in df.columns
+                if c.startswith(("f_score", "quality_", "earnings_", "profitability_",
+                                 "margin_stability", "growth_quality", "pe_", "pb_",
+                                 "deep_value", "roe_", "revenue_", "margin_trend",
+                                 "earnings_surprise"))
+                or c in ("pe_pb_divergence",)
+            ])
             df = add_lag_features(df, temporal_cols, self.LAGS)
-            df = add_rolling_features(df, temporal_cols, self.ROLLING_WINDOWS)
             df = add_calendar_features(df)
 
         return df
@@ -1033,7 +1073,7 @@ class FeaturePipeline:
     @staticmethod
     def _prep_feature_df(df: pd.DataFrame) -> pd.DataFrame:
         """Drop metadata columns and rows with inf/NaN — shared by sequencing methods."""
-        drop_cols = ["stock_code", "sector", "size_proxy"]
+        drop_cols = ["stock_code", "sector", "sector_code", "size_proxy"]
         feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
         feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
         return feat_df.dropna()
@@ -1095,6 +1135,71 @@ class FeaturePipeline:
         # Sample i predicts return ending at valid_dates[seq_len-1+i+horizon]
         return valid_dates[self.seq_len - 1 + self.horizon:
                            self.seq_len - 1 + self.horizon + n_samples]
+
+    # ------------------------------------------------------------------
+    # Dynamic column discovery (replaces hardcoded PK/PO lists)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _discover_pk_columns(df: pd.DataFrame) -> list[str]:
+        """Auto-discover past-known columns from a reference DataFrame.
+
+        PK columns come from: OHLCV, technical indicators, scoring,
+        microstructure, calendar, intraday, and fundamental refinements.
+        Everything else is PO.
+        """
+        pk_prefixes = [
+            "open", "high", "low", "close", "volume", "amount",
+            "ma_", "ema_", "macd_", "rsi_", "kdj_", "boll_", "atr_",
+            "roc_", "wr_", "cci_", "vol_", "volume_", "amount_",
+            "kmid", "klen", "kup", "klow", "ksft",
+            "open0", "high0", "low0",
+            "adx", "adxr", "pdi", "mdi",
+            "mfi_", "cmo_", "trix",
+            "obv", "turnover",
+            "is_limit_", "gap_", "volume_anomaly", "limit_up_",
+            "is_one_word", "seal_quality",
+            "day_of_", "month", "quarter",
+            "minutes_", "is_am_", "is_pm_", "session_", "bar_of_", "opening_",
+            "session_high",
+            "trend_level", "bias_", "buy_signal",
+            "pct_change",
+            "max_", "min_", "qtlu_", "qtld_", "rank_", "rsv_",
+            "corr_", "cord_", "beta_", "rsqr_", "resi_",
+            "vma_", "vstd_",
+            "cntp_", "cntn_", "cntd_",
+            "sump_", "sumn_", "sumd_",
+            "imax_", "imin_", "imxd_",
+            "wvma_", "vsump_", "vsumn_", "vsumd_",
+            "interaction_",
+            "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
+            "debt_ratio", "gross_margin", "net_margin",
+            "pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm",
+            "f_score", "quality_composite", "earnings_quality",
+            "profitability_stability", "margin_stability", "growth_quality",
+            "pe_percentile_", "pb_percentile_", "pe_pb_divergence", "deep_value",
+            "roe_trend_", "revenue_trend_", "margin_trend_", "roe_accel",
+            "earnings_surprise",
+            "pe_sector_ratio", "pb_sector_ratio", "ps_sector_ratio",
+            "leverage_warning", "valuation_composite_z",
+        ]
+        pk = []
+        for col in df.columns:
+            if col in ("date", "stock_code", "sector", "size_proxy", "sector_code"):
+                continue
+            for prefix in pk_prefixes:
+                if col == prefix or col.startswith(prefix):
+                    pk.append(col)
+                    break
+        return pk
+
+    @staticmethod
+    def _discover_po_columns(df: pd.DataFrame, pk_set: set[str] | None = None) -> list[str]:
+        """Auto-discover PO columns — everything not PK and not metadata."""
+        if pk_set is None:
+            pk_set = set(FeaturePipeline._discover_pk_columns(df))
+        skip = {"date", "stock_code", "sector", "size_proxy", "sector_code"}
+        return [c for c in df.columns if c not in pk_set and c not in skip]
 
     def build_panel_features(
         self,
@@ -1242,20 +1347,56 @@ class FeaturePipeline:
                     fill_df = pd.DataFrame(fill_data, index=df.index)
                     all_feat_dfs[i] = pd.concat([df, fill_df], axis=1)
 
+        # ── Cross-sectional fundamental features ──
+        # Sector-relative valuation, leverage warning, composite cheapness.
+        # Computed on the full multi-stock panel so sector medians are meaningful.
+        cs_fund_cols = ["date", "stock_code", "sector_code",
+                        "pe_ttm", "pb_mrq", "ps_ttm", "debt_ratio",
+                        "pe_percentile_252d", "pb_percentile_252d"]
+        if (self._fundamental_refiner is not None
+                and any("sector_code" in df.columns for df in all_feat_dfs)):
+            panel_parts: list[pd.DataFrame] = []
+            for i, df in enumerate(all_feat_dfs):
+                if len(df) == 0:
+                    continue
+                avail = [c for c in cs_fund_cols if c in df.columns]
+                if "sector_code" not in avail:
+                    continue
+                part = df[avail].copy()
+                panel_parts.append(part)
+            if panel_parts:
+                cs_panel = pd.concat(panel_parts, ignore_index=True)
+                cs_panel = FundamentalRefiner.add_cross_sectional(cs_panel)
+                new_cs_cols = [c for c in cs_panel.columns
+                               if c not in set(cs_fund_cols)]
+                if new_cs_cols:
+                    for i, df in enumerate(all_feat_dfs):
+                        if len(df) == 0 or "sector_code" not in df.columns:
+                            continue
+                        stock_code = codes[i]
+                        stock_cs = cs_panel[cs_panel["stock_code"] == stock_code]
+                        if stock_cs.empty:
+                            continue
+                        merge_df = stock_cs[["date"] + new_cs_cols].copy()
+                        df = df.merge(merge_df, on="date", how="left")
+                        for col in new_cs_cols:
+                            if col not in df.columns:
+                                df[col] = np.float32(0.0)
+                            else:
+                                df[col] = df[col].fillna(0.0).astype(np.float32)
+                        all_feat_dfs[i] = df
+
         if max_T < self.seq_len + 5:
             raise ValueError(
                 f"Max timesteps ({max_T}) must be > seq_len+5 ({self.seq_len + 5})"
             )
 
-        # Determine feature dimensions from first stock
+        # ── Dynamic column discovery (replaces hardcoded _PAST_KNOWN/OBSERVED_COLS) ──
         first_df = all_feat_dfs[0]
         static_cols_available = [c for c in _STATIC_FEATURE_COLS if c in first_df.columns]
-        pk_cols_available = [c for c in _PAST_KNOWN_COLS if c in first_df.columns]
-        po_cols_available = [c for c in _PAST_OBSERVED_COLS if c in first_df.columns]
-        # Dynamically include has_* flags (ZI-fill indicators) so the model
-        # can distinguish true zeros from "no data available" zeros.
-        has_cols = [c for c in first_df.columns if c.startswith("has_")]
-        po_cols_available += has_cols
+        pk_cols_available = self._discover_pk_columns(first_df)
+        pk_set = set(pk_cols_available)
+        po_cols_available = self._discover_po_columns(first_df, pk_set)
 
         # Compute static features from first 20 days (zero look-ahead bias).
         # Stock-invariant characteristics — size, liquidity, risk, price tier.
