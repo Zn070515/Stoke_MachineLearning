@@ -216,11 +216,28 @@ class ConceptBlockEncoder(PreprocessingStep):
         # Board overlap: per stock, average Jaccard with other stocks in same boards
         # Simplified: board_count as a proxy (more boards = higher neighborhood density)
         if "board_count" in df.columns:
-            # Normalize to [0, 1]
-            max_bc = df["board_count"].max()
-            if max_bc > 0:
+            # Normalize to [0, 1] with a per-stock EXPANDING max (causal).
+            # A full-sample max() would leak future board counts into every
+            # historical row and shift all scores retroactively when data is
+            # extended; the expanding max only uses data up to each row, so
+            # overlap scores are stable and leak-free.
+            if "stock_code" in df.columns and "date" in df.columns:
+                t = df[["stock_code", "date", "board_count"]].copy()
+                t["date"] = pd.to_datetime(t["date"], errors="coerce")
+                # board_count is constant within (date, stock_code) — collapse
+                g = t.drop_duplicates(["stock_code", "date"])
+                g = g.sort_values(["stock_code", "date"])
+                g["_cmax"] = g.groupby("stock_code")["board_count"].cummax()
+                g = g.set_index(["stock_code", "date"])
+                keys = pd.MultiIndex.from_arrays(
+                    [df["stock_code"], pd.to_datetime(df["date"], errors="coerce")]
+                )
+                run_max = g["_cmax"].reindex(keys).to_numpy(dtype=np.float64)
                 df["board_overlap_score"] = (
-                    df["board_count"] / max_bc
+                    np.where(
+                        run_max > 0, df["board_count"] / run_max, 0.0
+                    )
                 ).astype(np.float32)
             else:
-                df["board_overlap_score"] = 0.0
+                # No stock/date info — fall back to a fixed reference of 1.0
+                df["board_overlap_score"] = 1.0 if df["board_count"].max() > 0 else 0.0
