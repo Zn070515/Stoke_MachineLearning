@@ -43,8 +43,9 @@ class MarketWideStorage:
     def save(self, df: pd.DataFrame) -> None:
         """Save per-stock market data to flat files, merging with existing.
 
-        Loads existing flat file, concatenates new rows, drops duplicates
-        by (date, stock_code), and writes back atomically.
+        Loads existing flat file, concatenates new rows, drops duplicate
+        rows (identical across all columns), and writes back atomically.
+        Multi-row-per-day events (e.g. block_trade) are preserved.
         Thread-safe: uses temp file + atomic rename per stock.
         """
         if df.empty:
@@ -66,7 +67,9 @@ class MarketWideStorage:
                 if "stock_code" not in existing.columns:
                     existing["stock_code"] = code
                 new_rows = pd.concat([existing, new_rows], ignore_index=True)
-            new_rows = new_rows.drop_duplicates(subset=["date"], keep="last")
+            # Dedup identical rows (not by date only — block_trade has
+            # multiple trades per day that must all be preserved).
+            new_rows = new_rows.drop_duplicates(keep="last")
             new_rows = new_rows.sort_values("date")
             fd, tmp_path = tempfile.mkstemp(
                 suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
