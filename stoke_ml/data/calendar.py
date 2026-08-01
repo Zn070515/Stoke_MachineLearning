@@ -61,7 +61,7 @@ class TradingCalendar:
         dt.date(2024, 9, 29), dt.date(2024, 10, 12),
         # 2025
         dt.date(2025, 1, 26), dt.date(2025, 2, 8),
-        dt.date(2025, 4, 27), dt.date(2025, 5, 4),
+        dt.date(2025, 4, 27),
         dt.date(2025, 9, 28), dt.date(2025, 10, 11),
         # 2026 (published schedule)
         dt.date(2026, 2, 14), dt.date(2026, 2, 22),
