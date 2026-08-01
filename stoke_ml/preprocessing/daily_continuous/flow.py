@@ -95,7 +95,10 @@ class FlowDecomposer(PreprocessingStep):
         per-stock flow DataFrame carries no close column, so the gated
         features never fired before).  Populates ``df["_close"]`` and
         returns True when a close series is available.  Idempotent: a second
-        call short-circuits once ``_close`` is already present.
+        call short-circuits once ``_close`` is already present.  When the
+        merged close is all-NaN, ``_close`` is dropped before returning
+        False so a later call re-attempts the merge instead of spuriously
+        short-circuiting into a residual fallback.
         """
         if "_close" in df.columns:
             return True
@@ -103,20 +106,37 @@ class FlowDecomposer(PreprocessingStep):
             df["_close"] = df["close"]
             return True
         daily_data = kwargs.get("daily_data")
-        if daily_data is not None and not daily_data.empty:
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            merge_on = [c for c in ["date", "stock_code"] if c in df.columns]
-            if len(merge_on) == 2 and all(c in daily_data.columns for c in merge_on):
-                dd = daily_data.copy()
-                dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
-                merged = df.merge(
-                    dd[merge_on + ["close"]].rename(columns={"close": "_close"}),
-                    on=merge_on, how="left",
-                )
-                df["_close"] = merged["_close"]
-                return bool(df["_close"].notna().any())
+        merged = FlowDecomposer._merge_daily_close(df, daily_data)
+        if "close" in merged.columns:
+            df["_close"] = merged["close"]
+            if df["_close"].notna().any():
+                return True
+            df.drop(columns=["_close"], inplace=True, errors="ignore")
         return False
+
+    @staticmethod
+    def _merge_daily_close(df, daily_data) -> pd.DataFrame:
+        """Return *df* merged with the daily ``close`` column from *daily_data*.
+
+        Merges daily_data's ``close`` by (date, stock_code).  Returns the
+        original *df* unchanged when daily_data is missing/empty or the merge
+        keys aren't available, so callers fall back to a close column already
+        present on *df*.
+        """
+        if daily_data is None or daily_data.empty:
+            return df
+        merge_on = [c for c in ["date", "stock_code"] if c in df.columns]
+        if len(merge_on) != 2 or not all(c in daily_data.columns for c in merge_on):
+            return df
+        out = df.copy()
+        if "date" in out.columns:
+            out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        dd = daily_data.copy()
+        if "date" in dd.columns:
+            dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
+        return out.merge(
+            dd[merge_on + ["close"]], on=merge_on, how="left"
+        )
 
     # ── L1: size-tier ratios ──────────────────────────────────────────
 
@@ -250,22 +270,9 @@ class FlowDecomposer(PreprocessingStep):
         if "main_net" not in flow_cols:
             return
         daily_data = kwargs.get("daily_data")
-        if daily_data is not None and not daily_data.empty:
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            merge_on = [c for c in ["date", "stock_code"] if c in df.columns]
-            if len(merge_on) == 2 and all(c in daily_data.columns for c in merge_on):
-                dd = daily_data.copy()
-                dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
-                merged = df.merge(
-                    dd[merge_on + ["close"]].rename(columns={"close": "_mcap_proxy"}),
-                    on=merge_on, how="left",
-                )
-                df["_mcap_proxy"] = merged["_mcap_proxy"]
-            elif "close" in df.columns:
-                df["_mcap_proxy"] = df["close"]
-            else:
-                return
+        merged = FlowDecomposer._merge_daily_close(df, daily_data)
+        if "close" in merged.columns:
+            df["_mcap_proxy"] = merged["close"]
         elif "close" in df.columns:
             df["_mcap_proxy"] = df["close"]
         else:

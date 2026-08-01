@@ -66,6 +66,9 @@ class SectorBroadcaster(PreprocessingStep):
         if "date" in ir.columns:
             ir["date"] = pd.to_datetime(ir["date"], errors="coerce")
         ir = ir.rename(columns={"code": "sector_code"})
+        # Dedup insurance: producer guarantees unique (date, sector) rows today,
+        # but guard against a left-merge row explosion if that ever regresses.
+        ir = ir.drop_duplicates(subset=["date", "sector_code"], keep="last")
 
         # Map stocks to sectors
         if sector_map:
@@ -320,15 +323,18 @@ class SectorBroadcaster(PreprocessingStep):
         def _residualize_date(grp):
             # ir is already 1 row per sector per date (no dedup needed), but
             # keep a guard so dates with too few sectors get alpha = 0.
+            # NaN rows (missing change_pct/_mkt_return) stay NaN here and are
+            # zeroed by the panel-level fillna(0) below — never a fitted value.
+            grp["sector_alpha"] = np.nan
             m = grp["change_pct"].notna() & grp["_mkt_return"].notna()
             if m.sum() < 3:
-                grp["sector_alpha"] = 0.0
+                grp.loc[m, "sector_alpha"] = 0.0
                 return grp
             c = P.polyfit(grp.loc[m, "_mkt_return"].values,
                           grp.loc[m, "change_pct"].values, 1)
-            fitted = c[0] + c[1] * grp["_mkt_return"].fillna(0)
-            grp["sector_alpha"] = (
-                (grp["change_pct"].fillna(0) - fitted)
+            fitted = c[0] + c[1] * grp.loc[m, "_mkt_return"]
+            grp.loc[m, "sector_alpha"] = (
+                (grp.loc[m, "change_pct"] - fitted)
             ).astype(np.float32)
             return grp
 
@@ -348,39 +354,33 @@ class SectorBroadcaster(PreprocessingStep):
         return df
 
 
-def _cross_sectional_zscore(df, col, window, by=None):
+def _cross_sectional_zscore(df, col, window, by):
     """Cross-sectional z-score: (value - date_mean) / date_std per date.
 
     Uses rolling *window* of trading days to smooth both mean and std,
     falling back to expanding-window when fewer than *window* dates available.
     Winsorizes at 1%/99% within each cross-section before z-scoring.
 
-    When ``by`` is given (e.g. ``by="sector_code"`` on a panel with multiple
-    rows per date), the rolling smoothing is applied per group in row order so
-    the window never crosses group boundaries.  ``df`` should be sorted by
-    ``by`` then date for a chronological within-group smoothing.
-    Backward-compatible: without ``by``, the rolling is applied over row order
-    as before (the per-stock case, where each date has a single row).
+    ``by`` is the grouping column (e.g. ``by="sector_code"``) over which the
+    rolling-window smoothing is applied in row order, so the window never
+    crosses group boundaries.  ``df`` should be sorted by ``by`` then date
+    for a chronological within-group smoothing.
     """
     date_mean_series = df.groupby("date")[col].transform("mean")
     date_std_series = df.groupby("date")[col].transform("std")
-    if by is not None:
-        keys = df[by].values
-        date_mean = (
-            date_mean_series.groupby(keys)
-            .rolling(window, min_periods=1)
-            .mean()
-            .reset_index(level=0, drop=True)
-        )
-        date_std = (
-            date_std_series.groupby(keys)
-            .rolling(window, min_periods=1)
-            .mean()
-            .reset_index(level=0, drop=True)
-        )
-    else:
-        date_mean = date_mean_series.rolling(window, min_periods=1).mean()
-        date_std = date_std_series.rolling(window, min_periods=1).mean()
+    keys = df[by].values
+    date_mean = (
+        date_mean_series.groupby(keys)
+        .rolling(window, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    date_std = (
+        date_std_series.groupby(keys)
+        .rolling(window, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
     # Winsorize within each date cross-section before z-scoring
     lo = df.groupby("date")[col].transform(lambda s: s.quantile(0.01))
     hi = df.groupby("date")[col].transform(lambda s: s.quantile(0.99))
