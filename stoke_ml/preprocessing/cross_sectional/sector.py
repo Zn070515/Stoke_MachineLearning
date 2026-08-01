@@ -79,15 +79,41 @@ class SectorBroadcaster(PreprocessingStep):
         # L3-4: sector momentum + RRG (returns merged df)
         df = self._add_sector_momentum(df, ir)
 
-        # L4: breadth normalization
-        if "up_count" in df.columns and "down_count" in df.columns:
+        # L4: breadth normalization.  ``sector_breadth_raw`` uses the merged
+        # ir columns (correct), but the cross-sectional z collapses on a
+        # per-stock df (1 row/date -> x - x = 0).  Compute the z on the full
+        # ir PANEL (all sectors per date), then broadcast by date+sector_code.
+        if (
+            "up_count" in df.columns
+            and "down_count" in df.columns
+            and "up_count" in ir.columns
+            and "down_count" in ir.columns
+        ):
             total = df["up_count"] + df["down_count"]
             df["sector_breadth_raw"] = (
                 (df["up_count"] - df["down_count"]) / total.replace(0, np.nan)
             ).astype(np.float32)
-            df["sector_breadth_z"] = _cross_sectional_zscore(
-                df, "sector_breadth_raw", self.breadth_normalize_window
+
+            panel = ir.copy()
+            # Sort so the per-sector rolling smoothing in the z-score is
+            # chronological within each sector.
+            panel = panel.sort_values(["sector_code", "date"])
+            panel["_breadth_raw"] = (
+                (panel["up_count"] - panel["down_count"])
+                / (panel["up_count"] + panel["down_count"]).replace(0, np.nan)
+            ).astype(np.float32)
+            # by="sector_code" makes the rolling-window smoothing per-sector
+            # chronological (never crossing sector boundaries).
+            panel["_breadth_z"] = _cross_sectional_zscore(
+                panel, "_breadth_raw", self.breadth_normalize_window, by="sector_code"
             )
+            df = df.merge(
+                panel[["date", "sector_code", "_breadth_z"]],
+                on=["date", "sector_code"],
+                how="left",
+            )
+            df["sector_breadth_z"] = df["_breadth_z"].fillna(0).astype(np.float32)
+            df.drop(columns=["_breadth_z"], inplace=True)
 
         # L5: rotation signals (require date-sorted df)
         if "rank" in df.columns:
@@ -124,8 +150,8 @@ class SectorBroadcaster(PreprocessingStep):
         # P1 #7: crowding indicators
         df = self._add_crowding(df)
 
-        # P1 #8: residual momentum (strip market beta)
-        df = self._add_residual_momentum(df)
+        # P1 #8: residual momentum (strip market beta) — computed on the ir panel
+        df = self._add_residual_momentum(df, ir)
 
         return df
 
@@ -258,81 +284,103 @@ class SectorBroadcaster(PreprocessingStep):
 
     # ── P1 #8: residual momentum ─────────────────────────────────────
 
-    def _add_residual_momentum(self, df):
+    def _add_residual_momentum(self, df, ir):
         """Strip market beta from sector returns via cross-sectional regression.
 
-        For each date, regresses sector return on market return and keeps
-        the residual — purified sector alpha, orthogonal to market direction.
+        Computed on the industry_ranking PANEL (all sectors per date), then
+        broadcast to the per-stock df.  A per-stock df carries exactly one
+        sector per date, so a per-date cross-sectional regression on ``df``
+        dedups to a single sector and collapses to alpha = 0.
+
+        For each date, regresses every sector's ``change_pct`` on that date's
+        market return (polyfit degree 1) and keeps the residual — purified
+        sector alpha, orthogonal to market direction.
+
+        Market return = equal-weight mean of sector ``change_pct`` per date.
+        NOTE: ``ir`` carries sector-level returns (not individual stocks), so
+        the sector-equal-weight mean is the available "market" proxy.
         """
-        if "sector_code" not in df.columns or "change_pct" not in df.columns:
+        if ir is None or ir.empty:
             return df
-        if "close" not in df.columns or "stock_code" not in df.columns:
+        if "sector_code" not in ir.columns or "change_pct" not in ir.columns:
             return df
 
-        # Market return: equal-weighted mean of stock returns per date
-        if "close" in df.columns:
-            df_sorted = df.sort_values(["stock_code", "date"])
-            df_sorted["_ret"] = (
-                df_sorted.groupby("stock_code")["close"].pct_change()
+        panel = ir.copy()
+
+        # Market return: equal-weight mean of sector returns per date
+        mkt = (
+            panel.groupby("date", as_index=False)["change_pct"].mean().rename(
+                columns={"change_pct": "_mkt_return"}
             )
-            mkt_ret = (
-                df_sorted.groupby("date")["_ret"]
-                .mean()
-                .reset_index(name="mkt_return")
-            )
-            df_sorted.drop(columns=["_ret"], inplace=True)
-        else:
-            return df
-
-        # Sector-level daily return (from industry_ranking change_pct)
-        if "change_pct" not in df.columns:
-            return df
-
-        # Merge market return and run per-date cross-sectional regression
-        df = df.merge(mkt_ret, on="date", how="left")
+        )
+        panel = panel.merge(mkt, on="date", how="left")
 
         from numpy.polynomial import polynomial as P
 
         def _residualize_date(grp):
-            # Dedup by sector_code so large sectors don't dominate regression
-            dedup = grp.drop_duplicates(subset=["sector_code"])
-            m = dedup["change_pct"].notna() & dedup["mkt_return"].notna()
+            # ir is already 1 row per sector per date (no dedup needed), but
+            # keep a guard so dates with too few sectors get alpha = 0.
+            m = grp["change_pct"].notna() & grp["_mkt_return"].notna()
             if m.sum() < 3:
                 grp["sector_alpha"] = 0.0
                 return grp
-            c = P.polyfit(dedup.loc[m, "mkt_return"].values,
-                          dedup.loc[m, "change_pct"].values, 1)
-            fitted = c[0] + c[1] * grp["mkt_return"].fillna(0)
+            c = P.polyfit(grp.loc[m, "_mkt_return"].values,
+                          grp.loc[m, "change_pct"].values, 1)
+            fitted = c[0] + c[1] * grp["_mkt_return"].fillna(0)
             grp["sector_alpha"] = (
                 (grp["change_pct"].fillna(0) - fitted)
             ).astype(np.float32)
             return grp
 
         # pandas >=3.0 drops groupby key columns from apply() results
-        date_series = df["date"].copy()
-        df = df.groupby("date", group_keys=False).apply(_residualize_date)
-        df["date"] = date_series
-        df.drop(columns=["mkt_return"], inplace=True)
+        date_series = panel["date"].copy()
+        panel = panel.groupby("date", group_keys=False).apply(_residualize_date)
+        panel["date"] = date_series
+        panel["sector_alpha"] = panel["sector_alpha"].fillna(0).astype(np.float32)
+
+        # Broadcast residual alpha back onto the per-stock df
+        df = df.merge(
+            panel[["date", "sector_code", "sector_alpha"]],
+            on=["date", "sector_code"],
+            how="left",
+        )
+        df["sector_alpha"] = df["sector_alpha"].fillna(0).astype(np.float32)
         return df
 
 
-def _cross_sectional_zscore(df, col, window):
+def _cross_sectional_zscore(df, col, window, by=None):
     """Cross-sectional z-score: (value - date_mean) / date_std per date.
 
     Uses rolling *window* of trading days to smooth both mean and std,
     falling back to expanding-window when fewer than *window* dates available.
     Winsorizes at 1%/99% within each cross-section before z-scoring.
+
+    When ``by`` is given (e.g. ``by="sector_code"`` on a panel with multiple
+    rows per date), the rolling smoothing is applied per group in row order so
+    the window never crosses group boundaries.  ``df`` should be sorted by
+    ``by`` then date for a chronological within-group smoothing.
+    Backward-compatible: without ``by``, the rolling is applied over row order
+    as before (the per-stock case, where each date has a single row).
     """
-    date_mean = (
-        df.groupby("date")[col].transform("mean")
-        .rolling(window, min_periods=1)
-        .mean()
-    )
-    date_std = (
-        df.groupby("date")[col].transform("std")
-        .rolling(window, min_periods=1)
-        .mean()
-    )
+    date_mean_series = df.groupby("date")[col].transform("mean")
+    date_std_series = df.groupby("date")[col].transform("std")
+    if by is not None:
+        keys = df[by].values
+        date_mean = (
+            date_mean_series.groupby(keys)
+            .rolling(window, min_periods=1)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        date_std = (
+            date_std_series.groupby(keys)
+            .rolling(window, min_periods=1)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+    else:
+        date_mean = date_mean_series.rolling(window, min_periods=1).mean()
+        date_std = date_std_series.rolling(window, min_periods=1).mean()
     # Winsorize within each date cross-section before z-scoring
     lo = df.groupby("date")[col].transform(lambda s: s.quantile(0.01))
     hi = df.groupby("date")[col].transform(lambda s: s.quantile(0.99))
