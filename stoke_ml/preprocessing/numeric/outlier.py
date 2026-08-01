@@ -26,6 +26,15 @@ class OutlierDetector(PreprocessingStep):
         self._bounds: dict[str, tuple[float, float]] = {}
 
     def fit(self, df, **kwargs):
+        """Compute the per-column clip set (which columns get winsorized).
+
+        NOTE: fit() uses FULL-SAMPLE statistics to decide the clip column-set,
+        and skips columns whose full-sample MAD < 1e-10.  transform() is causal
+        (trailing window), but the *include-set* decided here can leak the
+        future: a column constant for most of history then volatile late would
+        only be included because of that later data.  Call fit() on TRAINING
+        windows only — never on a window that includes the evaluation period.
+        """
         self._bounds = {}
         for col in df.select_dtypes(include=[np.number]).columns:
             if col in self._LIMIT_COLS:

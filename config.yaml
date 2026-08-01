@@ -221,6 +221,9 @@ preprocessing:
 
   monitor:
     enabled: true
+    # QualityMonitor is wired into PreprocessingPipeline.run() (summary logs).
+    # DriftMonitor is attached via pp.drift_monitor but needs a fit-on-train /
+    # transform-on-eval lifecycle — not yet invoked (follow-up).
     log_dir: "logs/quality"
     missing_warn_threshold: 0.2
     missing_error_threshold: 0.5
@@ -229,4 +232,6 @@ preprocessing:
 
   registry:
     enabled: true
+    # FeatureRegistry is attached via pp.registry but nothing populates it yet
+    # — not yet used for validation (follow-up).
     baseline_update_freq: "monthly"

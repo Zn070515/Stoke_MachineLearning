@@ -39,7 +39,22 @@ class PreprocessingPipeline:
                 f"Chain '{chain_name}' not found. "
                 f"Available: {self.list_chains()}"
             )
-        return chain.fit_transform(df, **kwargs)
+        out = chain.fit_transform(df, **kwargs)
+        qm = getattr(self, "_quality_monitor", None)
+        if qm is not None:
+            qm.transform(out)  # pure check, does not modify data
+            report = qm.report
+            errors = [r for r in report if r["level"] == "ERROR"]
+            warns = [r for r in report if r["level"] == "WARN"]
+            logger.info(
+                "QualityMonitor[%s]: %d errors, %d warnings",
+                chain_name, len(errors), len(warns),
+            )
+            if errors:
+                logger.warning(
+                    "QualityMonitor[%s] errors: %s", chain_name, errors[:3]
+                )
+        return out
 
     def get_chain(self, name: str):
         """Return the named PreprocessingChain, or None if not registered."""
@@ -52,6 +67,21 @@ class PreprocessingPipeline:
     def topic_modeler(self):
         """The TopicModeler instance, if configured. May be None."""
         return getattr(self, "_topic_modeler", None)
+
+    @property
+    def quality_monitor(self):
+        """The QualityMonitor instance, if configured. May be None."""
+        return getattr(self, "_quality_monitor", None)
+
+    @property
+    def drift_monitor(self):
+        """The DriftMonitor instance, if configured. May be None."""
+        return getattr(self, "_drift_monitor", None)
+
+    @property
+    def registry(self):
+        """The FeatureRegistry instance, if configured. May be None."""
+        return getattr(self, "_registry", None)
 
     @classmethod
     def from_config(cls, config: dict) -> PreprocessingPipeline:

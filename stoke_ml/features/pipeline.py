@@ -1205,11 +1205,14 @@ class FeaturePipeline:
             ], dtype=np.float32)
 
         y = target[self.seq_len - 1: self.seq_len - 1 + n_samples]
-        # aligned_close must step by horizon so np.diff(aligned_close) yields
-        # horizon-day returns matching label y. For horizon=1 this reduces to
-        # consecutive closes (identical to the original); for horizon>1 sample
-        # every horizon-th close and pad the tail with the last close so the
-        # length stays n_samples+1 (diff keeps matching n_samples predictions).
+        # aligned_close steps by horizon so diff(aligned_close)[k] equals the
+        # horizon-day return of the NON-OVERLAPPING sample k*horizon (y[k*horizon]),
+        # not y[k]. For horizon=1 this reduces to consecutive closes and pairs
+        # with every prediction. For horizon>1 the overlapping windows mean
+        # n_samples horizon returns cannot be derived from n_samples+1 prices,
+        # so compute_financial_metrics(prices, predictions) is only correct for
+        # horizon=1; multi-horizon financial metrics are unsupported
+        # (see audit-doc follow-up 2026-08-02).
         aligned_close = close[self.seq_len - 1 :: self.horizon][: n_samples + 1]
         if len(aligned_close) < n_samples + 1:
             aligned_close = np.concatenate([
