@@ -40,13 +40,20 @@ class MarketWideStorage:
         os.makedirs(p, exist_ok=True)
         return p
 
-    def save(self, df: pd.DataFrame) -> None:
+    def save(self, df: pd.DataFrame, replace_range: bool = False) -> None:
         """Save per-stock market data to flat files, merging with existing.
 
         Loads existing flat file, concatenates new rows, drops duplicate
         rows (identical across all columns), and writes back atomically.
         Multi-row-per-day events (e.g. block_trade) are preserved.
         Thread-safe: uses temp file + atomic rename per stock.
+
+        ``replace_range=True`` marks this as a *derived-view* write (used by
+        preprocessing reprocessing): existing rows whose ``date`` falls inside
+        the new rows' [min, max] range are dropped before merging, so a rerun
+        yields exactly the current transform output for that range instead of
+        accumulating stale rows (e.g. after a logic fix changes values for the
+        same date). Rows outside the range are preserved for partial runs.
         """
         if df.empty:
             return
@@ -66,6 +73,12 @@ class MarketWideStorage:
                 # Backward compat: older files may lack stock_code column
                 if "stock_code" not in existing.columns:
                     existing["stock_code"] = code
+                if replace_range:
+                    lo = new_rows["date"].min()
+                    hi = new_rows["date"].max()
+                    existing = existing[
+                        (existing["date"] < lo) | (existing["date"] > hi)
+                    ]
                 new_rows = pd.concat([existing, new_rows], ignore_index=True)
             # Dedup identical rows (not by date only — block_trade has
             # multiple trades per day that must all be preserved).

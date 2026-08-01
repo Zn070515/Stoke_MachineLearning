@@ -187,7 +187,7 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
                 trading_dates=trading_dates,
             )
             if not processed.empty:
-                dest.save(processed)
+                dest.save(processed, replace_range=True)
                 total += len(processed)
         except Exception:
             logger.warning("%s preprocessing failed for %s", dtype, code, exc_info=True)
@@ -269,7 +269,7 @@ def _process_board(chain, stock_list, data_dir, args):
                 concept_map=concept_map if concept_map else None,
             )
             if not processed.empty:
-                dest.save(processed)
+                dest.save(processed, replace_range=True)
                 total += len(processed)
         except Exception:
             logger.warning("board preprocessing failed for %s", code, exc_info=True)
@@ -362,7 +362,7 @@ def _process_sector(chain, stock_list, data_dir, args):
                 sector_features=sector_features,
             )
             if not processed.empty:
-                dest.save(processed)
+                dest.save(processed, replace_range=True)
                 total += len(processed)
             if (i + 1) % 500 == 0:
                 logger.info("  sector progress: %d/%d stocks, %d rows",
