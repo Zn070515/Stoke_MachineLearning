@@ -1796,6 +1796,21 @@ _CS_NORM_SKIP_COLS = frozenset({
     "minutes_from_open", "minutes_to_close", "is_am_session", "is_pm_session",
     "session_progress", "bar_of_day",
     "day_of_week", "day_of_month", "month", "quarter",
+    # Macro (market-wide, identical for every stock on a date)
+    "shibor_O_N", "shibor_1W", "shibor_2W", "shibor_1M",
+    "shibor_3M", "shibor_6M", "shibor_9M", "shibor_1Y",
+    "fx_usd_cny", "fx_eur_cny", "fx_jpy_cny", "fx_hkd_cny", "fx_gbp_cny",
+    "bond_cn_2y", "bond_cn_5y", "bond_cn_10y", "bond_cn_30y",
+    "bond_cn_10y2y_spread",
+    "bond_us_2y", "bond_us_5y", "bond_us_10y", "bond_us_30y",
+    "bond_us_10y2y_spread",
+    "gdp_cn_yoy", "m2_yoy", "m1_yoy", "sf_total", "cpi_yoy",
+    # Industry cross-sectional stats (row-wise over ALL industries — market-wide).
+    # NOTE: ind_matched_return / stock_vs_industry are PER-STOCK and intentionally
+    # excluded from this set (they carry cross-sectional signal).
+    "ind_pct_up", "ind_return_mean", "ind_return_std",
+    "ind_return_max", "ind_return_min", "ind_return_skew",
+    "ind_dispersion_20d",
 })
 
 _PAST_OBSERVED_COLS = [
