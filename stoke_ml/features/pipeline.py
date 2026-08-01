@@ -1686,8 +1686,9 @@ def _compute_static_quantiles(
     # z-scored predictions back to raw return space for cross-sectional ranking.
     if "daily_ret_vol" in needed or "daily_ret_mean" in needed:
         for i, df in enumerate(all_feat_dfs):
-            if len(df) > 0 and "close" in df.columns:
-                c = df["close"].values.astype(np.float64)
+            if len(df) >= 3 and "close" in df.columns:
+                n_days = min(first_n, len(df))   # first_n = 20, no look-ahead
+                c = df["close"].iloc[:n_days].values.astype(np.float64)
                 ret = np.diff(c) / (c[:-1] + 1e-8)
                 ret = ret[np.isfinite(ret)]
                 df["daily_ret_vol"] = float(np.std(ret)) if len(ret) > 1 else 0.0
