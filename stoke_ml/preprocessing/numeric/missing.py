@@ -99,7 +99,7 @@ class MissingImputer(PreprocessingStep):
         """Attempt Kalman smoothing on a gap segment.
 
         Fits a local-level model on pre-gap observations, forecasts into
-        the gap, and blends toward the post-gap anchor for continuity.
+        the gap causally — no post-gap data is used (no look-ahead leakage).
         """
         try:
             from statsmodels.tsa.statespace.structural import UnobservedComponents
@@ -107,9 +107,7 @@ class MissingImputer(PreprocessingStep):
             return None
 
         pre = values[max(0, start - 5):start]
-        post = values[end:min(len(values), end + 5)]
         pre = pre[~np.isnan(pre)]
-        post = post[~np.isnan(post)]
 
         if len(pre) < 2:
             return None
@@ -122,11 +120,8 @@ class MissingImputer(PreprocessingStep):
             fitted = model.fit(disp=False)
             forecast = fitted.forecast(steps=gap_len)
 
-            # Blend forecast toward post-gap anchor for smooth continuity
-            if len(post) > 0:
-                anchor = float(post[0])
-                blend = np.linspace(0.0, 0.5, gap_len)
-                return forecast * (1.0 - blend) + anchor * blend
+            # Causal forecast only — do NOT blend toward the post-gap
+            # anchor: that would leak future information into imputed rows.
             return forecast
         except Exception:
             return None
