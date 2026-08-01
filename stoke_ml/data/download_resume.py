@@ -30,8 +30,9 @@ def skip_completed_stocks(
        to *start_date* or earlier
 
     Corrupted / unreadable files are silently deleted so the stock is
-    re-downloaded.  Files that have data but donʼt reach *start_date* are also
-    deleted — we prefer a clean re-download over appending.
+    re-downloaded.  Files that have data but donʼt reach *start_date* are
+    treated as complete and kept (bounded-pagination sources only have a
+    limited history) — never deleted on resume.
     """
     pending: list[str] = []
     skipped = 0
@@ -66,18 +67,19 @@ def skip_completed_stocks(
             if oldest <= start_ts:
                 skipped += 1
                 continue
-            # data exists but doesnʼt reach start_date → re-download
+            # Data exists but doesn't reach start_date (e.g. bounded
+            # pagination on news).  Do NOT delete — just skip this run so
+            # we don't destroy existing data and re-fetch it next time.
+            skipped += 1
             logger.debug(
-                "  %s: data only from %s, need ≤%s — re-downloading",
+                "  %s: oldest %s is after %s — treating as complete (bounded source)",
                 code, str(oldest.date()), str(start_ts.date()),
             )
-            _safe_unlink(path)
+            continue
         else:
             # No date-column or no date filter — existing file is enough
             skipped += 1
             continue
-
-        pending.append(code)
 
     if skipped:
         logger.info(
@@ -131,7 +133,7 @@ def skip_completed_years(
         return years, 0
 
     for year in years:
-        if year <= max_date.year:
+        if year < max_date.year:
             skipped += 1
         else:
             pending.append(year)
