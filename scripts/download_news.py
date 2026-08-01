@@ -60,6 +60,10 @@ def main():
                         help="Seconds between stocks (default: from config)")
     parser.add_argument("--skip-sentiment", action="store_true",
                         help="Skip sentiment computation (raw only)")
+    parser.add_argument("--raw-only", action="store_true",
+                        help="Only download and save raw Bronze, skip Silver/Gold")
+    parser.add_argument("--no-bodies", action="store_true",
+                        help="Skip article body fetching (defer to post-processing)")
     parser.add_argument("--concurrent", action="store_true",
                         help="Use concurrent downloader")
     parser.add_argument("--workers", type=int, default=4,
@@ -70,6 +74,10 @@ def main():
                         help="End date filter YYYY-MM-DD")
     parser.add_argument("--no-resume", action="store_true",
                         help="Re-download all stocks (ignore existing files)")
+    parser.add_argument("--shard", type=int, default=None,
+                        help="Shard index (0-based) for parallel download")
+    parser.add_argument("--num-shards", type=int, default=None,
+                        help="Total number of shards (required with --shard)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -86,6 +94,24 @@ def main():
     if not codes:
         logger.error("No stock codes found. Run download_data.py first.")
         sys.exit(1)
+
+    if (args.shard is not None) != (args.num_shards is not None):
+        parser.error("--shard and --num-shards must be used together")
+    if args.shard is not None and not (0 <= args.shard < args.num_shards):
+        parser.error(f"--shard must be in [0, {args.num_shards})")
+
+    shard_tag = f"_shard{args.shard}" if args.shard is not None else ""
+
+    if args.shard is not None:
+        total = len(codes)
+        size = (total + args.num_shards - 1) // args.num_shards
+        start = args.shard * size
+        end = min(start + size, total)
+        codes = codes[start:end]
+        if not codes:
+            logger.error("Shard %d: no stocks in range [%d:%d]", args.shard, start, end)
+            sys.exit(1)
+        logger.info("Shard %d/%d: %d stocks [%d:%d]", args.shard, args.num_shards, len(codes), start, end)
 
     # Resume: skip stocks whose raw data already covers start_date
     raw_dir = os.path.join(data_dir, "a_shares", "news_raw")
@@ -139,6 +165,7 @@ def main():
                 start_date=args.start,
                 end_date=args.end,
                 max_pages=args.max_pages,
+                fetch_bodies=not args.no_bodies,
             )
             if not args.skip_sentiment and not df.empty:
                 df = compute_raw_sentiment(df, analyzer)
@@ -164,19 +191,20 @@ def main():
             logger.info("  %s: %d articles saved (raw)", code, len(df))
             total_articles += len(df)
 
-            # PIT-align -> Silver
-            silver = news_storage.bronze_to_silver(code)
-            if not silver.empty:
-                news_storage.save_silver_news(code, silver)
+            if not args.raw_only:
+                # PIT-align -> Silver
+                silver = news_storage.bronze_to_silver(code)
+                if not silver.empty:
+                    news_storage.save_silver_news(code, silver)
 
-            # Daily aggregation -> Gold
-            if not args.skip_sentiment:
-                gold = news_storage.silver_to_gold(code, analyzer)
-                if not gold.empty:
-                    news_storage.save_daily_sentiment(gold)
-                    news_days = gold["has_news"].sum()
-                    logger.info("  %s: %d sentiment days (%d with news)",
-                                code, len(gold), news_days)
+                # Daily aggregation -> Gold
+                if not args.skip_sentiment:
+                    gold = news_storage.silver_to_gold(code, analyzer)
+                    if not gold.empty:
+                        news_storage.save_daily_sentiment(gold)
+                        news_days = gold["has_news"].sum()
+                        logger.info("  %s: %d sentiment days (%d with news)",
+                                    code, len(gold), news_days)
 
             success += 1
     else:
@@ -192,6 +220,7 @@ def main():
                     start_date=args.start,
                     end_date=args.end,
                     max_pages=args.max_pages,
+                    fetch_bodies=not args.no_bodies,
                 )
             except Exception as e:
                 logger.error("  %s: fetch failed: %s", code, e)
@@ -204,7 +233,7 @@ def main():
                 continue
 
             # Compute sentiment on titles
-            if not args.skip_sentiment:
+            if not args.skip_sentiment and not args.raw_only:
                 df = compute_raw_sentiment(df, analyzer)
 
             # Save raw (Bronze)
@@ -212,19 +241,20 @@ def main():
             logger.info("  %s: %d articles saved (raw)", code, len(df))
             total_articles += len(df)
 
-            # PIT-align -> Silver
-            silver = news_storage.bronze_to_silver(code)
-            if not silver.empty:
-                news_storage.save_silver_news(code, silver)
+            if not args.raw_only:
+                # PIT-align -> Silver
+                silver = news_storage.bronze_to_silver(code)
+                if not silver.empty:
+                    news_storage.save_silver_news(code, silver)
 
-            # Daily aggregation -> Gold
-            if not args.skip_sentiment:
-                gold = news_storage.silver_to_gold(code, analyzer)
-                if not gold.empty:
-                    news_storage.save_daily_sentiment(gold)
-                    news_days = gold["has_news"].sum()
-                    logger.info("  %s: %d sentiment days (%d with news)",
-                                code, len(gold), news_days)
+                # Daily aggregation -> Gold
+                if not args.skip_sentiment:
+                    gold = news_storage.silver_to_gold(code, analyzer)
+                    if not gold.empty:
+                        news_storage.save_daily_sentiment(gold)
+                        news_days = gold["has_news"].sum()
+                        logger.info("  %s: %d sentiment days (%d with news)",
+                                    code, len(gold), news_days)
 
             success += 1
 

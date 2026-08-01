@@ -40,6 +40,7 @@ class NewsPipeline:
         start_date: str | None = None,
         end_date: str | None = None,
         max_pages: int = 3,
+        fetch_bodies: bool = True,
     ) -> pd.DataFrame:
         """Fetch news from all active sources, deduplicate by (title, date).
 
@@ -57,7 +58,7 @@ class NewsPipeline:
                     max_pages=max_pages,
                 )
                 if source_name in _BODY_SOURCES:
-                    kwargs["fetch_bodies"] = True
+                    kwargs["fetch_bodies"] = kwargs.get("fetch_bodies", True)
                 df = source.fetch_news(**kwargs)
                 if not df.empty:
                     df["source"] = source_name

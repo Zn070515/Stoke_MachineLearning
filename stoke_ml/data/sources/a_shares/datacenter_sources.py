@@ -124,22 +124,82 @@ SHAREHOLDER_COLS = [
 
 
 class ShareholderSource:
-    """Fetch shareholder count changes (股东户数变化) per stock.
+    """Fetch shareholder count (股东户数) — market-wide by quarter-end date.
 
-    Declining shareholder count = ownership concentration = bullish signal
-    (retail exits, institutions accumulate). Quarterly frequency.
+    Uses EastMoney RPT_HOLDERNUM_DET which returns ALL stocks' holder counts
+    for a given END_DATE in one paginated call (~10 pages × 500 = ~5000 stocks).
+    Declining shareholder count = ownership concentration = bullish signal.
+
+    Also supports per-stock RPT_HOLDERNUMLATEST as a fallback for
+    backward-compatible single-stock queries.
     """
 
     SOURCE_NAME = "eastmoney_shareholder"
 
-    def __init__(self, min_interval: float = 1.2):
+    def __init__(self, min_interval: float = 0.8):
         self._client = EastMoneyClient(min_interval=min_interval)
+        self._api_url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        self._report = "RPT_HOLDERNUM_DET"
+        self._columns = (
+            "SECURITY_CODE,SECURITY_NAME_ABBR,END_DATE,"
+            "HOLDER_NUM,HOLDER_NUM_CHANGE,HOLDER_NUM_RATIO,"
+            "PRE_HOLDER_NUM,PRE_END_DATE,"
+            "AVG_HOLD_NUM,AVG_MARKET_CAP,TOTAL_A_SHARES,TOTAL_MARKET_CAP,"
+            "HOLD_NOTICE_DATE,CLOSE_PRICE,CHANGE_REASON,CHANGE_SHARES"
+        )
+
+    def fetch_quarter(self, date_str: str, page_size: int = 500) -> pd.DataFrame:
+        """Fetch shareholder count for ALL stocks on a quarter-end date.
+
+        Args:
+            date_str: YYYY-MM-DD quarter-end (e.g. '2023-09-30').
+            page_size: Records per page (max 500).
+
+        Returns:
+            DataFrame with SHAREHOLDER_COLS for all stocks on that date.
+        """
+        import requests as req
+        all_rows = []
+        page = 1
+        while True:
+            data = self._client.datacenter(
+                self._report,
+                filter_str=f"(END_DATE='{date_str}')",
+                page_size=page_size,
+                page_number=page,
+                sort_columns="SECURITY_CODE",
+                sort_types="1",
+            )
+            if not data:
+                break
+            for r in data:
+                holder_num = int(r.get("HOLDER_NUM") or 0)
+                avg_shares = float(r.get("AVG_HOLD_NUM") or 0)
+                if holder_num == 0 and avg_shares == 0:
+                    continue
+                all_rows.append({
+                    "date": str(r.get("END_DATE", ""))[:10],
+                    "stock_code": str(r.get("SECURITY_CODE", "")),
+                    "holder_num": holder_num,
+                    "change_num": int(r.get("HOLDER_NUM_CHANGE") or 0),
+                    "change_ratio": float(r.get("HOLDER_NUM_RATIO") or 0),
+                    "avg_shares": avg_shares,
+                })
+            if len(data) < page_size:
+                break
+            page += 1
+
+        if not all_rows:
+            return pd.DataFrame(columns=SHAREHOLDER_COLS)
+        df = pd.DataFrame(all_rows)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df
 
     def fetch(self, code: str, page_size: int = 20) -> pd.DataFrame:
-        """Fetch shareholder count records with pagination.
+        """Per-stock fetch — backward compatible.
 
-        Returns DataFrame with: date, holder_num, change_num(环比变化量),
-        change_ratio(环比变化率%), avg_shares(户均持股).
+        Uses RPT_HOLDERNUMLATEST for single-stock queries.
+        For bulk download, prefer fetch_quarter().
         """
         all_raw = []
         page = 1
@@ -170,7 +230,7 @@ class ShareholderSource:
                 "holder_num": int(r.get("HOLDER_NUM") or 0),
                 "change_num": int(r.get("HOLDER_NUM_CHANGE") or 0),
                 "change_ratio": float(r.get("HOLDER_NUM_RATIO") or 0),
-                "avg_shares": float(r.get("AVG_FREE_SHARES") or 0),
+                "avg_shares": float(r.get("AVG_HOLD_NUM") or 0),
             })
 
         df = pd.DataFrame(rows, columns=SHAREHOLDER_COLS)

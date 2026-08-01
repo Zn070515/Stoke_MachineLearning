@@ -11,8 +11,8 @@ from curl_cffi import requests
 logger = logging.getLogger(__name__)
 
 SINA_NEWS_URL = (
-    "https://vip.stock.finance.sina.com.cn/corp/go.php/"
-    "vCB_AllNewsStock/symbol/{prefix}{code}.phtml"
+    "http://vip.stock.finance.sina.com.cn/corp/view/"
+    "vCB_AllNewsStock.php?symbol={prefix}{code}&Page={page}"
 )
 HEADERS = {
     "User-Agent": (
@@ -52,12 +52,7 @@ class SinaNewsSource:
         all_items = []
 
         for page in range(1, max_pages + 1):
-            if page == 1:
-                url = SINA_NEWS_URL.format(prefix=prefix, code=stock_code)
-            else:
-                url = SINA_NEWS_URL.format(
-                    prefix=prefix, code=stock_code
-                ) + f"/{page}.phtml"
+            url = SINA_NEWS_URL.format(prefix=prefix, code=stock_code, page=page)
 
             try:
                 resp = requests.get(
