@@ -27,6 +27,11 @@ class EventToDaily(PreprocessingStep):
         event_type: "block_trade" | "shareholder" | "lockup" | "dividend"
         decay_halflife_days: half-life for exponential decay (dividend/lockup).
         forward_fill_max: max consecutive days to forward-fill before ZI.
+        persistence_mode: "ffill" | "decay" | "zi" (config-driven).  "decay"/"zi"
+            are Phase-2 stubs that currently fall back to forward-fill.
+        event_time_features: whether to append {prefix}_days_since/_count_20d/
+            _intensity_20d/_last_direction columns.
+        persistence_halflife: per-column half-life overrides (Phase-2 TBD).
     """
 
     # Per-event-type column groups for event-time feature generation.
@@ -65,12 +70,34 @@ class EventToDaily(PreprocessingStep):
         event_type: str,
         decay_halflife_days: int = 90,
         forward_fill_max: int = 5,
+        persistence_mode: str = "ffill",
+        event_time_features: bool = True,
+        persistence_halflife: dict | None = None,
     ):
         if event_type not in ("block_trade", "shareholder", "lockup", "dividend"):
             raise ValueError(f"Unknown event_type: {event_type}")
         self.event_type = event_type
         self.decay_halflife_days = decay_halflife_days
         self.forward_fill_max = forward_fill_max
+        if persistence_mode not in ("ffill", "decay", "zi"):
+            logger.warning(
+                "EventToDaily(%s): unknown persistence_mode=%r, falling back to 'ffill'",
+                event_type, persistence_mode,
+            )
+            persistence_mode = "ffill"
+        self.persistence_mode = persistence_mode
+        self.event_time_features = bool(event_time_features)
+        self.persistence_halflife = dict(persistence_halflife or {})
+        # TODO(Phase 2): real exponential-decay / ZI persistence is not yet
+        # implemented — "decay" and "zi" currently fall back to forward-fill
+        # behavior in _fill_to_daily.  Config is wired through so a future
+        # implementation can swap in without changing call sites.
+        if persistence_mode != "ffill":
+            logger.warning(
+                "EventToDaily(%s): persistence_mode=%r is a stub that falls "
+                "back to forward-fill (TODO Phase 2)",
+                event_type, persistence_mode,
+            )
 
     def transform(
         self,
@@ -528,7 +555,11 @@ class EventToDaily(PreprocessingStep):
         *raw_event_dates* must be passed when calling after ``_fill_to_daily``
         to avoid treating ffill'd rows as real events.  Pass the unique
         event dates from the pre-ffill aggregated DataFrame.
+
+        No-op (returns *df* unchanged) when ``event_time_features`` is False.
         """
+        if not self.event_time_features:
+            return df
         spec = self._EVENT_TIME_SPEC.get(self.event_type)
         if spec is None or df.empty:
             return df

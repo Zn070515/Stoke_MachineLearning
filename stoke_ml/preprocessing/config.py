@@ -25,6 +25,8 @@ from stoke_ml.preprocessing.event_sparse.aggregator import EventToDaily
 from stoke_ml.preprocessing.cross_sectional.board import BoardBroadcaster
 from stoke_ml.preprocessing.cross_sectional.sector import SectorBroadcaster
 from stoke_ml.preprocessing.categorical.encoder import ConceptBlockEncoder
+from stoke_ml.preprocessing.monitor import QualityMonitor, DriftMonitor
+from stoke_ml.preprocessing.registry import FeatureRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,9 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
             event_type=etype,
             decay_halflife_days=ecfg.get("decay_halflife_days", 90),
             forward_fill_max=ecfg.get("forward_fill_max", 5),
+            persistence_mode=ecfg.get("persistence_mode", "ffill"),
+            event_time_features=ecfg.get("event_time_features", True),
+            persistence_halflife=ecfg.get("persistence_halflife"),
         ))
         echain.add(MissingImputer(
             short_gap_max=ecfg.get("short_gap_max", 5),
@@ -229,5 +234,21 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
             min_stocks_per_board=concept_cfg.get("min_stocks_per_board", 5),
         ))
         pp.register_chain("concept", concept_chain)
+
+    # ── Optional monitoring / feature-registry attachment ──
+    mon_cfg = pp_cfg.get("monitor", {})
+    if mon_cfg.get("enabled", False):
+        pp._quality_monitor = QualityMonitor(
+            missing_warn_threshold=mon_cfg.get("missing_warn_threshold", 0.2),
+            missing_error_threshold=mon_cfg.get("missing_error_threshold", 0.5),
+            constant_warn_threshold=mon_cfg.get("constant_warn_threshold", 0.99),
+        )
+        pp._drift_monitor = DriftMonitor(
+            sigma_threshold=mon_cfg.get("drift_sigma_threshold", 3.0),
+        )
+    reg_cfg = pp_cfg.get("registry", {})
+    if reg_cfg.get("enabled", False):
+        reg_path = pp_cfg.get("registry_path", "models/features/feature_registry.json")
+        pp._registry = FeatureRegistry.load(reg_path)
 
     return pp
