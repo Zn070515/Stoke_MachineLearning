@@ -361,20 +361,14 @@ class EventToDaily(PreprocessingStep):
                     suffixes=("", "_agg"),
                 )
 
-        # Historical lockup return
+        # Historical lockup return — merged close now only used on the daily
+        # grid (after _fill_to_daily); see the post-ffill computation below.
         if not hist.empty and close_prices is not None:
             close_prices = self._ensure_stock_code(close_prices, df)
             hist = hist.merge(
                 close_prices[["date", "stock_code", "close"]],
                 on=["date", "stock_code"], how="left",
             )
-            if "close" in hist.columns:
-                hist["unlock_return_30d"] = (
-                    hist.groupby("stock_code")["close"]
-                    .transform(lambda s: s.shift(-30) / s - 1)
-                    .fillna(0)
-                    .astype(np.float32)
-                )
 
         result_parts = []
         if not hist.empty:
@@ -391,6 +385,34 @@ class EventToDaily(PreprocessingStep):
 
         if trading_dates is not None:
             result = self._fill_to_daily(result, trading_dates, max_ffill=self.forward_fill_max)
+
+        # unlock_return_30d computed on the DAILY grid (post-ffill) so the
+        # 30-day window means 30 trading days, not 30 sparse event rows.
+        # Overlay the true per-day close from close_prices: the ffill'd
+        # ``close`` (merged only at sparse event rows) would otherwise
+        # measure against the next event's carried price and collapse the
+        # window to ~0.  Falls back to the ffill'd close when unavailable.
+        daily_close = None
+        if close_prices is not None:
+            cp = self._ensure_stock_code(close_prices, df)
+            dd = cp[["date", "stock_code", "close"]].copy()
+            dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
+            merged = result.merge(
+                dd.rename(columns={"close": "_daily_close"}),
+                on=["date", "stock_code"], how="left",
+            )
+            if merged["_daily_close"].notna().any():
+                daily_close = merged["_daily_close"]
+        if daily_close is None and "close" in result.columns:
+            daily_close = result["close"]
+        if daily_close is not None:
+            result["_unlock_close"] = daily_close
+            grp = result.groupby("stock_code")["_unlock_close"]
+            fut30 = grp.shift(-30)
+            result["unlock_return_30d"] = (
+                (fut30 / result["_unlock_close"] - 1).fillna(0.0).astype(np.float32)
+            )
+            result.drop(columns=["_unlock_close"], inplace=True)
 
         result = self._add_event_time_features(result, raw_event_dates=raw_dates)
         return result
