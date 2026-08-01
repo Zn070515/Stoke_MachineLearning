@@ -4,6 +4,8 @@ import time
 
 import pandas as pd
 
+from stoke_ml.data.calendar import TradingCalendar
+
 logger = logging.getLogger(__name__)
 
 MARGIN_COLS = [
@@ -31,7 +33,7 @@ class MarginTradingSource:
             logger.warning("AKShare not available for margin data")
             return pd.DataFrame()
 
-        dates = pd.date_range(start=start_date, end=end_date, freq="B")
+        dates = TradingCalendar.get_trading_days(start_date, end_date)
         all_frames = []
 
         for d in dates:

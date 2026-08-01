@@ -4,6 +4,8 @@ import time
 
 import pandas as pd
 
+from stoke_ml.data.calendar import TradingCalendar
+
 logger = logging.getLogger(__name__)
 
 LHB_COLS = [
@@ -54,7 +56,7 @@ class DragonTigerSource:
         except ImportError:
             return pd.DataFrame()
 
-        dates = pd.date_range(start=start_date, end=end_date, freq="B")
+        dates = TradingCalendar.get_trading_days(start_date, end_date)
         frames = []
         for d in dates:
             date_str = d.strftime("%Y%m%d")
