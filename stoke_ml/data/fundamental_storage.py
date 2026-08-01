@@ -153,6 +153,10 @@ class FundamentalStorage:
                         method="linear", limit_direction="forward"
                     )
             else:
-                result[col] = result[col].ffill()
+                # ffill with the expiry window so stale values don't persist
+                # past max_gap_days (which the per-row loop already NaN'd).
+                result[col] = result[col].ffill(
+                    limit=max_gap_days if max_gap_days > 0 else None
+                )
 
         return result.reset_index(drop=True)
