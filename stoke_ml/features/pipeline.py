@@ -1205,7 +1205,17 @@ class FeaturePipeline:
             ], dtype=np.float32)
 
         y = target[self.seq_len - 1: self.seq_len - 1 + n_samples]
-        aligned_close = close[self.seq_len - 1: self.seq_len - 1 + n_samples + 1]
+        # aligned_close must step by horizon so np.diff(aligned_close) yields
+        # horizon-day returns matching label y. For horizon=1 this reduces to
+        # consecutive closes (identical to the original); for horizon>1 sample
+        # every horizon-th close and pad the tail with the last close so the
+        # length stays n_samples+1 (diff keeps matching n_samples predictions).
+        aligned_close = close[self.seq_len - 1 :: self.horizon][: n_samples + 1]
+        if len(aligned_close) < n_samples + 1:
+            aligned_close = np.concatenate([
+                aligned_close,
+                np.full(n_samples + 1 - len(aligned_close), close[-1]),
+            ])
 
         return X, y, aligned_close.astype(np.float32)
 
