@@ -190,7 +190,7 @@ def main():
                         args.start, args.end, stock_codes=[c],
                     ),
                 )
-                frames = [d for d in results.values() if not d.empty]
+                frames = [d for d in results.values() if d is not None and not d.empty]
                 df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             elif stock_codes:
                 # Save incrementally in batches of 50 to avoid timeout
