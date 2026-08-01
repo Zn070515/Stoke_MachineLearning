@@ -437,7 +437,7 @@ class DividendSource:
             rows.append({
                 "date": str(r.get("EX_DIVIDEND_DATE", ""))[:10],
                 "stock_code": code,
-                "bonus_rmb": float(r.get("PRETAX_BONUS_RMB") or 0),
+                "bonus_rmb": float(r.get("PRETAX_BONUS_RMB") or 0) / 10.0,
                 "transfer_ratio": float(r.get("TRANSFER_RATIO") or 0),
                 "bonus_ratio": float(r.get("BONUS_RATIO") or 0),
                 "plan": str(r.get("ASSIGN_PROGRESS") or ""),

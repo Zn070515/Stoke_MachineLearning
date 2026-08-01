@@ -416,6 +416,8 @@ class EventToDaily(PreprocessingStep):
                 how="left",
             )
             if "close" in df.columns:
+                # bonus_rmb is per-share (divided by 10 at the source) —
+                # dividend_yield is a proper per-share yield.
                 df["dividend_yield"] = (
                     df["bonus_rmb"] / df["close"].replace(0, np.nan)
                 ).astype(np.float32)
