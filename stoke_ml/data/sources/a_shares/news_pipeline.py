@@ -58,7 +58,7 @@ class NewsPipeline:
                     max_pages=max_pages,
                 )
                 if source_name in _BODY_SOURCES:
-                    kwargs["fetch_bodies"] = kwargs.get("fetch_bodies", True)
+                    kwargs["fetch_bodies"] = fetch_bodies
                 df = source.fetch_news(**kwargs)
                 if not df.empty:
                     df["source"] = source_name
