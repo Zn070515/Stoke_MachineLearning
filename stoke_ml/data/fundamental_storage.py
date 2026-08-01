@@ -105,10 +105,12 @@ class FundamentalStorage:
         Uses disclose_date for forward-fill to prevent lookahead bias.
 
         Args:
-            max_gap_days: Max days a value stays fresh after disclosure.
+            max_gap_days: A disclosed value is fresh for exactly this many
+                days after disclosure, then NaN until the next disclosure.
             interpolate: DEPRECATED — linear interpolation leaks future
                 filings into the past.  Kept for backward compat but
-                strongly discouraged.  Use forward-fill only.
+                strongly discouraged.  When False, values are set by the
+                per-row expiry loop (no forward-fill).
         """
         raw = self.load(stock_code, "2010-01-01", end_date)
         if raw.empty:
@@ -153,10 +155,10 @@ class FundamentalStorage:
                         method="linear", limit_direction="forward"
                     )
             else:
-                # ffill with the expiry window so stale values don't persist
-                # past max_gap_days (which the per-row loop already NaN'd).
-                result[col] = result[col].ffill(
-                    limit=max_gap_days if max_gap_days > 0 else None
-                )
+                # No ffill: the per-row loop above already sets the value for
+                # exactly max_gap_days after each disclosure and NaNs the rest,
+                # honoring the "max days a value stays fresh" contract.  Any
+                # ffill here would re-introduce stale values.
+                pass
 
         return result.reset_index(drop=True)
