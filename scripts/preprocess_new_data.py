@@ -333,6 +333,24 @@ def _process_sector(chain, stock_list, data_dir, args):
     from stoke_ml.data.storage import DataStorage
     ds = DataStorage(data_dir)
     dest = MarketWideStorage(data_dir, args.save_to or "industry_ranking_processed")
+
+    # Precompute stock-independent sector features ONCE from the ranking,
+    # then broadcast to every stock — avoids ~N recomputations of momentum /
+    # RRG / breadth_z / relative_strength / alpha inside SectorBroadcaster.
+    from stoke_ml.preprocessing.cross_sectional.sector import SectorBroadcaster
+    sector_step = next(
+        (s for s in chain.steps if isinstance(s, SectorBroadcaster)), None
+    )
+    if sector_step is None:
+        sector_step = SectorBroadcaster()
+    sector_features = sector_step.build_sector_features(industry_ranking)
+    logger.info(
+        "  Precomputed sector features: %d rows, %d sectors",
+        len(sector_features),
+        sector_features["sector_code"].nunique()
+        if "sector_code" in sector_features.columns else 0,
+    )
+
     total = 0
     for i, code in enumerate(stock_list):
         try:
@@ -341,6 +359,7 @@ def _process_sector(chain, stock_list, data_dir, args):
                 continue
             processed = chain.fit_transform(
                 base, industry_ranking=industry_ranking, sector_map=sector_map,
+                sector_features=sector_features,
             )
             if not processed.empty:
                 dest.save(processed)

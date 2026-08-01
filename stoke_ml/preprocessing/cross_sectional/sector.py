@@ -42,6 +42,7 @@ class SectorBroadcaster(PreprocessingStep):
         df: pd.DataFrame,
         industry_ranking: Optional[pd.DataFrame] = None,
         sector_map: Optional[dict[str, str]] = None,
+        sector_features: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Add sector features to the per-stock DataFrame.
 
@@ -49,26 +50,30 @@ class SectorBroadcaster(PreprocessingStep):
             df: per-stock daily DataFrame (date + stock_code).
             industry_ranking: daily industry ranking with columns
                 [date, code, change_pct, up_count, down_count, leader, rank].
+                Used to (re)build ``sector_features`` when it is not supplied.
             sector_map: dict stock_code → industry_code.
+            sector_features: precomputed panel from ``build_sector_features``.
+                When provided, the stock-independent sector features
+                (momentum, RRG, breadth_z, relative_strength, alpha) are
+                broadcast straight from this panel instead of being
+                recomputed once per stock.
         """
         if df.empty:
-            return df
-        if industry_ranking is None or industry_ranking.empty:
             return df
         if sector_map is None:
             sector_map = {}
 
+        if sector_features is None:
+            # Standalone recompute path: build the panel from the ranking.
+            if industry_ranking is None or industry_ranking.empty:
+                return df
+            sector_features = self.build_sector_features(industry_ranking)
+        if sector_features is None or sector_features.empty:
+            return df
+
         df = df.copy()
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-        ir = industry_ranking.copy()
-        if "date" in ir.columns:
-            ir["date"] = pd.to_datetime(ir["date"], errors="coerce")
-        ir = ir.rename(columns={"code": "sector_code"})
-        # Dedup insurance: producer guarantees unique (date, sector) rows today,
-        # but guard against a left-merge row explosion if that ever regresses.
-        ir = ir.drop_duplicates(subset=["date", "sector_code"], keep="last")
 
         # Map stocks to sectors
         if sector_map:
@@ -76,70 +81,33 @@ class SectorBroadcaster(PreprocessingStep):
         else:
             return df
 
-        # L1-2: join sector features
-        df = df.merge(ir, on=["date", "sector_code"], how="left", suffixes=("", "_sec"))
+        # Drop any previously-broadcast sector columns so a re-run never
+        # produces suffixed duplicates from the merge below.
+        stale = [c for c in df.columns if c.startswith("momentum_")]
+        stale += ["sector_rrg_y", "sector_rrg_x", "sector_rrg_quadrant",
+                  "sector_relative_strength", "sector_breadth_raw",
+                  "sector_breadth_z", "sector_alpha"]
+        df.drop(columns=[c for c in stale if c in df.columns],
+                inplace=True, errors="ignore")
 
-        # L3-4: sector momentum + RRG (returns merged df)
-        df = self._add_sector_momentum(df, ir)
+        # L1-2: broadcast the precomputed sector panel to each stock row.
+        df = df.merge(
+            sector_features, on=["date", "sector_code"], how="left", suffixes=("", "_sec")
+        )
 
-        # L4: breadth normalization.  ``sector_breadth_raw`` uses the merged
-        # ir columns (correct), but the cross-sectional z collapses on a
-        # per-stock df (1 row/date -> x - x = 0).  Compute the z on the full
-        # ir PANEL (all sectors per date), then broadcast by date+sector_code.
-        if (
-            "up_count" in df.columns
-            and "down_count" in df.columns
-            and "up_count" in ir.columns
-            and "down_count" in ir.columns
-        ):
-            total = df["up_count"] + df["down_count"]
-            df["sector_breadth_raw"] = (
-                (df["up_count"] - df["down_count"]) / total.replace(0, np.nan)
-            ).astype(np.float32)
+        # L4: RRG quadrant (derived from the broadcast sector_rrg_x/y).
+        if "sector_rrg_x" in df.columns and "sector_rrg_y" in df.columns:
+            df["sector_rrg_quadrant"] = (
+                (df["sector_rrg_x"].gt(0).astype(int)) * 2
+                + df["sector_rrg_y"].gt(0).astype(int)
+            ).astype(np.int8)
 
-            panel = ir.copy()
-            # Sort so the per-sector rolling smoothing in the z-score is
-            # chronological within each sector.
-            panel = panel.sort_values(["sector_code", "date"])
-            panel["_breadth_raw"] = (
-                (panel["up_count"] - panel["down_count"])
-                / (panel["up_count"] + panel["down_count"]).replace(0, np.nan)
-            ).astype(np.float32)
-            # by="sector_code" makes the rolling-window smoothing per-sector
-            # chronological (never crossing sector boundaries).
-            panel["_breadth_z"] = _cross_sectional_zscore(
-                panel, "_breadth_raw", self.breadth_normalize_window, by="sector_code"
-            )
-            df = df.merge(
-                panel[["date", "sector_code", "_breadth_z"]],
-                on=["date", "sector_code"],
-                how="left",
-            )
-            df["sector_breadth_z"] = df["_breadth_z"].fillna(0).astype(np.float32)
-            df.drop(columns=["_breadth_z"], inplace=True)
-
-        # L5: rotation signals (require date-sorted df)
+        # L5: rotation signals (per-stock; require date-sorted df).
         if "rank" in df.columns:
             df = df.sort_values(["stock_code", "date"])
             df["sector_rank_change"] = (
                 df.groupby("stock_code")["rank"].diff().fillna(0).astype(np.int16)
             )
-
-        # Cross-sectional features must be computed on the PANEL (all sectors
-        # from industry_ranking), then broadcast to each stock by date.
-        # A per-stock groupby collapses to x - x = 0, so the sector mean must
-        # come from the full cross-sector ``ir`` frame.  ``df["change_pct"]``
-        # here is the sector's daily change_pct (the stock's own return is
-        # ``pct_change``), so sector_relative_strength = sector − market-mean.
-        if "date" in ir.columns and "change_pct" in ir.columns:
-            panel = ir.groupby("date", as_index=False)["change_pct"].mean()
-            panel = panel.rename(columns={"change_pct": "_sector_mean"})
-            df = df.merge(panel, on=["date"], how="left")
-            if "change_pct" in df.columns and "_sector_mean" in df.columns:
-                df["sector_relative_strength"] = (
-                    df["change_pct"] - df["_sector_mean"]
-                ).fillna(0.0).astype(np.float32)
-                df.drop(columns=["_sector_mean"], inplace=True)
 
         if "rank" in df.columns:
             df["is_top5_sector"] = df["rank"].le(5).astype(np.int8)
@@ -150,24 +118,88 @@ class SectorBroadcaster(PreprocessingStep):
                 df["leader"].astype(str) == df["stock_code"].astype(str)
             ).astype(np.int8)
 
-        # P1 #7: crowding indicators
+        # P1 #7: crowding indicators (per-stock volume).
         df = self._add_crowding(df)
-
-        # P1 #8: residual momentum (strip market beta) — computed on the ir panel
-        df = self._add_residual_momentum(df, ir)
 
         return df
 
-    def _add_sector_momentum(self, df, industry_ranking):
-        """Compute sector momentum for each window and RRG features.
+    def build_sector_features(self, industry_ranking) -> pd.DataFrame:
+        """Precompute all stock-independent sector features once.
 
-        Returns the df mutated with new columns merged in.
+        Runs the cross-sector computations (momentum, RRG, breadth z,
+        relative strength, residual alpha) on the full industry-ranking
+        panel — once per ranking instead of once per stock — and returns a
+        de-duplicated, sorted panel that ``transform`` broadcasts by
+        (date, sector_code).
+
+        Returns columns:
+          date, sector_code, change_pct, up_count, down_count, rank, leader,
+          momentum_{w}d (each window), sector_rrg_y, sector_rrg_x,
+          sector_relative_strength, sector_breadth_raw, sector_breadth_z,
+          sector_alpha.
         """
+        if industry_ranking is None or industry_ranking.empty:
+            return industry_ranking
+
         ir = industry_ranking.copy()
+        if "date" in ir.columns:
+            ir["date"] = pd.to_datetime(ir["date"], errors="coerce")
+        ir = ir.rename(columns={"code": "sector_code"})
+        # Dedup insurance: producer guarantees unique (date, sector) rows.
+        ir = ir.drop_duplicates(subset=["date", "sector_code"], keep="last")
+        # Numeric coercion: upstream rows may arrive as object dtype (e.g.
+        # after a ragged concat); the rolling/z/regression math needs numerics.
+        for col in ("change_pct", "up_count", "down_count", "rank"):
+            if col in ir.columns:
+                ir[col] = pd.to_numeric(ir[col], errors="coerce")
+
+        if "sector_code" not in ir.columns or "change_pct" not in ir.columns:
+            return ir
+
+        # L3-4: sector momentum + RRG (per-sector chronological).
+        ir = self._panel_momentum_rrg(ir)
+
+        # L4: breadth normalization — cross-sectional z per date.
+        if "up_count" in ir.columns and "down_count" in ir.columns:
+            ir["sector_breadth_raw"] = (
+                (ir["up_count"] - ir["down_count"])
+                / (ir["up_count"] + ir["down_count"]).replace(0, np.nan)
+            ).astype(np.float32)
+            ir["sector_breadth_z"] = _cross_sectional_zscore(
+                ir, "sector_breadth_raw", self.breadth_normalize_window, by="sector_code"
+            )
+
+        # sector_relative_strength: sector − cross-sector mean (per date).
+        if "change_pct" in ir.columns:
+            mkt = ir.groupby("date", as_index=False)["change_pct"].mean()
+            mkt = mkt.rename(columns={"change_pct": "_sector_mean"})
+            ir = ir.merge(mkt, on="date", how="left")
+            ir["sector_relative_strength"] = (
+                ir["change_pct"] - ir["_sector_mean"]
+            ).fillna(0.0).astype(np.float32)
+            ir.drop(columns=["_sector_mean"], inplace=True)
+
+        # P1 #8: residual momentum (strip market beta).
+        ir = self._panel_alpha(ir)
+
+        # Final column set, sorted, de-duplicated.
+        cols = ["date", "sector_code", "change_pct", "up_count", "down_count",
+                "rank", "leader"]
+        cols += [f"momentum_{w}d" for w in self.momentum_windows]
+        cols += ["sector_rrg_y", "sector_rrg_x", "sector_relative_strength",
+                 "sector_breadth_raw", "sector_breadth_z", "sector_alpha"]
+        cols = [c for c in cols if c in ir.columns]
+        ir = ir[cols]
+        ir = ir.sort_values(["sector_code", "date"])
+        ir = ir.drop_duplicates(subset=["date", "sector_code"], keep="last")
+        return ir
+
+    def _panel_momentum_rrg(self, ir):
+        """Add ``momentum_{w}d`` and ``sector_rrg_{x,y}`` columns to the panel."""
         if "date" not in ir.columns or "sector_code" not in ir.columns:
-            return df
+            return ir
         if "change_pct" not in ir.columns:
-            return df
+            return ir
 
         ir = ir.sort_values(["sector_code", "date"])
         for w in self.momentum_windows:
@@ -175,50 +207,29 @@ class SectorBroadcaster(PreprocessingStep):
                 ir.groupby("sector_code")["change_pct"]
                 .transform(lambda s: s.rolling(w, min_periods=max(5, w // 4)).sum())
             )
-        # Merge back
-        mom_cols = ["date", "sector_code"] + [
-            f"momentum_{w}d" for w in self.momentum_windows
-        ]
-        ir_mom = ir[mom_cols]
-        if "sector_code" in df.columns:
-            df.drop(
-                columns=[c for c in df.columns if c.startswith("momentum_")],
-                inplace=True,
-                errors="ignore",
-            )
-            df = df.merge(ir_mom, on=["date", "sector_code"], how="left")
 
-        # RRG: compute sector-level RS-Ratio from industry_ranking (not per-stock)
-        ir_sector = ir.copy()
         if 252 in self.momentum_windows:
-            ir_sector["_cum_return"] = (
-                ir_sector.groupby("sector_code")["change_pct"]
+            ir["_cum_return"] = (
+                ir.groupby("sector_code")["change_pct"]
                 .transform(lambda s: s.rolling(252, min_periods=63).sum())
             )
             # RS-Momentum: cumulative return cross-sectional z-score per date
-            date_mean = ir_sector.groupby("date")["_cum_return"].transform("mean")
-            date_std = ir_sector.groupby("date")["_cum_return"].transform("std")
-            ir_sector["_rrg_y"] = (
-                (ir_sector["_cum_return"] - date_mean) / (date_std + 1e-8)
+            date_mean = ir.groupby("date")["_cum_return"].transform("mean")
+            date_std = ir.groupby("date")["_cum_return"].transform("std")
+            ir["_rrg_y"] = (
+                (ir["_cum_return"] - date_mean) / (date_std + 1e-8)
             )
             # RS-Momentum: rate of change of RS-Ratio over 10d
-            ir_sector["_rrg_x"] = (
-                ir_sector.groupby("sector_code")["_rrg_y"]
+            ir["_rrg_x"] = (
+                ir.groupby("sector_code")["_rrg_y"]
                 .diff(10)
                 .fillna(0)
             )
-            ir_rrg = ir_sector[["date", "sector_code", "_rrg_y", "_rrg_x"]]
-            df = df.merge(ir_rrg, on=["date", "sector_code"], how="left")
-            df["sector_rrg_y"] = df["_rrg_y"].astype(np.float32)
-            df["sector_rrg_x"] = df["_rrg_x"].astype(np.float32)
-            df.drop(columns=["_rrg_y", "_rrg_x"], inplace=True, errors="ignore")
-            # Quadrant: x>0=leading, x<0=lagging  ×  y>0=strong, y<0=weak
-            df["sector_rrg_quadrant"] = (
-                (df["sector_rrg_x"].gt(0).astype(int)) * 2
-                + df["sector_rrg_y"].gt(0).astype(int)
-            ).astype(np.int8)
-
-        return df
+            ir["sector_rrg_y"] = ir["_rrg_y"].astype(np.float32)
+            ir["sector_rrg_x"] = ir["_rrg_x"].astype(np.float32)
+            ir.drop(columns=["_cum_return", "_rrg_y", "_rrg_x"],
+                    inplace=True, errors="ignore")
+        return ir
 
     # ── P1 #7: crowding indicators ───────────────────────────────────
 
@@ -287,26 +298,21 @@ class SectorBroadcaster(PreprocessingStep):
 
     # ── P1 #8: residual momentum ─────────────────────────────────────
 
-    def _add_residual_momentum(self, df, ir):
-        """Strip market beta from sector returns via cross-sectional regression.
+    def _panel_alpha(self, ir):
+        """Add ``sector_alpha`` to the panel via per-date cross-sectional regression.
 
-        Computed on the industry_ranking PANEL (all sectors per date), then
-        broadcast to the per-stock df.  A per-stock df carries exactly one
-        sector per date, so a per-date cross-sectional regression on ``df``
-        dedups to a single sector and collapses to alpha = 0.
-
-        For each date, regresses every sector's ``change_pct`` on that date's
-        market return (polyfit degree 1) and keeps the residual — purified
-        sector alpha, orthogonal to market direction.
+        Regresses every sector's ``change_pct`` on that date's market return
+        (polyfit degree 1) and keeps the residual — purified sector alpha,
+        orthogonal to market direction.
 
         Market return = equal-weight mean of sector ``change_pct`` per date.
         NOTE: ``ir`` carries sector-level returns (not individual stocks), so
         the sector-equal-weight mean is the available "market" proxy.
         """
         if ir is None or ir.empty:
-            return df
+            return ir
         if "sector_code" not in ir.columns or "change_pct" not in ir.columns:
-            return df
+            return ir
 
         panel = ir.copy()
 
@@ -343,15 +349,8 @@ class SectorBroadcaster(PreprocessingStep):
         panel = panel.groupby("date", group_keys=False).apply(_residualize_date)
         panel["date"] = date_series
         panel["sector_alpha"] = panel["sector_alpha"].fillna(0).astype(np.float32)
-
-        # Broadcast residual alpha back onto the per-stock df
-        df = df.merge(
-            panel[["date", "sector_code", "sector_alpha"]],
-            on=["date", "sector_code"],
-            how="left",
-        )
-        df["sector_alpha"] = df["sector_alpha"].fillna(0).astype(np.float32)
-        return df
+        panel.drop(columns=["_mkt_return"], inplace=True)
+        return panel
 
 
 def _cross_sectional_zscore(df, col, window, by):
