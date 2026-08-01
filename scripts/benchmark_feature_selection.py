@@ -202,6 +202,7 @@ def main():
         train_years=cfg.training.validation.train_years,
         val_months=cfg.training.validation.val_months,
         step_months=6,  # wider step → fewer folds for benchmark speed
+        horizon=cfg.features.target_horizon,
     )
 
     all_results = []

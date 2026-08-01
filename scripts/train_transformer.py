@@ -102,6 +102,7 @@ def main():
     splitter = WalkForwardSplitter(
         train_years=cfg.training.validation.train_years,
         val_months=cfg.training.validation.val_months,
+        horizon=cfg.features.target_horizon,
     )
 
     for code in codes:

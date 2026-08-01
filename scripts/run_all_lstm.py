@@ -93,6 +93,7 @@ def run_single_stock(code: str, cfg, storage, news_storage, output_dir: str) -> 
     splitter = WalkForwardSplitter(
         train_years=cfg.training.validation.train_years,
         val_months=cfg.training.validation.val_months,
+        horizon=cfg.features.target_horizon,
     )
 
     n_samples = len(X)
