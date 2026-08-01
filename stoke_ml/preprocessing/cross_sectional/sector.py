@@ -95,6 +95,13 @@ class SectorBroadcaster(PreprocessingStep):
             sector_features, on=["date", "sector_code"], how="left", suffixes=("", "_sec")
         )
 
+        # Preserve OLD raw-output parity: on dates before the ranking's
+        # coverage the left-merge leaves these NaN; the pre-refactor
+        # transform 0-filled them, so keep that here.
+        for col in ("sector_relative_strength", "sector_breadth_z", "sector_alpha"):
+            if col in df.columns:
+                df[col] = df[col].fillna(0.0).astype(np.float32)
+
         # L4: RRG quadrant (derived from the broadcast sector_rrg_x/y).
         if "sector_rrg_x" in df.columns and "sector_rrg_y" in df.columns:
             df["sector_rrg_quadrant"] = (
