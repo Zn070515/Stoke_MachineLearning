@@ -96,10 +96,21 @@ class SectorBroadcaster(PreprocessingStep):
                 df.groupby("stock_code")["rank"].diff().fillna(0).astype(np.int16)
             )
 
-        if "change_pct" in df.columns:
-            df["sector_relative_strength"] = (
-                df["change_pct"] - df.groupby("date")["change_pct"].transform("mean")
-            ).astype(np.float32)
+        # Cross-sectional features must be computed on the PANEL (all sectors
+        # from industry_ranking), then broadcast to each stock by date.
+        # A per-stock groupby collapses to x - x = 0, so the sector mean must
+        # come from the full cross-sector ``ir`` frame.  ``df["change_pct"]``
+        # here is the sector's daily change_pct (the stock's own return is
+        # ``pct_change``), so sector_relative_strength = sector − market-mean.
+        if "date" in ir.columns and "change_pct" in ir.columns:
+            panel = ir.groupby("date", as_index=False)["change_pct"].mean()
+            panel = panel.rename(columns={"change_pct": "_sector_mean"})
+            df = df.merge(panel, on=["date"], how="left")
+            if "change_pct" in df.columns and "_sector_mean" in df.columns:
+                df["sector_relative_strength"] = (
+                    df["change_pct"] - df["_sector_mean"]
+                ).fillna(0.0).astype(np.float32)
+                df.drop(columns=["_sector_mean"], inplace=True)
 
         if "rank" in df.columns:
             df["is_top5_sector"] = df["rank"].le(5).astype(np.int8)
