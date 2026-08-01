@@ -665,6 +665,7 @@ class FeaturePipeline:
             return df
         s = sentiment_df.copy()
         s["date"] = pd.to_datetime(s["date"])
+        s = s.drop_duplicates(subset="date", keep="last")
         available = [c for c in SENTIMENT_COLS if c in s.columns]
         extra = [c for c in s.columns
                  if c not in SENTIMENT_COLS and c not in ("date", "stock_code")
@@ -847,6 +848,7 @@ class FeaturePipeline:
             return df
         g = guba_df.copy()
         g["date"] = pd.to_datetime(g["date"])
+        g = g.drop_duplicates(subset="date", keep="last")
         available = [c for c in GUBA_COLS if c in g.columns]
         extra = [c for c in g.columns
                  if c not in GUBA_COLS and c not in ("date", "stock_code")
@@ -866,6 +868,7 @@ class FeaturePipeline:
             return df
         c = comment_df.copy()
         c["date"] = pd.to_datetime(c["date"])
+        c = c.drop_duplicates(subset="date", keep="last")
         available = [col for col in COMMENT_COLS if col in c.columns]
         extra = [col for col in c.columns
                  if col not in COMMENT_COLS and col not in ("date", "stock_code")
