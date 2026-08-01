@@ -56,7 +56,8 @@ class DragonTigerSource:
         except ImportError:
             return pd.DataFrame()
 
-        dates = TradingCalendar.get_trading_days(start_date, end_date)
+        calendar = TradingCalendar("a_shares")
+        dates = calendar.get_trading_days(start_date, end_date)
         frames = []
         for d in dates:
             date_str = d.strftime("%Y%m%d")

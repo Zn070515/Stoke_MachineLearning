@@ -33,7 +33,8 @@ class MarginTradingSource:
             logger.warning("AKShare not available for margin data")
             return pd.DataFrame()
 
-        dates = TradingCalendar.get_trading_days(start_date, end_date)
+        calendar = TradingCalendar("a_shares")
+        dates = calendar.get_trading_days(start_date, end_date)
         all_frames = []
 
         for d in dates:
