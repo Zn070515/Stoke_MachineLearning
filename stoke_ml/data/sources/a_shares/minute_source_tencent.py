@@ -95,15 +95,11 @@ class TencentMinuteSource:
     ) -> pd.DataFrame:
         """Convert Tencent mkline format to standard schema.
 
-        Tencent returns: [time, open, close, high, low, volume, n1, n2]
+        Tencent returns: [time, open, close, high, low, volume]
         Note: column order differs from standard (close before high/low).
         """
-        columns = ["time_str", "open", "close", "high", "low", "volume",
-                   "n1", "n2"]
+        columns = ["time_str", "open", "close", "high", "low", "volume"]
         df = pd.DataFrame(raw, columns=columns)
-
-        # Drop unused columns
-        df.drop(columns=["n1", "n2"], inplace=True)
 
         # Parse time: YYYYMMDDHHMM → datetime
         df["datetime"] = pd.to_datetime(df["time_str"], format="%Y%m%d%H%M")
