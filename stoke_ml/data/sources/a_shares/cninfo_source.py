@@ -258,34 +258,47 @@ class CninfoSource:
             "sortType": "",
             "isHLtitle": "true",
         }
-        try:
-            resp = self._session.post(
-                CNINFO_QUERY, data=body, headers=HEADERS,
-                timeout=30, impersonate="chrome120",
-            )
-            if resp.status_code != 200:
-                return [], False
-            data = resp.json()
-            items = []
-            for ann in data.get("announcements", []):
-                title = (ann.get("announcementTitle") or "").strip()
-                title = re.sub(r"<[^>]+>", "", title)
-                ts = ann.get("announcementTime", 0)
-                date_str = (
-                    time.strftime("%Y-%m-%d", time.localtime(ts / 1000)) if ts
-                    else ""
+        last_resp = None
+        for attempt in range(3):
+            try:
+                resp = self._session.post(
+                    CNINFO_QUERY, data=body, headers=HEADERS,
+                    timeout=30, impersonate="chrome120",
                 )
-                adjunct = ann.get("adjunctUrl") or ""
-                items.append({
-                    "date": date_str,
-                    "title": title,
-                    "notice_type": ann.get("announcementTypeName") or "",
-                    "url": adjunct,
-                })
-            has_more = bool(data.get("hasMore"))
-            return items, has_more
-        except Exception:
-            return [], False
+                if resp.status_code != 200:
+                    last_resp = resp
+                    time.sleep(1.0 * (attempt + 1))
+                    continue  # retry
+                data = resp.json()
+                items = []
+                for ann in data.get("announcements", []):
+                    title = (ann.get("announcementTitle") or "").strip()
+                    title = re.sub(r"<[^>]+>", "", title)
+                    ts = ann.get("announcementTime", 0)
+                    date_str = (
+                        time.strftime("%Y-%m-%d", time.localtime(ts / 1000)) if ts
+                        else ""
+                    )
+                    adjunct = ann.get("adjunctUrl") or ""
+                    items.append({
+                        "date": date_str,
+                        "title": title,
+                        "notice_type": ann.get("announcementTypeName") or "",
+                        "url": adjunct,
+                    })
+                has_more = bool(data.get("hasMore"))
+                return items, has_more
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                # 3 failed attempts — genuinely degraded; surface as failure
+                raise
+        # 3 attempts all non-200 — treat as hard failure, not silent end-of-data
+        raise RuntimeError(
+            f"cninfo query failed after 3 attempts: "
+            f"HTTP {last_resp.status_code if last_resp is not None else 'unknown'}"
+        )
 
 
 def quick_test(code: str = "000001"):
