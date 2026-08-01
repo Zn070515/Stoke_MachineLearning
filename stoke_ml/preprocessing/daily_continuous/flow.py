@@ -72,17 +72,51 @@ class FlowDecomposer(PreprocessingStep):
         self._compute_ratios(df, flow_cols_present)
         self._compute_intensity(df, flow_cols_present)
         self._compute_persistence(df, flow_cols_present)
-        self._compute_divergence(df, flow_cols_present)
+        self._compute_divergence(df, flow_cols_present, **kwargs)
         self._compute_market_cap_adj(df, flow_cols_present, **kwargs)
         self._compute_broad_main(df, flow_cols_present)
-        if self.residualize and "close" in df.columns:
-            self._compute_residual(df)
+        if self.residualize:
+            self._compute_residual(df, **kwargs)
         if "large_ratio" in df.columns and "small_ratio" in df.columns:
             df["large_minus_small"] = (df["large_ratio"] - df["small_ratio"]).astype(
                 np.float32
             )
 
+        # Drop the temporary close series merged for divergence/residual.
+        df.drop(columns=["_close"], inplace=True, errors="ignore")
         return df
+
+    @staticmethod
+    def _merge_close(df, **kwargs) -> bool:
+        """Source a close-price series for price-vs-flow features.
+
+        Prefers an existing ``close`` column on *df*; otherwise merges
+        ``close`` from the ``daily_data`` kwarg by date+stock_code (the
+        per-stock flow DataFrame carries no close column, so the gated
+        features never fired before).  Populates ``df["_close"]`` and
+        returns True when a close series is available.  Idempotent: a second
+        call short-circuits once ``_close`` is already present.
+        """
+        if "_close" in df.columns:
+            return True
+        if "close" in df.columns:
+            df["_close"] = df["close"]
+            return True
+        daily_data = kwargs.get("daily_data")
+        if daily_data is not None and not daily_data.empty:
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            merge_on = [c for c in ["date", "stock_code"] if c in df.columns]
+            if len(merge_on) == 2 and all(c in daily_data.columns for c in merge_on):
+                dd = daily_data.copy()
+                dd["date"] = pd.to_datetime(dd["date"], errors="coerce")
+                merged = df.merge(
+                    dd[merge_on + ["close"]].rename(columns={"close": "_close"}),
+                    on=merge_on, how="left",
+                )
+                df["_close"] = merged["_close"]
+                return bool(df["_close"].notna().any())
+        return False
 
     # ── L1: size-tier ratios ──────────────────────────────────────────
 
@@ -165,14 +199,16 @@ class FlowDecomposer(PreprocessingStep):
 
     # ── L4: divergence ────────────────────────────────────────────────
 
-    def _compute_divergence(self, df, flow_cols):
-        if "close" not in df.columns or "main_net" not in flow_cols:
+    def _compute_divergence(self, df, flow_cols, **kwargs):
+        if "main_net" not in flow_cols:
+            return
+        if not self._merge_close(df, **kwargs):
             return
         w = max(self.divergence_window, 1)
         has_stock = "stock_code" in df.columns
 
         if has_stock:
-            price_chg = df.groupby("stock_code")["close"].pct_change()
+            price_chg = df.groupby("stock_code")["_close"].pct_change()
             price_z = (
                 price_chg.groupby(df["stock_code"])
                 .rolling(w, min_periods=3)
@@ -192,7 +228,7 @@ class FlowDecomposer(PreprocessingStep):
                 .reset_index(level=0, drop=True)
             )
         else:
-            price_chg = df["close"].pct_change()
+            price_chg = df["_close"].pct_change()
             price_z = price_chg.rolling(w, min_periods=3).apply(_zscore_last, raw=True)
             flow_cumsum = df["main_net"].rolling(w, min_periods=3).sum()
             flow_z = flow_cumsum.rolling(w, min_periods=3).apply(_zscore_last, raw=True)
@@ -256,7 +292,7 @@ class FlowDecomposer(PreprocessingStep):
 
     # ── L7: residualization ───────────────────────────────────────────
 
-    def _compute_residual(self, df):
+    def _compute_residual(self, df, **kwargs):
         """Strip return contamination from flow signal.
 
         Regresses flow_z on contemporaneous return and keeps the residual:
@@ -265,10 +301,12 @@ class FlowDecomposer(PreprocessingStep):
         """
         if "flow_z" not in df.columns:
             return
+        if not self._merge_close(df, **kwargs):
+            return
         ret = (
-            df.groupby("stock_code")["close"].pct_change()
+            df.groupby("stock_code")["_close"].pct_change()
             if "stock_code" in df.columns
-            else df["close"].pct_change()
+            else df["_close"].pct_change()
         )
         mask = ret.notna() & df["flow_z"].notna()
         if mask.sum() < 10:
