@@ -1746,62 +1746,6 @@ def _alpha158_factor_names() -> list[str]:
     return names
 
 
-_PAST_KNOWN_COLS = [
-    # OHLCV
-    "open", "high", "low", "close", "volume",
-    # Moving averages
-    "ma_5", "ma_10", "ma_20", "ma_60", "ma_120",
-    "ema_12", "ema_26",
-    # MACD
-    "macd_dif", "macd_dea", "macd_hist",
-    # RSI
-    "rsi_6", "rsi_12", "rsi_24",
-    # KDJ (9-day and 14-day)
-    "kdj_k_9", "kdj_d_9", "kdj_j_9",
-    "kdj_k_14", "kdj_d_14", "kdj_j_14",
-    # Bollinger Bands
-    "boll_mid", "boll_upper", "boll_lower", "boll_pct",
-    # ATR
-    "atr_14",
-    # ROC
-    "roc_6", "roc_12", "roc_20",
-    # Williams %R
-    "wr_10", "wr_20",
-    # CCI
-    "cci_14", "cci_20",
-    # Historical volatility
-    "vol_5", "vol_20",
-    # Volume
-    "volume_ma5", "volume_ratio", "vol_up_ratio_20", "obv",
-    # Amount (conditional on availability)
-    "amount_ma5", "amount_ratio", "turnover_proxy",
-    # K-bar microstructural (Alpha158 K-series, 9 factors)
-    "kmid", "klen", "kmid2", "kup", "kup2",
-    "klow", "klow2", "ksft", "ksft2",
-    # Price standardization (Alpha158, 3 factors)
-    "open0", "high0", "low0",
-    # ADX family (trend strength)
-    "adx", "adxr", "pdi", "mdi",
-    # MFI / CMO / TRIX
-    "mfi_14", "cmo_14", "trix",
-    # Microstructure
-    "is_limit_up", "is_limit_down", "gap_up_pct", "gap_down_pct",
-    "volume_ratio_20", "volume_anomaly", "limit_up_streak",
-    "is_one_word_board", "seal_quality",
-    "limit_up_count_5d", "limit_up_count_20d",
-    # Calendar
-    "day_of_week", "day_of_month", "month", "quarter",
-    # Intraday (minute mode)
-    "minutes_from_open", "minutes_to_close", "is_am_session", "is_pm_session",
-    "session_progress", "bar_of_day", "opening_imbalance",
-    "session_high_position",
-    # Fundamental (forward-filled quarterly)
-    "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
-    "debt_ratio", "gross_margin", "net_margin",
-    # Valuation (Baostock daily PE/PB/PS/PCF)
-    "pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm",
-] + _alpha158_factor_names()
-
 # Features that are stock-invariant (same value for every stock on a given date).
 # Cross-sectional z-score normalization would divide by near-zero std, producing
 # saturated ±10.0 values with no signal. Skip them.
@@ -1825,51 +1769,6 @@ _CS_NORM_SKIP_COLS = frozenset({
     "ind_return_max", "ind_return_min", "ind_return_skew",
     "ind_dispersion_20d",
 })
-
-_PAST_OBSERVED_COLS = [
-    # Sentiment (news)
-    "sentiment_mean", "sentiment_std", "news_count",
-    "positive_ratio", "negative_ratio",
-    # Guba
-    "guba_sentiment_mean", "guba_sentiment_std",
-    "guba_positive_ratio", "guba_negative_ratio", "guba_post_count",
-    # Comment
-    "comment_score", "comment_attention", "comment_institution", "comment_trend",
-    # Announcement
-    "ann_sentiment_mean", "ann_sentiment_std",
-    "ann_count", "ann_positive_ratio", "ann_negative_ratio", "has_announce",
-    # Margin
-    "margin_balance", "margin_buy", "short_balance", "margin_net",
-    # Northbound
-    "north_hold_pct", "north_net_buy",
-    # Dragon Tiger
-    "lhb_net_amount", "lhb_buy_ratio",
-    # ETF flow
-    "sector_etf_flow", "sector_etf_amount",
-    # Capital flow
-    "flow_intensity", "flow_z", "flow_momentum",
-    "flow_market_cap_adj", "broad_main_net",
-    # Block trade
-    "buyer_is_inst", "buyer_is_hot_money",
-    "seller_is_inst", "seller_is_hot_money",
-    "premium_pct_wavg", "permanent_impact", "temporary_impact",
-    "amount_vol_6d", "is_deep_discount",
-    "trade_count", "premium_pct_mean", "total_amount",
-    # Shareholder
-    "HN_z", "PCRC", "dual_concentration_signal",
-    # Lockup
-    "unlock_pressure", "unlock_pressure_mcap",
-    "days_to_nearest_unlock", "unlock_count_upcoming",
-    # Board
-    "is_zt", "is_zb", "board_height_20d", "seal_strength",
-    "seal_intensity", "concept_zt_count", "concept_zt_ratio",
-    "concept_board_height",
-    # Sector
-    "sector_relative_strength", "sector_breadth_z",
-    "sector_vol_volatility", "sector_turnover_z", "sector_alpha",
-    # Concept
-    "avg_concept_heat", "is_concept_leader",
-]
 
 
 def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:

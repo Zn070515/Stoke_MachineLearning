@@ -75,36 +75,6 @@ def _build_sector_return_map(codes, date_start, date_end, data_dir):
     return sector_med.to_dict(), sectors
 
 
-def _compute_rel_labels(y_abs, dates, sector_map, sector_of_code):
-    """Replace absolute labels with sector-relative labels.
-
-    y_abs: original binary labels from pipeline
-    dates: prediction dates from pipeline (same length as y_abs)
-    sector_map: {(date, sector): median_return}
-    sector_of_code: sector name for this stock
-    """
-    y_rel = y_abs.copy()
-    for i, d in enumerate(dates):
-        key = (pd.Timestamp(d).date(), sector_of_code)
-        # If sector median return > 0, stock needs to beat it
-        if key in sector_map:
-            med_ret = sector_map[key]
-            # y_rel = 1 if the stock outperformed sector median
-            # y_abs[i] = 1 means stock went up (close[t+1] > close[t])
-            # We need actual return to compare, but all we have is up/down
-            # Instead: y_rel = 1 if (stock_up AND sector_down) OR (stock_up > sector_avg_up)
-            # Simplification: treat sector median > 0 as "sector up", then
-            # y_rel = 1 if stock_up > sector_up
-            # Since y_abs is binary up/down, approximate:
-            #   if sector went up and stock went up → y_rel = 1 (outperform)
-            #   if sector went down and stock went up → y_rel = 1 (outperform)
-            #   if sector went up and stock went down → y_rel = 0
-            #   if sector went down and stock went down → y_rel = 0
-            # This is just: y_rel = y_abs (same!) when sector-neutral
-            # Better: use continuous labels from close data
-            pass
-    return y_rel
-
 
 def main():
     parser = argparse.ArgumentParser(description="Label type benchmark")
