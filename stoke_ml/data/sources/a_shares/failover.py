@@ -8,6 +8,7 @@ Tries sources in priority order:
 """
 import time
 import logging
+import numpy as np
 import pandas as pd
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 from stoke_ml.data.sources.a_shares.efinance_source import EfinanceSource
@@ -67,22 +68,34 @@ class AShareDownloader:
         if got_start > requested_start:
             gap_end = got_start - pd.Timedelta(days=1)
             gap_end_str = gap_end.strftime("%Y-%m-%d")
+            got_start_str = str(got_start)
+            got_end_str = str(pd.to_datetime(df["date"]).max().date() if len(df) else "?")
             logger.info(
                 "  %s: %s returned %s→%s, backfilling %s→%s via Baostock",
-                stock_code, source_used, got_start, df["date"].max()[:10] if len(df) else "?",
+                stock_code, source_used, got_start_str, got_end_str,
                 start_date, gap_end_str,
             )
             try:
                 bs_source = self._sources[-1]  # Baostock is last in priority list
                 bs_df = bs_source.fetch_daily(stock_code, start_date, gap_end_str)
                 if len(bs_df) > 0:
+                    # Unit normalization: stored convention is 股 (shares).
+                    # Baostock already returns 股; efinance/tushare return 手
+                    # (lots, ×100).  Scale ONLY the primary-source rows so the
+                    # concatenated volume column is consistent (naive ×100 of
+                    # the whole frame would double-count the Baostock rows).
+                    if source_used in ("efinance", "tushare") and "volume" in df.columns:
+                        vol = pd.to_numeric(df["volume"], errors="coerce")
+                        df["volume"] = (vol * 100.0).astype(np.float32)
                     df = pd.concat([bs_df, df], ignore_index=True)
                     df = df.sort_values("date").reset_index(drop=True)
                     df = df.drop_duplicates(subset="date", keep="last")
                     logger.info(
                         "  %s: stitched %d + %d = %d rows [%s → %s]",
                         stock_code, len(bs_df), len(df) - len(bs_df),
-                        len(df), df["date"].min()[:10], df["date"].max()[:10],
+                        len(df),
+                        str(pd.to_datetime(df["date"]).min().date()),
+                        str(pd.to_datetime(df["date"]).max().date()),
                     )
                 else:
                     logger.info("  %s: Baostock backfill returned empty, keeping %d rows",
