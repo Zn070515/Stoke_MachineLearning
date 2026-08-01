@@ -523,11 +523,20 @@ class EventToDaily(PreprocessingStep):
         # to scanning trigger columns for non-zero values.
         event_mask = np.zeros(n, dtype=bool)
         if raw_event_dates is not None and len(raw_event_dates) > 0:
-            df_dates = pd.DatetimeIndex(df["date"].values)
+            # Map each raw event date onto the trading-day grid with a
+            # RIGHT bias.  searchsorted(side="left") over the sorted grid
+            # returns the first trading day STRICTLY AFTER a non-trading-day
+            # event, so a weekend/holiday event lands on the LATER (next)
+            # trading day and is never known a day early.  Exact matches stay
+            # on their own day.  Units are normalized to nanoseconds so the
+            # comparison is valid regardless of the grid's storage dtype.
+            df_ts = np.asarray(df["date"].values).astype("datetime64[ns]").astype(np.int64)
             for ed in raw_event_dates:
-                idx = df_dates.get_indexer([ed], method="nearest")
-                if idx[0] >= 0:
-                    event_mask[idx[0]] = True
+                t = np.datetime64(ed).astype("datetime64[ns]").astype(np.int64)
+                pos = np.searchsorted(df_ts, t, side="left")
+                if pos >= len(df_ts):
+                    continue
+                event_mask[pos] = True
         else:
             trigger_cols = [c for c in spec["trigger_cols"] if c in df.columns]
             if not trigger_cols:
