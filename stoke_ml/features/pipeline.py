@@ -543,9 +543,6 @@ class FeaturePipeline:
                 self._intraday = MinuteIntradayFeatures()
             df = self._intraday.compute_all(df)
 
-        if self.use_interaction:
-            df = self._interaction.compute_all(df)
-
         # 2. Merge aux DataFrames (expanded PO columns)
         df = self._merge_sentiment(df, sentiment_df)
         df = self._merge_announcements(df, announcement_df)
@@ -567,6 +564,11 @@ class FeaturePipeline:
         df = self._merge_concept(df, concept_df)
         df = self._merge_macro(df, macro_df)
         df = self._merge_industry(df, industry_df)
+
+        # Interaction features require merged sentiment columns — must run
+        # after the aux merges (was previously a silent no-op).
+        if self.use_interaction:
+            df = self._interaction.compute_all(df)
 
         # Defragment after merge calls
         df = df.copy()
