@@ -801,7 +801,7 @@ class FeaturePipeline:
             fd = fd.drop_duplicates(subset="date", keep="last")
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
-        df[available] = df[available].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available)
         return df
 
     def _merge_valuation(self, df: pd.DataFrame,
@@ -818,7 +818,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(vd[["date"] + available], on="date", how="left")
-        df[available] = df[available].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available)
         return df
 
     def _merge_etf_flow(self, df: pd.DataFrame,
@@ -836,7 +836,7 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(ef[["date"] + available], on="date", how="left")
-        df[available] = df[available].fillna(0.0).astype(np.float32)
+        _batch_fill_shift(df, available)
         return df
 
     def _merge_guba(self, df: pd.DataFrame,
