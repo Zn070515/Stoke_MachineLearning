@@ -338,12 +338,13 @@ def build_stock(raw: pd.DataFrame, kline: pd.DataFrame) -> pd.DataFrame:
 
     # Net pledged-share fraction: +ratio for active, -ratio for released announcements.
     r["_delta"] = np.where(r[CN["status"]] == "未解押", r[CN["ratio"]], -r[CN["ratio"]])
-    delta = r.groupby("ann_dt")["_delta"].sum().rename("_delta").reset_index(names="date")
+    # pandas 3.0.3: Series.reset_index(names=...) unsupported -> rename instead.
+    delta = r.groupby("ann_dt")["_delta"].sum().rename("_delta").reset_index().rename(columns={"ann_dt": "date"})
 
     # As-of margin line: last announced ACTIVE pledge's 预估平仓线, forward-filled.
     active = r[r[CN["status"]] == "未解押"]
     line = (active.groupby("ann_dt")[CN["margin_line"]]
-            .last().rename("_margin_line").reset_index(names="date"))
+            .last().rename("_margin_line").reset_index().rename(columns={"ann_dt": "date"}))
 
     k = kline[["date", "close"]].copy()
     k["date"] = pd.to_datetime(k["date"]).dt.normalize()
@@ -376,6 +377,8 @@ def main():
 
     files = sorted(glob.glob(os.path.join(base, "pledge", "*.parquet")))
     codes = [os.path.splitext(os.path.basename(f))[0] for f in files]
+    # pledge/ dir also holds aggregate tables (market_pledge_stats, pledge_ratios) — keep per-stock only.
+    codes = [c for c in codes if len(c) == 6 and c.isdigit()]
     if args.stocks:
         codes = [c for c in codes if c in set(args.stocks.split(","))]
     if args.shard:
@@ -388,7 +391,8 @@ def main():
     for i, code in enumerate(codes):
         try:
             raw = pd.read_parquet(os.path.join(base, "pledge", f"{code}.parquet"))
-            kline = storage.load_daily(code)
+            # load_daily requires start/end; wide range never excludes dates.
+            kline = storage.load_daily(code, "1990-12-19", "2030-12-31")
             df = build_stock(raw, kline)
             if not df.empty:
                 df["stock_code"] = code
