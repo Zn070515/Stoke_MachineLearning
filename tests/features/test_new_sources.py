@@ -34,6 +34,8 @@ def test_merge_daily_aux_pit_lag():
 def test_merge_market_env_global(tmp_path):
     me = pd.DataFrame({"date": pd.bdate_range("2021-01-04", periods=10),
                        "high_low_ratio": np.linspace(-1, 1, 10)})
+    me_path = tmp_path / "market_env_daily.parquet"
+    me.to_parquet(me_path)
     df = _kline(n=10)
     p = FeaturePipeline(use_technical=False, use_scoring=False, use_temporal=False,
                         use_sentiment=False, use_announcements=False, use_guba=False,
