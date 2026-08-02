@@ -41,7 +41,9 @@ def main():
     if not feat_files:
         print("no feature files")
         return
-    codes = args.stocks.split(",") if args.stocks else None
+    codes = None
+    if args.stocks and args.stocks.strip():
+        codes = [s.strip() for s in args.stocks.split(",")]
     if codes is None:
         rng = np.random.default_rng(0)
         codes = [os.path.basename(f).replace(".parquet", "")
@@ -66,13 +68,13 @@ def main():
             except Exception:
                 skip += 1
                 continue
-            if raw.empty or feat.empty or raw_col not in raw or feat_col not in feat:
+            if raw.empty or feat.empty:
                 skip += 1
                 continue
             raw["date"] = pd.to_datetime(raw["date"]).dt.normalize()
             feat["date"] = pd.to_datetime(feat["date"]).dt.normalize()
-            raw = raw.drop_duplicates("date")
-            feat = feat.drop_duplicates("date")
+            raw = raw.drop_duplicates("date", keep="last")
+            feat = feat.drop_duplicates("date", keep="last")
             # Expected: feature at t == raw at t-1.
             merged = feat.merge(raw.rename(columns={raw_col: "raw"}), on="date", how="left")
             merged = merged.sort_values("date")
