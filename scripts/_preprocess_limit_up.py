@@ -148,7 +148,9 @@ def build_market_daily(base: str) -> pd.DataFrame:
     zb = _date_counts(os.path.join(base, ZB_DIR)).rename("zb_count")
     dt = _date_counts(os.path.join(base, DT_DIR)).rename("dt_count")
     yzt = _date_counts(os.path.join(base, YZT_DIR)).rename("yzt_count")
-    df = pd.concat([zt, zb, dt, yzt], axis=1, keys=["zt_count", "zb_count", "dt_count", "yzt_count"])
+    # Series are already uniquely named by .rename(); no keys= (which would wrap
+    # a MultiIndex on some pandas versions and mangle column names on write).
+    df = pd.concat([zt, zb, dt, yzt], axis=1)
     df = df.fillna(0).reset_index(names="date")
     df["market_zt_ratio"] = (df["zt_count"] / N_LISTED).astype(np.float32)
     z20 = df["zt_count"].rolling(20)
@@ -158,6 +160,10 @@ def build_market_daily(base: str) -> pd.DataFrame:
     if os.path.exists(sent):
         s = pd.read_parquet(sent)
         s["date"] = pd.to_datetime(s["date"]).dt.normalize()
+        # sentiment.parquet carries its own zt/zb/dt/yzt counts; drop them so the
+        # merge doesn't collide with the full-history aggregation (which would
+        # otherwise rename both sides to *_x/*_y).
+        s = s.drop(columns=["zt_count", "zb_count", "dt_count", "yzt_count"], errors="ignore")
         df = df.merge(s, on="date", how="left")
         df["has_market_sent"] = df["break_rate"].notna()
     else:
