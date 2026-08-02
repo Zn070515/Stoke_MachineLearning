@@ -775,7 +775,11 @@ def main():
                     continue
                 df = query_flat(bs, fn, day)
                 df["index_code"] = idx
-                df.to_parquet(out, index=False, compression="lz4")
+                # Atomic write: a killed process must not leave a truncated
+                # snapshot that --resume would skip as "done" and lose forever.
+                tmp = out + ".tmp"
+                df.to_parquet(tmp, index=False, compression="lz4")
+                os.replace(tmp, out)
             if (i + 1) % 12 == 0:
                 print(f"  {i+1}/{len(grid)} grid months done")
     finally:
