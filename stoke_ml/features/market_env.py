@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 
 # factor name -> (source col, z-window); window=None means use the raw value.
+# Note: cpi_yoy / m1_yoy / m2_yoy are monthly series forward-filled to daily, so a
+# 60-trading-day window spans only ~2-3 monthly prints; their z reflects short-term
+# deviation with some window-alignment artifact. Accepted known limitation.
 _FACTOR_Z = {
     "menv_shibor_1m_z": ("shibor_1M", 60),
     "menv_fx_usd_cny_z": ("fx_usd_cny", 60),
@@ -52,5 +55,15 @@ class MarketEnvRefiner:
                 out[col] = out[src].astype(np.float32)
         present = [c for c in _COMPOSITE if c in out.columns]
         if present:
-            out["menv_regime_z"] = out[present].mean(axis=1).fillna(0.0).astype(np.float32)
+            # Scale members comparably before averaging: the _FACTOR_Z members are
+            # already z-scores (~scale 1); the _FACTOR_RAW members are raw spreads
+            # (much larger scale) and would otherwise dominate the composite mean.
+            comp = []
+            for c in present:
+                if c in _FACTOR_RAW:
+                    comp.append(_rolling_z(out[c], 60))
+                else:
+                    comp.append(out[c])
+            out["menv_regime_z"] = (pd.concat(comp, axis=1).mean(axis=1)
+                                    .fillna(0.0).astype(np.float32))
         return out
