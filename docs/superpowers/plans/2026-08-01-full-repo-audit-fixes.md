@@ -1044,6 +1044,15 @@ Mark all fixed items as ✅ in `docs/research-findings/2026-08-01-full-repo-code
 - [x] **Step 1: Update the doc status.**
 - [x] **Step 2: Commit** — `git commit -m "docs: mark audit findings fixed (see plan 2026-08-01)"` (ac9cfbe)
 
+### Task G4: Full-suite verification (added 2026-08-02)
+
+- [x] **Step 1: Run full test suite at HEAD** — 207 passed, 23 failed, 4 errors.
+- [x] **Step 2: Classify failures against pre-audit baseline (6335c7b).**
+  - 4 `test_outlier.py` failures = audit regressions (Phase D causal rolling MAD). Fixed by reverting `transform` to fit-bounds clip (28dc5a2); all 8 outlier tests pass.
+  - 3 guba_source errors = environmental (WAF blocking), not code.
+  - 16 pre-existing failures (also fail at baseline WITH data): root cause for many is macro merge + blanket `dropna()` in `_prep_feature_df` (NaN z20 columns empty the frame). Tracked as follow-up §8.8 in audit doc.
+- [x] **Step 3: Update audit doc §8 follow-ups** (outlier regression + test classification) — commit ac9cfbe/70eda2d-era doc, updated 2026-08-02.
+
 ---
 
 ## Verification Summary (run all)
