@@ -864,6 +864,7 @@ def build_stock(membership: pd.DataFrame, kline: pd.DataFrame) -> pd.DataFrame:
     # Half-open interval [in, out); NaT out_date = still active -> cap past data end.
     m["out_date"] = m["out_date"].fillna(d1 + pd.Timedelta(days=1))
     m = m[(m["in_date"] <= d1) & (m["out_date"] > d0)]
+    m = m[m["in_date"].notna()]  # guard: a NaT in_date would mark the whole history as a member
 
     n = len(dates)
     is_mem = np.zeros(n, dtype=bool)
@@ -877,8 +878,10 @@ def build_stock(membership: pd.DataFrame, kline: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame({"date": pd.to_datetime(dates), "is_index_member": is_mem,
                         "n_indexes": n_idx})
-    # Net membership change within trailing 30 trading days (+add, -drop).
-    out["idx_change_30d"] = (out["is_index_member"].astype(int).diff()
+    # Net membership change within trailing 30 trading days. n_indexes.diff()
+    # captures cross-index churn (a stock joining CSI500 while staying in
+    # CSI300 still changes index exposure); a binary member-flag diff misses it.
+    out["idx_change_30d"] = (out["n_indexes"].diff()
                              .rolling(30).sum().fillna(0).astype("int16"))
     return out
 
