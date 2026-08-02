@@ -113,6 +113,10 @@ def main():
         if not parts:
             continue
         panel = pd.concat(parts, ignore_index=True)
+        # A discovered column may be absent from every successfully-loaded
+        # file (e.g. a feature only present in stocks that failed to load);
+        # drop it here so g[col] below cannot KeyError and kill the run.
+        cols = [c for c in cols if c in panel.columns]
         # Pre-group once per window and reuse across every feature instead of
         # re-masking / re-grouping the full panel per (feature, date|stock).
         date_groups = {d: g for d, g in panel.groupby("date")}
