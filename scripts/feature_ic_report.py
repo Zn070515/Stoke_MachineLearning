@@ -20,6 +20,7 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from scipy.stats import spearmanr
 
 from stoke_ml.config import load_config
@@ -62,13 +63,20 @@ def main():
         log.error("no feature files under %s", feat_dir)
         return
 
-    # Discover feature columns from the first file.
-    first = pd.read_parquet(files[0])
-    cols = [c for c in first.columns
+    # Discover feature columns as a union across a sample of files.
+    # Some columns are sparse (present for some stocks, absent for others);
+    # reading only the first file would silently drop them from the report.
+    # Read schema metadata only (no data) via ParquetFile for cheap discovery.
+    union = set()
+    n_sample = min(50, len(files))
+    for f in files[:n_sample]:
+        union.update(pq.ParquetFile(f).schema.names)
+    cols = [c for c in union
             if c not in SKIP and not c.startswith("fwd_")]
     if args.feature_subset:
         cols = [c for c in cols if c in set(args.feature_subset.split(","))]
-    log.info("%d stocks, %d candidate features", len(files), len(cols))
+    log.info("%d stocks, %d candidate features (sampled %d files)",
+             len(files), len(cols), n_sample)
 
     # Per-window: collect (date, stock, feature, fwd_ret) long frames.
     windows = {"full": [], "primary": []}
@@ -76,17 +84,24 @@ def main():
     for f in files:
         try:
             df = pd.read_parquet(f, columns=["date", "stock_code", "close"] + cols)
-        except Exception as e:
-            log.warning("skip %s: %s", os.path.basename(f), e)
-            continue
+        except Exception:
+            # Some discovered column is absent in this file; re-read the full
+            # file and intersect against what is actually available so a missing
+            # sparse feature never drops the whole stock.
+            try:
+                df = pd.read_parquet(f)
+            except Exception as e:
+                log.warning("skip %s: %s", os.path.basename(f), e)
+                continue
         if len(df) < 30 or "close" not in df:
             continue
+        want = [c for c in cols if c in df.columns]
         df["fwd_ret"] = forward_return(df)
         df["date"] = pd.to_datetime(df["date"])
         n_loaded += 1
         for win, mask in (("full", df["date"] >= pd.Timestamp("2010-01-01")),
                           ("primary", df["date"] >= PRIMARY)):
-            sub = df.loc[mask, ["date", "stock_code", "fwd_ret"] + cols]
+            sub = df.loc[mask, ["date", "stock_code", "fwd_ret"] + want]
             sub = sub.dropna(subset=["fwd_ret"])
             windows[win].append(sub)
     log.info("loaded %d stocks", n_loaded)
