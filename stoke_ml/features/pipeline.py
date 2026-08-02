@@ -592,6 +592,11 @@ class FeaturePipeline:
     ) -> pd.DataFrame:
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
+        # Preserve the K-line pct_change column across technical computation.
+        # compute_all drops it as an intermediate column; restoring the daily
+        # value here keeps pct_change as a same-day PK feature (no lag) and
+        # prevents aux merges from injecting their own (possibly stale) one.
+        _pct_change = df["pct_change"].copy() if "pct_change" in df.columns else None
 
         if self.use_new_preprocessing and self.preprocessing:
             df = self.preprocessing.run("numeric", df)
@@ -599,6 +604,8 @@ class FeaturePipeline:
         # 1. Technical indicators + scoring + microstructure (no aux dependency)
         if self.use_technical:
             df = self._ti.compute_all(df)
+        if _pct_change is not None:
+            df["pct_change"] = _pct_change.fillna(0.0).astype(np.float32)
         if self.use_scoring:
             df = self._scorer.score(df)
 
@@ -1998,8 +2005,8 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str]) -> None:
 def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     """Merge a preprocessed auxiliary DataFrame on date with ZI fill + PIT lag.
 
-    Any column that exists in *aux* (except date, stock_code, has_* flags)
-    is merged and lagged by 1 trading day.
+    Any column that exists in *aux* (except date, stock_code, has_* flags and
+    K-line derived columns) is merged and lagged by 1 trading day.
     """
     a = aux.copy()
     a["date"] = pd.to_datetime(a["date"])
@@ -2007,7 +2014,11 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
     a = a.drop(columns=["stock_code"], errors="ignore")
     a = a.drop_duplicates(subset="date", keep="last")
 
-    skip = {"date", "stock_code"}
+    # K-line derived columns must NEVER come from aux. technical.compute_all
+    # drops pct_change/vol_change as intermediates, which would otherwise let
+    # an aux (e.g. board/industry ranking) inject its own — possibly stale —
+    # values as if they were the stock's daily return.
+    skip = {"date", "stock_code", "pct_change", "vol_change"}
     available = [c for c in a.columns if c not in skip]
     # Drop aux columns that collide with existing df columns (e.g. block_trade
     # has 'volume'/'amount' which clash with K-line OHLCV). Colliding columns
