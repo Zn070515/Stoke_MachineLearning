@@ -23,7 +23,7 @@ def _z(s: pd.Series, win: int = 20) -> pd.Series:
 def build_turnover_daily(base: str) -> pd.Series:
     """Sum 'amount' across all daily flat files per date -> z-scored turnover."""
     amounts = []
-    for f in glob.glob(os.path.join(base, "daily", "*.parquet")):
+    for f in glob.glob(os.path.join(base, "daily", "[0-9][0-9][0-9][0-9][0-9][0-9].parquet")):
         try:
             d = pd.read_parquet(f, columns=["date", "amount"])
             d["date"] = pd.to_datetime(d["date"]).dt.normalize()
@@ -67,13 +67,16 @@ def main():
     # so the monthly figure takes effect near month-end before daily resample/ffill.
     acc = pd.read_parquet(os.path.join(br, "account_stats.parquet"))
     acc["date"] = pd.to_datetime(acc["数据日期"].astype(str) + "-28", errors="coerce")
+    acc = acc.dropna(subset=["date"])
     acc = acc.sort_values("date").set_index("date")
     acc = acc.rename(columns={
         "新增投资者-数量": "investor_new_num",
         "沪深总市值": "mkt_cap_total",
         "沪深户均市值": "avg_account_cap",
     })
-    acc_daily = acc[["investor_new_num", "mkt_cap_total", "avg_account_cap"]].resample("D").ffill()
+    acc_raw = acc[["investor_new_num", "mkt_cap_total", "avg_account_cap"]].resample("D").ffill()
+    acc_z_monthly = acc[["investor_new_num", "mkt_cap_total", "avg_account_cap"]].apply(_z)
+    acc_z_daily = acc_z_monthly.resample("D").ffill()
 
     hl = pd.read_parquet(os.path.join(br, "highs_lows.parquet"))
     hl["date"] = pd.to_datetime(hl["date"]).dt.normalize()
@@ -82,10 +85,10 @@ def main():
 
     series = {
         "high_low_ratio": hl["high_low_ratio"],
-        "mkt_cap_total_z": _z(acc_daily["mkt_cap_total"]),
-        "avg_account_cap_z": _z(acc_daily["avg_account_cap"]),
-        "investor_new_num": acc_daily["investor_new_num"],
-        "investor_new_z": _z(acc_daily["investor_new_num"]),
+        "mkt_cap_total_z": acc_z_daily["mkt_cap_total"],
+        "avg_account_cap_z": acc_z_daily["avg_account_cap"],
+        "investor_new_num": acc_raw["investor_new_num"],
+        "investor_new_z": acc_z_daily["investor_new_num"],
     }
     adv = build_industry_advance(base)
     if not adv.empty:
