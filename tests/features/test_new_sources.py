@@ -47,7 +47,7 @@ def test_merge_market_env_global(tmp_path):
                         use_concept=False, use_macro=False, use_industry=False,
                         use_emotion_refine=False, use_fundamental_refine=False,
                         use_temporal_stats=False, use_pledge=False, use_limit_up=False,
-                        use_index_membership=False)
+                        use_index_membership=False, use_market_env=True)
     # _merge_market_env reads from cfg data_dir; bypass by injecting cache.
     p._market_env_cache = me
     out = p._merge_market_env(df)
@@ -93,7 +93,7 @@ def test_ic_correctness_known_signal():
     rng = np.random.default_rng(1)
     dates = pd.bdate_range("2021-01-01", periods=30)
     ics = []
-    for d in dates:
+    for _ in dates:
         n = 80
         noise = rng.normal(0, 0.1, n)
         sig = rng.normal(0, 1, n)
