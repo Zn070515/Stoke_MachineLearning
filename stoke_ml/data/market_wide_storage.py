@@ -5,10 +5,41 @@ Partitions: data/a_shares/{data_type}/{year}/{month}/{stock_code}.parquet
 import logging
 import os
 import tempfile
+import time
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_LOCK_TIMEOUT = 600.0
+_LOCK_STALE = 900.0
+
+
+def _acquire_lock(target: str, timeout: float = _LOCK_TIMEOUT) -> str:
+    """Exclusive per-file lock via atomic mkdir. Returns the lock dir path."""
+    lock_dir = target + ".lock"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return lock_dir
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_dir) > _LOCK_STALE:
+                    os.rmdir(lock_dir)  # steal stale lock from a crashed process
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"could not acquire lock: {lock_dir}")
+            time.sleep(0.05)
+
+
+def _release_lock(lock_dir: str) -> None:
+    try:
+        os.rmdir(lock_dir)
+    except OSError:
+        pass
 
 MARKET_DATA_TYPES = [
     "dragon_tiger", "margin", "northbound",
@@ -65,36 +96,43 @@ class MarketWideStorage:
 
         base = self._base_dir()
         for code, group in df.groupby("stock_code"):
-            new_rows = group.sort_values("date")
             out_path = os.path.join(base, f"{code}.parquet")
-            if os.path.isfile(out_path):
-                existing = pd.read_parquet(out_path)
-                existing["date"] = pd.to_datetime(existing["date"])
-                # Backward compat: older files may lack stock_code column
-                if "stock_code" not in existing.columns:
-                    existing["stock_code"] = code
-                if replace_range:
-                    lo = new_rows["date"].min()
-                    hi = new_rows["date"].max()
-                    existing = existing[
-                        (existing["date"] < lo) | (existing["date"] > hi)
-                    ]
-                new_rows = pd.concat([existing, new_rows], ignore_index=True)
-            # Dedup identical rows (not by date only — block_trade has
-            # multiple trades per day that must all be preserved).
-            new_rows = new_rows.drop_duplicates(keep="last")
-            new_rows = new_rows.sort_values("date")
-            fd, tmp_path = tempfile.mkstemp(
-                suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
-            )
-            os.close(fd)
+            # Read-modify-write must be exclusive: atomic rename alone only
+            # protects readers from torn files, not concurrent writers from
+            # overwriting each other's merged rows (parallel year backfills).
+            lock_dir = _acquire_lock(out_path)
             try:
-                new_rows.to_parquet(tmp_path, index=False, compression='lz4')
-                os.replace(tmp_path, out_path)
-            except Exception:
-                if os.path.isfile(tmp_path):
-                    os.unlink(tmp_path)
-                raise
+                new_rows = group.sort_values("date")
+                if os.path.isfile(out_path):
+                    existing = pd.read_parquet(out_path)
+                    existing["date"] = pd.to_datetime(existing["date"])
+                    # Backward compat: older files may lack stock_code column
+                    if "stock_code" not in existing.columns:
+                        existing["stock_code"] = code
+                    if replace_range:
+                        lo = new_rows["date"].min()
+                        hi = new_rows["date"].max()
+                        existing = existing[
+                            (existing["date"] < lo) | (existing["date"] > hi)
+                        ]
+                    new_rows = pd.concat([existing, new_rows], ignore_index=True)
+                # Dedup identical rows (not by date only — block_trade has
+                # multiple trades per day that must all be preserved).
+                new_rows = new_rows.drop_duplicates(keep="last")
+                new_rows = new_rows.sort_values("date")
+                fd, tmp_path = tempfile.mkstemp(
+                    suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
+                )
+                os.close(fd)
+                try:
+                    new_rows.to_parquet(tmp_path, index=False, compression='lz4')
+                    os.replace(tmp_path, out_path)
+                except Exception:
+                    if os.path.isfile(tmp_path):
+                        os.unlink(tmp_path)
+                    raise
+            finally:
+                _release_lock(lock_dir)
 
     def load(
         self, stock_code: str, start_date: str, end_date: str

@@ -1,4 +1,5 @@
 """Margin trading & short selling data (融资融券) via AKShare."""
+import datetime as dt
 import logging
 import time
 
@@ -21,11 +22,15 @@ class MarginTradingSource:
     SOURCE_NAME = "akshare_margin"
 
     def fetch_daily(
-        self, start_date: str, end_date: str, sleep: float = 0.3
+        self, start_date: str, end_date: str, sleep: float = 0.3,
+        dates: list[dt.date] | None = None,
     ) -> pd.DataFrame:
         """Fetch margin trading details for all stocks over a date range.
 
         AKShare margin APIs accept a single date at a time, so we loop.
+
+        ``dates`` optionally overrides the trading-day list (used for
+        pre-2015 backfill where ``TradingCalendar`` has no holiday table).
         """
         try:
             import akshare as ak
@@ -33,8 +38,9 @@ class MarginTradingSource:
             logger.warning("AKShare not available for margin data")
             return pd.DataFrame()
 
-        calendar = TradingCalendar("a_shares")
-        dates = calendar.get_trading_days(start_date, end_date)
+        if dates is None:
+            calendar = TradingCalendar("a_shares")
+            dates = calendar.get_trading_days(start_date, end_date)
         all_frames = []
 
         for d in dates:
