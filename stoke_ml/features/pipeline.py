@@ -339,6 +339,10 @@ class FeaturePipeline:
         concept_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
         industry_df: pd.DataFrame | None = None,
+        limit_up_df: pd.DataFrame | None = None,  # unused hook while deferred (top scope note)
+        pledge_df: pd.DataFrame | None = None,
+        market_env_df: pd.DataFrame | None = None,
+        index_membership_df: pd.DataFrame | None = None,
         return_dates: bool = False,
     ) -> tuple:
         """Build features for a single stock. Returns (X, y, aligned_close).
@@ -353,6 +357,8 @@ class FeaturePipeline:
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
             macro_df=macro_df, industry_df=industry_df,
+            limit_up_df=limit_up_df, pledge_df=pledge_df,
+            market_env_df=market_env_df, index_membership_df=index_membership_df,
         )
         X, y, aligned_close = self._create_sequences(feats, target_col)
 
@@ -390,6 +396,10 @@ class FeaturePipeline:
         concept_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
         industry_df: pd.DataFrame | None = None,
+        limit_up_df: pd.DataFrame | None = None,  # unused hook while deferred (top scope note)
+        pledge_df: pd.DataFrame | None = None,
+        market_env_df: pd.DataFrame | None = None,
+        index_membership_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Engineer features for a single stock, returning the full DataFrame.
 
@@ -404,6 +414,8 @@ class FeaturePipeline:
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
             macro_df=macro_df, industry_df=industry_df,
+            limit_up_df=limit_up_df, pledge_df=pledge_df,
+            market_env_df=market_env_df, index_membership_df=index_membership_df,
         )
 
     def save_features(
@@ -430,6 +442,10 @@ class FeaturePipeline:
         concept_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
         industry_df: pd.DataFrame | None = None,
+        limit_up_df: pd.DataFrame | None = None,  # unused hook while deferred (top scope note)
+        pledge_df: pd.DataFrame | None = None,
+        market_env_df: pd.DataFrame | None = None,
+        index_membership_df: pd.DataFrame | None = None,
     ) -> str:
         """Engineer features and save to parquet. Returns output_path."""
         feats = self._engineer_features(
@@ -439,6 +455,8 @@ class FeaturePipeline:
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
             macro_df=macro_df, industry_df=industry_df,
+            limit_up_df=limit_up_df, pledge_df=pledge_df,
+            market_env_df=market_env_df, index_membership_df=index_membership_df,
         )
         feats.to_parquet(output_path, index=False, compression="lz4")
         return output_path
@@ -562,6 +580,10 @@ class FeaturePipeline:
         concept_df: pd.DataFrame | None = None,
         macro_df: pd.DataFrame | None = None,
         industry_df: pd.DataFrame | None = None,
+        limit_up_df: pd.DataFrame | None = None,  # unused hook while deferred (top scope note)
+        pledge_df: pd.DataFrame | None = None,
+        market_env_df: pd.DataFrame | None = None,
+        index_membership_df: pd.DataFrame | None = None,
         skip_temporal: bool = False,
     ) -> pd.DataFrame:
         df = df.copy()
@@ -606,6 +628,12 @@ class FeaturePipeline:
         df = self._merge_macro(df, macro_df)
         df = self._merge_industry(df, industry_df)
 
+        # _merge_limit_up is DEFERRED (limit-up ecology family, top scope note):
+        # the method exists (Step 1) but is intentionally NOT wired here.
+        df = self._merge_pledge(df, pledge_df)
+        df = self._merge_market_env(df, market_env_df)
+        df = self._merge_index_membership(df, index_membership_df)
+
         # Interaction features require merged sentiment columns — must run
         # after the aux merges (was previously a silent no-op).
         if self.use_interaction:
@@ -621,6 +649,10 @@ class FeaturePipeline:
         # 4. Per-stock fundamental refinement (quality, stability, valuation, trends)
         if self._fundamental_refiner is not None:
             df = self._fundamental_refiner.refine(df)
+
+        # 4b. Market-environment factors (macro composite + regime score)
+        if self._market_env_refiner is not None:
+            df = self._market_env_refiner.refine(df)
 
         # 5. Temporal statistics on PO columns (replaces add_rolling_features)
         if self._temporal_transformer is not None:
@@ -655,6 +687,14 @@ class FeaturePipeline:
             temporal_cols += _active_cols(df, CONCEPT_COLS)
             temporal_cols += _active_cols(df, MACRO_COLS)
             temporal_cols += _active_cols(df, INDUSTRY_COLS)
+            temporal_cols += _active_cols(df, LIMIT_UP_COLS)
+            temporal_cols += _active_cols(df, PLEDGE_COLS)
+            temporal_cols += _active_cols(df, INDEX_MEMBER_COLS)
+            temporal_cols += _active_cols(df, MARKET_ENV_COLS)
+            temporal_cols += _active_cols(df, DRAGON_TIGER_SEAT_COLS)
+            temporal_cols += _active_cols(df, [
+                c for c in df.columns if c.startswith("menv_")
+            ])
             # Dynamic PO columns
             temporal_cols += _active_cols(df, [
                 c for c in df.columns
@@ -1001,6 +1041,33 @@ class FeaturePipeline:
             concept_df = _aggregate_concept_long(concept_df)
         return _merge_daily_aux(df, concept_df)
 
+    def _merge_limit_up(self, df: pd.DataFrame,
+                        limit_up_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not self.use_limit_up:
+            return df
+        if limit_up_df is None or limit_up_df.empty:
+            self._warn_if_missing("limit_up")
+            return df
+        return _merge_daily_aux(df, limit_up_df)
+
+    def _merge_pledge(self, df: pd.DataFrame,
+                      pledge_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not self.use_pledge:
+            return df
+        if pledge_df is None or pledge_df.empty:
+            self._warn_if_missing("pledge")
+            return df
+        return _merge_daily_aux(df, pledge_df)
+
+    def _merge_index_membership(self, df: pd.DataFrame,
+                                im_df: pd.DataFrame | None) -> pd.DataFrame:
+        if not self.use_index_membership:
+            return df
+        if im_df is None or im_df.empty:
+            self._warn_if_missing("index_membership")
+            return df
+        return _merge_daily_aux(df, im_df)
+
     def _merge_macro(self, df: pd.DataFrame,
                      macro_df: pd.DataFrame | None = None) -> pd.DataFrame:
         if not self.use_macro:
@@ -1031,6 +1098,37 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(macro[["date"] + available], on="date", how="left")
+        _batch_fill_shift(df, available)
+        return df
+
+    def _merge_market_env(self, df: pd.DataFrame,
+                          market_env_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        if not self.use_market_env:
+            return df
+        if market_env_df is None:
+            market_env_df = self._market_env_cache
+            if market_env_df is None:
+                import os
+                from stoke_ml.config import load_config
+                cfg = load_config()
+                path = os.path.join(cfg.project.data_dir, "a_shares", "market_breadth",
+                                    "market_env_daily.parquet")
+                if not os.path.exists(path):
+                    self._warn_if_missing("market_env")
+                    return df
+                market_env_df = pd.read_parquet(path)
+                self._market_env_cache = market_env_df
+        if market_env_df is None or market_env_df.empty:
+            return df
+        me = market_env_df.copy()
+        if me.index.name == "date":
+            me = me.reset_index()
+        me["date"] = pd.to_datetime(me["date"]).dt.normalize()
+        me = me.drop_duplicates(subset="date", keep="last")
+        available = [c for c in MARKET_ENV_COLS if c in me.columns]
+        if not available:
+            return df
+        df = df.merge(me[["date"] + available], on="date", how="left")
         _batch_fill_shift(df, available)
         return df
 
