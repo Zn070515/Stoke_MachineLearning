@@ -613,14 +613,20 @@ intervals. Baostock has NO historical data for 000852 (CSI1000) or 000688
 (科创50) — documented coverage gaps.
 
 Baostock row semantics: a query at date D returns every constituent as of D,
-each row carrying `updateDate` = the exact date that membership spell became
-effective (an index adjustment date). A stock present across many queries
-keeps the SAME updateDate until it is dropped and re-added (new updateDate).
+each row carrying `updateDate`. In baostock 0.9.20 `updateDate` is Baostock's
+monthly data-refresh date (the last trading day of the prior month), re-stamped
+on EVERY query for every stock — NOT an index adjustment date. A stock present
+in consecutive monthly snapshots is therefore a continuous member; an absence
+from one or more snapshots marks a removal.
 
-Reconstruction: for each (index, stock), each distinct updateDate starts a
-membership spell. The spell's out_date = the last query date that still
-reported that spell (the last confirmation before removal); NaT means the
-stock was still a member at the final grid query (open-ended).
+Reconstruction: for each (index, stock), a membership spell is a run of
+consecutive snapshot dates in which the stock appears. in_date = the earliest
+refresh date (updateDate) seen in the run (a proxy for when membership became
+effective); out_date = the last snapshot date that still reported the stock
+(the last confirmation before removal); NaT means the stock was still a member
+at the final grid query (open-ended). Spans are resolved to the monthly grid —
+a stock joining/leaving between snapshots is attributed to the boundary of its
+presence run.
 
 Outputs:
   data/a_shares/index_constituents_hist/snapshots/{index}/{YYYY-MM-DD}.parquet
@@ -655,9 +661,10 @@ def query_flat(bs, fn_name, date, retries=RETRIES):
             rs = fn(date=date)
             if rs.error_code != "0":
                 raise RuntimeError(f"{fn_name}@{date}: {rs.error_code} {rs.error_msg}")
-            cols = rs.get_fields()
-            rows = rs.get_row_data()
-            df = pd.DataFrame(rows, columns=cols)
+            cols = rs.fields  # baostock 0.9.20 stores field names here (no get_fields())
+            df = rs.get_data()  # full DataFrame; pagination handled internally
+            if df.empty:
+                df = pd.DataFrame(columns=cols)
             df["query_date"] = pd.Timestamp(date)
             return df
         except Exception as e:
@@ -668,7 +675,15 @@ def query_flat(bs, fn_name, date, retries=RETRIES):
 
 
 def rebuild_membership(snap_dir):
-    """Concatenate cached snapshots -> membership interval DataFrame."""
+    """Concatenate cached snapshots -> membership interval DataFrame.
+
+    Baostock 0.9.20 re-stamps updateDate (its monthly refresh date) on every
+    query for every stock, so spells are keyed on CONTIGUOUS PRESENCE across
+    snapshot dates rather than on updateDate: a stock present in consecutive
+    monthly snapshots is one continuous membership spell. in_date = the run's
+    earliest refresh date (updateDate); out_date = the last snapshot that
+    reported the stock, NaT if the run reaches the final grid query.
+    """
     frames = []
     for idx in INDICES:
         sd = os.path.join(snap_dir, idx)
@@ -693,11 +708,19 @@ def rebuild_membership(snap_dir):
     last_grid = allq["query_date"].max()
     rows = []
     for (idx, code), g in allq.groupby(["index_code", "stock_code"]):
-        last_seen = g.groupby("updateDate")["query_date"].max()
-        for u, ls in last_seen.items():
-            still_active = ls >= last_grid
+        g = g.sort_values("query_date")
+        # A new spell starts when > 1 calendar month elapses between two
+        # consecutive snapshots (the stock was absent -> a removal + re-add).
+        month_ids = g["query_date"].dt.to_period("M").astype("int64")
+        new_run = month_ids.diff().gt(1)
+        new_run.iloc[0] = True
+        for _rid, rg in g.groupby(new_run.cumsum()):
+            in_date = rg["updateDate"].min()
+            out_date = rg["query_date"].max()
+            still_active = out_date >= last_grid
             rows.append({"stock_code": code, "index_code": idx,
-                         "in_date": u, "out_date": pd.NaT if still_active else ls})
+                         "in_date": in_date,
+                         "out_date": pd.NaT if still_active else out_date})
     return pd.DataFrame(rows, columns=["stock_code", "index_code", "in_date", "out_date"])
 
 
@@ -713,6 +736,8 @@ def main():
     base = os.path.join(cfg.project.data_dir, "a_shares", "index_constituents_hist")
     snap_dir = os.path.join(base, "snapshots")
     os.makedirs(snap_dir, exist_ok=True)
+    for idx in INDICES:
+        os.makedirs(os.path.join(snap_dir, idx), exist_ok=True)
 
     try:
         import baostock as bs
@@ -722,6 +747,23 @@ def main():
     lg = bs.login()
     if lg.error_code != "0":
         raise SystemExit(f"bs.login failed: {lg.error_code} {lg.error_msg}")
+    # Best-effort: avoid indefinite hang on a dead connection (retry loop recovers).
+    try:
+        _sock = bs.__session.sock
+        if _sock is not None:
+            _sock.settimeout(90)
+    except Exception:
+        pass  # internal attribute may differ across baostock versions — non-fatal
+    # baostock 0.9.20 has no module-level __session; the live socket lives at
+    # baostock.common.context.default_socket. Without a timeout a dead connection
+    # hangs send_msg forever; the retry loop only helps if the recv raises.
+    try:
+        import baostock.common.context as _bs_ctx
+        _sock = getattr(_bs_ctx, "default_socket", None)
+        if _sock is not None:
+            _sock.settimeout(90)
+    except Exception:
+        pass  # non-fatal; --resume reruns cover any hang
 
     grid = pd.date_range(args.start, args.end, freq="MS")
     try:
