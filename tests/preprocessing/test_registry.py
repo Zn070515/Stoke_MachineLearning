@@ -75,8 +75,9 @@ class TestFeatureRegistry:
         reg.register(FeatureDefinition(name="f1", category="text", tags=["ablation=guba", "lag=1"]))
         reg.register(FeatureDefinition(name="f2", category="text", tags=["ablation=guba", "lag=1"]))
         reg.register(FeatureDefinition(name="f3", category="numeric", tags=["ablation=guba", "scaled"]))
+        # All three features carry the "ablation=guba" tag → all match
         xq = reg.get_by_group("ablation=guba")
-        assert sorted(xq) == ["f1", "f3"]
+        assert sorted(xq) == ["f1", "f2", "f3"]
 
     def test_get_by_group_no_match(self):
         reg = FeatureRegistry()
@@ -88,7 +89,8 @@ class TestFeatureRegistry:
         reg.register(FeatureDefinition(name="f1", category="text", source="guba"))
         reg.register(FeatureDefinition(name="f2", category="text", source="guba"))
         reg.register(FeatureDefinition(name="f3", category="text", source="guba"))
-        assert sorted(reg.get_by_source("guba")) == ["f1", "f3"]
+        # All three features have source "guba" → all match
+        assert sorted(reg.get_by_source("guba")) == ["f1", "f2", "f3"]
 
     def test_validate_matrix_passes_for_matching_columns(self):
         reg = FeatureRegistry()

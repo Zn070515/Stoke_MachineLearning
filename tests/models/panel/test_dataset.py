@@ -36,22 +36,24 @@ class TestPanelDataset:
     def test_getitem_shapes(self):
         data = make_synthetic_data(n_days=100, seq_len=60)
         ds = PanelDataset(data, seq_len=60)
-        static, pk, po, y_dir, y_ret, y_vol = ds[0]
+        static, pk, po, y_dir, y_ret, y_vol, date_idx = ds[0]
         assert static.shape == (8,)
         assert pk.shape == (60, 20)
         assert po.shape == (60, 12)
         assert y_dir.ndim == 0  # scalar
         assert y_ret.ndim == 0
         assert y_vol.ndim == 0
+        assert date_idx == 0  # default 0 when no date_indices passed
 
     def test_collate_fn(self):
         data = make_synthetic_data(n_days=100, seq_len=60)
         ds = PanelDataset(data, seq_len=60)
         batch = [ds[i] for i in range(4)]
-        static, pk, po, y_dir, y_ret, y_vol = panel_collate(batch)
+        static, pk, po, y_dir, y_ret, y_vol, date_idx = panel_collate(batch)
         assert static.shape == (4, 8)
         assert pk.shape == (4, 60, 20)
         assert po.shape == (4, 60, 12)
         assert y_dir.shape == (4,)
         assert y_ret.shape == (4,)
         assert y_vol.shape == (4,)
+        assert date_idx.shape == (4,)

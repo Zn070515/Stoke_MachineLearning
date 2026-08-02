@@ -187,10 +187,17 @@ def accel(arr: np.ndarray, fast: int, slow: int) -> np.ndarray:
 
 
 def zscore(arr: np.ndarray, window: int) -> np.ndarray:
-    """Z-score: (v - ma_window) / std_window with expanding fallback."""
+    """Z-score: (v - ma_window) / std_window with expanding fallback.
+
+    Windows whose std ≈ 0 (constant series, e.g. quarterly macro forward-
+    filled to daily) yield z=0 rather than NaN — a constant feature has no
+    deviation, so its z-score is neutral. Matches expanding_zscore.
+    """
     ma = rolling_mean(arr, window)
     std = rolling_std(arr, window)
-    valid = std > 1e-10
-    out = np.full(len(arr), np.nan, dtype=np.float64)
-    out[valid] = (arr[valid] - ma[valid]) / std[valid]
-    return out
+    eps = 1e-8
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = (arr - ma) / np.maximum(std, eps)
+    # Warmup rows (ma is NaN) stay NaN; constant windows get z=0.
+    z[np.isnan(ma)] = np.nan
+    return z

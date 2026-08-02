@@ -232,6 +232,8 @@ def _rolling_position(high, low, close):
     def _pad(vals, d):
         return np.pad(vals, (d - 1, 0), constant_values=np.nan)
     for d in _WINDOWS:
+        if len(c) < d:
+            continue  # pandas .rolling(d) semantics: too short → no output
         high_n = pd.Series(
             _pad(np.max(sliding_window_view(h, d), axis=1), d),
             index=high.index,
@@ -281,6 +283,8 @@ def _rolling_trend(close, volume):
     c = close.values.astype(np.float64)
     v = volume.values.astype(np.float64)
     for d in _WINDOWS:
+        if len(c) < d:
+            continue  # pandas .rolling(d) semantics: too short → no output
         x = _X[d]
         sx = _X_SX[d]
         denom = _X_DENOM[d]
@@ -376,6 +380,8 @@ def _rolling_aroon_vol(high, low, close, volume):
     l = low.values.astype(np.float64)
     out = {}
     for d in _WINDOWS:
+        if len(h) < d:
+            continue  # pandas .rolling(d) semantics: too short → no output
         # imax: position of max in window / (d-1), vectorized
         h_win = sliding_window_view(h, d)
         imax_vals = np.argmax(h_win, axis=1).astype(np.float64) / (d - 1)

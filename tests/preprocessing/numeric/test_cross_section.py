@@ -18,15 +18,16 @@ class TestCrossSectionNormalizer:
 
     def test_sector_stage_neutralizes(self):
         csn = CrossSectionNormalizer(stages=["sector"])
+        # ≥2 stocks per (date, sector) so the neutralization actually applies
         df = pd.DataFrame({
-            "date": pd.date_range("2024-01-02", periods=6, freq="B"),
-            "stock_code": ["A", "B", "A", "C", "B", "C"],
-            "x": [100.0, 200.0, 110.0, 50.0, 190.0, 55.0],
-            "sector": ["bank", "tech", "bank", "health", "tech", "health"],
+            "date": ["2024-01-02"] * 6 + ["2024-01-03"] * 6,
+            "stock_code": ["A", "B", "C", "D", "E", "F"] * 2,
+            "x": [100.0, 120.0, 200.0, 220.0, 50.0, 70.0,
+                  110.0, 130.0, 205.0, 225.0, 55.0, 75.0],
+            "sector": ["bank", "bank", "tech", "tech", "health", "health"] * 2,
         })
         result = csn.fit_transform(df)
         assert "x" in result.columns
-        assert "x_raw" in result.columns
         # Within each (date, sector), median should be 0 after neutralization
         medians = result.groupby(["date", "sector"])["x"].median()
         assert (medians.abs() < 0.01).all()
@@ -63,11 +64,14 @@ class TestCrossSectionNormalizer:
             "date": ["2024-01-02"] * 15,
             "stock_code": [f"S{i}" for i in range(15)],
             "x": [float(i * 10) for i in range(15)],
-            "market_cap": [1e8 + i * 5e7 for i in range(15)],
+            "size_proxy": [1e8 + i * 5e7 for i in range(15)],
         })
         result = csn.fit_transform(df)
         assert "x" in result.columns
-        assert "x_pre_size" in result.columns
+        # Residuals after regressing x on size + size²: the size trend is
+        # removed, so residual spread is far smaller than the raw spread.
+        assert not np.allclose(result["x"].values, df["x"].values)
+        assert result["x"].std() < 0.3 * df["x"].std()
 
     def test_adaptive_stage_applies_alpha(self):
         csn = CrossSectionNormalizer(stages=["adaptive"])

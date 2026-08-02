@@ -48,7 +48,9 @@ class CrossSectionNormalizer(PreprocessingStep):
         columns: list[str] | None = None,
     ):
         self.enabled = enabled
-        self.stages = stages or ["sector", "size", "rank"]
+        # Match preprocessing/config.py and config.yaml defaults; "rank" was
+        # the divergent default (production uses sector/size/adaptive).
+        self.stages = stages or ["sector", "size", "adaptive"]
         self.columns = columns
 
     # ------------------------------------------------------------------

@@ -87,14 +87,15 @@ class TestFeaturePipelineBuild:
         assert len(X) == 0
         assert len(y) == 0
 
-    def test_target_is_binary(self):
+    def test_target_is_ternary(self):
         pipe = FeaturePipeline(
             seq_len=20, use_sentiment=False, use_announcements=False,
             use_guba=False, use_comment=False,
         )
         df = _make_kl(200)
         _, y, _ = pipe.build_features(df, target_col="close")
-        assert set(np.unique(y)).issubset({0, 1})
+        # 3-class: down / flat / up (threshold 0.003), matching XGBoost num_class=3
+        assert set(np.unique(y)).issubset({0, 1, 2})
 
 
 class TestFeaturePipelineFlags:
