@@ -134,6 +134,35 @@ MACRO_COLS = [
     "gdp_cn_yoy", "m2_yoy", "m1_yoy", "sf_total", "cpi_yoy",
 ]
 
+LIMIT_UP_COLS = [
+    "zt_first_seal_hour", "zt_last_seal_hour", "zt_seal_fund_ratio",
+    "zt_break_times", "zt_limit_days", "zt_pct",
+    "zb_first_seal_hour", "zb_break_times", "zb_amplitude", "zb_speed",
+    "dt_seal_fund_ratio", "dt_open_times", "dt_days", "dt_pe",
+    "yzt_first_seal_hour", "yzt_limit_days",
+    "has_zt", "has_zb", "has_dt", "has_yzt",
+]  # DEFERRED (limit-up ecology family, top scope note) — defined for future re-enable, NOT wired
+
+PLEDGE_COLS = [
+    "pledge_ratio", "pledge_margin_dist", "pledge_risk",
+    "pledge_count_20d", "has_pledge",
+]
+
+INDEX_MEMBER_COLS = [
+    "is_index_member", "n_indexes", "idx_change_30d",
+]  # no index_weight — Baostock has no historical weights (A4a scope note)
+
+# Must match scripts/_preprocess_market_env.py output exactly (7 cols, no
+# limit-up temperature cols — that family is deferred).
+MARKET_ENV_COLS = [
+    "high_low_ratio", "mkt_cap_total_z", "avg_account_cap_z",
+    "investor_new_num", "investor_new_z", "market_adv_ratio", "market_turnover_z",
+]
+
+DRAGON_TIGER_SEAT_COLS = [
+    "lhb_is_wave", "lhb_is_sustained", "lhb_is_drop", "lhb_count_5d",
+]
+
 
 class FeaturePipeline:
     """End-to-end feature engineering for stock prediction."""
@@ -172,6 +201,11 @@ class FeaturePipeline:
         use_concept: bool = True,
         use_macro: bool = True,
         use_industry: bool = True,
+        use_limit_up: bool = False,  # DEFERRED (limit-up ecology, top scope note)
+        use_pledge: bool = True,
+        use_market_env: bool = True,
+        use_index_membership: bool = True,
+        use_market_env_refine: bool = True,
         minute_mode: bool = False,
         feature_selection_k: int = 500,
         use_new_preprocessing: bool = False,
@@ -209,6 +243,12 @@ class FeaturePipeline:
         self.use_concept = use_concept
         self.use_macro = use_macro
         self.use_industry = use_industry
+        self.use_limit_up = use_limit_up  # inert while deferred (not wired in _engineer_features)
+        self.use_pledge = use_pledge
+        self.use_market_env = use_market_env
+        self.use_index_membership = use_index_membership
+        self.use_market_env_refine = use_market_env_refine
+        self._market_env_cache: pd.DataFrame | None = None
         self.minute_mode = minute_mode
         self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
@@ -229,6 +269,7 @@ class FeaturePipeline:
         self._temporal_transformer = TemporalTransformer() if use_temporal_stats else None
         self._emotion_refiner = EmotionRefiner() if use_emotion_refine else None
         self._fundamental_refiner = FundamentalRefiner() if use_fundamental_refine else None
+        self._market_env_refiner = None  # constructed in B4 (MarketEnvRefiner)
 
     def _warn_if_missing(self, key: str) -> None:
         """Emit one-time debug log when use_*=True but no data was passed.
