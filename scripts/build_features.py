@@ -97,6 +97,14 @@ def _load_etf(args: dict, code: str):
         return None
 
 
+def _is_valid_feature(path: str) -> bool:
+    """A 0-byte (interrupted-write) parquet is not a usable feature file."""
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def build_one(args: dict) -> tuple[str, str]:
     """Build features for one stock. args carries ALL inputs; returns (code, status)."""
     code = args["code"]
@@ -118,7 +126,7 @@ def build_one(args: dict) -> tuple[str, str]:
             use_index_membership=args["use_index_membership"],
         )
         output_path = os.path.join(args["output_dir"], f"{code}.parquet")
-        if os.path.exists(output_path) and not args["force"]:
+        if not args["force"] and _is_valid_feature(output_path):
             return code, "exists"
         df = args["storage"].load_daily(code, start_date=args["start"], end_date=args["end"])
         if df.empty:

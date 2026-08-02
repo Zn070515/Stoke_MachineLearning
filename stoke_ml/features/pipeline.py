@@ -4,6 +4,7 @@ Integrates K-line, sentiment, market-wide (margin/northbound/dragon-tiger),
 ETF sector flow, and fundamental data into a unified feature set.
 """
 import logging
+import os
 
 import pandas as pd
 import numpy as np
@@ -459,7 +460,9 @@ class FeaturePipeline:
             limit_up_df=limit_up_df, pledge_df=pledge_df,
             market_env_df=market_env_df, index_membership_df=index_membership_df,
         )
-        feats.to_parquet(output_path, index=False, compression="lz4")
+        tmp_path = f"{output_path}.tmp"
+        feats.to_parquet(tmp_path, index=False, compression="lz4")
+        os.replace(tmp_path, output_path)
         return output_path
 
     @staticmethod
