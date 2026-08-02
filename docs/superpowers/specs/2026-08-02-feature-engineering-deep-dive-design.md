@@ -47,7 +47,7 @@ and per-stock time coverage via parquet date-column scans).
 | Market | `market_breadth` | 2 | investor counts, total cap | **Not yet in FE** |
 | Market | `index_constituents` | 1 | weights, membership | **Not yet in FE** |
 | Macro | `macro` | 1 | 28 cols: shibor/fx/bond/cpi/m2 | Global |
-| Text raw | `news_raw/silver`, `guba_raw/silver`, `announcements` | 5530 | titles/bodies + sentiment | News 2023+, guba 2021+ |
+| Text raw | `news_raw/silver`, `guba_raw/silver`, `announcements` | 5530 | titles/bodies + sentiment | News ~7mo trailing (2025-12+), guba 2021+ |
 
 ### 1.2 Time coverage matrix (per-stock start-year distributions)
 
@@ -56,7 +56,7 @@ and per-stock time coverage via parquet date-column scans).
 | `daily` | 2000–2026 | 2000: 864 stocks; ~2600 stocks pre-2015; ~2900 post-2015; 80 in 2026 |
 | `fundamentals_daily` | **2015–2026** | **Uniform: all 5530 stocks from 2015** |
 | `guba_sentiment` | 2015–2026 | Broad: 625 (2015) … 880 (2020) … 506 (2025), 5524 stocks |
-| `sentiment` (news) | **mostly 2026** | 4704 start in 2026, 790 in 2025, ~36 before → **~6 months usable** |
+| `sentiment` (news) | **mostly 2026** | 4639 start in 2026, 807 in 2025, ~84 before → **~7 months usable (2025-12+)** |
 | `valuation` | 2000–2026 | Mirrors listing year; 5509 stocks reach 2026 |
 | `capital_flow` | 2022-08+ | 5201 stocks |
 | `margin` | 2024-09+ | 4610 stocks |
@@ -67,8 +67,10 @@ and per-stock time coverage via parquet date-column scans).
 ### 1.3 Core contradictions revealed
 
 1. **Sentiment history is extremely lopsided.** News Gold (`sentiment/`) exists
-   for only ~6 months (mostly 2026) while guba Gold has 10 years. Raw news
-   (`news_raw/silver`) reaches back to 2023, so the Gold layer can be rebuilt.
+   for only ~7 months (mostly 2025-12 onward) while guba Gold has 10 years. Raw
+   news (`news_raw/silver`) is structurally capped by free-API pagination
+   limits (~3-6 months per fetch), so reaching 2023 is **not feasible** — the
+   Gold layer can only be rebuilt from the existing ~7-month raw window.
 2. **Sector/board data is a shell.** `concept_blocks` and `industry_ranking`
    are a few-day snapshot; `industry_ranking_processed` inherits that. Only the
    `industry/industry_ranking_computed` file carries 2015–2026 history.
@@ -247,7 +249,7 @@ logs/build_features_*.log           parallel build log
 | Risk | Mitigation |
 |------|-----------|
 | New sparse sources dilute signal | `has_*` flags; IC report grades each feature; correlation dedup |
-| news sentiment only 6 months | Rebuild news Gold from `news_raw/silver` (2023+) as a data backfill |
+| news sentiment only ~7 months | Rebuild news Silver+Gold from `news_raw` (2025-12+) for freshness; **no free-API route reaches 2023** |
 | Sector shell (snapshot-only) | Backfill `industry_ranking_processed` from `industry/industry_ranking_computed` (2015+) |
 | northbound frozen 2024-08 | Accept + document; substitute with margin/capital-flow north components if needed |
 | Parallel build nondeterminism | Determinism test; per-shard isolation |
@@ -259,9 +261,15 @@ logs/build_features_*.log           parallel build log
 
 Short-board items identified in deconstruction that may be backfilled before
 full build (see separate execution task):
-1. Rebuild news Gold (`sentiment/`) from raw/silver 2023+ → 3y sentiment.
+1. Rebuild news Silver+Gold from raw — **verified 2026-08: not a 3y backfill**.
+   Free-API pagination caps depth at ~3-6 months per fetch (EastMoney search
+   `beginTime`/`endTime` ignored, ~3 pages max; Sina AllNewsStock ~days; Sina
+   roll keyword ~3-4 days). `news_raw` spans only 2025-12+ (89% of stocks start
+   2025-12/2026). Rebuild refreshes Silver+Gold to the raw ceiling instead.
 2. Backfill `industry_ranking_processed` sector history from
-   `industry/industry_ranking_computed`.
-3. Evaluate `capital_flow` / `margin` historical API availability.
+   `industry/industry_ranking_computed` — **done** (2015-2026).
+3. Evaluate `capital_flow` / `margin` historical API availability —
+   **done**: capital_flow reachable to 2010-03 (Sina, main_net only),
+   margin reachable to 2012 (SSE/SZSE via AKShare). Both backfills running.
 4. Accept-and-document `northbound` freeze.
 5. Evaluate `concept_blocks` historical feasibility.
