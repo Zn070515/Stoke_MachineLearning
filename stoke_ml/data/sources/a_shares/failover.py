@@ -103,6 +103,28 @@ class AShareDownloader:
             except Exception as e:
                 logger.warning("  %s: Baostock backfill failed: %s", stock_code, e)
 
+        return self._repair_pct_change(df)
+
+    @staticmethod
+    def _repair_pct_change(df: pd.DataFrame) -> pd.DataFrame:
+        """Derive pct_change from close wherever a source left it zero/missing.
+
+        Some sources (e.g. AKShare stock_zh_a_daily) do not return 涨跌幅 and
+        would otherwise persist 0.0, silently flattening every momentum feature.
+        close is the single source of truth; a real flat day recomputes to ~0,
+        so overwriting zeros is always safe.
+        """
+        if df.empty or "close" not in df.columns:
+            return df
+        df = df.sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(df["close"], errors="coerce")
+        if "pct_change" not in df.columns:
+            df["pct_change"] = close.pct_change() * 100.0
+            return df
+        pct = pd.to_numeric(df["pct_change"], errors="coerce")
+        bad = (pct.isna() | (pct == 0)) & close.notna()
+        if bad.any():
+            df.loc[bad, "pct_change"] = close.pct_change().mul(100.0).loc[bad]
         return df
 
     def _record_failure(self, name: str):

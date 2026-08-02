@@ -49,15 +49,18 @@ class AKShareSource(AShareSourceBase):
                 k: v for k, v in self.CN_COL_MAP.items() if k in df.columns
             })
         cols = ["date", "open", "high", "low", "close", "volume", "amount",
-                "turnover", "amplitude"]
+                "turnover", "amplitude", "pct_change"]
         keep = [c for c in cols if c in df.columns]
         df = df[keep].copy()
         for col in ["open", "high", "low", "close", "volume", "amount",
-                     "turnover", "amplitude"]:
+                     "turnover", "amplitude", "pct_change"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        if "pct_change" not in df.columns:
-            df["pct_change"] = 0.0
+        if "pct_change" not in df.columns or df["pct_change"].fillna(0).abs().sum() == 0:
+            # stock_zh_a_daily (Sina qfq) omits 涨跌幅; derive from close instead
+            # of persisting zeros. qfq preserves daily returns within a factor
+            # epoch, so close.pct_change() matches the exchange 涨跌幅.
+            df["pct_change"] = df["close"].pct_change() * 100.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
