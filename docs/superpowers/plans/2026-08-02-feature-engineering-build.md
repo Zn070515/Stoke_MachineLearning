@@ -964,7 +964,7 @@ me = pd.read_parquet(os.path.join(base, 'market_breadth', 'market_env_daily.parq
 print('market_env_daily dates:', len(me), me.index.min(), me.index.max())
 "
 ```
-Expected: `pledge_processed` ≈3259, `index_membership_processed` few-hundred (all 3-index members 2015-2026), `market_env_daily` has full 2021+ history. (Limit-up preprocess outputs are excluded here — that family is deferred per the top scope note, though A1 keeps running incrementally.)
+Expected: `pledge_processed` = 3257 (708 with any pledge exposure, all covering 2021+), `index_membership_processed` = 1491 (all 3-index members 2015-2026 with daily kline coverage; 88 delisted/renamed codes without klines excluded), `market_env_daily` = 7454 rows covering 2000-01-04 → 2026-07-31 with the 7 market-env columns. (Limit-up preprocess outputs are excluded here — that family is deferred per the top scope note, though A1 keeps running incrementally.)
 
 ---
 
