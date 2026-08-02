@@ -1230,7 +1230,12 @@ git commit -m "feat: wire limit-up/pledge/market-env/index-membership merges int
         for c in ("lhb_is_wave", "lhb_is_sustained", "lhb_is_drop"):
             agg[c] = agg[c].fillna(False).astype(np.float32)
         df = df.merge(agg, on="date", how="left")
-        _batch_fill_shift(df, [c for c in DRAGON_TIGER_COLS if c in df.columns])
+        # PIT: shift the three flags together with DRAGON_TIGER_COLS so they lag
+        # alongside lhb_present (an unshifted same-day flag would leak day-t info
+        # against the lagged present for the same event).
+        flag_cols = ["lhb_is_wave", "lhb_is_sustained", "lhb_is_drop"]
+        _batch_fill_shift(df, [c for c in DRAGON_TIGER_COLS if c in df.columns]
+                          + [c for c in flag_cols if c in df.columns])
         # Past-5-trading-day LHB frequency (computed AFTER the PIT shift, so it
         # never looks ahead; must NOT be shifted again).
         if "lhb_present" in df.columns:
