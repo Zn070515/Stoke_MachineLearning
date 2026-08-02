@@ -190,7 +190,7 @@ def build_market_daily(base: str) -> pd.DataFrame:
     zb = _date_counts(os.path.join(base, ZB_DIR)).rename("zb_count")
     dt = _date_counts(os.path.join(base, DT_DIR)).rename("dt_count")
     yzt = _date_counts(os.path.join(base, YZT_DIR)).rename("yzt_count")
-    df = pd.concat([zt, zb, dt, yzt], axis=1, keys=["zt_count", "zb_count", "dt_count", "yzt_count"])
+    df = pd.concat([zt, zb, dt, yzt], axis=1)  # Series already uniquely named — no keys= (avoids MultiIndex column mangling on parquet round-trip)
     df = df.fillna(0).reset_index(names="date")
     df["market_zt_ratio"] = (df["zt_count"] / N_LISTED).astype(np.float32)
     z20 = df["zt_count"].rolling(20)
