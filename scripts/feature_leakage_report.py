@@ -5,8 +5,12 @@ For each new source, on a sample of stocks, verify the PIT invariant:
 Also flags any feature whose cross-sectional |IC| is implausibly high (> 0.15)
 for manual review (the classic look-ahead signature).
 
-Checks cover 2 sources (pledge + index_membership); the limit-up family is
-deferred per the top scope note.
+Checks cover 3 sources (pledge + index_membership + board); the limit-up
+family is deferred per the top scope note. Board columns are PIT-verified
+because they showed the strongest cross-sectional |IC| in feature_ic_report.py
+(board_count / board_momentum_* / board_overlap_score) — the classic look-ahead
+signature. is_zt/board_height_20d/seal_intensity/concept_zt_ratio are direct
+pass-throughs of board_processed, so feature@t == raw@t-1 must hold exactly.
 
 Output: reports/feature_leakage_report.csv
 """
@@ -21,10 +25,15 @@ from stoke_ml.config import load_config
 
 SAMPLES = 30
 # source_dir -> (feature_source_col, feature_col_in_panel, shift)
-# limit-up family excluded (deferred per top scope note). 2 sources total.
+# limit-up family excluded (deferred per top scope note). 3 sources total.
 CHECKS = [
     ("pledge_processed", "has_pledge", "has_pledge", 1),
     ("index_membership_processed", "is_index_member", "is_index_member", 1),
+    # Board pass-throughs: strongest |IC| cluster, so verify the PIT lag directly.
+    ("board_processed", "is_zt", "is_zt", 1),
+    ("board_processed", "board_height_20d", "board_height_20d", 1),
+    ("board_processed", "seal_intensity", "seal_intensity", 1),
+    ("board_processed", "concept_zt_ratio", "concept_zt_ratio", 1),
 ]
 
 
