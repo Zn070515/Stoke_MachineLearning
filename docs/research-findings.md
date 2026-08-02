@@ -426,3 +426,20 @@ CSV: `models/checkpoints/label_benchmark.csv`
 ---
 
 > **参考资料：** [ml-quant-trading](https://github.com/initial-d/ml-quant-trading) · [qlib-factor-zoo](https://github.com/JustinF8/qlib-factor-zoo) · [FactorMiner](https://github.com/CharlesJ-ABu/FactorMiner) · [QuantMind](https://github.com/qusong0627/QuantMind) · [同花顺量化](https://quant.10jqka.com.cn/view/article/8F9RSG6HNQ1582620HY53IE988) · [华泰金工](https://m.sohu.com/a/997408608_122014422/) · [东方 DFQ](http://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/lastest/rptid/785320315165/index.phtml) · [光大 大宗交易](https://stock.finance.sina.com.cn/stock/view/paper.php?symbol=sh000001&reportid=744566192026)
+
+---
+
+## 2026-08-02 FE v2: 4 new feature families
+
+**F1 构建**：5530 只 × 3744 列/股（516 base + 3228 时序展开），109GB，2000-01-04 → 2026-07-31，确定性验证 692/692 字节一致。FE v2 四家族接线：pledge(5) / index_membership(3) / market_env(7) / macro regime menv(49 base)。limit-up 保持 deferred（`use_limit_up=False`）。
+
+**F2 IC 报告**（80-stock panel，计划 300 因机器内存降级）：
+- 截面 IC 表面最强在 board 家族（board_count ic=0.22~0.29，ICIR 高达 80），但 **coverage≈0 → 稀疏伪信号**：抽样前 80 只全为 000 开头大盘蓝筹，打板/概念/情绪特征几乎恒 0，截面无变化，IC 只在少数日期偶然算得
+- 真实稳健信号在时序 IC：bt_days_since 0.073 / qtld_60d 0.054 / mdi 0.045 / sumn_30d 0.044
+- 产出：reports/feature_ic_report.csv（3859 特征 × 2 窗口 × 80 只）
+
+**F3 泄露审计**：PIT 实测 3 源全通过——pledge 14/14 ok、index_membership 11/11 ok、board 4 通道 30/30 ok（feature@t == raw@t-1）。**无 PIT 泄漏**。high_ic 标记 28 个，结合 coverage=0 判定为稀疏伪信号。产出：reports/feature_leakage_report.csv。
+
+**已知问题**：
+- 🔴 pct_change 自 2026-06-18 起全 A 股为 0（增量下载写 0；close 完好，fwd_ret 不受影响）——任务 #342 待修
+- pledge 源覆盖 59%（3259/5530）；pe_ttm 56% 日期为 0（早期无估值数据）；news_count 覆盖低（000001 仅 21 天）
