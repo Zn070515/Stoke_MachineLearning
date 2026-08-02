@@ -55,29 +55,12 @@ class OutlierDetector(PreprocessingStep):
         if df.empty or not self._bounds:
             return df.copy()
         df = df.copy()
-        for col in self._bounds:
+        for col, (lower, upper) in self._bounds.items():
             if col not in df.columns:
                 continue
-            if not self.clip:
-                continue
-            if df[col].dtype.kind == "i":
-                df[col] = df[col].astype(np.float64)
-            s = df[col].astype(np.float64)
-            # Causal (trailing, up-to-current-point) MAD winsorization: the
-            # clip bounds for row i use ONLY rows up to i, so no future data
-            # leaks into the clip.  For series <= 252 rows this is a true
-            # expanding window; for longer series it is a bounded 252-day
-            # trailing window (efficient, still causal).  Rows with fewer than
-            # 10 observations up to and including themselves are left as-is.
-            w = min(len(s), 252)
-            cnt = s.rolling(w, min_periods=1).count()
-            med = s.rolling(w, min_periods=10).median()
-            abs_dev = (s - med).abs()
-            # min_periods=1 so MAD is available as soon as the median is
-            # (the <10-observation guard is enforced via *valid* below).
-            mad = abs_dev.rolling(w, min_periods=1).median()
-            lower = med - self.threshold * mad
-            upper = med + self.threshold * mad
-            valid = (cnt >= 10) & med.notna() & mad.notna()
-            df[col] = s.mask(valid, s.clip(lower=lower, upper=upper))
+            if self.clip:
+                if df[col].dtype.kind == "i":
+                    df[col] = df[col].astype(np.float64)
+                mask = df[col].notna()
+                df.loc[mask, col] = df.loc[mask, col].clip(lower, upper)
         return df
