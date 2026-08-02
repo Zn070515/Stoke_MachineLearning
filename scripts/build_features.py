@@ -78,7 +78,13 @@ def main():
     )
     # limit-up ecology family is DEFERRED (top scope note) — no --no-limit-up flag
     parser.add_argument("--no-pledge", action="store_true", help="Exclude pledge risk")
-    parser.add_argument("--no-market-env", action="store_true", help="Exclude market env")
+    # --no-market-env disables the market-breadth channel (market_* cols);
+    # --no-market-env-refine disables the macro-regime refiner (menv_* factors)
+    parser.add_argument("--no-market-env", action="store_true",
+                        help="Exclude market breadth (market_* cols); use "
+                             "--no-market-env-refine for menv_* macro-regime factors")
+    parser.add_argument("--no-market-env-refine", action="store_true",
+                        help="Exclude MarketEnvRefiner macro-regime factors (menv_*)")
     parser.add_argument("--no-index-membership", action="store_true",
                         help="Exclude index membership")
     parser.add_argument(
@@ -145,6 +151,7 @@ def main():
         use_limit_up=False,  # limit-up family deferred (top scope note)
         use_pledge=not args.no_pledge,
         use_market_env=not args.no_market_env,
+        use_market_env_refine=not args.no_market_env_refine,
         use_index_membership=not args.no_index_membership,
     )
 
