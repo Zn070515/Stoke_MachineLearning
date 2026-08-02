@@ -63,20 +63,20 @@ def main():
         log.error("no feature files under %s", feat_dir)
         return
 
-    # Discover feature columns as a union across a sample of files.
+    # Discover feature columns as a union across ALL files.
     # Some columns are sparse (present for some stocks, absent for others);
     # reading only the first file would silently drop them from the report.
-    # Read schema metadata only (no data) via ParquetFile for cheap discovery.
+    # ParquetFile reads footer metadata only (no data), so iterating every file
+    # is cheap even for thousands of panels and catches rare (~1%) sparse columns.
     union = set()
-    n_sample = min(50, len(files))
-    for f in files[:n_sample]:
+    for f in files:
         union.update(pq.ParquetFile(f).schema.names)
     cols = [c for c in union
             if c not in SKIP and not c.startswith("fwd_")]
     if args.feature_subset:
         cols = [c for c in cols if c in set(args.feature_subset.split(","))]
-    log.info("%d stocks, %d candidate features (sampled %d files)",
-             len(files), len(cols), n_sample)
+    log.info("%d stocks, %d candidate features (%d files)",
+             len(files), len(cols), len(files))
 
     # Per-window: collect (date, stock, feature, fwd_ret) long frames.
     windows = {"full": [], "primary": []}
@@ -96,8 +96,10 @@ def main():
         if len(df) < 30 or "close" not in df:
             continue
         want = [c for c in cols if c in df.columns]
-        df["fwd_ret"] = forward_return(df)
         df["date"] = pd.to_datetime(df["date"])
+        # forward return uses shift(-1) and assumes chronological row order.
+        df = df.sort_values("date")
+        df["fwd_ret"] = forward_return(df)
         n_loaded += 1
         for win, mask in (("full", df["date"] >= pd.Timestamp("2010-01-01")),
                           ("primary", df["date"] >= PRIMARY)):
@@ -111,15 +113,27 @@ def main():
         if not parts:
             continue
         panel = pd.concat(parts, ignore_index=True)
-        dates = panel["date"].unique()
+        # Pre-group once per window and reuse across every feature instead of
+        # re-masking / re-grouping the full panel per (feature, date|stock).
+        date_groups = {d: g for d, g in panel.groupby("date")}
+        stock_groups = {c: g for c, g in panel.groupby("stock_code")}
+        n_dates = len(date_groups)
         for col in cols:
             # ---- cross-sectional IC (per date across stocks) ----
             ics = []
-            for d in dates:
-                sub = panel[panel["date"] == d][[col, "fwd_ret"]].dropna()
-                if len(sub) < min_stocks or sub[col].nunique() < 2:
+            for g in date_groups.values():
+                x = g[col].to_numpy()
+                y = g["fwd_ret"].to_numpy()
+                if np.issubdtype(x.dtype, np.number) and np.issubdtype(y.dtype, np.number):
+                    m = ~(np.isnan(x.astype(float)) | np.isnan(y.astype(float)))
+                    xv, yv = x[m], y[m]
+                else:
+                    # Non-numeric feature (e.g. boolean flag): keep pandas dropna.
+                    sub = g[[col, "fwd_ret"]].dropna()
+                    xv, yv = sub[col].to_numpy(), sub["fwd_ret"].to_numpy()
+                if len(xv) < min_stocks or len(np.unique(xv)) < 2:
                     continue
-                rho, _ = spearmanr(sub[col], sub["fwd_ret"])
+                rho, _ = spearmanr(xv, yv)
                 if np.isfinite(rho):
                     ics.append(rho)
             if ics:
@@ -127,7 +141,7 @@ def main():
                 ic_cross = float(ics.mean())
                 icir = float(ics.mean() / ics.std()) if ics.std() > 0 else 0.0
                 pos = float((ics > 0).mean())
-                coverage = float(len(ics) / len(dates))
+                coverage = float(len(ics) / n_dates)
             else:
                 # No date had >= min_stocks distinct values (e.g. global feature).
                 ic_cross = np.nan
@@ -136,10 +150,17 @@ def main():
                 coverage = 0.0
             # ---- time-series IC (per stock over time) ----
             ts_ics = []
-            for code, g in panel.groupby("stock_code"):
-                gg = g[[col, "fwd_ret"]].dropna()
-                if len(gg) >= 30 and gg[col].nunique() >= 2:
-                    rho, _ = spearmanr(gg[col], gg["fwd_ret"])
+            for g in stock_groups.values():
+                x = g[col].to_numpy()
+                y = g["fwd_ret"].to_numpy()
+                if np.issubdtype(x.dtype, np.number) and np.issubdtype(y.dtype, np.number):
+                    m = ~(np.isnan(x.astype(float)) | np.isnan(y.astype(float)))
+                    xv, yv = x[m], y[m]
+                else:
+                    gg = g[[col, "fwd_ret"]].dropna()
+                    xv, yv = gg[col].to_numpy(), gg["fwd_ret"].to_numpy()
+                if len(xv) >= 30 and len(np.unique(xv)) >= 2:
+                    rho, _ = spearmanr(xv, yv)
                     if np.isfinite(rho):
                         ts_ics.append(rho)
             ic_ts = float(np.mean(ts_ics)) if ts_ics else np.nan
@@ -162,6 +183,9 @@ def main():
         return "high" if ic >= 0.02 else ("medium" if ic >= 0.01 else "low")
 
     rep["grade"] = rep.apply(_grade, axis=1)
+    rep["grade"] = pd.Categorical(rep["grade"],
+                                  categories=["high", "medium", "low"],
+                                  ordered=True)
     rep = rep.sort_values(["window", "grade", "ic_cross"],
                           ascending=[True, True, False],
                           na_position="last")
