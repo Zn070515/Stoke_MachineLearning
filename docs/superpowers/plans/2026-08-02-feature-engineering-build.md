@@ -1104,8 +1104,14 @@ Expected: ok (after Task B4 creates `market_env.py`).
         if market_env_df is None or market_env_df.empty:
             return df
         me = market_env_df.copy()
-        if me.index.name == "date":
-            me = me.reset_index()
+        # Mirror _merge_macro's defensive date handling: named "date" index,
+        # unnamed DatetimeIndex, or date-as-column all resolve to a date col.
+        if "date" not in me.columns:
+            if isinstance(me.index, pd.DatetimeIndex):
+                me = me.reset_index()
+                me = me.rename(columns={"index": "date"})
+            else:
+                return df
         me["date"] = pd.to_datetime(me["date"]).dt.normalize()
         me = me.drop_duplicates(subset="date", keep="last")
         available = [c for c in MARKET_ENV_COLS if c in me.columns]
