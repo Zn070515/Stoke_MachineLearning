@@ -56,12 +56,14 @@ def build_stock(raw: pd.DataFrame, kline: pd.DataFrame) -> pd.DataFrame:
     out["_delta"] = out["_delta"].fillna(0.0)
     out["pledge_ratio"] = out["_delta"].cumsum().clip(lower=0.0).astype(np.float32)
     out["_margin_line"] = out["_margin_line"].ffill()
+    # No active pledge exposure -> no margin line (clears stale line after full release).
+    out.loc[out["pledge_ratio"] < 1e-7, "_margin_line"] = np.nan
     out["pledge_margin_dist"] = (out["close"] / out["_margin_line"] - 1.0)
     out["pledge_risk"] = out["pledge_margin_dist"].notna() & (out["pledge_margin_dist"] < 0.20)
     out["pledge_count_20d"] = out["_delta"].ne(0).astype(int).rolling(20, min_periods=1).sum().astype("int16")
     out["has_pledge"] = out["pledge_ratio"].gt(0).cummax()
     out = out.drop(columns=["close", "_delta", "_margin_line"])
-    out["pledge_margin_dist"] = out["pledge_margin_dist"].fillna(0.0).astype(np.float32)
+    out["pledge_margin_dist"] = out["pledge_margin_dist"].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32)
     out["pledge_ratio"] = out["pledge_ratio"].fillna(0.0)
     return out.sort_values("date").reset_index(drop=True)
 
