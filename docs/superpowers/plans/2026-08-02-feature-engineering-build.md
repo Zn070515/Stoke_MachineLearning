@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Wire the 4 new feature families (limit-up ecology, pledge risk, market+macro env, index membership) into the existing 4-layer feature factory, add the L4 IC/leakage evaluation gate, parallelize the full 5530-stock build, and verify with tests.
+**Goal:** Wire the 3 new feature families (pledge risk, market+macro env, index membership) into the existing 4-layer feature factory, add the L4 IC/leakage evaluation gate, parallelize the full 5530-stock build, and verify with tests.
+
+> **SCOPE ADJUSTMENT (2026-08-02, user decision):** The limit-up ecology family (limit-up pools zt/zb/dt/yzt + market temperature) is **DEFERRED**. Verified empirically: EastMoney and AKShare limit-up pool APIs do NOT support historical backfill (dates before 2026-07 return 0 rows; the existing 1-month corpus is daily-incremental). With the 2021+ training window, limit-up features would be all-zero/constant — no signal. The preprocess script `_preprocess_limit_up.py` (Task A1) IS kept (its outputs are ready and will grow via daily increments), but Tasks A3/B1/B2/B5 are scoped to NOT wire limit-up columns (`market_zt_ratio`, `market_heat_z`, `has_market_sent`, `has_zt` etc.) into the pipeline. Dragon-tiger seat classification (B3) is UNAFFECTED (dragon_tiger spans 2015-2026).
 
 **Architecture:** Follows `docs/superpowers/specs/2026-08-02-feature-engineering-deep-dive-design.md`. New raw sources are preprocessed into per-stock daily parquet (`*_processed/{code}.parquet`, mirroring `board_processed`) plus global daily files (`limit_up_market_daily.parquet`, `market_env_daily.parquet`). `FeaturePipeline` gains 4 `_merge_*` methods following the existing `_merge_macro` (global, disk-cached) and `_merge_daily_aux` (per-stock daily) patterns. A new L3 `MarketEnvRefiner` compresses raw macro cols into `menv_*` factors. L4 adds `feature_ic_report.py` + `feature_leakage_report.py`.
 
