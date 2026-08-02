@@ -1008,21 +1008,21 @@ Remove unreferenced dead code from the audit P3 list that has zero callers:
 - `stoke_ml/data/cleaner.py`: `DataCleaner` (verify no imports)
 - `scripts/benchmark_labels.py:78`: `_compute_rel_labels` dead function
 
-- [ ] **Step 1: Grep for each symbol; if zero references, delete.**
-- [ ] **Step 2: Run a smoke import** — `PYTHONPATH=. ./.venv/Scripts/python -c "import stoke_ml.features.pipeline; import stoke_ml.models.panel.model; print('OK')"`
-- [ ] **Step 3: Commit** — `git commit -m "chore: remove dead code (attention.py, _PAST_*_COLS, cleaner, _compute_rel_labels)"`
+- [x] **Step 1: Grep for each symbol; if zero references, delete.**
+- [x] **Step 2: Run a smoke import** — `PYTHONPATH=. ./.venv/Scripts/python -c "import stoke_ml.features.pipeline; import stoke_ml.models.panel.model; print('OK')"`
+- [x] **Step 3: Commit** — `git commit -m "chore: remove dead code (attention.py, _PAST_*_COLS, cleaner, _compute_rel_labels)"` (2f91975)
 
 ### Task G2: Re-run dividend preprocessing to regenerate corrected data
 
 After A1 (code fix), existing `dividend_processed` parquet is still 10× wrong.
 
-- [ ] **Step 1: Re-run dividend preprocessing**
+- [x] **Step 1: Re-run dividend preprocessing**
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type dividend --start 2000-01-01
 ```
 
-- [ ] **Step 2: Spot-check 000001 dividend_yield ≈ 2-3% (was ~28%)**
+- [x] **Step 2: Spot-check 000001 dividend_yield ≈ 2-3% (was ~28%)**
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -c "
@@ -1032,15 +1032,17 @@ y = df[df['dividend_yield'] > 0]['dividend_yield']
 print('000001 max dividend_yield:', float(y.max()), '(expect < 0.10)')
 "
 ```
+(000001 max=0.0919, 600519 max=0.0522, no duplicate dates.)
 
-- [ ] **Step 3: Commit data regeneration** (if data dir is tracked) — otherwise note in commit message.
+- [x] **Step 3: Commit data regeneration** (if data dir is tracked) — otherwise note in commit message.
+(Noted in fddd655 commit message; 35.9M rows regenerated 2000-01-01..2026-08-02.)
 
 ### Task G3: Update audit doc status
 
 Mark all fixed items as ✅ in `docs/research-findings/2026-08-01-full-repo-code-audit.md`.
 
-- [ ] **Step 1: Update the doc status.**
-- [ ] **Step 2: Commit** — `git commit -m "docs: mark audit findings fixed (see plan 2026-08-01)"`
+- [x] **Step 1: Update the doc status.**
+- [x] **Step 2: Commit** — `git commit -m "docs: mark audit findings fixed (see plan 2026-08-01)"` (ac9cfbe)
 
 ---
 
