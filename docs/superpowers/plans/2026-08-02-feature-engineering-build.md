@@ -23,7 +23,7 @@
   - `pledge/{code}.parquet`: 序号, 股票代码, 股票简称, 股东名称, 质押股份数量, 占所持股份比例, 占总股本比例, 质押机构, 最新价, 质押日收盘价, 预估平仓线, 质押开始日期, 质押结束日期, 状态("未解押"/"已解押"), 公告日期, stock_code
   - `market_breadth/account_stats.parquet` (monthly): 数据日期("2015-04"), 新增投资者-数量, 期末投资者-总量, 沪深总市值, 沪深户均市值, 上证指数-收盘
   - `market_breadth/highs_lows.parquet` (daily): date(str), close, high20, low20, high60, low60, high120, low120 (per-day counts of stocks at 20/60/120-day highs/lows)
-  - `index_constituents/constituents.parquet`: 日期(str), index_code, index_name, stock_code, stock_name, weight, snapshot_date — monthly index snapshots (CSI300/CSI500/CSI1000/…)
+  - `index_constituents/constituents.parquet`: 日期(str), index_code, index_name, stock_code, stock_name, weight, snapshot_date — monthly index snapshots (CSI300/CSI500/CSI1000/…) **⚠ single 2026-06-30 snapshot only → superseded by A4a Baostock backfill into `index_constituents_hist/membership.parquet` (3 indices, no weight)**
   - `limit_up_sentiment/sentiment.parquet` (global, **only 25 rows**): date, zt_count, zb_count, dt_count, yzt_count, break_rate, max_height, advance_rate, ladder_2..ladder_6plus — **too sparse alone; full history comes from per-stock aggregation**
   - `dragon_tiger/{code}.parquet`: date, stock_code, stock_name, lhb_reason, buy_amount, sell_amount, net_amount — **no seat/broker column**; `lhb_reason` strings like "日涨幅偏离值达7%", "日换手率达20%", "连续三个交易日内涨幅偏离值累计达20%"
 - **Pipeline integration points** (`stoke_ml/features/pipeline.py`):
@@ -592,67 +592,247 @@ git commit -m "feat: build global market-environment daily panel (breadth + sent
 
 ---
 
+### Task A4a: `scripts/download_index_hist.py`
+
+> **SCOPE ADJUSTMENT (2026-08-02, user decision):** Index constituents was a single 2026-06-30 snapshot (1900 rows) — unusable for the 2021+ window. AKShare (no historical API) and JRJ (404) are both dead. Pivot to **Baostock**, which has official free historical constituent queries for exactly 3 indices: **000300 (沪深300), 000905 (中证500), 000016 (上证50)**. **000852 (中证1000) and 000688 (科创50) are coverage gaps** (no Baostock API). Consequently `index_weight` is DROPPED (Baostock provides no historical weights) — A4 outputs `is_index_member` / `n_indexes` / `idx_change_30d` only.
+
+**Files:**
+- Create: `scripts/download_index_hist.py`
+- Output: `data/a_shares/index_constituents_hist/membership.parquet` (intervals) + `snapshots/{index}/{date}.parquet` (raw audit trail)
+
+Queries Baostock constituent sets on a monthly grid; reconstructs per-stock membership intervals.
+
+- [ ] **Step 1: Write the script**
+
+```python
+"""Download historical index-constituent membership from Baostock.
+
+Queries constituent sets on a monthly grid for the 3 major indices Baostock
+covers (000300 / 000905 / 000016) and reconstructs per-stock membership
+intervals. Baostock has NO historical data for 000852 (CSI1000) or 000688
+(科创50) — documented coverage gaps.
+
+Baostock row semantics: a query at date D returns every constituent as of D,
+each row carrying `updateDate` = the exact date that membership spell became
+effective (an index adjustment date). A stock present across many queries
+keeps the SAME updateDate until it is dropped and re-added (new updateDate).
+
+Reconstruction: for each (index, stock), each distinct updateDate starts a
+membership spell. The spell's out_date = the last query date that still
+reported that spell (the last confirmation before removal); NaT means the
+stock was still a member at the final grid query (open-ended).
+
+Outputs:
+  data/a_shares/index_constituents_hist/snapshots/{index}/{YYYY-MM-DD}.parquet
+      raw query result per index-date (audit trail)
+  data/a_shares/index_constituents_hist/membership.parquet
+      long-form intervals: stock_code, index_code, in_date, out_date
+"""
+import argparse
+import os
+import time
+
+import pandas as pd
+
+from stoke_ml.config import load_config
+
+INDICES = {
+    "000300": ("query_hs300_stocks", "沪深300"),
+    "000905": ("query_zz500_stocks", "中证500"),
+    "000016": ("query_sz50_stocks", "上证50"),
+}
+GRID_START = "2015-01-01"
+GRID_END = "2026-12-31"
+RETRIES = 3
+
+
+def query_flat(bs, fn_name, date, retries=RETRIES):
+    """One constituent query -> DataFrame, with retry."""
+    fn = getattr(bs, fn_name)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            rs = fn(date=date)
+            if rs.error_code != "0":
+                raise RuntimeError(f"{fn_name}@{date}: {rs.error_code} {rs.error_msg}")
+            cols = rs.get_fields()
+            rows = rs.get_row_data()
+            df = pd.DataFrame(rows, columns=cols)
+            df["query_date"] = pd.Timestamp(date)
+            return df
+        except Exception as e:
+            last_err = e
+            print(f"  retry {fn_name}@{date} ({attempt+1}/{retries}): {e}")
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"{fn_name}@{date}: failed after {retries} attempts: {last_err}")
+
+
+def rebuild_membership(snap_dir):
+    """Concatenate cached snapshots -> membership interval DataFrame."""
+    frames = []
+    for idx in INDICES:
+        sd = os.path.join(snap_dir, idx)
+        if not os.path.isdir(sd):
+            continue
+        for f in sorted(os.listdir(sd)):
+            if not f.endswith(".parquet"):
+                continue
+            df = pd.read_parquet(os.path.join(sd, f))
+            if df.empty:
+                continue
+            df["index_code"] = idx
+            frames.append(df)
+    if not frames:
+        raise SystemExit("no snapshots collected — run without --resume first")
+    allq = pd.concat(frames, ignore_index=True)
+    allq["stock_code"] = allq["code"].astype(str).str.rsplit(".", n=1).str[-1]
+    allq["updateDate"] = pd.to_datetime(allq["updateDate"], errors="coerce").dt.normalize()
+    allq["query_date"] = pd.to_datetime(allq["query_date"]).dt.normalize()
+    allq = allq.dropna(subset=["stock_code", "updateDate"])
+
+    last_grid = allq["query_date"].max()
+    rows = []
+    for (idx, code), g in allq.groupby(["index_code", "stock_code"]):
+        last_seen = g.groupby("updateDate")["query_date"].max()
+        for u, ls in last_seen.items():
+            still_active = ls >= last_grid
+            rows.append({"stock_code": code, "index_code": idx,
+                         "in_date": u, "out_date": pd.NaT if still_active else ls})
+    return pd.DataFrame(rows, columns=["stock_code", "index_code", "in_date", "out_date"])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", default=GRID_START)
+    ap.add_argument("--end", default=GRID_END)
+    ap.add_argument("--resume", action="store_true",
+                    help="skip (index, date) snapshots already cached")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    base = os.path.join(cfg.project.data_dir, "a_shares", "index_constituents_hist")
+    snap_dir = os.path.join(base, "snapshots")
+    os.makedirs(snap_dir, exist_ok=True)
+
+    try:
+        import baostock as bs
+    except ImportError:
+        raise SystemExit("baostock not installed: pip install baostock")
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise SystemExit(f"bs.login failed: {lg.error_code} {lg.error_msg}")
+
+    grid = pd.date_range(args.start, args.end, freq="MS")
+    try:
+        for i, d in enumerate(grid):
+            day = d.strftime("%Y-%m-%d")
+            for idx, (fn, _name) in INDICES.items():
+                out = os.path.join(snap_dir, idx, f"{day}.parquet")
+                if args.resume and os.path.exists(out):
+                    continue
+                df = query_flat(bs, fn, day)
+                df["index_code"] = idx
+                df.to_parquet(out, index=False, compression="lz4")
+            if (i + 1) % 12 == 0:
+                print(f"  {i+1}/{len(grid)} grid months done")
+    finally:
+        bs.logout()
+
+    mem = rebuild_membership(snap_dir)
+    mem.to_parquet(os.path.join(base, "membership.parquet"), index=False, compression="lz4")
+    print(f"membership.parquet: {len(mem)} spells, {mem['stock_code'].nunique()} stocks")
+    print(mem.groupby("index_code")["stock_code"].nunique().to_string())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 2: Smoke-run (small grid)**
+
+Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/download_index_hist.py --start 2015-01-01 --end 2015-06-01`
+Expected: 18 snapshots (3 indices × 6 months); `membership.parquet` built; `600519` has both `000016` and `000300` spells; `000001` has an `000300` spell.
+
+- [ ] **Step 3: Run full grid**
+
+Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/download_index_hist.py`
+Expected: ~414 snapshots; membership covers every stock ever in the 3 indices over 2015-2026 (a few hundred unique).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scripts/download_index_hist.py
+git commit -m "feat: backfill historical index-constituent membership from Baostock"
+```
+
+---
+
 ### Task A4: `scripts/_preprocess_index_membership.py`
 
 **Files:**
 - Create: `scripts/_preprocess_index_membership.py`
 - Output: `data/a_shares/index_membership_processed/{code}.parquet` (per-stock daily)
 
-Converts monthly index-constituent snapshots into per-stock daily membership/weight with 30-day add/drop events.
+Converts historical membership intervals into per-stock daily membership with 30-day add/drop events. NO `index_weight` (see A4a scope note).
 
 - [ ] **Step 1: Write the script**
 
 ```python
-"""Preprocess index-constituent snapshots into per-stock daily membership.
+"""Preprocess historical index-membership intervals into per-stock daily features.
 
-Snapshots are monthly (constituents.parquet has one row per stock-index-snapshot).
-Forward-fill membership/weight between snapshots; flag membership changes
-within the trailing 30 days.
+PIT rule: membership is judged purely from interval data produced by
+scripts/download_index_hist.py (Baostock monthly-grid reconstruction).
+in_date is the exact adjustment effective date; a stock is a member on
+trading day d iff some interval has in_date <= d < out_date (out_date NaT
+means still active). Expanded on the stock's own K-line trading calendar.
 """
 import argparse
-import glob
 import os
 
+import numpy as np
 import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 
 OUT_DIR = "index_membership_processed"
-MAJOR = {"000300", "000905", "000852", "000016"}  # CSI300 / CSI500 / CSI1000 / SSE50
 
 
-def build_daily_membership(constituents: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Return {code: daily membership frame} for stocks appearing in any snapshot."""
-    c = constituents.copy()
-    c["date"] = pd.to_datetime(c["日期"], errors="coerce").dt.normalize()
-    c = c.dropna(subset=["date"])
-    c = c[c["index_code"].astype(str).isin(MAJOR)]
-    if c.empty:
-        return {}
-    c["stock_code"] = c["stock_code"].astype(str)
+def build_stock(membership: pd.DataFrame, kline: pd.DataFrame) -> pd.DataFrame:
+    """Membership intervals + K-line -> daily membership feature frame."""
+    empty = pd.DataFrame(columns=["date", "is_index_member", "n_indexes", "idx_change_30d"])
+    if membership.empty or kline.empty:
+        return empty
+    k = kline[["date"]].copy()
+    k["date"] = pd.to_datetime(k["date"]).dt.normalize()
+    k = k.drop_duplicates("date").sort_values("date")
+    dates = k["date"].to_numpy()  # datetime64[ns]
+    d0, d1 = pd.Timestamp(dates[0]), pd.Timestamp(dates[-1])
 
-    per_stock: dict[str, pd.DataFrame] = {}
-    for code, g in c.groupby("stock_code"):
-        snap = g[["date", "index_code", "weight"]].drop_duplicates("date")
-        snap = snap.sort_values("date")
-        # Weight = max across member indexes on that date (single row per snapshot).
-        snap = snap.groupby("date").agg(
-            index_weight=("weight", "max"),
-            n_indexes=("index_code", "nunique"),
-        ).reset_index()
-        # Fill daily from the stock's K-line calendar for full history.
-        snap["is_index_member"] = True
-        daily = (pd.DataFrame({"date": pd.date_range(snap["date"].min(),
-                                                     snap["date"].max(), freq="D")})
-                 .merge(snap, on="date", how="left"))
-        daily["is_index_member"] = daily["is_index_member"].ffill().fillna(False).astype(bool)
-        daily["index_weight"] = daily["index_weight"].ffill().fillna(0.0).astype("float32")
-        daily["n_indexes"] = daily["n_indexes"].ffill().fillna(0).astype("int16")
-        # 30-day add/drop: membership changed within trailing 30 calendar days.
-        daily["idx_change_30d"] = daily["is_index_member"].astype(int).diff().rolling(30).sum().fillna(0).astype("int16")
-        per_stock[code] = daily
-    return per_stock
+    m = membership.copy()
+    m["in_date"] = pd.to_datetime(m["in_date"]).dt.normalize()
+    m["out_date"] = pd.to_datetime(m["out_date"], errors="coerce").dt.normalize()
+    # Half-open interval [in, out); NaT out_date = still active -> cap past data end.
+    m["out_date"] = m["out_date"].fillna(d1 + pd.Timedelta(days=1))
+    m = m[(m["in_date"] <= d1) & (m["out_date"] > d0)]
+
+    n = len(dates)
+    is_mem = np.zeros(n, dtype=bool)
+    n_idx = np.zeros(n, dtype="int16")
+    for _, row in m.iterrows():
+        lo = int(np.searchsorted(dates, row["in_date"].to_datetime64(), side="left"))
+        hi = int(np.searchsorted(dates, row["out_date"].to_datetime64(), side="left"))
+        if hi > lo:
+            is_mem[lo:hi] = True
+            n_idx[lo:hi] += 1
+
+    out = pd.DataFrame({"date": pd.to_datetime(dates), "is_index_member": is_mem,
+                        "n_indexes": n_idx})
+    # Net membership change within trailing 30 trading days (+add, -drop).
+    out["idx_change_30d"] = (out["is_index_member"].astype(int).diff()
+                             .rolling(30).sum().fillna(0).astype("int16"))
+    return out
 
 
 def main():
@@ -664,11 +844,11 @@ def main():
     cfg = load_config()
     data_dir = cfg.project.data_dir
     base = os.path.join(data_dir, "a_shares")
+    storage = DataStorage(data_dir)
 
-    constituents = pd.read_parquet(os.path.join(base, "index_constituents", "constituents.parquet"))
-    per_stock = build_daily_membership(constituents)
+    membership = pd.read_parquet(os.path.join(base, "index_constituents_hist", "membership.parquet"))
 
-    codes = sorted(per_stock)
+    codes = sorted(membership["stock_code"].astype(str).unique())
     if args.stocks:
         codes = [c for c in codes if c in set(args.stocks.split(","))]
     if args.shard:
@@ -677,11 +857,21 @@ def main():
 
     out_dir = os.path.join(base, OUT_DIR)
     os.makedirs(out_dir, exist_ok=True)
-    for code in codes:
-        df = per_stock[code].copy()
-        df["stock_code"] = code
-        df.to_parquet(os.path.join(out_dir, f"{code}.parquet"), index=False, compression="lz4")
-    print(f"index membership: {len(codes)} stocks written")
+    written = 0
+    for i, code in enumerate(codes):
+        try:
+            m = membership[membership["stock_code"].astype(str) == code]
+            kline = storage.load_daily(code, "1990-12-19", "2030-12-31")
+            df = build_stock(m, kline)
+            if not df.empty:
+                df["stock_code"] = code
+                df.to_parquet(os.path.join(out_dir, f"{code}.parquet"), index=False, compression="lz4")
+                written += 1
+        except Exception as e:
+            print(f"  {code}: SKIP {e}")
+        if (i + 1) % 500 == 0:
+            print(f"  index membership processed {i+1}/{len(codes)}")
+    print(f"index membership done: {written}/{len(codes)}")
 
 
 if __name__ == "__main__":
@@ -691,18 +881,18 @@ if __name__ == "__main__":
 - [ ] **Step 2: Smoke-run**
 
 Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/_preprocess_index_membership.py --stocks 000001,600519`
-Expected: files written; `000001` (平安银行, CSI300 member) has `is_index_member=True` and `index_weight≈0.345` on recent dates.
+Expected: files written; `000001` (平安银行, 沪深300) has `is_index_member=True` and `n_indexes==1` on recent dates; `600519` (贵州茅台, 沪深300+上证50) has `n_indexes==2`.
 
 - [ ] **Step 3: Run full**
 
 Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/_preprocess_index_membership.py`
-Expected: membership files for all stocks appearing in the ~1900-row snapshot table.
+Expected: membership files for every stock appearing in `membership.parquet` (all 3-index members 2015-2026).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add scripts/_preprocess_index_membership.py
-git commit -m "feat: preprocess index-constituent snapshots into daily membership"
+git commit -m "feat: preprocess index-membership intervals into daily features"
 ```
 
 ---
@@ -716,16 +906,14 @@ Run:
 PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python -c "
 import glob, os, pandas as pd
 base = 'data/a_shares'
-for d in ['limit_up_processed', 'pledge_processed', 'index_membership_processed']:
+for d in ['pledge_processed', 'index_membership_processed']:
     fs = glob.glob(os.path.join(base, d, '*.parquet'))
     print(d, len(fs), 'files')
-md = pd.read_parquet(os.path.join(base, 'limit_up_market_daily.parquet'))
 me = pd.read_parquet(os.path.join(base, 'market_breadth', 'market_env_daily.parquet'))
-print('limit_up_market_daily dates:', len(md), md['date'].min(), md['date'].max())
 print('market_env_daily dates:', len(me), me.index.min(), me.index.max())
 "
 ```
-Expected: `limit_up_processed` ≈1600, `pledge_processed` ≈3259, `index_membership_processed` few-hundred-to-thousands, both global files have full 2021+ history.
+Expected: `pledge_processed` ≈3259, `index_membership_processed` few-hundred (all 3-index members 2015-2026), `market_env_daily` has full 2021+ history. (Limit-up preprocess outputs are excluded here — that family is deferred per the top scope note, though A1 keeps running incrementally.)
 
 ---
 
@@ -746,7 +934,7 @@ LIMIT_UP_COLS = [
     "dt_seal_fund_ratio", "dt_open_times", "dt_days", "dt_pe",
     "yzt_first_seal_hour", "yzt_limit_days",
     "has_zt", "has_zb", "has_dt", "has_yzt",
-]
+]  # DEFERRED (limit-up ecology family, top scope note) — defined for future re-enable, NOT wired
 
 PLEDGE_COLS = [
     "pledge_ratio", "pledge_margin_dist", "pledge_risk",
@@ -754,15 +942,14 @@ PLEDGE_COLS = [
 ]
 
 INDEX_MEMBER_COLS = [
-    "is_index_member", "index_weight", "n_indexes", "idx_change_30d",
-]
+    "is_index_member", "n_indexes", "idx_change_30d",
+]  # no index_weight — Baostock has no historical weights (A4a scope note)
 
+# Must match scripts/_preprocess_market_env.py output exactly (7 cols, no
+# limit-up temperature cols — that family is deferred).
 MARKET_ENV_COLS = [
-    "investor_new_num", "investor_new_z", "mkt_cap_total_z",
-    "avg_account_cap_z", "high_low_ratio", "market_zt_ratio", "market_heat_z",
-    "market_adv_ratio", "market_turnover_z",
-    "break_rate", "max_height", "advance_rate", "ladder_2", "ladder_3",
-    "ladder_4", "ladder_5", "ladder_6plus", "has_market_sent",
+    "high_low_ratio", "mkt_cap_total_z", "avg_account_cap_z",
+    "investor_new_num", "investor_new_z", "market_adv_ratio", "market_turnover_z",
 ]
 
 DRAGON_TIGER_SEAT_COLS = [
@@ -773,7 +960,7 @@ DRAGON_TIGER_SEAT_COLS = [
 - [ ] **Step 2: Add constructor params + state** (after `use_industry`, before `minute_mode`)
 
 ```python
-        use_limit_up: bool = True,
+        use_limit_up: bool = False,  # DEFERRED (limit-up ecology, top scope note)
         use_pledge: bool = True,
         use_market_env: bool = True,
         use_index_membership: bool = True,
@@ -783,7 +970,7 @@ DRAGON_TIGER_SEAT_COLS = [
 In the body (mirroring `self.use_macro = use_macro`):
 
 ```python
-        self.use_limit_up = use_limit_up
+        self.use_limit_up = use_limit_up  # inert while deferred (not wired in _engineer_features)
         self.use_pledge = use_pledge
         self.use_market_env = use_market_env
         self.use_index_membership = use_index_membership
@@ -881,7 +1068,8 @@ Expected: ok (after Task B4 creates `market_env.py`).
 - [ ] **Step 3: Wire into `_engineer_features` merge sequence** — after `df = self._merge_industry(...)` (line 566)
 
 ```python
-        df = self._merge_limit_up(df, limit_up_df)
+        # _merge_limit_up is DEFERRED (limit-up ecology family, top scope note):
+        # the method exists (Step 1) but is intentionally NOT wired here.
         df = self._merge_pledge(df, pledge_df)
         df = self._merge_market_env(df, market_env_df)
         df = self._merge_index_membership(df, index_membership_df)
@@ -898,7 +1086,7 @@ Expected: ok (after Task B4 creates `market_env.py`).
 - [ ] **Step 5: Add new params to `_engineer_features` signature** (after `industry_df`, line 523)
 
 ```python
-        limit_up_df: pd.DataFrame | None = None,
+        limit_up_df: pd.DataFrame | None = None,  # unused hook while deferred (top scope note)
         pledge_df: pd.DataFrame | None = None,
         market_env_df: pd.DataFrame | None = None,
         index_membership_df: pd.DataFrame | None = None,
@@ -1140,7 +1328,7 @@ In `main()`, after the existing `_a` dir block (line ~100-109):
 After `--no-comment` (line 78):
 
 ```python
-    parser.add_argument("--no-limit-up", action="store_true", help="Exclude limit-up ecology")
+    # limit-up ecology family is DEFERRED (top scope note) — no --no-limit-up flag
     parser.add_argument("--no-pledge", action="store_true", help="Exclude pledge risk")
     parser.add_argument("--no-market-env", action="store_true", help="Exclude market env")
     parser.add_argument("--no-index-membership", action="store_true",
@@ -1150,7 +1338,7 @@ After `--no-comment` (line 78):
 - [ ] **Step 2: Pass flags to `FeaturePipeline(...)`** (after `use_comment=use_cm,` line 135)
 
 ```python
-        use_limit_up=not args.no_limit_up,
+        use_limit_up=False,  # limit-up family deferred (top scope note)
         use_pledge=not args.no_pledge,
         use_market_env=not args.no_market_env,
         use_index_membership=not args.no_index_membership,
@@ -1159,7 +1347,7 @@ After `--no-comment` (line 78):
 - [ ] **Step 3: Load new per-stock files** (after `concept_df = ...` line 195)
 
 ```python
-            limit_up_df = _load_stock_parquet(limit_up_dir, code)
+            # limit_up_df intentionally NOT loaded (family deferred, top scope note)
             pledge_df = _load_stock_parquet(pledge_dir, code)
             index_membership_df = _load_stock_parquet(index_membership_dir, code)
 ```
@@ -1167,13 +1355,13 @@ After `--no-comment` (line 78):
 Add to the `loaded_parts` list (line ~204):
 
 ```python
-                ("LU_P", limit_up_df), ("Pledge", pledge_df), ("IdxM", index_membership_df),
+                ("Pledge", pledge_df), ("IdxM", index_membership_df),
 ```
 
 - [ ] **Step 4: Pass to `save_features(...)`** (after `concept_df=...` line 231)
 
 ```python
-                limit_up_df=limit_up_df if not limit_up_df.empty else None,
+                limit_up_df=None,  # deferred (top scope note)
                 pledge_df=pledge_df if not pledge_df.empty else None,
                 index_membership_df=index_membership_df if not index_membership_df.empty else None,
 ```
@@ -1189,12 +1377,12 @@ Then inspect columns:
 PYTHONPATH=. ./.venv/Scripts/python -c "
 import pandas as pd
 df = pd.read_parquet('data/features_dev/000001.parquet')
-new = [c for c in df.columns if c.startswith(('zt_','zb_','dt_','yzt_','has_zt','has_zb','has_dt','has_yzt','pledge_','lhb_','market_','menv_','is_index','index_w','idx_'))]
+new = [c for c in df.columns if c.startswith(('pledge_','lhb_','market_','menv_','is_index','idx_'))]
 print('new cols:', len(new)); print(sorted(new)[:60])
-print('has_zt nonzero dates:', int((df['has_zt']>0).sum()))
+print('pledge_risk nonzero dates:', int((df['pledge_risk']>0).sum()))
 "
 ```
-Expected: new cols present (with `_ma5/_ma10/_ma20/_std20/_accel/_z20` variants from TemporalTransformer), `has_zt`>0 on some 2021+ dates.
+Expected: new cols present (with `_ma5/_ma10/_ma20/_std20/_accel/_z20` variants from TemporalTransformer), `pledge_risk`>0 on some dates. (No `zt_/zb_/dt_/yzt_/has_zt` cols — limit-up family deferred per top scope note.)
 
 - [ ] **Step 6: Commit**
 
@@ -1374,8 +1562,8 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Smoke-run on a small subset**
 
-Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/feature_ic_report.py --features-dir data/features_dev --max-stocks 15 --feature-subset zt_first_seal_hour,has_zt,pledge_ratio,market_heat_z,menv_regime_z,lhb_count_5d`
-Expected: `reports/feature_ic_report.csv` with rows for the 6 features; `menv_regime_z`/`market_heat_z` show `ic_cross≈0` (global — expected) but nonzero `ic_ts`.
+Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/feature_ic_report.py --features-dir data/features_dev --max-stocks 15 --feature-subset pledge_ratio,is_index_member,high_low_ratio,market_turnover_z,menv_regime_z,lhb_count_5d`
+Expected: `reports/feature_ic_report.csv` with rows for the 6 features; `menv_regime_z`/`high_low_ratio` show `ic_cross≈0` (global — expected) but nonzero `ic_ts`.
 
 - [ ] **Step 3: Commit**
 
@@ -1417,8 +1605,8 @@ from stoke_ml.config import load_config
 
 SAMPLES = 30
 # source_dir -> (feature_source_col, feature_col_in_panel, shift)
+# limit-up family excluded (deferred per top scope note).
 CHECKS = [
-    ("limit_up_processed", "has_zt", "has_zt", 1),
     ("pledge_processed", "has_pledge", "has_pledge", 1),
     ("index_membership_processed", "is_index_member", "is_index_member", 1),
 ]
@@ -1545,7 +1733,7 @@ def build_one(args: dict) -> tuple[str, str]:
         if os.path.exists(output_path) and not args["force"]:
             return code, "exists"
         loaders = {
-            "limit_up_df": ("limit_up_dir", "limit_up_processed"),
+            # limit_up_df intentionally absent (family deferred, top scope note)
             "pledge_df": ("pledge_dir", "pledge_processed"),
             "index_membership_df": ("index_dir", "index_membership_processed"),
         }
@@ -1572,7 +1760,7 @@ def build_one(args: dict) -> tuple[str, str]:
             comment_df=_load_opt(args, "comment_storage", "build_features", code),
             announcement_df=_load_opt(args, "ann_storage", "load_daily_sentiment", code),
             etf_flow_df=_load_etf(args, code),
-            limit_up_df=aux["limit_up_df"] or None,
+            limit_up_df=None,  # deferred (top scope note)
             pledge_df=aux["pledge_df"] or None,
             index_membership_df=aux["index_membership_df"] or None,
         )
@@ -1614,8 +1802,7 @@ def _load_etf(args, code):
                         help="k/n shard over codes, e.g. 0/4")
     parser.add_argument("--jobs", type=int, default=1,
                         help="parallel worker processes (0 = cpu_count)")
-    parser.add_argument("--limit-up", dest="use_limit_up", action="store_true", default=True)
-    parser.add_argument("--no-limit-up", dest="use_limit_up", action="store_false")
+    # limit-up family deferred (top scope note): use_limit_up hard-False, no flag
     parser.add_argument("--pledge", dest="use_pledge", action="store_true", default=True)
     parser.add_argument("--no-pledge", dest="use_pledge", action="store_false")
     parser.add_argument("--market-env", dest="use_market_env", action="store_true", default=True)
@@ -1642,7 +1829,8 @@ def _load_etf(args, code):
         "horizon": cfg.features.target_horizon,
         "use_sentiment": cfg.features.get("use_sentiment", True),
         "use_guba": use_gb, "use_comment": use_cm,
-        "use_limit_up": args.use_limit_up, "use_pledge": args.use_pledge,
+        "use_limit_up": False,  # limit-up deferred (top scope note)
+        "use_pledge": args.use_pledge,
         "use_market_env": args.use_market_env,
         "use_index_membership": args.use_index_membership,
         "storage": storage, "news_storage": news_storage,
@@ -1728,18 +1916,18 @@ def _kline(n=120, start="2021-01-04"):
 
 def test_merge_daily_aux_pit_lag():
     df = _kline()
-    aux = pd.DataFrame({"date": df["date"], "zt_break_times": 3.0, "has_zt": True})
+    aux = pd.DataFrame({"date": df["date"], "pledge_ratio": 3.0, "has_pledge": True})
     merged = _merge_daily_aux(df.copy(), aux)
     # feature at t == source at t-1 (PIT lag 1)
-    assert np.allclose(merged["zt_break_times"].iloc[1:].values,
-                       aux["zt_break_times"].iloc[:-1].values)
-    assert merged["has_zt"].iloc[1]  # first aux row shifted to second K-line day
-    assert not merged["has_zt"].iloc[0]
+    assert np.allclose(merged["pledge_ratio"].iloc[1:].values,
+                       aux["pledge_ratio"].iloc[:-1].values)
+    assert merged["has_pledge"].iloc[1]  # first aux row shifted to second K-line day
+    assert not merged["has_pledge"].iloc[0]
 
 
 def test_merge_market_env_global(tmp_path):
     me = pd.DataFrame({"date": pd.bdate_range("2021-01-04", periods=10),
-                       "market_heat_z": np.linspace(-1, 1, 10)})
+                       "high_low_ratio": np.linspace(-1, 1, 10)})
     from stoke_ml.features import pipeline as P
     me_path = tmp_path / "market_env_daily.parquet"
     me.to_parquet(me_path)
@@ -1758,9 +1946,9 @@ def test_merge_market_env_global(tmp_path):
     # _merge_market_env reads from cfg data_dir; bypass by injecting cache.
     p._market_env_cache = me
     out = p._merge_market_env(df)
-    assert "market_heat_z" in out.columns
+    assert "high_low_ratio" in out.columns
     # lagged: out[t] == me[t-1]
-    assert np.allclose(out["market_heat_z"].iloc[1:].values, me["market_heat_z"].iloc[:-1].values)
+    assert np.allclose(out["high_low_ratio"].iloc[1:].values, me["high_low_ratio"].iloc[:-1].values)
 
 
 def test_market_env_refiner_factors():
@@ -1842,8 +2030,8 @@ Runs the complete 5530-stock feature build (all 4 new sources enabled), then app
 
 - [ ] **Step 1: Confirm preprocess outputs are complete**
 
-Run: `PYTHONPATH=. ./.venv/Scripts/python -c "import glob,os; [print(d, len(glob.glob(os.path.join('data/a_shares', d, '*.parquet')))) for d in ('limit_up_processed','pledge_processed','index_membership_processed')]; print('market_env_daily.parquet', os.path.exists('data/a_shares/market_breadth/market_env_daily.parquet'))"`
-Expected: `limit_up_processed` ~1600+, `pledge_processed` ≥ 100, `index_membership_processed` ~1900 (constituents), market_env_daily exists.
+Run: `PYTHONPATH=. ./.venv/Scripts/python -c "import glob,os; [print(d, len(glob.glob(os.path.join('data/a_shares', d, '*.parquet')))) for d in ('pledge_processed','index_membership_processed')]; print('market_env_daily.parquet', os.path.exists('data/a_shares/market_breadth/market_env_daily.parquet'))"`
+Expected: `pledge_processed` ≈3257, `index_membership_processed` few-hundred (all 3-index members 2015-2026), market_env_daily exists. (limit-up family excluded — deferred per top scope note.)
 
 - [ ] **Step 2: Launch full build over 8 shards × 4 workers**
 
@@ -1893,7 +2081,7 @@ Nothing new to commit (build is output data; scripts already committed). Skip co
 - [ ] **Step 1: Run IC report over the full feature set**
 
 Run: `PYTHONPATH=. PYTHONIOENCODING=utf-8 ./.venv/Scripts/python scripts/feature_ic_report.py --features-dir data/features --max-stocks 300`
-Expected: `reports/feature_ic_report.csv` with one row per feature (all features, not just the 6 smoke-tested). Confirm `has_zt`, `zt_first_seal_hour`, `pledge_risk`, `is_index_member` have plausible `ic_cross` values; global features (`market_*`, `menv_*`) show `ic_cross≈0` with nonzero `ic_ts`.
+Expected: `reports/feature_ic_report.csv` with one row per feature (all features, not just the 6 smoke-tested). Confirm `pledge_risk`, `is_index_member` have plausible `ic_cross` values; global features (`market_*`, `menv_*`) show `ic_cross≈0` with nonzero `ic_ts`. (No `has_zt`/`zt_*` rows — limit-up family deferred per top scope note.)
 
 - [ ] **Step 2: Commit**
 
@@ -1944,7 +2132,7 @@ git commit -m "docs: record FE v2 build results (4 new families, IC, leakage aud
 ## Self-review (writing-plans)
 
 **Spec coverage:**
-- §3.1 limit-up ecology → A1 (preprocess) + B2 (`_merge_limit_up`) + B3 (`_merge_dragon_tiger` lhb_reason) ✓
+- §3.1 limit-up ecology → A1 (preprocess) + B2 (`_merge_limit_up` implemented but NOT wired — deferred per top scope note) + B3 (`_merge_dragon_tiger` lhb_reason) ✓
 - §3.2 equity/capital risk → A2 (pledge) + B2 (`_merge_pledge`) ✓
 - §3.3 market+macro → A3 (`_preprocess_market_env`) + A4 (index membership) + B4 (`MarketEnvRefiner`) ✓
 - §3.4 feature evaluation → C1 (IC) + C2 (leakage) + F2/F3 ✓
@@ -1954,8 +2142,8 @@ git commit -m "docs: record FE v2 build results (4 new families, IC, leakage aud
 **Placeholder scan:** Every step has concrete code or a run command; no TBD/TODO found. ✓
 
 **Type consistency:**
-- `market_heat_z`, `market_zt_ratio`, `has_market_sent` produced in A1, consumed in A3/B2 — identical spelling. ✓
+- MARKET_ENV_COLS (B1) match `_preprocess_market_env.py` output exactly (7 cols, no limit-up temperature) ✓
 - `market_adv_ratio` (derived in A3) vs `advance_rate` (raw sentiment col kept as-is) — both in B1 `MARKET_ENV_COLS`; intentional (raw rides along, guarded by `has_market_sent`). ✓
 - `zt_first_seal_hour`, `pledge_ratio`, `is_index_member`, `idx_change_30d` match between A1/A2/A4 outputs and B1 constants and C1 `--feature-subset`. ✓
-- B5 build_features flags (`--limit-up/--pledge/--market-env/--index-membership`) match D1 dual-store flags. ✓
+- B5 build_features flags (`--pledge/--market-env/--index-membership`) match D1 dual-store flags; limit-up hard-False (deferred). ✓
 - New PO prefixes (`zt_/zb_/dt_/yzt_/pledge_/lhb_/market_/idx_/index_/menv_/has_`) require no `_PK_PREFIXES` edits per TemporalTransformer scan. ✓
