@@ -829,9 +829,11 @@ Converts historical membership intervals into per-stock daily membership with 30
 
 PIT rule: membership is judged purely from interval data produced by
 scripts/download_index_hist.py (Baostock monthly-grid reconstruction).
-in_date is the exact adjustment effective date; a stock is a member on
-trading day d iff some interval has in_date <= d < out_date (out_date NaT
-means still active). Expanded on the stock's own K-line trading calendar.
+in_date is the run's earliest Baostock monthly-refresh date (a proxy for
+when membership became effective, per A4a's corrected semantics — NOT an
+exact adjustment date); a stock is a member on trading day d iff some
+interval has in_date <= d < out_date (out_date NaT means still active).
+Expanded on the stock's own K-line trading calendar.
 """
 import argparse
 import os
