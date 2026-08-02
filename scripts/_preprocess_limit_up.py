@@ -42,7 +42,7 @@ YZT_COLS = [
 
 
 def parse_hour(t):
-    """Parse 'HH:MM:SS' to float hour (09:25 -> 9.42). NaN/'' -> 0.0."""
+    """Parse 'HH:MM[:SS]' to float hour (09:25 -> 9.42, 09:25:00 -> 9.42). NaN/'' -> 0.0."""
     if t is None or (isinstance(t, float) and np.isnan(t)):
         return 0.0
     s = str(t).strip()
@@ -50,7 +50,9 @@ def parse_hour(t):
         return 0.0
     parts = s.split(":")
     try:
-        return int(parts[0]) + int(parts[1]) / 60.0 + int(parts[2]) / 3600.0
+        h, m = int(parts[0]), int(parts[1])
+        sec = int(parts[2]) / 3600.0 if len(parts) > 2 else 0.0
+        return h + m / 60.0 + sec
     except (ValueError, IndexError):
         return 0.0
 
@@ -136,7 +138,8 @@ def _date_counts(directory: str) -> pd.Series:
         try:
             d = pd.read_parquet(f, columns=["date"])
             frames.append(pd.to_datetime(d["date"], errors="coerce").dt.normalize().dropna())
-        except Exception:
+        except Exception as e:
+            print(f"  WARN {os.path.basename(f)}: {e!r}", file=sys.stderr)
             continue
     if not frames:
         return pd.Series(dtype="int64")
