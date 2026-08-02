@@ -40,6 +40,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# storage_key -> True once a channel has emitted a one-time load-failure warning
+_reported_load_fail: set[str] = set()
+
 
 def available_stocks(storage: DataStorage, market: str = "a_shares") -> list[str]:
     base = os.path.join(storage._root, market, "daily")
@@ -74,6 +77,12 @@ def _load_opt(args: dict, storage_key: str, method: str, code: str):
         out = getattr(obj, method)(code, args["start"], args["end"])
         return out if not out.empty else None
     except Exception:
+        if storage_key not in _reported_load_fail:
+            logger.warning(
+                "channel %s failed to load for %s (suppressing further warnings)",
+                storage_key, code,
+            )
+            _reported_load_fail.add(storage_key)
         return None
 
 
@@ -108,12 +117,12 @@ def build_one(args: dict) -> tuple[str, str]:
             use_market_env_refine=args["use_market_env_refine"],
             use_index_membership=args["use_index_membership"],
         )
-        df = args["storage"].load_daily(code, start_date=args["start"], end_date=args["end"])
-        if df.empty:
-            return code, "empty"
         output_path = os.path.join(args["output_dir"], f"{code}.parquet")
         if os.path.exists(output_path) and not args["force"]:
             return code, "exists"
+        df = args["storage"].load_daily(code, start_date=args["start"], end_date=args["end"])
+        if df.empty:
+            return code, "empty"
         # limit_up_df intentionally absent (family deferred, top scope note)
         a_shares = os.path.join(args["data_dir"], "a_shares")
         pledge_df = _load_stock_parquet(os.path.join(a_shares, "pledge_processed"), code)
@@ -145,7 +154,7 @@ def build_one(args: dict) -> tuple[str, str]:
         )
         return code, "built"
     except Exception:
-        logging.getLogger(__name__).exception("[%s] failed", code)
+        logger.exception("[%s] failed", code)
         return code, "failed"
 
 
@@ -226,7 +235,12 @@ def main():
 
     # k/n shard over the code list (applies to serial AND parallel dispatch)
     if args.shard:
-        k, n = map(int, args.shard.split("/"))
+        try:
+            k, n = map(int, args.shard.split("/"))
+        except ValueError:
+            parser.error("--shard must be k/n")
+        if n < 1 or k < 0 or k >= n:
+            parser.error("--shard: k in [0, n) and n >= 1")
         codes = [c for i, c in enumerate(codes) if i % n == k]
 
     output_dir = args.output_dir or os.path.join(data_dir, "features")
@@ -272,6 +286,9 @@ def main():
     }
 
     tasks = [{**worker_args, "code": c} for c in codes]
+
+    if args.jobs < 0:
+        parser.error("--jobs must be >= 0")
 
     if args.jobs == 1:
         results = [build_one(t) for t in tasks]
