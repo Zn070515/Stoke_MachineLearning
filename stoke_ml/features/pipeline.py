@@ -835,6 +835,11 @@ class FeaturePipeline:
             return df
         dt = dt_df.copy()
         dt["date"] = pd.to_datetime(dt["date"])
+        reason = dt.get("lhb_reason",
+                        pd.Series(index=dt.index, dtype=str)).fillna("").astype(str)
+        dt["lhb_is_wave"] = reason.str.contains("振幅|换手", regex=True)
+        dt["lhb_is_sustained"] = reason.str.contains("连续", regex=False)
+        dt["lhb_is_drop"] = reason.str.contains("跌幅|跌停|下跌", regex=True)
         dt = dt.drop(columns=["stock_code", "stock_name", "lhb_reason"],
                       errors="ignore")
         # Aggregate multiple entries per date
@@ -847,12 +852,23 @@ class FeaturePipeline:
                                      + 1),
             ),
             lhb_present=("net_amount", "count"),
+            lhb_is_wave=("lhb_is_wave", "any"),
+            lhb_is_sustained=("lhb_is_sustained", "any"),
+            lhb_is_drop=("lhb_is_drop", "any"),
         ).reset_index()
         agg["lhb_present"] = (agg["lhb_present"] > 0).astype(np.float32)
         agg["lhb_buy_ratio"] = agg["lhb_buy_ratio"].fillna(0.5).astype(np.float32)
         agg["lhb_net_amount"] = agg["lhb_net_amount"].fillna(0.0).astype(np.float32)
+        for c in ("lhb_is_wave", "lhb_is_sustained", "lhb_is_drop"):
+            agg[c] = agg[c].fillna(False).astype(np.float32)
         df = df.merge(agg, on="date", how="left")
-        _batch_fill_shift(df, [c for c in DRAGON_TIGER_COLS if c in df.columns])
+        flag_cols = ["lhb_is_wave", "lhb_is_sustained", "lhb_is_drop"]
+        _batch_fill_shift(df, [c for c in DRAGON_TIGER_COLS if c in df.columns]
+                          + [c for c in flag_cols if c in df.columns])
+        # Past-5-trading-day LHB frequency (computed AFTER the PIT shift, so it
+        # never looks ahead; must NOT be shifted again).
+        if "lhb_present" in df.columns:
+            df["lhb_count_5d"] = df["lhb_present"].rolling(5, min_periods=1).sum().astype("int16")
         return df
 
     def _merge_fundamental(self, df: pd.DataFrame,
