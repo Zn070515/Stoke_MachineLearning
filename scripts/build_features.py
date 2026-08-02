@@ -4,15 +4,21 @@ Run once before training to decouple expensive feature engineering from
 the training loop.  Training scripts can then use ``--prebuilt`` to skip
 straight to sequence slicing.
 
+Supports multiprocessing (``--jobs N``, ``--jobs 0`` = auto cpu_count) and
+sharding (``--shard k/n``) for parallel builds across processes/machines.
+
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py
   PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --stock 000001
   PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --no-guba --no-comment
+  PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --jobs 8 --shard 0/4
 """
 import argparse
 import logging
 import os
 import sys
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -59,6 +65,90 @@ def _load_stock_parquet(directory: str, code: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _load_opt(args: dict, storage_key: str, method: str, code: str):
+    """Call a per-stock storage loader, mapping missing/empty to None."""
+    obj = args.get(storage_key)
+    if obj is None:
+        return None
+    try:
+        out = getattr(obj, method)(code, args["start"], args["end"])
+        return out if not out.empty else None
+    except Exception:
+        return None
+
+
+def _load_etf(args: dict, code: str):
+    try:
+        sector = args["sector_mapper"].get_sector(code)
+        if not sector:
+            return None
+        out = args["etf_storage"].load_sector_flow(sector, args["start"], args["end"])
+        return out if not out.empty else None
+    except Exception:
+        return None
+
+
+def build_one(args: dict) -> tuple[str, str]:
+    """Build features for one stock. args carries ALL inputs; returns (code, status)."""
+    code = args["code"]
+    try:
+        pipeline = FeaturePipeline(
+            seq_len=args["seq_len"],
+            horizon=args["horizon"],
+            flat_mode=False,
+            use_technical=args["use_technical"],
+            use_scoring=args["use_scoring"],
+            use_temporal=args["use_temporal"],
+            use_sentiment=args["use_sentiment"],
+            use_guba=args["use_guba"],
+            use_comment=args["use_comment"],
+            use_limit_up=args["use_limit_up"],  # False (deferred, top scope note)
+            use_pledge=args["use_pledge"],
+            use_market_env=args["use_market_env"],
+            use_market_env_refine=args["use_market_env_refine"],
+            use_index_membership=args["use_index_membership"],
+        )
+        df = args["storage"].load_daily(code, start_date=args["start"], end_date=args["end"])
+        if df.empty:
+            return code, "empty"
+        output_path = os.path.join(args["output_dir"], f"{code}.parquet")
+        if os.path.exists(output_path) and not args["force"]:
+            return code, "exists"
+        # limit_up_df intentionally absent (family deferred, top scope note)
+        a_shares = os.path.join(args["data_dir"], "a_shares")
+        pledge_df = _load_stock_parquet(os.path.join(a_shares, "pledge_processed"), code)
+        index_membership_df = _load_stock_parquet(
+            os.path.join(a_shares, "index_membership_processed"), code)
+        pipeline.save_features(
+            output_path, df,
+            sentiment_df=_load_opt(args, "news_storage", "load_daily_sentiment", code),
+            margin_df=_load_opt(args, "margin_storage", "load", code),
+            northbound_df=_load_opt(args, "nb_storage", "load", code),
+            dragon_tiger_df=_load_opt(args, "dt_storage", "load", code),
+            fundamental_df=_load_opt(args, "fund_storage", "forward_fill_to_daily", code),
+            valuation_df=_load_stock_parquet(os.path.join(a_shares, "valuation"), code),
+            capital_flow_df=_load_stock_parquet(os.path.join(a_shares, "capital_flow_processed"), code),
+            board_df=_load_stock_parquet(os.path.join(a_shares, "board_processed"), code),
+            sector_df=_load_stock_parquet(os.path.join(a_shares, "industry_ranking_processed"), code),
+            block_trade_df=_load_stock_parquet(os.path.join(a_shares, "block_trade_processed"), code),
+            dividend_df=_load_stock_parquet(os.path.join(a_shares, "dividend_processed"), code),
+            lockup_df=_load_stock_parquet(os.path.join(a_shares, "lockup_processed"), code),
+            shareholder_df=_load_stock_parquet(os.path.join(a_shares, "shareholder_processed"), code),
+            concept_df=_load_stock_parquet(os.path.join(a_shares, "concept_blocks_processed"), code),
+            guba_df=_load_opt(args, "guba_storage", "load_daily_sentiment", code),
+            comment_df=_load_opt(args, "comment_storage", "build_features", code),
+            announcement_df=_load_opt(args, "ann_storage", "load_daily_sentiment", code),
+            etf_flow_df=_load_etf(args, code),
+            limit_up_df=None,  # deferred (top scope note)
+            pledge_df=pledge_df if not pledge_df.empty else None,
+            index_membership_df=index_membership_df if not index_membership_df.empty else None,
+        )
+        return code, "built"
+    except Exception:
+        logging.getLogger(__name__).exception("[%s] failed", code)
+        return code, "failed"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pre-build features for all stocks")
     parser.add_argument("--config", type=str, default=None, help="Path to config.yaml")
@@ -76,19 +166,37 @@ def main():
     parser.add_argument(
         "--no-comment", action="store_true", help="Exclude AKShare comment sentiment",
     )
-    # limit-up ecology family is DEFERRED (top scope note) — no --no-limit-up flag
-    parser.add_argument("--no-pledge", action="store_true", help="Exclude pledge risk")
-    # --no-market-env disables the market-breadth channel (7 market-env cols);
+    parser.add_argument(
+        "--shard", type=str, default=None,
+        help="k/n shard over codes, e.g. 0/4",
+    )
+    parser.add_argument(
+        "--jobs", type=int, default=1,
+        help="parallel worker processes (0 = cpu_count)",
+    )
+    # limit-up ecology family is DEFERRED (top scope note) — no --limit-up flag
+    parser.add_argument("--pledge", dest="use_pledge", action="store_true", default=True,
+                        help="Include pledge risk (default)")
+    parser.add_argument("--no-pledge", dest="use_pledge", action="store_false",
+                        help="Exclude pledge risk")
+    # --market-env disables the market-breadth channel (7 market-env cols);
     # --no-market-env-refine disables the macro-regime refiner (menv_* factors).
     # NOTE: the market_ prefix is shared — the board channel's market_state_*
     # columns (use_board) are NOT affected by either flag.
-    parser.add_argument("--no-market-env", action="store_true",
+    parser.add_argument("--market-env", dest="use_market_env", action="store_true", default=True,
+                        help="Include market breadth (default)")
+    parser.add_argument("--no-market-env", dest="use_market_env", action="store_false",
                         help="Exclude market breadth (7 market-env cols); use "
                              "--no-market-env-refine for menv_* macro-regime factors. "
                              "market_state_* (board) is a separate channel")
-    parser.add_argument("--no-market-env-refine", action="store_true",
+    parser.add_argument("--market-env-refine", dest="use_market_env_refine", action="store_true",
+                        default=True,
+                        help="Include MarketEnvRefiner macro-regime factors (menv_*, default)")
+    parser.add_argument("--no-market-env-refine", dest="use_market_env_refine", action="store_false",
                         help="Exclude MarketEnvRefiner macro-regime factors (menv_*)")
-    parser.add_argument("--no-index-membership", action="store_true",
+    parser.add_argument("--index-membership", dest="use_index_membership", action="store_true",
+                        default=True, help="Include index membership (default)")
+    parser.add_argument("--no-index-membership", dest="use_index_membership", action="store_false",
                         help="Exclude index membership")
     parser.add_argument(
         "--force", action="store_true", help="Overwrite existing feature files",
@@ -110,30 +218,16 @@ def main():
     ann_storage = AnnouncementStorage(data_dir)
     sector_mapper = StockSectorMapper()
 
-    # Directories for per-stock processed parquet files
-    _a = os.path.join(data_dir, "a_shares")
-    valuation_dir = os.path.join(_a, "valuation")
-    capital_flow_dir = os.path.join(_a, "capital_flow_processed")
-    board_dir = os.path.join(_a, "board_processed")
-    sector_dir = os.path.join(_a, "industry_ranking_processed")
-    block_trade_dir = os.path.join(_a, "block_trade_processed")
-    dividend_dir = os.path.join(_a, "dividend_processed")
-    lockup_dir = os.path.join(_a, "lockup_processed")
-    shareholder_dir = os.path.join(_a, "shareholder_processed")
-    concept_dir = os.path.join(_a, "concept_blocks_processed")
-    limit_up_dir = os.path.join(_a, "limit_up_processed")
-    pledge_dir = os.path.join(_a, "pledge_processed")
-    index_membership_dir = os.path.join(_a, "index_membership_processed")
-    # market_env_daily is global -> auto-loaded by _merge_market_env internally
-
-    # Macro and industry are auto-loaded by the pipeline internally
-    # (they're global, not per-stock, and _merge_macro/_merge_industry
-    #  handle disk loading + caching)
     codes = [args.stock] if args.stock else available_stocks(storage)
 
     if not codes:
         logger.error("No stock data found. Run a data downloader first.")
         sys.exit(1)
+
+    # k/n shard over the code list (applies to serial AND parallel dispatch)
+    if args.shard:
+        k, n = map(int, args.shard.split("/"))
+        codes = [c for i, c in enumerate(codes) if i % n == k]
 
     output_dir = args.output_dir or os.path.join(data_dir, "features")
     os.makedirs(output_dir, exist_ok=True)
@@ -141,135 +235,54 @@ def main():
     use_gb = not args.no_guba
     use_cm = not args.no_comment
 
-    pipeline = FeaturePipeline(
-        seq_len=cfg.features.seq_len,
-        horizon=cfg.features.target_horizon,
-        flat_mode=False,
-        use_technical=cfg.features.technical_indicators,
-        use_scoring=cfg.features.rule_based_scoring,
-        use_temporal=cfg.features.temporal_features,
-        use_sentiment=cfg.features.get("use_sentiment", True),
-        use_guba=use_gb,
-        use_comment=use_cm,
-        use_limit_up=False,  # limit-up family deferred (top scope note)
-        use_pledge=not args.no_pledge,
-        use_market_env=not args.no_market_env,
-        use_market_env_refine=not args.no_market_env_refine,
-        use_index_membership=not args.no_index_membership,
-    )
-
     date_start = cfg.markets.a_shares.start_date
     date_end = datetime.now().strftime("%Y-%m-%d")
 
-    built = 0
-    skipped = 0
-    failed = 0
+    worker_args = {
+        "code": None,
+        "seq_len": cfg.features.seq_len,
+        "horizon": cfg.features.target_horizon,
+        "use_technical": cfg.features.technical_indicators,
+        "use_scoring": cfg.features.rule_based_scoring,
+        "use_temporal": cfg.features.temporal_features,
+        "use_sentiment": cfg.features.get("use_sentiment", True),
+        "use_guba": use_gb,
+        "use_comment": use_cm,
+        "use_limit_up": False,  # limit-up deferred (top scope note)
+        "use_pledge": args.use_pledge,
+        "use_market_env": args.use_market_env,
+        "use_market_env_refine": args.use_market_env_refine,
+        "use_index_membership": args.use_index_membership,
+        "storage": storage,
+        "news_storage": news_storage,
+        "margin_storage": margin_storage,
+        "nb_storage": nb_storage,
+        "dt_storage": dt_storage,
+        "fund_storage": fund_storage,
+        "etf_storage": etf_storage,
+        "guba_storage": guba_storage,
+        "comment_storage": comment_storage,
+        "ann_storage": ann_storage,
+        "sector_mapper": sector_mapper,
+        "data_dir": data_dir,
+        "output_dir": output_dir,
+        "start": date_start,
+        "end": date_end,
+        "force": args.force,
+    }
 
-    for code in codes:
-        output_path = os.path.join(output_dir, f"{code}.parquet")
-        if os.path.exists(output_path) and not args.force:
-            logger.info("[%s] already exists, skipping (use --force to rebuild)", code)
-            skipped += 1
-            continue
+    tasks = [{**worker_args, "code": c} for c in codes]
 
-        logger.info("=== [%s] building features ===", code)
+    if args.jobs == 1:
+        results = [build_one(t) for t in tasks]
+    else:
+        workers = args.jobs if args.jobs > 1 else min(32, (os.cpu_count() or 1) + 2)
+        logger.info("Building %d stocks across %d workers", len(codes), workers)
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(build_one, tasks))
 
-        try:
-            # Load K-line
-            df = storage.load_daily(code, start_date=date_start, end_date=date_end)
-            if df.empty:
-                logger.warning("[%s] No K-line data, skipping", code)
-                skipped += 1
-                continue
-
-            # Load daily sentiment
-            sentiment_df = news_storage.load_daily_sentiment(code, date_start, date_end)
-
-            # Load market-wide data
-            margin_df = margin_storage.load(code, date_start, date_end)
-            nb_df = nb_storage.load(code, date_start, date_end)
-            dt_df = dt_storage.load(code, date_start, date_end)
-
-            # Load fundamentals
-            fundamental_df = fund_storage.forward_fill_to_daily(code, date_start, date_end)
-
-            # Load ETF flow
-            etf_df = pd.DataFrame()
-            sector = sector_mapper.get_sector(code)
-            if sector:
-                etf_df = etf_storage.load_sector_flow(sector, date_start, date_end)
-
-            # Load Guba + Comment
-            guba_df = guba_storage.load_daily_sentiment(code, date_start, date_end)
-            comment_df = comment_storage.build_features(code, date_start, date_end)
-
-            # Load announcement sentiment
-            announcement_df = ann_storage.load_daily_sentiment(code, date_start, date_end)
-
-            # Load per-stock processed data
-            valuation_df = _load_stock_parquet(valuation_dir, code)
-            capital_flow_df = _load_stock_parquet(capital_flow_dir, code)
-            board_df = _load_stock_parquet(board_dir, code)
-            sector_df = _load_stock_parquet(sector_dir, code)
-            block_trade_df = _load_stock_parquet(block_trade_dir, code)
-            dividend_df = _load_stock_parquet(dividend_dir, code)
-            lockup_df = _load_stock_parquet(lockup_dir, code)
-            shareholder_df = _load_stock_parquet(shareholder_dir, code)
-            concept_df = _load_stock_parquet(concept_dir, code)
-            # limit_up_df intentionally NOT loaded (family deferred, top scope note)
-            pledge_df = _load_stock_parquet(pledge_dir, code)
-            index_membership_df = _load_stock_parquet(index_membership_dir, code)
-
-            loaded_parts = [f"K={len(df)}"]
-            for label, d in [
-                ("S", sentiment_df), ("M", margin_df), ("N", nb_df),
-                ("DT", dt_df), ("F", fundamental_df), ("ETF", etf_df),
-                ("GB", guba_df), ("CM", comment_df), ("Ann", announcement_df),
-                ("Val", valuation_df), ("CF", capital_flow_df), ("Brd", board_df),
-                ("Sec", sector_df), ("BT", block_trade_df), ("Div", dividend_df),
-                ("LU", lockup_df), ("SH", shareholder_df), ("Conc", concept_df),
-                ("Pledge", pledge_df), ("IdxM", index_membership_df),
-            ]:
-                if not d.empty:
-                    loaded_parts.append(f"{label}={len(d)}")
-            logger.info("[%s] loaded: %s", code, " ".join(loaded_parts))
-
-            # Engineer + save
-            pipeline.save_features(
-                output_path,
-                df,
-                sentiment_df=sentiment_df if not sentiment_df.empty else None,
-                margin_df=margin_df if not margin_df.empty else None,
-                northbound_df=nb_df if not nb_df.empty else None,
-                dragon_tiger_df=dt_df if not dt_df.empty else None,
-                fundamental_df=fundamental_df if not fundamental_df.empty else None,
-                valuation_df=valuation_df if not valuation_df.empty else None,
-                etf_flow_df=etf_df if not etf_df.empty else None,
-                announcement_df=announcement_df if not announcement_df.empty else None,
-                guba_df=guba_df if not guba_df.empty else None,
-                comment_df=comment_df if not comment_df.empty else None,
-                capital_flow_df=capital_flow_df if not capital_flow_df.empty else None,
-                block_trade_df=block_trade_df if not block_trade_df.empty else None,
-                shareholder_df=shareholder_df if not shareholder_df.empty else None,
-                lockup_df=lockup_df if not lockup_df.empty else None,
-                dividend_df=dividend_df if not dividend_df.empty else None,
-                board_df=board_df if not board_df.empty else None,
-                sector_df=sector_df if not sector_df.empty else None,
-                concept_df=concept_df if not concept_df.empty else None,
-                limit_up_df=None,  # deferred (top scope note)
-                pledge_df=pledge_df if not pledge_df.empty else None,
-                index_membership_df=index_membership_df if not index_membership_df.empty else None,
-            )
-            built += 1
-
-        except Exception:
-            logger.exception("[%s] failed", code)
-            failed += 1
-
-    logger.info(
-        "Done: %d built, %d skipped, %d failed (out of %d stocks)",
-        built, skipped, failed, len(codes),
-    )
+    counts = Counter(s for _, s in results)
+    logger.info("Done: %s (out of %d stocks)", dict(counts), len(codes))
 
 
 if __name__ == "__main__":
