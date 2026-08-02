@@ -76,6 +76,11 @@ def main():
     parser.add_argument(
         "--no-comment", action="store_true", help="Exclude AKShare comment sentiment",
     )
+    # limit-up ecology family is DEFERRED (top scope note) — no --no-limit-up flag
+    parser.add_argument("--no-pledge", action="store_true", help="Exclude pledge risk")
+    parser.add_argument("--no-market-env", action="store_true", help="Exclude market env")
+    parser.add_argument("--no-index-membership", action="store_true",
+                        help="Exclude index membership")
     parser.add_argument(
         "--force", action="store_true", help="Overwrite existing feature files",
     )
@@ -107,6 +112,10 @@ def main():
     lockup_dir = os.path.join(_a, "lockup_processed")
     shareholder_dir = os.path.join(_a, "shareholder_processed")
     concept_dir = os.path.join(_a, "concept_blocks_processed")
+    limit_up_dir = os.path.join(_a, "limit_up_processed")
+    pledge_dir = os.path.join(_a, "pledge_processed")
+    index_membership_dir = os.path.join(_a, "index_membership_processed")
+    # market_env_daily is global -> auto-loaded by _merge_market_env internally
 
     # Macro and industry are auto-loaded by the pipeline internally
     # (they're global, not per-stock, and _merge_macro/_merge_industry
@@ -133,6 +142,10 @@ def main():
         use_sentiment=cfg.features.get("use_sentiment", True),
         use_guba=use_gb,
         use_comment=use_cm,
+        use_limit_up=False,  # limit-up family deferred (top scope note)
+        use_pledge=not args.no_pledge,
+        use_market_env=not args.no_market_env,
+        use_index_membership=not args.no_index_membership,
     )
 
     date_start = cfg.markets.a_shares.start_date
@@ -193,6 +206,9 @@ def main():
             lockup_df = _load_stock_parquet(lockup_dir, code)
             shareholder_df = _load_stock_parquet(shareholder_dir, code)
             concept_df = _load_stock_parquet(concept_dir, code)
+            # limit_up_df intentionally NOT loaded (family deferred, top scope note)
+            pledge_df = _load_stock_parquet(pledge_dir, code)
+            index_membership_df = _load_stock_parquet(index_membership_dir, code)
 
             loaded_parts = [f"K={len(df)}"]
             for label, d in [
@@ -202,6 +218,7 @@ def main():
                 ("Val", valuation_df), ("CF", capital_flow_df), ("Brd", board_df),
                 ("Sec", sector_df), ("BT", block_trade_df), ("Div", dividend_df),
                 ("LU", lockup_df), ("SH", shareholder_df), ("Conc", concept_df),
+                ("Pledge", pledge_df), ("IdxM", index_membership_df),
             ]:
                 if not d.empty:
                     loaded_parts.append(f"{label}={len(d)}")
@@ -229,6 +246,9 @@ def main():
                 board_df=board_df if not board_df.empty else None,
                 sector_df=sector_df if not sector_df.empty else None,
                 concept_df=concept_df if not concept_df.empty else None,
+                limit_up_df=None,  # deferred (top scope note)
+                pledge_df=pledge_df if not pledge_df.empty else None,
+                index_membership_df=index_membership_df if not index_membership_df.empty else None,
             )
             built += 1
 
