@@ -16,6 +16,7 @@ from stoke_ml.features.temporal import (
 from stoke_ml.features.transform import TemporalTransformer
 from stoke_ml.features.emotion import EmotionRefiner
 from stoke_ml.features.fundamental import FundamentalRefiner
+from stoke_ml.features.market_env import MarketEnvRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +270,7 @@ class FeaturePipeline:
         self._temporal_transformer = TemporalTransformer() if use_temporal_stats else None
         self._emotion_refiner = EmotionRefiner() if use_emotion_refine else None
         self._fundamental_refiner = FundamentalRefiner() if use_fundamental_refine else None
-        self._market_env_refiner = None  # constructed in B4 (MarketEnvRefiner)
+        self._market_env_refiner = MarketEnvRefiner() if use_market_env_refine else None
 
     def _warn_if_missing(self, key: str) -> None:
         """Emit one-time debug log when use_*=True but no data was passed.
