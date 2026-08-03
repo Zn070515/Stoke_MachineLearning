@@ -21,6 +21,20 @@ from stoke_ml.features.market_env import MarketEnvRefiner
 
 logger = logging.getLogger(__name__)
 
+# Fix 3 (sparse feature policy): drop structurally-dead columns — constant on
+# >=90% of stocks per reports/feature_sparsity_report.csv — from training.  The
+# SPARSE_KEEP_PREFIXES families are exempt: they are genuinely-rare events that
+# stay constant for most stocks but carry real signal on their activation days
+# (market-state regimes, dragon-tiger presence, dividend growth, pledge plan
+# stage, transfer ratio).  Data-driven: when a source gets fixed and features
+# are rebuilt, the column's constant_stock_ratio drops and it leaves the drop
+# set automatically.
+DEAD_FEATURE_RATIO = 0.9
+SPARSE_KEEP_PREFIXES = (
+    "market_state_", "is_dt", "dividend_growth", "plan_stage_", "transfer_ratio",
+)
+SPARSITY_REPORT = "reports/feature_sparsity_report.csv"
+
 SENTIMENT_COLS = [
     "sentiment_mean", "sentiment_std", "news_count",
     "positive_ratio", "negative_ratio", "has_news",
@@ -60,6 +74,11 @@ COMMENT_COLS = [
 FUNDAMENTAL_COLS = [
     "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
     "debt_ratio", "gross_margin", "net_margin",
+]
+
+EARNINGS_COLS = [
+    "has_forecast", "net_profit_yoy_low", "net_profit_yoy_high",
+    "net_profit_low", "net_profit_high", "forecast_age",
 ]
 
 VALUATION_COLS = ["pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm"]
@@ -189,6 +208,7 @@ class FeaturePipeline:
         use_northbound: bool = True,
         use_dragon_tiger: bool = True,
         use_fundamental: bool = True,
+        use_earnings: bool = True,
         use_valuation: bool = True,
         use_etf_flow: bool = True,
         use_interaction: bool = True,
@@ -216,6 +236,7 @@ class FeaturePipeline:
         use_emotion_refine: bool = True,
         use_fundamental_refine: bool = True,
         use_temporal_stats: bool = True,
+        drop_dead_features: bool = True,
     ):
         self.seq_len = seq_len
         self.horizon = horizon
@@ -231,6 +252,7 @@ class FeaturePipeline:
         self.use_northbound = use_northbound
         self.use_dragon_tiger = use_dragon_tiger
         self.use_fundamental = use_fundamental
+        self.use_earnings = use_earnings
         self.use_valuation = use_valuation
         self.use_etf_flow = use_etf_flow
         self.use_interaction = use_interaction
@@ -272,6 +294,7 @@ class FeaturePipeline:
         self._emotion_refiner = EmotionRefiner() if use_emotion_refine else None
         self._fundamental_refiner = FundamentalRefiner() if use_fundamental_refine else None
         self._market_env_refiner = MarketEnvRefiner() if use_market_env_refine else None
+        self.drop_dead_features = drop_dead_features
 
     def _warn_if_missing(self, key: str) -> None:
         """Emit one-time debug log when use_*=True but no data was passed.
@@ -326,6 +349,7 @@ class FeaturePipeline:
         northbound_df: pd.DataFrame | None = None,
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
+        earnings_df: pd.DataFrame | None = None,
         valuation_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
@@ -354,7 +378,7 @@ class FeaturePipeline:
         """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
-            dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
+            dragon_tiger_df, fundamental_df, earnings_df, valuation_df, etf_flow_df,
             announcement_df, guba_df, comment_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
@@ -383,6 +407,7 @@ class FeaturePipeline:
         northbound_df: pd.DataFrame | None = None,
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
+        earnings_df: pd.DataFrame | None = None,
         valuation_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
@@ -411,7 +436,7 @@ class FeaturePipeline:
         """
         return self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
-            dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
+            dragon_tiger_df, fundamental_df, earnings_df, valuation_df, etf_flow_df,
             announcement_df, guba_df, comment_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
@@ -429,6 +454,7 @@ class FeaturePipeline:
         northbound_df: pd.DataFrame | None = None,
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
+        earnings_df: pd.DataFrame | None = None,
         valuation_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
@@ -452,7 +478,7 @@ class FeaturePipeline:
         """Engineer features and save to parquet. Returns output_path."""
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
-            dragon_tiger_df, fundamental_df, valuation_df, etf_flow_df,
+            dragon_tiger_df, fundamental_df, earnings_df, valuation_df, etf_flow_df,
             announcement_df, guba_df, comment_df,
             capital_flow_df, block_trade_df, shareholder_df,
             lockup_df, dividend_df, board_df, sector_df, concept_df,
@@ -569,6 +595,7 @@ class FeaturePipeline:
         northbound_df: pd.DataFrame | None = None,
         dragon_tiger_df: pd.DataFrame | None = None,
         fundamental_df: pd.DataFrame | None = None,
+        earnings_df: pd.DataFrame | None = None,
         valuation_df: pd.DataFrame | None = None,
         etf_flow_df: pd.DataFrame | None = None,
         announcement_df: pd.DataFrame | None = None,
@@ -624,6 +651,7 @@ class FeaturePipeline:
         df = self._merge_northbound(df, northbound_df)
         df = self._merge_dragon_tiger(df, dragon_tiger_df)
         df = self._merge_fundamental(df, fundamental_df)
+        df = self._merge_earnings(df, earnings_df)
         df = self._merge_valuation(df, valuation_df)
         df = self._merge_etf_flow(df, etf_flow_df)
         df = self._merge_guba(df, guba_df)
@@ -909,6 +937,31 @@ class FeaturePipeline:
             fd = fd.drop_duplicates(subset="date", keep="last")
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
+        _batch_fill_shift(df, available)
+        return df
+
+    def _merge_earnings(self, df: pd.DataFrame,
+                        earnings_df: pd.DataFrame | None) -> pd.DataFrame:
+        """Merge the per-stock daily earnings-active frame (see EarningsStorage).
+
+        The storage already forward-fills the net-profit band across trading
+        days (a forecast stays active until superseded) and applies the
+        post-close → next-trading-day PIT mapping; this method only merges on
+        date and applies the standard lag+ZI fill, so the signal first appears
+        one extra trading day out — no same-day leakage.
+        """
+        if not self.use_earnings:
+            return df
+        if earnings_df is None or earnings_df.empty:
+            self._warn_if_missing("earnings")
+            return df
+        ed = earnings_df.copy()
+        ed["date"] = pd.to_datetime(ed["date"])
+        ed = ed.drop_duplicates(subset="date", keep="last")
+        available = [c for c in EARNINGS_COLS if c in ed.columns]
+        if not available:
+            return df
+        df = df.merge(ed[["date"] + available], on="date", how="left")
         _batch_fill_shift(df, available)
         return df
 
@@ -1329,11 +1382,45 @@ class FeaturePipeline:
     # Sequence creation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _prep_feature_df(df: pd.DataFrame) -> pd.DataFrame:
-        """Drop metadata columns and rows with inf/NaN — shared by sequencing methods."""
+    _dead_feature_set: frozenset[str] = frozenset()
+    _dead_feature_checked: bool = False
+
+    @classmethod
+    def _dead_features(cls) -> frozenset[str]:
+        """Structurally-dead feature names to drop from training (cached once)."""
+        if cls._dead_feature_checked:
+            return cls._dead_feature_set
+        cls._dead_feature_checked = True
+        try:
+            from stoke_ml.config import get_project_root
+            rep = pd.read_csv(get_project_root() / SPARSITY_REPORT)
+        except Exception as e:
+            logger.warning("dead-feature drop disabled: %s", e)
+            return cls._dead_feature_set
+        if "feature" not in rep.columns or "constant_stock_ratio" not in rep.columns:
+            return cls._dead_feature_set
+        drop = {
+            name for name, const in zip(rep["feature"], rep["constant_stock_ratio"])
+            if const >= DEAD_FEATURE_RATIO
+            and not name.startswith(SPARSE_KEEP_PREFIXES)
+        }
+        cls._dead_feature_set = frozenset(drop)
+        logger.info(
+            "dead-feature drop: %d constant columns excluded from training",
+            len(drop),
+        )
+        return cls._dead_feature_set
+
+    def _prep_feature_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop metadata/dead columns and rows with inf/NaN — shared by sequencing methods."""
         drop_cols = ["stock_code", "sector", "sector_code", "size_proxy"]
         feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+        if self.drop_dead_features:
+            dead = self._dead_features()
+            if dead:
+                feat_df = feat_df.drop(
+                    columns=[c for c in dead if c in feat_df.columns]
+                )
         feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
         return feat_df.dropna()
 
@@ -1667,8 +1754,16 @@ class FeaturePipeline:
         first_df = all_feat_dfs[0]
         static_cols_available = [c for c in _STATIC_FEATURE_COLS if c in first_df.columns]
         pk_cols_available = self._discover_pk_columns(first_df)
+        if self.drop_dead_features:
+            dead = self._dead_features()
+            if dead:
+                pk_cols_available = [c for c in pk_cols_available if c not in dead]
         pk_set = set(pk_cols_available)
         po_cols_available = self._discover_po_columns(first_df, pk_set)
+        if self.drop_dead_features:
+            dead = self._dead_features()
+            if dead:
+                po_cols_available = [c for c in po_cols_available if c not in dead]
 
         # Compute static features from first 20 days (zero look-ahead bias).
         # Stock-invariant characteristics — size, liquidity, risk, price tier.
