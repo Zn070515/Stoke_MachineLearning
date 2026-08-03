@@ -1597,19 +1597,43 @@ class FeaturePipeline:
                       (``save_features(panel_mode=True)``).  When set, per-stock
                       features are loaded from ``{prebuilt_dir}/{code}.parquet``
                       instead of being engineered live; ``aux_data`` is ignored.
-                      This makes the training input byte-identical to a
-                      ``build_features.py --panel-mode`` run.
+                      All parquets must have been built with the SAME ``--use-*``
+                      flags (same column schema); the column set is verified
+                      against the first stock and a mismatch raises ValueError.
 
         Returns:
             dict with numpy arrays: static_features, past_known, past_observed,
             y_direction, y_return, y_volatility.
         """
         codes = sorted(panel["stock_code"].unique())
-        N = len(codes)
         aux_data = aux_data or {}
+
+        if prebuilt_dir:
+            # A missing prebuilt parquet would otherwise surface as a bare
+            # FileNotFoundError mid-loop (or an empty frame corrupting the
+            # panel).  Drop missing stocks up front; fail loudly if the dir
+            # holds nothing usable at all.
+            prebuilt_paths = {
+                c: os.path.join(prebuilt_dir, f"{c}.parquet") for c in codes
+            }
+            missing = [c for c, p in prebuilt_paths.items() if not os.path.isfile(p)]
+            if len(missing) == len(codes):
+                raise FileNotFoundError(
+                    f"No prebuilt feature parquets found in {prebuilt_dir}"
+                )
+            if missing:
+                logger.warning(
+                    "prebuilt_dir missing %d/%d parquets (first 20: %s); "
+                    "dropping those stocks from the panel",
+                    len(missing), len(codes), missing[:20],
+                )
+                codes = [c for c in codes if c not in set(missing)]
+
+        N = len(codes)
 
         # Engineer features per stock (reuses existing pipeline)
         all_feat_dfs = []
+        expected_cols: set[str] | None = None
         for code in codes:
             if prebuilt_dir:
                 path = os.path.join(prebuilt_dir, f"{code}.parquet")
@@ -1618,8 +1642,7 @@ class FeaturePipeline:
                 # Flat prebuilt (data/features/) carries temporal lag columns
                 # (skip_temporal=False).  Panel training uses skip_temporal=True
                 # (xLSTM learns the time structure itself), so drop *_lag{N}
-                # columns — the remainder is byte-identical to a --panel-mode
-                # build (3815 - 2064 lag cols = 1751).
+                # columns — the remainder matches a --panel-mode build.
                 lag_cols = [c for c in feats.columns if re.search(r"_lag\d+$", c)]
                 if lag_cols:
                     feats = feats.drop(columns=lag_cols)
@@ -1627,6 +1650,22 @@ class FeaturePipeline:
                 # to re-apply even though save_features(panel_mode=True) already
                 # added them — guards against hand-built parquets.
                 feats = add_calendar_features(feats)
+                # Schema check: every prebuilt parquet must carry the same
+                # column set (same --use-* flags during build).  A stock built
+                # with different flags would silently shift every feature's
+                # meaning in the panel.
+                if expected_cols is None:
+                    expected_cols = set(feats.columns)
+                else:
+                    missing_cols = expected_cols - set(feats.columns)
+                    extra_cols = set(feats.columns) - expected_cols
+                    if missing_cols or extra_cols:
+                        raise ValueError(
+                            f"Prebuilt feature column mismatch for {code}: "
+                            f"missing {sorted(missing_cols)}, extra {sorted(extra_cols)}. "
+                            "All parquets must be built with the same --use-* "
+                            "flags in build_features.py."
+                        )
             else:
                 mask = panel["stock_code"] == code
                 df_stock = panel[mask].sort_values("date").reset_index(drop=True)
@@ -1828,8 +1867,19 @@ class FeaturePipeline:
         for col in norm_cols:
             if col not in all_feat.columns:
                 continue
-            stats = all_feat.groupby("date")[col].agg(["mean", "std"])
+            stats = all_feat.groupby("date")[col].agg(["mean", "std", "count"])
             stats["std"] = stats["std"].fillna(1.0).clip(lower=1e-8)
+            # Dates with very few listed stocks (the 2000-2015 backfill has
+            # 1-5 stocks/day) give a degenerate cross-section: std→0 inflates
+            # z-scores to ±hundreds, which dominates the loss.  Fall back to
+            # the pooled global mean/std for those sparse dates — the global
+            # moments are stable even when the daily cross-section is tiny.
+            sparse = stats["count"] < 5
+            if sparse.any():
+                pooled_mean = float(np.nanmean(all_feat[col].values))
+                pooled_std = max(float(np.nanstd(all_feat[col].values)), 1e-8)
+                stats.loc[sparse, "mean"] = pooled_mean
+                stats.loc[sparse, "std"] = pooled_std
             date_stats[col] = stats
 
         for df in all_feat_dfs:
