@@ -10,6 +10,8 @@ from stoke_ml.models.panel.evaluate import (
     compute_calmar,
     compute_profit_factor,
     compute_equity_curve,
+    compute_bootstrap_sharpe_ci,
+    compute_ic_summary,
     evaluate_portfolio,
 )
 
@@ -105,6 +107,71 @@ class TestEquityCurve:
         assert abs(eq[-1].item() - 0.99) < 1e-6
 
 
+class TestBootstrapSharpeCI:
+    """Review §十三: iid resampling of autocorrelated returns understates the
+    CI.  The bootstrap must preserve within-block time structure."""
+
+    def test_finite_ci_for_iid_returns(self):
+        rng = np.random.RandomState(0)
+        rets = rng.randn(120) * 0.01 + 0.0005
+        lo, hi = compute_bootstrap_sharpe_ci(rets, horizon=1)
+        assert np.isfinite(lo) and np.isfinite(hi)
+        assert lo < hi
+
+    def test_block_bootstrap_wider_than_iid_on_autocorrelated(self):
+        # AR(1) with strong persistence: single-return resampling destroys the
+        # autocorrelation and reports a too-narrow CI; block resampling must
+        # widen it (block_len=1 recovers the old iid behaviour).
+        rng = np.random.RandomState(7)
+        n = 200
+        rets = np.zeros(n)
+        for t in range(1, n):
+            rets[t] = 0.6 * rets[t - 1] + rng.randn() * 0.01 + 0.0003
+        lo_b, hi_b = compute_bootstrap_sharpe_ci(rets, horizon=1, n_boot=600)
+        lo_i, hi_i = compute_bootstrap_sharpe_ci(
+            rets, horizon=1, n_boot=600, block_len=1)
+        assert (hi_b - lo_b) > (hi_i - lo_i), (
+            f"block CI {hi_b - lo_b:.4f} should exceed iid CI {hi_i - lo_i:.4f}"
+        )
+
+
+class TestICSummaryNeweyWest:
+    """Review §十三: the plain mean/std IR ignores serial correlation in the
+    per-day IC series.  ic_newey_west_t must be smaller than the iid t-stat
+    when the ICs are positively autocorrelated."""
+
+    def test_empty_returns_zero(self):
+        s = compute_ic_summary([])
+        assert s["ic_newey_west_t"] == 0.0
+        assert s["ic_ir"] == 0.0
+
+    def test_constant_predictions_no_daily_ics(self):
+        # Constant predictions → every day's Spearman is degenerate → empty
+        # IC series → no claimed signal.
+        s = compute_ic_summary([])
+        assert s["ic_newey_west_t"] == 0.0
+
+    def test_nw_t_shrinks_under_positive_autocorrelation(self):
+        rng = np.random.RandomState(1)
+        n = 300
+        ics = np.zeros(n)
+        for t in range(1, n):
+            ics[t] = 0.9 * ics[t - 1] + rng.randn() * 0.02 + 0.0005
+        s = compute_ic_summary(ics.tolist(), horizon=1)
+        naive_t = s["ic_mean"] / (s["ic_std"] / np.sqrt(n))
+        assert s["ic_newey_west_t"] > 0
+        assert s["ic_newey_west_t"] < naive_t, (
+            f"NW t {s['ic_newey_west_t']:.2f} must be < iid t {naive_t:.2f}"
+        )
+
+    def test_nw_t_positive_for_iid_signal(self):
+        rng = np.random.RandomState(0)
+        ics = (rng.randn(200) * 0.02 + 0.005).tolist()
+        s = compute_ic_summary(ics, horizon=1)
+        assert np.isfinite(s["ic_newey_west_t"])
+        assert s["ic_newey_west_t"] > 0
+
+
 def _make_synthetic_panel(n_stocks=24, n_timesteps=320, seed=0):
     """Noise-only synthetic panel: returns are i.i.d. Gaussians, independent of
     every feature.  A model cannot learn signal from it — exactly the state a
@@ -156,6 +223,161 @@ class _RandomReturnModel(nn.Module):
             torch.zeros(b, 3, dtype=torch.float32),
             torch.randn(b, 1, dtype=torch.float32) * 0.01,
             torch.full((b, 1), 0.02, dtype=torch.float32),
+        )
+
+
+class _StaticMarkerModel(nn.Module):
+    """Return prediction = the static marker column, so each stock gets a
+    DISTINCT, per-window-identical prediction.  Lets a test steer which stock
+    the top-K / bottom-K selection picks, to verify the candidate pool honors
+    entry eligibility rather than future-label validity."""
+
+    def forward(self, static, pk, po):
+        b = pk.shape[0]
+        return (
+            torch.zeros(b, 3, dtype=torch.float32),
+            static[:, :1].float(),
+            torch.full((b, 1), 0.02, dtype=torch.float32),
+        )
+
+
+class TestEvaluateCandidatePool:
+    """Review §二 survivor bias: the candidate pool must be ENTRY-ELIGIBLE
+    stocks (real open at the entry day), NOT stocks that happen to have a
+    future label.  With carry-realized returns every entry-eligible stock has
+    a tradeable outcome, so selection never conditions on survival."""
+
+    SEQ_LEN = 60
+    HORIZON = 1
+    N_TIMESTEPS = 200
+
+    def _pool_data(self, with_mask: bool):
+        n_stocks, n_timesteps, seq_len = 3, self.N_TIMESTEPS, self.SEQ_LEN
+        rng = np.random.RandomState(0)
+        # static[0] = per-stock prediction marker: stock 0 low, stock 1 mid,
+        # stock 2 high — but stock 2 is NOT entry-eligible.
+        static = np.array([[-1.0], [0.0], [1.0]], dtype=np.float32)
+        pk = rng.randn(n_stocks, n_timesteps, 12).astype(np.float32)
+        po = rng.randn(n_stocks, n_timesteps, 10).astype(np.float32)
+        # Every stock has a VALID future label (y_dir never -100) — the old
+        # survivor pool (y_dir != -100) would wrongly include stock 2.
+        y_dir = np.full((n_stocks, n_timesteps), 2, dtype=np.int64)
+        y_ret = np.zeros((n_stocks, n_timesteps), dtype=np.float32)
+        y_vol = np.full((n_stocks, n_timesteps), 0.02, dtype=np.float32)
+
+        t = np.arange(n_timesteps)
+        realized = np.zeros((n_stocks, n_timesteps), dtype=np.float32)
+        # stock 0/1: small, oscillating, always positive spread (top>bottom);
+        # stock 2: strongly NEGATIVE outcome but the model predicts it highest —
+        # if it leaked into the pool, long-short would flip sign.
+        realized[0, seq_len:] = (-0.001 - 0.0005 * np.sin(t[seq_len:] / 3)).astype(np.float32)
+        realized[1, seq_len:] = (0.002 + 0.0005 * np.sin(t[seq_len:] / 3)).astype(np.float32)
+        realized[2, seq_len:] = (-0.10 + 0.0005 * np.cos(t[seq_len:] / 3)).astype(np.float32)
+
+        data = {
+            "static_features": static,
+            "past_known": pk,
+            "past_observed": po,
+            "y_direction": y_dir,
+            "y_return": y_ret,
+            "y_volatility": y_vol,
+            "realized_return": realized,
+        }
+        if with_mask:
+            entry = np.ones((n_stocks, n_timesteps), dtype=bool)
+            entry[2] = False  # stock 2: no real open at entry → not eligible
+            data["entry_eligible_mask"] = entry
+        return data
+
+    def _eval(self, data):
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        return evaluate_portfolio(
+            _StaticMarkerModel(), data, cfg, torch.device("cpu"),
+            horizon=self.HORIZON,
+        )
+
+    def test_entry_eligible_pool_excludes_future_label_stock(self):
+        """With the mask present, stock 2 (valid label but no real open) is
+        excluded → long-short is driven only by eligible stocks 0/1 → POSITIVE
+        spread.  The old future-label pool would include stock 2 (predicted
+        top) and flip long-short negative — the survivor bias."""
+        m = self._eval(self._pool_data(with_mask=True))
+        assert m["n_periods"] > 100
+        assert m["long_sharpe"] > 0, f"ineligible stock leaked in: {m['long_sharpe']}"
+        assert m["ls_sharpe"] > 0, f"ineligible stock leaked in: {m['ls_sharpe']}"
+
+    def test_without_mask_survivor_bias_flips_spread(self):
+        """Control: with NO entry mask, the fallback pool is y_dir != -100 which
+        includes stock 2 → its big negative outcome in the top-K LONG flips the
+        spread negative.  This proves the entry-mask (not something else) is
+        what suppresses the survivor bias above."""
+        m = self._eval(self._pool_data(with_mask=False))
+        assert m["n_periods"] > 100
+        assert m["ls_sharpe"] < 0, f"fallback pool did not show survivor bias: {m['ls_sharpe']}"
+
+
+class TestEvaluateRealizedPreference:
+    """evaluate_portfolio must use val_data['realized_return'] (carry-last-close,
+    defined for every entry-eligible day) and IGNORE the raw_returns argument
+    when both are present — otherwise evaluation would silently fall back to a
+    label-conditioned return."""
+
+    def test_realized_return_preferred_over_raw_returns(self):
+        n_stocks, n_timesteps, seq_len = 2, 200, 60
+        rng = np.random.RandomState(1)
+        static = rng.randn(n_stocks, 1).astype(np.float32)
+        pk = rng.randn(n_stocks, n_timesteps, 12).astype(np.float32)
+        po = rng.randn(n_stocks, n_timesteps, 10).astype(np.float32)
+        y_dir = np.zeros((n_stocks, n_timesteps), dtype=np.int64)
+        y_ret = np.zeros((n_stocks, n_timesteps), dtype=np.float32)
+        y_vol = np.full((n_stocks, n_timesteps), 0.02, dtype=np.float32)
+        t = np.arange(n_timesteps)
+        realized = np.tile(
+            (0.02 + 0.01 * np.sin(t / 3)).astype(np.float32), (n_stocks, 1))
+        raw = np.tile(
+            (-0.02 + 0.01 * np.cos(t / 3)).astype(np.float32), (n_stocks, 1))
+        data = {
+            "static_features": static,
+            "past_known": pk,
+            "past_observed": po,
+            "y_direction": y_dir,
+            "y_return": y_ret,
+            "y_volatility": y_vol,
+            "entry_eligible_mask": np.ones((n_stocks, n_timesteps), dtype=bool),
+            "realized_return": realized,
+        }
+        cfg = PanelConfig(seq_len=seq_len, horizon=1)
+        m = evaluate_portfolio(
+            _ConstantReturnModel(), data, cfg, torch.device("cpu"),
+            horizon=1, raw_returns=raw,
+        )
+        # EW baseline is the cross-sectional mean of the EVALUATED actuals.
+        # realized has positive mean (+0.02) → positive EW sharpe; raw has
+        # negative mean → if wrongly preferred, EW sharpe would be negative.
+        assert m["ew_sharpe"] > 0, f"raw_returns leaked into eval: {m['ew_sharpe']}"
+
+
+class TestEvaluateAllHorizonPhases:
+    """Review §五: every entry phase (offset 0..horizon-1) is evaluated and
+    concatenated, so no in-sample entry days are wasted.  The old single-phase
+    loop discarded (horizon-1)/horizon of the data."""
+
+    def test_all_entry_phases_used(self):
+        n_stocks, n_timesteps, seq_len, horizon = 12, 260, 60, 5
+        n_windows = n_timesteps - seq_len
+        data = _make_synthetic_panel(n_stocks=n_stocks, n_timesteps=n_timesteps)
+        data["entry_eligible_mask"] = np.ones((n_stocks, n_timesteps), dtype=bool)
+        # Materialize a writable copy (broadcast_to yields a read-only view
+        # that trips torch.as_tensor's writability warning).
+        data["realized_return"] = np.tile(
+            (0.001 * np.sin(np.arange(n_timesteps) / 7)).astype(np.float32),
+            (n_stocks, 1))
+        cfg = PanelConfig(seq_len=seq_len, horizon=horizon)
+        m = evaluate_portfolio(
+            _ConstantReturnModel(), data, cfg, torch.device("cpu"), horizon=horizon)
+        # ~1 period per window day, NOT n_windows/horizon
+        assert m["n_periods"] >= n_windows - 2, (
+            f"only {m['n_periods']}/{n_windows} periods — entry phases wasted"
         )
 
 

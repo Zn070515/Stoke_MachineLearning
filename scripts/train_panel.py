@@ -26,6 +26,7 @@ from stoke_ml.config import load_config
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.train import train_panel
+from stoke_ml.models.panel.evaluate import evaluate_portfolio
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -133,30 +134,6 @@ def _resolve_universe(
         chosen = members[:limit] if limit else members
         return chosen, f"{universe} {len(chosen)} (PIT union, cap={limit})"
     raise ValueError(f"unknown --universe: {universe}")
-
-
-def _best_eval_metrics(history: dict) -> tuple[dict, int]:
-    """Metrics of the exact deployed (best-val-loss) checkpoint.
-
-    train_panel evaluates the best checkpoint once after loading best_state
-    and stores it under history["best_metrics"].  Use that directly instead of
-    the nearest-eval-epoch proxy — the in-loop val_metrics snapshots come from
-    whatever model was current at that eval epoch, which can differ from the
-    checkpoint that is actually returned and saved.  Fall back to the nearest
-    eval only if best_metrics is unavailable (e.g. evaluation failed).
-    """
-    best = history.get("best_metrics")
-    if best:
-        return best, history.get("best_epoch_idx", 0) + 1
-    metrics = history.get("val_metrics") or []
-    if not metrics:
-        return {}, 0
-    eval_epochs = history.get("val_eval_epochs")
-    if not eval_epochs or len(eval_epochs) != len(metrics):
-        eval_epochs = [5 * (i + 1) for i in range(len(metrics))]
-    best_epoch = history.get("best_epoch_idx", 0) + 1
-    nearest = min(range(len(metrics)), key=lambda i: abs(eval_epochs[i] - best_epoch))
-    return metrics[nearest], eval_epochs[nearest]
 
 
 def load_aux_data(
@@ -444,9 +421,41 @@ def _cross_sectional_normalize(
     return y_out
 
 
+def _slice_panel(panel_data: dict, tslice: slice) -> dict:
+    """Slice every time-axis array of the panel by `tslice`.
+
+    Static features are shared (not sliced).  Arrays that downstream code
+    mutates in place (y_return z-score + clip, and their neighbours) are copied
+    so one fold's normalization never corrupts the shared panel for later
+    folds.
+    """
+    return {
+        "static_features": panel_data["static_features"],
+        "past_known": panel_data["past_known"][:, tslice],
+        "past_observed": panel_data["past_observed"][:, tslice],
+        "y_direction": panel_data["y_direction"][:, tslice],
+        "y_return": panel_data["y_return"][:, tslice].copy(),
+        "y_volatility": panel_data["y_volatility"][:, tslice].copy(),
+        "observation_mask": panel_data["observation_mask"][:, tslice],
+        "entry_eligible_mask": panel_data["entry_eligible_mask"][:, tslice],
+        "return_target_mask": panel_data["return_target_mask"][:, tslice],
+        "vol_target_mask": panel_data["vol_target_mask"][:, tslice],
+        "realized_return": panel_data["realized_return"][:, tslice].copy(),
+        "date_indices": panel_data["date_indices"][:, tslice].copy(),
+    }
+
+
+def _fmt_date(global_dates, idx):
+    """Global-calendar position → 'YYYY-MM-DD'.  Out of range → None."""
+    if global_dates is None or idx < 0 or idx >= len(global_dates):
+        return None
+    return str(np.datetime_as_string(global_dates[idx], unit="D"))
+
+
 def _augment_sequence(
     pk: np.ndarray,
     po: np.ndarray,
+    obs_mask: np.ndarray | None = None,
     noise_std: float = 0.01,
     mask_prob: float = 0.05,
     feat_dropout: float = 0.02,
@@ -460,7 +469,10 @@ def _augment_sequence(
     3. Feature dropout — zero out random feature dimensions
 
     All augmentations are conservative (small magnitudes) to avoid
-    distorting the financial signal.
+    distorting the financial signal.  Gaussian noise is gated by `obs_mask`
+    (True = real observation) so zero-padded history of new listings stays
+    exactly zero instead of gaining fake noise that the model would read as
+    real data.
     """
     if rng is None:
         rng = np.random.RandomState()
@@ -468,10 +480,16 @@ def _augment_sequence(
     pk_aug = pk.copy()
     po_aug = po.copy()
 
-    # 1. Gaussian noise (per-element, independent)
+    # 1. Gaussian noise (per-element, independent), only on real-observation days
     if noise_std > 0:
-        pk_aug += rng.randn(*pk.shape).astype(np.float32) * noise_std
-        po_aug += rng.randn(*po.shape).astype(np.float32) * noise_std
+        noise_pk = rng.randn(*pk.shape).astype(np.float32) * noise_std
+        noise_po = rng.randn(*po.shape).astype(np.float32) * noise_std
+        if obs_mask is not None:
+            obs_b = obs_mask[..., None].astype(np.float32)
+            noise_pk *= obs_b
+            noise_po *= obs_b
+        pk_aug += noise_pk
+        po_aug += noise_po
 
     # 2. Time masking: zero out a random contiguous block of length 1-5
     if mask_prob > 0 and pk.shape[1] >= 3:
@@ -678,6 +696,10 @@ def main():
         panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
     )
 
+    # Union trading calendar (datetime64[ns]) — fold boundaries in index space
+    # map back to real dates for the summary (review v3 §十五).
+    global_dates = panel_data.get("global_dates")
+
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
     dims = f"S={panel_data['static_features'].shape[1]} " \
@@ -741,99 +763,123 @@ def main():
         train_start = 0
         val_end = min(val_start + val_len, n_timesteps)
 
-        train_slice = slice(train_start, train_end)
+        # Carve the last ~15% of the trainable span as inner_val — used ONLY
+        # for checkpoint selection inside train_panel.  The outer test (the old
+        # val window) is fully held out of training and evaluated exactly once
+        # on the deployed checkpoint.
+        n_train_targets = train_end - config.seq_len
+        inner_val_len = max(1, int(round(0.15 * n_train_targets)))
+        inner_val_context_start = train_end - inner_val_len - config.seq_len
+        if inner_val_context_start < config.seq_len + 1:
+            # not enough rows left for one inner_train + one inner_val window
+            break
+        inner_train_end = inner_val_context_start
         val_context_start = val_start - config.seq_len
-        val_slice = slice(val_context_start, val_end)
 
-        # Build a validity mask: position (i,t) is valid if y_direction != -100
-        # (i.e. not tail-padded and not limit-up/down masked).
-        train_mask = panel_data["y_direction"][:, train_slice] != -100
-        val_mask = panel_data["y_direction"][:, val_slice] != -100
+        inner_train_slice = slice(0, inner_train_end)
+        inner_val_slice = slice(inner_val_context_start, train_end)
+        outer_test_slice = slice(val_context_start, val_end)
 
-        train_data = {
-            "static_features": panel_data["static_features"],
-            "past_known": panel_data["past_known"][:, train_slice],
-            "past_observed": panel_data["past_observed"][:, train_slice],
-            "y_direction": panel_data["y_direction"][:, train_slice],
-            "y_return": panel_data["y_return"][:, train_slice].copy(),
-            "y_volatility": panel_data["y_volatility"][:, train_slice].copy(),
-            "date_indices": panel_data["date_indices"][:, train_slice].copy(),
-        }
-        val_data = {
-            "static_features": panel_data["static_features"],
-            "past_known": panel_data["past_known"][:, val_slice],
-            "past_observed": panel_data["past_observed"][:, val_slice],
-            "y_direction": panel_data["y_direction"][:, val_slice],
-            "y_return": panel_data["y_return"][:, val_slice].copy(),
-            "y_volatility": panel_data["y_volatility"][:, val_slice].copy(),
-            "date_indices": panel_data["date_indices"][:, val_slice].copy(),
-        }
+        inner_train_data = _slice_panel(panel_data, inner_train_slice)
+        inner_val_data = _slice_panel(panel_data, inner_val_slice)
+        outer_test_data = _slice_panel(panel_data, outer_test_slice)
 
         # y_return: cross-sectional z-score per date — preserves relative
         # ordering across stocks so ranking loss and IC evaluation work on a
-        # consistent scale.  y_volatility: kept as the raw positive future-vol
-        # target (std of the next-horizon daily returns).  VolatilityHead
-        # outputs softplus > 0, so z-scoring the target would reintroduce the
+        # consistent scale.  Normalize using the RETURN-target mask (clean
+        # open-to-open returns) so dirty/missing positions don't skew the
+        # z-score.  y_volatility: kept as the raw positive future-vol target
+        # (std of the next-horizon daily returns).  VolatilityHead outputs
+        # softplus > 0, so z-scoring the target would reintroduce the
         # negative-target-vs-positive-output contradiction — it must stay in
         # original units.
-        train_data["y_return"] = _cross_sectional_normalize(
-            train_data["y_return"], train_mask,
+        inner_train_data["y_return"] = _cross_sectional_normalize(
+            inner_train_data["y_return"], inner_train_data["return_target_mask"],
         )
-        # Save raw returns BEFORE normalization for portfolio evaluation.
-        raw_val_y_return = val_data["y_return"].copy()
-        val_data["y_return"] = _cross_sectional_normalize(
-            val_data["y_return"], val_mask,
+        inner_val_data["y_return"] = _cross_sectional_normalize(
+            inner_val_data["y_return"], inner_val_data["return_target_mask"],
+        )
+        outer_test_data["y_return"] = _cross_sectional_normalize(
+            outer_test_data["y_return"], outer_test_data["return_target_mask"],
         )
         # Clip normalized targets to [-5, 5] — same band for train and val so
         # the model is never asked to fit z-scores beyond the eval range.
         # (Only y_return is z-scored; y_volatility stays in original units,
         # well below 5, so the clip applies to y_return only.)
-        np.clip(val_data["y_return"], -5.0, 5.0, out=val_data["y_return"])
-        np.clip(train_data["y_return"], -5.0, 5.0, out=train_data["y_return"])
+        for dd in (inner_train_data, inner_val_data, outer_test_data):
+            np.clip(dd["y_return"], -5.0, 5.0, out=dd["y_return"])
 
-        # Time-series data augmentation on training data.
-        # Each stock's sequence gets independent noise/masking/dropout
-        # — increases effective dataset size and improves robustness.
+        # Time-series data augmentation on the inner-training data.
+        # Each stock's sequence gets independent noise/masking/dropout —
+        # Gaussian noise gated by observation_mask so zero-padded history
+        # (new listings) stays exactly zero instead of gaining fake noise.
         if not args.no_augment:
             pk_aug, po_aug = _augment_sequence(
-                train_data["past_known"],
-                train_data["past_observed"],
+                inner_train_data["past_known"],
+                inner_train_data["past_observed"],
+                obs_mask=inner_train_data["observation_mask"],
                 noise_std=0.005,
                 mask_prob=0.03,
                 feat_dropout=0.01,
                 rng=rng,
             )
-            train_data["past_known"] = pk_aug
-            train_data["past_observed"] = po_aug
+            inner_train_data["past_known"] = pk_aug
+            inner_train_data["past_observed"] = po_aug
 
-        logger.info("Fold %d/%d: train [%d:%d], val [%d:%d]",
+        logger.info("Fold %d/%d: inner_train [%d:%d] inner_val [%d:%d] "
+                    "outer_test [%d:%d]",
                     fold, args.max_folds or "∞",
-                    train_start, train_end, val_start, val_end)
+                    0, inner_train_end,
+                    inner_val_context_start, train_end,
+                    val_context_start, val_end)
 
         t0 = time.time()
+        # Checkpoint selection runs on inner_val inside train_panel; the
+        # returned model is the best-inner-val checkpoint.
         model, history = train_panel(
-            config, train_data, val_data, device,
-            raw_val_returns=raw_val_y_return,
+            config, inner_train_data, inner_val_data, device,
+            raw_val_returns=inner_val_data["realized_return"],
         )
         elapsed = time.time() - t0
 
-        if history["val_ls_sharpe"]:
-            best_m, best_eval_epoch = _best_eval_metrics(history)
-            best_ls = best_m.get("ls_sharpe", 0)
+        # Evaluate the exact deployed checkpoint ONCE on the held-out outer
+        # test — the honest out-of-sample number, never used for selection.
+        outer_m = evaluate_portfolio(
+            model, outer_test_data, config, device,
+            horizon=config.horizon,
+            raw_returns=outer_test_data["realized_return"],
+        )
+        best_epoch = history.get("best_epoch_idx", 0) + 1
+        if outer_m["n_periods"] >= 2:
+            best_ls = outer_m["ls_sharpe"]
             all_sharpes.append(best_ls)
-            fold_histories.append(history)
+            # Input-context date bounds of each segment — column t of the panel
+            # is global_dates[t], so a slice [a,b) covers dates [a, b-1].
+            fold_histories.append({
+                "history": history,
+                "outer_metrics": outer_m,
+                "best_epoch": best_epoch,
+                "train_start": _fmt_date(global_dates, 0),
+                "train_end": _fmt_date(global_dates, inner_train_end - 1),
+                "inner_val_start": _fmt_date(global_dates, inner_val_context_start),
+                "inner_val_end": _fmt_date(global_dates, train_end - 1),
+                "test_start": _fmt_date(global_dates, val_context_start),
+                "test_end": _fmt_date(global_dates, val_end - 1),
+            })
             logger.info(
-                "  Fold %d: eval@epoch%d LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
+                "  Fold %d: best@epoch%d OUTER-TEST LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
                 "Long_Sharpe=%.2f Q5-Q1=%.1fbp EW_Sharpe=%.2f (%.1fs)",
-                fold, best_eval_epoch, best_ls,
-                best_m.get("ic_mean", 0), best_m.get("ic_ir", 0),
-                best_m.get("long_sharpe", 0),
-                best_m.get("q5mq1_ret", 0) * 10000,
-                best_m.get("ew_sharpe", 0),
+                fold, best_epoch, best_ls,
+                outer_m.get("ic_mean", 0), outer_m.get("ic_ir", 0),
+                outer_m.get("long_sharpe", 0),
+                outer_m.get("q5mq1_ret", 0) * 10000,
+                outer_m.get("ew_sharpe", 0),
                 elapsed,
             )
         else:
-            logger.warning("  Fold %d: no valid metrics (%.1fs)", fold, elapsed)
+            logger.warning(
+                "  Fold %d: outer-test too short for metrics (%.1fs)", fold, elapsed,
+            )
 
         val_start -= step
 
@@ -845,9 +891,11 @@ def main():
     if all_sharpes:
         logger.info("=== %d-Fold Summary ===", len(all_sharpes))
         logger.info("LS_Sharpe mean: %.2f ± %.2f", np.mean(all_sharpes), np.std(all_sharpes))
+        # IC comes from the outer-test evaluation of the exact deployed
+        # checkpoint (outer_metrics) — never an in-loop proxy.
         all_ics = [
-            _best_eval_metrics(h)[0].get("ic_mean", float("nan"))
-            for h in fold_histories if h.get("val_metrics")
+            f["outer_metrics"].get("ic_mean", float("nan"))
+            for f in fold_histories if f.get("outer_metrics")
         ]
         all_ics = [x for x in all_ics if not np.isnan(x)]
         if all_ics:
@@ -859,14 +907,32 @@ def main():
             "ic_mean": float(np.mean(all_ics)) if all_ics else None,
             "ic_std": float(np.std(all_ics)) if all_ics else None,
             "universe": universe_desc,
+            # Review v3 §十三: with step < val_len the outer-test folds OVERLAP
+            # (adjacent folds share test days), so mean±std across folds is NOT
+            # the dispersion of independent experiments.  Surface it instead of
+            # letting the numbers be misread; per-fold test_start/test_end make
+            # the overlap visible.
+            "folds_overlap": bool(step < val_len),
+            "fold_note": (
+                "Outer-test folds overlap (step < val_len): adjacent folds share "
+                "test days, so mean±std is the dispersion of the fold schedule, "
+                "not independent experiments."
+                if step < val_len else None
+            ),
             "folds": [],
         }
-        for i, h in enumerate(fold_histories):
-            m, eval_epoch = _best_eval_metrics(h)
+        for i, f in enumerate(fold_histories):
+            m = f["outer_metrics"]
             summary_data["folds"].append({
                 "fold": i + 1,
-                "best_epoch": h.get("best_epoch_idx", 0) + 1,
-                "eval_epoch": eval_epoch,
+                "best_epoch": f["best_epoch"],
+                "eval_epoch": f["best_epoch"],
+                "train_start": f.get("train_start"),
+                "train_end": f.get("train_end"),
+                "inner_val_start": f.get("inner_val_start"),
+                "inner_val_end": f.get("inner_val_end"),
+                "test_start": f.get("test_start"),
+                "test_end": f.get("test_end"),
                 "ls_sharpe": m.get("ls_sharpe"),
                 "ic_mean": m.get("ic_mean"),
                 "ic_ir": m.get("ic_ir"),

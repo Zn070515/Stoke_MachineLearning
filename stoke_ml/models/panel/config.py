@@ -56,6 +56,12 @@ class PanelConfig:
     # Sequence
     seq_len: int = 60
 
+    # Sample eligibility (review v3 §四): a window is trainable only if its
+    # input has >= min_history real observations (new listings with mostly
+    # zero-padded history are excluded) AND the target day is entry-eligible
+    # AND at least one target mask is set.
+    min_history: int = 50
+
     # Output
     num_direction_classes: int = 3  # down / flat / up
     horizon: int = 5

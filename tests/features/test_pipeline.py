@@ -243,6 +243,96 @@ class TestPanelCalendarAlignment:
         assert n_zero_valid == 0
 
 
+class TestPanelMasksAndCarry:
+    """Review §二/§六/§八: mask splitting + carry-last-close realization.
+
+    build_panel_features must emit per-task masks and a realized-return array
+    whose semantics match the review:
+      - entry_eligible_mask ⊆ observation_mask (every open-valid day is a real
+        day, but a real day may lack an open — e.g. a data gap);
+      - return_target_mask = a clean open[t+h]/open[t]-1 exists;
+      - realized_return[t] = clean forward return where available, else carry
+        to the last real close in (t, t+h], else flat 0 — defined for EVERY
+        entry-eligible day so the candidate pool never conditions on a future
+        label existing.
+    """
+
+    @staticmethod
+    def _make_exact_panel():
+        """12 days, open=10..21 (+1/day), close=open+0.5 — fully deterministic
+        forward returns so the carry math is asserted exactly."""
+        dates = pd.bdate_range("2020-01-01", periods=12)
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+        return pd.DataFrame({
+            "date": dates,
+            "stock_code": ["600000"] * 12,
+            "open": open_,
+            "high": np.maximum(open_, close) + 0.2,
+            "low": np.minimum(open_, close) - 0.2,
+            "close": close,
+            "volume": np.full(12, 1_000_000.0),
+        })
+
+    def _build(self):
+        panel = self._make_exact_panel()
+        return FeaturePipeline(seq_len=5).build_panel_features(
+            panel, aux_data={}, horizon=3)
+
+    def test_carry_last_close_realized(self):
+        """Realized = clean open-to-open where available, else the last real
+        close in (t, t+h], else 0 — never NaN, never label-conditioned."""
+        p = self._build()
+        r = p["realized_return"][0]
+        ret = p["return_target_mask"][0]
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+
+        # Clean forward return where open[t+3] exists (t = 0..8)
+        for t in range(9):
+            assert ret[t], f"return target should be valid at t={t}"
+            assert np.isclose(r[t], open_[t + 3] / open_[t] - 1), f"t={t}"
+        assert not ret[9:].any(), "tail has no forward open → not a return target"
+
+        # Carry to the last real close in (t, t+h] — NOT flat 0
+        assert np.isclose(r[9], close[11] / open_[9] - 1)
+        assert np.isclose(r[10], close[11] / open_[10] - 1)
+        # No later close at all → flat 0
+        assert r[11] == 0.0
+
+    def test_masks_split(self):
+        """observation ⊇ entry; return/vol targets only where a clean window
+        exists; direction follows the forward-return threshold."""
+        p = self._build()
+        obs = p["observation_mask"][0]
+        entry = p["entry_eligible_mask"][0]
+        ret = p["return_target_mask"][0]
+        vol = p["vol_target_mask"][0]
+        # Every open-valid day is also close-valid in synthetic K-line
+        assert (entry & ~obs).sum() == 0
+        assert obs.all() and entry.all()
+        # Return target: clean open-to-open, last `horizon` days excluded
+        assert ret[:9].all() and not ret[9:].any()
+        # Vol target: (t, t+h] holds >= 2 valid close returns → t < T-h
+        assert vol[:9].all() and not vol[9:].any()
+        # All forward returns positive → every valid direction label is "up"
+        assert (p["y_direction"][0][:9] == 2).all()
+
+    def test_entry_subset_of_observation_calendar_aligned(self):
+        """On the multi-stock calendar-aligned panel, a real open never appears
+        on a day that isn't a real close (a K-line row supplies both)."""
+        base = pd.bdate_range("2020-01-01", "2020-08-31")
+        A = _make_panel_kl(list(base), seed=1)
+        A["stock_code"] = "000001"
+        B = _make_panel_kl(list(base), seed=2)
+        B["stock_code"] = "000002"
+        p = FeaturePipeline(seq_len=60).build_panel_features(
+            pd.concat([A, B], ignore_index=True), aux_data={}, horizon=5)
+        entry = p["entry_eligible_mask"]
+        obs = p["observation_mask"]
+        assert (entry & ~obs).sum() == 0
+
+
 class TestPanelTruncationInvariance:
     """Review §五 anti-cheat test #2: features must not see the future.
 

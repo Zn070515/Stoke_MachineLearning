@@ -37,7 +37,7 @@ class TestPanelDataset:
     def test_getitem_shapes(self):
         data = make_synthetic_data(n_days=100, seq_len=60)
         ds = PanelDataset(data, seq_len=60)
-        static, pk, po, y_dir, y_ret, y_vol, date_idx = ds[0]
+        static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask = ds[0]
         assert static.shape == (8,)
         assert pk.shape == (60, 20)
         assert po.shape == (60, 12)
@@ -45,12 +45,14 @@ class TestPanelDataset:
         assert y_ret.ndim == 0
         assert y_vol.ndim == 0
         assert date_idx == 0  # default 0 when no date_indices passed
+        # masks fall back to y_direction validity when target masks absent
+        assert bool(dir_mask) and bool(ret_mask) and bool(vol_mask)
 
     def test_collate_fn(self):
         data = make_synthetic_data(n_days=100, seq_len=60)
         ds = PanelDataset(data, seq_len=60)
         batch = [ds[i] for i in range(4)]
-        static, pk, po, y_dir, y_ret, y_vol, date_idx = panel_collate(batch)
+        static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask = panel_collate(batch)
         assert static.shape == (4, 8)
         assert pk.shape == (4, 60, 20)
         assert po.shape == (4, 60, 12)
@@ -58,6 +60,48 @@ class TestPanelDataset:
         assert y_ret.shape == (4,)
         assert y_vol.shape == (4,)
         assert date_idx.shape == (4,)
+        assert dir_mask.shape == (4,) and dir_mask.dtype == torch.bool
+        assert ret_mask.shape == (4,)
+        assert vol_mask.shape == (4,)
+
+    def test_valid_mask_requires_history_and_entry(self):
+        """Review §四: a window is trainable only when its input window holds
+        >= min_history real observations (new listings with mostly zero-padded
+        history are excluded) AND the target day is entry-eligible."""
+        data = make_synthetic_data(n_stocks=2, n_days=100, seq_len=60)
+        n_stocks, n_days = data["past_known"].shape[0], data["past_known"].shape[1]
+        obs = torch.zeros(n_stocks, n_days, dtype=torch.bool)
+        obs[0, :] = True          # stock 0 fully observed
+        obs[1, 90:] = True        # stock 1 only real from column 90 (new listing)
+        data["observation_mask"] = obs
+        data["entry_eligible_mask"] = torch.ones(n_stocks, n_days, dtype=torch.bool)
+        data["return_target_mask"] = torch.ones(n_stocks, n_days, dtype=torch.bool)
+        data["vol_target_mask"] = torch.ones(n_stocks, n_days, dtype=torch.bool)
+        ds = PanelDataset(data, seq_len=60, min_history=50)
+        vm = ds.valid_mask  # (2, 40)
+        # stock 0: window [0,60) has 60 real obs >= 50 → valid
+        assert bool(vm[0, 0])
+        # stock 1: window [0,60) has 0 real obs < 50 → invalid (new listing)
+        assert not bool(vm[1, 0])
+        # stock 1: every window holds at most 9 real obs (cols 90..98) < 50 → all invalid
+        assert not bool(vm[1, :].any())
+
+    def test_getitem_returns_per_task_masks(self):
+        """Review §八: each loss applies its own mask instead of one shared
+        y_direction mask — return-target valid but vol-target invalid must be
+        reflected separately."""
+        data = make_synthetic_data(n_stocks=2, n_days=100, seq_len=60)
+        n_stocks, n_days = data["past_known"].shape[0], data["past_known"].shape[1]
+        data["observation_mask"] = torch.ones(n_stocks, n_days, dtype=torch.bool)
+        data["entry_eligible_mask"] = torch.ones(n_stocks, n_days, dtype=torch.bool)
+        data["return_target_mask"] = torch.ones(n_stocks, n_days, dtype=torch.bool)
+        data["vol_target_mask"] = torch.zeros(n_stocks, n_days, dtype=torch.bool)
+        ds = PanelDataset(data, seq_len=60)
+        _, _, _, y_dir, y_ret, y_vol, _, dir_mask, ret_mask, vol_mask = ds[0]
+        assert bool(dir_mask)          # y_direction valid
+        assert bool(ret_mask)          # return target valid
+        assert not bool(vol_mask)      # vol target invalid
+
 
     def test_date_idx_is_target_date_not_last_feature_date(self):
         """Review §五 off-by-one: a window [start, end) is ranked by the TARGET
@@ -72,10 +116,10 @@ class TestPanelDataset:
         )
         ds = PanelDataset(data, seq_len=60)
         # window [0, 60): target lives at column 60 → date_idx must be 60.
-        _, _, _, _, _, _, date_idx = ds[0]
+        _, _, _, _, _, _, date_idx, *_ = ds[0]
         assert date_idx == 60
         # window [5, 65): target at column 65 → not 64.
-        _, _, _, _, _, _, date_idx = ds[5]
+        _, _, _, _, _, _, date_idx, *_ = ds[5]
         assert date_idx == 65
 
     def test_date_indices_narrower_than_timesteps_raises(self):

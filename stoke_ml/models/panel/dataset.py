@@ -2,6 +2,22 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 
+def _window_history_counts(obs_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """Real-observation count inside each length-seq_len input window.
+
+    obs_mask: (N, T) bool.  Returns (N, T-seq_len) where out[:, w] =
+    obs_mask[:, w : w+seq_len].sum() — how many genuinely-observed days the
+    model saw in window w (w = 0..T-seq_len-1, one per trainable target at
+    column w+seq_len), used to reject mostly-padded new listings.
+    """
+    n_stocks, n_timesteps = obs_mask.shape
+    cum = torch.cumsum(obs_mask.to(torch.int64), dim=1)
+    cum = torch.cat([torch.zeros(n_stocks, 1, dtype=torch.int64), cum], dim=1)
+    # cum[:, i] = sum of obs_mask[:, :i] → window count = cum[w+seq] - cum[w];
+    # drop the last column whose window [T-seq, T) has no in-bounds target day.
+    return (cum[:, seq_len:] - cum[:, :cum.shape[1] - seq_len])[:, :-1].to(torch.float32)
+
+
 class PanelDataset(Dataset):
     """Panel dataset for VSN+xLSTM model training.
 
@@ -17,8 +33,10 @@ class PanelDataset(Dataset):
         self,
         data: dict,
         seq_len: int = 60,
+        min_history: int = 50,
     ):
         self.seq_len = seq_len
+        self.min_history = min_history
 
         def _to_tensor(arr, dtype):
             if isinstance(arr, torch.Tensor):
@@ -32,15 +50,50 @@ class PanelDataset(Dataset):
         self.y_return = _to_tensor(data["y_return"], torch.float32)
         self.y_volatility = _to_tensor(data["y_volatility"], torch.float32)
 
+        # Per-task target masks (review v3 §八): each loss applies its own mask
+        # instead of one y_direction != -100 ruling all tasks.  Optional for
+        # backward-compat — synthetic test data without masks falls back to the
+        # old single-mask behaviour.
+        self.obs_mask = (
+            _to_tensor(data["observation_mask"], torch.bool)
+            if "observation_mask" in data else None
+        )
+        self.entry_eligible = (
+            _to_tensor(data["entry_eligible_mask"], torch.bool)
+            if "entry_eligible_mask" in data else None
+        )
+        self.ret_target = (
+            _to_tensor(data["return_target_mask"], torch.bool)
+            if "return_target_mask" in data else None
+        )
+        self.vol_target = (
+            _to_tensor(data["vol_target_mask"], torch.bool)
+            if "vol_target_mask" in data else None
+        )
+
         self.n_stocks = self.past_known.shape[0]
         self.n_timesteps = self.past_known.shape[1]
         self.n_windows = self.n_timesteps - seq_len
 
-        # valid_mask[stock, window] = 1.0 iff the target at end of that window
-        # is a real observation.  Stocks with shorter listing history are padded
-        # with y_direction == -100; windows whose target lands in the pad region
-        # must never be sampled (they are all-zero features → garbage gradients).
-        self.valid_mask = (self.y_direction[:, self.seq_len:] != -100)
+        if self.entry_eligible is not None and self.obs_mask is not None:
+            # Window [w, w+seq_len) is trainable iff the target day w+seq_len is
+            # entry-eligible, the input window holds >= min_history real
+            # observations (new listings with mostly zero-padded history are
+            # excluded — review v3 §四), and at least one target mask is set.
+            target_any = (self.y_direction[:, self.seq_len:] != -100)
+            if self.ret_target is not None:
+                target_any = target_any | self.ret_target[:, self.seq_len:]
+            if self.vol_target is not None:
+                target_any = target_any | self.vol_target[:, self.seq_len:]
+            hist_count = _window_history_counts(self.obs_mask, self.seq_len)
+            self.valid_mask = (
+                self.entry_eligible[:, self.seq_len:]
+                & (hist_count >= self.min_history)
+                & target_any
+            )
+        else:
+            # Backward-compat fallback: target-day label validity only.
+            self.valid_mask = (self.y_direction[:, self.seq_len:] != -100)
 
         # date_idx[t] = t for each window position — used by PairwiseRankingLoss
         # to group samples from the same calendar date for cross-sectional ranking.
@@ -74,9 +127,18 @@ class PanelDataset(Dataset):
         # Target is at `end` (the step after the window [start, end)), so the
         # date used to group this sample cross-sectionally is the TARGET date,
         # not the last feature date (`end - 1`).  Ranking pairs must compare
-        # stocks' outcomes on the SAME future day.
+        # stocks' outcomes on the SAME future day.  Under the open-entry
+        # convention (review v3 §六) `end` is the ENTRY date — buy at open[end],
+        # exit at open[end+horizon].
         date_idx = (self.date_indices[stock_idx, end].item()
                      if self.date_indices is not None else 0)
+
+        # Per-task target masks (review v3 §八): each loss applies its own mask.
+        dir_mask = (self.y_direction[stock_idx, end] != -100)
+        ret_mask = (self.ret_target[stock_idx, end]
+                    if self.ret_target is not None else dir_mask)
+        vol_mask = (self.vol_target[stock_idx, end]
+                    if self.vol_target is not None else dir_mask)
 
         return (
             self.static_features[stock_idx],
@@ -86,6 +148,9 @@ class PanelDataset(Dataset):
             self.y_return[stock_idx, end],
             self.y_volatility[stock_idx, end],
             date_idx,
+            dir_mask,
+            ret_mask,
+            vol_mask,
         )
 
 
@@ -128,7 +193,7 @@ class DateGroupedSampler(Sampler):
 
 
 def panel_collate(batch: list) -> tuple:
-    """Collate panel samples into batch tensors (includes date_idx)."""
+    """Collate panel samples into batch tensors (includes date_idx + per-task masks)."""
     return (
         torch.stack([b[0] for b in batch]),
         torch.stack([b[1] for b in batch]),
@@ -137,4 +202,7 @@ def panel_collate(batch: list) -> tuple:
         torch.stack([b[4] for b in batch]),
         torch.stack([b[5] for b in batch]),
         torch.tensor([b[6] for b in batch], dtype=torch.long),
+        torch.stack([b[7] for b in batch]),
+        torch.stack([b[8] for b in batch]),
+        torch.stack([b[9] for b in batch]),
     )

@@ -1442,16 +1442,6 @@ class FeaturePipeline:
         close = feat_df[target_col].values
         ret = (close[self.horizon:] - close[: -self.horizon]) / (close[: -self.horizon] + 1e-8)
         target = np.where(ret > 0.003, 2, np.where(ret < -0.003, 0, 1))
-        # Bias correction: mask untradable limit-up/down labels.
-        # Uses 1-day returns for the 9.5% check — the A-share ±10% limit is a
-        # 1-day concept; horizon returns can cross 9.5% over multiple days
-        # without ever hitting a limit board.
-        LIMIT_THRESHOLD = 0.095
-        ret_1d = (close[1:] - close[:-1]) / (close[:-1] + 1e-8)
-        ret_1d_aligned = ret_1d[: len(ret)]  # same start index as horizon ret
-        zt = (ret_1d_aligned > LIMIT_THRESHOLD) & (target == 2)
-        dt = (ret_1d_aligned < -LIMIT_THRESHOLD) & (target == 0)
-        target[zt | dt] = -100  # PyTorch CE ignore_index
 
         price_cols = ["open", "high", "low", "close", "date"]
         X_cols = [c for c in feat_df.columns if c not in price_cols]
@@ -1718,6 +1708,24 @@ class FeaturePipeline:
         y_vol_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         stock_T = np.zeros(N_stocks, dtype=np.int32)
 
+        # ── Per-task target masks ──
+        # Review v3 §二/§八: one `y_direction != -100` cannot carry four distinct
+        # jobs — "tradable today", "clean label exists", "loss applies here",
+        # "portfolio P&L computable".  Split them:
+        #   obs_arr        — real close at t (base observation / history count)
+        #   entry_arr      — real open at t → can enter a position at open[t]
+        #   ret_tgt_arr    — clean forward return open[t+h]/open[t]-1 available
+        #   vol_tgt_arr    — vol window (t, t+h] has >=2 valid daily returns
+        #   realized_arr   — evaluation P&L: clean open return, else carry to the
+        #                    last real close in (t, t+h], else 0 (flat) — so a
+        #                    stock that suspends/delists AFTER entry still counts
+        #                    and the Top-K pool never conditions on the future.
+        obs_arr = np.zeros((N_stocks, max_T), dtype=bool)
+        entry_arr = np.zeros((N_stocks, max_T), dtype=bool)
+        ret_tgt_arr = np.zeros((N_stocks, max_T), dtype=bool)
+        vol_tgt_arr = np.zeros((N_stocks, max_T), dtype=bool)
+        realized_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
+
         # Row i of a stock's feature df → its column on the global calendar.
         # Computed once here and reused by the feature-array scatter below.
         stock_pos: list[np.ndarray] = [np.empty(0, dtype=np.int32) for _ in range(N_stocks)]
@@ -1735,39 +1743,64 @@ class FeaturePipeline:
             stock_pos[i] = pos
             T_i = len(pos)
             stock_T[i] = T_i
+            # Trading-time convention (review v3 §六): features up to close[t]
+            # (window's last column end-1) → signal after close[t] → ENTER at
+            # open[end]=open[t+1] → hold h days → EXIT at open[end+h].  Labels
+            # are therefore open-to-open; entry eligibility needs a real open.
             close_full = np.full(max_T, np.nan, dtype=np.float64)
             close_full[pos] = df_sorted[target_col].to_numpy(dtype=np.float64)
-
-            # Forward return over `horizon` calendar days.  Only valid where
-            # close[t] and close[t+horizon] are BOTH real observations —
-            # not-yet-listed / suspended days (NaN close) never yield a label.
-            ret_fwd = np.full(max_T, np.nan, dtype=np.float32)
+            open_col = "open" if "open" in df_sorted.columns else target_col
+            open_full = np.full(max_T, np.nan, dtype=np.float64)
+            open_full[pos] = df_sorted[open_col].to_numpy(dtype=np.float64)
             close_valid = ~np.isnan(close_full)
+            open_valid = ~np.isnan(open_full)
+            obs_arr[i] = close_valid
+            entry_arr[i] = open_valid
+
+            # Clean forward return (training label): open[t] and open[t+h] both
+            # real.  Positions without one stay NaN → direction -100 / return 0
+            # with ret_tgt_arr False so training ignores them.
+            ret_fwd = np.full(max_T, np.nan, dtype=np.float32)
             if max_T > horizon:
-                both = close_valid[:-horizon] & close_valid[horizon:]
-                num = close_full[horizon:][both] - close_full[:-horizon][both]
-                ret_fwd[:max_T - horizon][both] = (num / (close_full[:-horizon][both] + 1e-8)).astype(np.float32)
-            # Direction label with scaled noise threshold.  Positions without a
-            # valid forward return stay -100 (CE ignore_index → excluded).
-            valid = np.isfinite(ret_fwd)
+                both = open_valid[:-horizon] & open_valid[horizon:]
+                num = open_full[horizon:][both] - open_full[:-horizon][both]
+                ret_fwd[:max_T - horizon][both] = (num / (open_full[:-horizon][both] + 1e-8)).astype(np.float32)
+            ret_tgt_arr[i] = np.isfinite(ret_fwd)
+            valid = ret_tgt_arr[i]
             y_dir_arr[i, valid] = np.where(
                 ret_fwd[valid] > dir_threshold, 2,
                 np.where(ret_fwd[valid] < -dir_threshold, 0, 1),
             )
             y_ret_arr[i] = np.nan_to_num(ret_fwd, nan=0.0)
 
+            # Realized return for portfolio evaluation — defined for EVERY
+            # entry-eligible (open-valid) day so the candidate pool never
+            # depends on whether a future label exists:
+            #   clean open[t]->open[t+h] where available; else carry to the last
+            #   real close in (t, t+h] / open[t] - 1; else 0 (no exit → flat).
+            realized = np.zeros(max_T, dtype=np.float32)
+            for t in range(max_T):
+                if not (open_valid[t] and open_full[t] > 0):
+                    continue
+                if t < max_T - horizon and np.isfinite(ret_fwd[t]):
+                    realized[t] = ret_fwd[t]
+                    continue
+                hi = min(t + horizon, max_T - 1)
+                later = np.nonzero(close_valid[t + 1:hi + 1])[0]
+                if later.size:
+                    k = t + 1 + int(later[-1])
+                    if close_full[k] > 0:
+                        realized[t] = float(close_full[k] / open_full[t] - 1.0)
+            realized_arr[i] = realized
+
             # FORWARD-looking realized volatility: std of the NEXT `horizon`
-            # daily returns (return[t+1 : t+horizon+1]).  This is a genuine
-            # prediction task — what inputs foreshadow elevated future risk —
-            # not a reconstruction of a known statistic already present in the
-            # technical features.  The target is strictly positive, matching
-            # the VolatilityHead's softplus output, so train_panel must NOT
-            # cross-sectionally z-score it (negative z-scores are inexpressible
-            # by softplus — the deterministic contradiction this replaces).
-            # Suspension gaps make a daily return NaN; they are skipped and a
-            # window with <2 valid returns stays 0 (those positions have
-            # y_dir=-100 so they never enter the vol loss).  Needs horizon>=2
-            # to be meaningful (a 1-day window has std 0).
+            # close-to-close daily returns (return[t+1 : t+horizon+1]).  The
+            # target is strictly positive, matching VolatilityHead's softplus —
+            # train_panel must NOT z-score it.  Suspension days leave a NaN
+            # daily return (skipped); a window with <2 valid returns sets
+            # vol_tgt_arr False so the vol loss never sees it.  (Known accepted
+            # deviation per review v3 §七.1: the clean forward return includes
+            # the resumption gap while vol skips it.)
             ret_daily = np.full(max_T, np.nan, dtype=np.float32)
             adj = close_valid[:-1] & close_valid[1:]
             ret_daily[:-1][adj] = (
@@ -1779,6 +1812,7 @@ class FeaturePipeline:
                 if len(finite) < 2:
                     continue
                 y_vol_arr[i, t] = float(np.std(finite))
+                vol_tgt_arr[i, t] = True
 
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
@@ -1943,8 +1977,8 @@ class FeaturePipeline:
 
         # Pre-allocate feature arrays aligned to the GLOBAL calendar (column t
         # is the same date for every stock).  Days before listing or during a
-        # suspension keep zero features; the y-direction -100 mask tells
-        # training & evaluation which positions are genuinely tradable.
+        # suspension keep zero features; observation_mask / entry_eligible_mask
+        # (returned below) tell training & evaluation which positions are real.
         static_arr = np.zeros((N_stocks, static_dim), dtype=np.float32)
         pk_arr = np.zeros((N_stocks, max_T, pk_dim), dtype=np.float32)
         po_arr = np.zeros((N_stocks, max_T, po_dim), dtype=np.float32)
@@ -1965,22 +1999,6 @@ class FeaturePipeline:
             # Past known / observed — scattered onto global-calendar columns.
             pk_arr[i, pos] = df_sorted[pk_cols_available].fillna(0.0).values.astype(np.float32)
             po_arr[i, pos] = df_sorted[po_cols_available].fillna(0.0).values.astype(np.float32)
-
-        # ── Limit-up/down bias correction (horizon=1 only) ──
-        # On days where a stock hits limit-up, positive returns are
-        # untradable — you cannot enter a buy position.  On limit-down
-        # days, negative returns are untradable.  Both should be ignored
-        # during training so the model does not learn fake alpha.
-        # This correction only applies to single-day returns (horizon=1):
-        # limit-up/down is a one-day phenomenon; multi-day returns can
-        # easily exceed 9.5 % without any untradable day.
-        # Reference: ml-quant-trading bias.py (see docs/research-findings.md §6.9).
-        if horizon == 1:
-            LIMIT_THRESHOLD = 0.095
-            for i in range(N_stocks):
-                zt_mask = (y_ret_arr[i] > LIMIT_THRESHOLD) & (y_dir_arr[i] == 2)
-                dt_mask = (y_ret_arr[i] < -LIMIT_THRESHOLD) & (y_dir_arr[i] == 0)
-                y_dir_arr[i, zt_mask | dt_mask] = -100  # PyTorch CE ignore_index
 
         # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
         # Alpha158 factors can produce Inf from near-zero divisors (e.g.
@@ -2007,6 +2025,9 @@ class FeaturePipeline:
         # so PairwiseRankingLoss groups true same-day cross-sections.
         date_idx_arr = np.tile(np.arange(max_T, dtype=np.int32), (N_stocks, 1))
 
+        # Union trading calendar (datetime64[ns]) — lets callers convert a
+        # panel column index back to the real trading date (review v3 §十五:
+        # summary.json should record which market period each fold tested).
         return {
             "static_features": static_arr,
             "past_known": pk_arr,
@@ -2015,6 +2036,12 @@ class FeaturePipeline:
             "y_return": y_ret_arr,
             "y_volatility": y_vol_arr,
             "date_indices": date_idx_arr,
+            "global_dates": global_dates,
+            "observation_mask": obs_arr,
+            "entry_eligible_mask": entry_arr,
+            "return_target_mask": ret_tgt_arr,
+            "vol_target_mask": vol_tgt_arr,
+            "realized_return": realized_arr,
         }
 
 

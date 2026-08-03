@@ -44,6 +44,7 @@ def _compute_val_loss(
     loss_fn: UncertaintyLoss,
     device: torch.device,
     use_amp: bool,
+    vol_enabled: bool = True,
 ) -> tuple[float, float, float, float]:
     model.eval()
     total, ce_sum, ret_sum, vol_sum, n = 0.0, 0.0, 0.0, 0.0, 0
@@ -51,35 +52,44 @@ def _compute_val_loss(
     skipped_batches = 0
     with torch.no_grad():
         for batch in val_loader:
-            static, pk, po, y_dir, y_ret, y_vol, _date_idx = batch
+            static, pk, po, y_dir, y_ret, y_vol, _date_idx, dir_mask, ret_mask, vol_mask = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
             y_dir = y_dir.to(device)
             y_ret = y_ret.to(device)
             y_vol = y_vol.to(device)
+            dir_mask = dir_mask.to(device).float()
+            ret_mask = ret_mask.to(device).float()
+            vol_mask = vol_mask.to(device).float()
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
                 if torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any() or torch.isnan(pred_vol).any():
                     nan_batches += 1
                     continue
-                mask = (y_dir != -100).float()
-                if mask.sum() == 0:
+                # Return loss is the fixed checkpoint-selection objective — a
+                # batch with no clean return targets carries no selection signal.
+                if ret_mask.sum() == 0:
                     skipped_batches += 1
                     continue
-                l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
-                l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
-                                 y_ret[mask > 0])
-                vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
-                l_vol = vol_err.sum() / mask.sum()
-                loss = loss_fn([l_ce, l_ret, l_vol])
+                l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)  # ignore_index=-100
+                l_ret = ret_loss(pred_ret.squeeze(-1)[ret_mask > 0],
+                                 y_ret[ret_mask > 0])
+                losses = [l_ce, l_ret]
+                if vol_enabled:
+                    if vol_mask.sum() > 0:
+                        vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * vol_mask
+                        losses.append(vol_err.sum() / vol_mask.sum())
+                    else:
+                        losses.append(torch.zeros((), device=device))
+                loss = loss_fn(losses)
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_batches += 1
                 continue
             total += loss.item()
             ce_sum += l_ce.item()
             ret_sum += l_ret.item()
-            vol_sum += l_vol.item()
+            vol_sum += losses[2].item() if vol_enabled else 0.0
             n += 1
     if nan_batches > 0 or skipped_batches > 0:
         logger.warning(
@@ -139,7 +149,11 @@ def train_panel(
         except Exception:
             logger.warning("torch.compile failed, continuing without compilation")
 
-    loss_fn = UncertaintyLoss(num_tasks=3).to(device)
+    # horizon==1 leaves no room for an intra-window vol estimate (vol window
+    # needs >= 2 daily returns), so the vol task is dropped entirely rather than
+    # learning a degenerate uncertainty weight on an all-zero target.
+    vol_enabled = config.horizon != 1
+    loss_fn = UncertaintyLoss(num_tasks=3 if vol_enabled else 2).to(device)
     ce_loss = nn.CrossEntropyLoss()
     ret_loss = AdjMSELoss(gamma=0.1)
     rank_loss = PairwiseRankingLoss(
@@ -195,7 +209,10 @@ def train_panel(
         if not any(head_n in n for head_n in head_param_names)
     ]
 
-    best_val_loss = float("inf")
+    # Checkpoint selection uses the FIXED return loss, not the learned-weighted
+    # total — the uncertainty log_vars are trainable parameters the model can
+    # inflate to shrink the total without improving return prediction.
+    best_val_ret = float("inf")
     best_state = None
     best_epoch_idx = 0
     patience_counter = 0
@@ -214,7 +231,7 @@ def train_panel(
         accum_count = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            static, pk, po, y_dir, y_ret, y_vol, date_idx = batch
+            static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -222,27 +239,38 @@ def train_panel(
             y_ret = y_ret.to(device)
             y_vol = y_vol.to(device)
             date_idx = date_idx.to(device)
+            dir_mask = dir_mask.to(device).float()
+            ret_mask = ret_mask.to(device).float()
+            vol_mask = vol_mask.to(device).float()
 
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                mask = (y_dir != -100).float()
-                if mask.sum() == 0:
-                    continue
+                # Per-task masks (review v3 §八): CE ignores -100 via
+                # ignore_index; return/vol apply their own target masks.
                 l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
-                l_ret = ret_loss(pred_ret.squeeze(-1)[mask > 0],
-                                 y_ret[mask > 0])
-                vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * mask
-                l_vol = vol_err.sum() / mask.sum()
+                losses = [l_ce]
+                if ret_mask.sum() > 0:
+                    losses.append(ret_loss(pred_ret.squeeze(-1)[ret_mask > 0],
+                                           y_ret[ret_mask > 0]))
+                else:
+                    losses.append(torch.zeros((), device=device))
+                if vol_enabled:
+                    if vol_mask.sum() > 0:
+                        vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * vol_mask
+                        losses.append(vol_err.sum() / vol_mask.sum())
+                    else:
+                        losses.append(torch.zeros((), device=device))
 
                 # Pairwise ranking loss — directly optimises for cross-sectional
-                # ordering (the same signal IC and Sharpe evaluate on).
+                # ordering (the same signal IC and Sharpe evaluate on).  Ranks
+                # clean return targets only.
                 l_rank = rank_loss(
                     pred_ret.squeeze(-1), y_ret,
-                    mask.squeeze(-1) if mask.dim() > 1 else mask,
+                    ret_mask,
                     date_idx,
                 )
 
-                total_loss = loss_fn([l_ce, l_ret, l_vol])
+                total_loss = loss_fn(losses)
                 total_loss = total_loss + config.rank_loss_weight * l_rank
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -304,15 +332,17 @@ def train_panel(
 
         val_loss, v_ce, v_ret, v_vol = _compute_val_loss(
             model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
+            vol_enabled=vol_enabled,
         )
         history["val_loss"].append(val_loss)
+        history.setdefault("val_ret", []).append(v_ret)
 
         # Step scheduler AFTER optimizer updates (PyTorch >=1.1 requirement).
         # Called here at epoch end since this is an epoch-level scheduler.
         scheduler.step()
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if v_ret < best_val_ret:
+            best_val_ret = v_ret
             best_epoch_idx = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
@@ -353,8 +383,8 @@ def train_panel(
                         optimizer.param_groups[0]["lr"])
 
         if patience_counter >= config.early_stop_patience:
-            logger.info("Early stopping at epoch %d (best val_loss=%.4f)",
-                        epoch + 1, best_val_loss)
+            logger.info("Early stopping at epoch %d (best val_ret=%.6f)",
+                        epoch + 1, best_val_ret)
             break
 
     if best_state is not None:
