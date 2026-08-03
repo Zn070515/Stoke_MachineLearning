@@ -1,0 +1,252 @@
+{
+  "timestamp": "2026-08-03T18:43:30.457251",
+  "passed": true,
+  "checks": [
+    {
+      "name": "daily_internal",
+      "passed": true,
+      "summary": "max_diff=0.000000 pollution_rows=0 problem_files=0",
+      "files_scanned": 5530,
+      "rows_scanned": 16254161,
+      "issue_count": 0,
+      "sample_issues": []
+    },
+    {
+      "name": "aux_pct_aligned",
+      "passed": true,
+      "summary": "max_diff=0.00000000 problem_files=0",
+      "files_scanned": 11060,
+      "rows_scanned": 22042882,
+      "issue_count": 0,
+      "sample_issues": []
+    },
+    {
+      "name": "aux_close_aligned",
+      "passed": true,
+      "summary": "max_abs_diff=0.000000 problem_files=0",
+      "files_scanned": 32286,
+      "rows_scanned": 88171528,
+      "issue_count": 0,
+      "sample_issues": []
+    },
+    {
+      "name": "feature_pct",
+      "passed": true,
+      "summary": "max_diff=0.000060 problem_files=0",
+      "files_scanned": 5530,
+      "rows_scanned": 16259691,
+      "issue_count": 0,
+      "sample_issues": []
+    },
+    {
+      "name": "sparsity",
+      "passed": true,
+      "summary": "event-sparse features=580 (showing 200) min_nz=0.0",
+      "files_scanned": 5530,
+      "rows_scanned": 0,
+      "issue_count": 200,
+      "sample_issues": [
+        {
+          "file": "comment_attention",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "comment_institution",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "comment_trend",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "small_net",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "mid_net",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_net",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "super_net",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "super_ratio",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_ratio",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "mid_ratio",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "small_ratio",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "main_ratio",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "broad_main_net",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_minus_small",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "transfer_ratio",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "plan_stage_encoded",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "dividend_growth",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "market_state_strong",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "market_state_ice",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "market_state_frenzy",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "sector_relative_strength",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "sector_alpha",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "concept_momentum_3m",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "concept_momentum_6m",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "concept_momentum_12m",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "is_concept_leader",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "is_concept_leader_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "is_concept_leader_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "is_concept_leader_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "super_ratio_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "super_ratio_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "super_ratio_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "super_ratio_accel",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_ratio_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_ratio_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_ratio_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_ratio_accel",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "mid_ratio_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "mid_ratio_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "mid_ratio_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "mid_ratio_accel",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "small_ratio_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "small_ratio_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "small_ratio_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "small_ratio_accel",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "main_ratio_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "main_ratio_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "main_ratio_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "main_ratio_accel",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "transfer_ratio_ma5",
+          "detail": "nz=0.0"
+        }
+      ]
+    }
+  ]
+}
