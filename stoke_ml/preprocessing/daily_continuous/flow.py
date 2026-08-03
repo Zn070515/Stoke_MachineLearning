@@ -146,7 +146,11 @@ class FlowDecomposer(PreprocessingStep):
         for c in ["super_net", "large_net", "mid_net", "small_net"]:
             if c in present:
                 total += df[c].abs()
-        eps = 1e-8
+        # When the tier breakdown is absent (e.g. Sina-only source zeroes all
+        # tier columns), a ratio is undefined — leave it NaN so the pipeline's
+        # ZI-fill turns it into 0 instead of the old eps-hack (main_net/1e-8 =
+        # main_net * 1e8, garbage scale that polluted features).
+        denom = total.replace(0, np.nan)
 
         tier_map = {
             "super_net": "super_ratio",
@@ -156,10 +160,10 @@ class FlowDecomposer(PreprocessingStep):
         }
         for src, dst in tier_map.items():
             if src in present:
-                df[dst] = (df[src] / (total + eps)).astype(np.float32)
+                df[dst] = (df[src] / denom).astype(np.float32)
 
         if "main_net" in present:
-            df["main_ratio"] = (df["main_net"] / (total + eps)).astype(np.float32)
+            df["main_ratio"] = (df["main_net"] / denom).astype(np.float32)
 
     # ── L2: OFI intensity ─────────────────────────────────────────────
 
