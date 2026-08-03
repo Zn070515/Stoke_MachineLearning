@@ -5,6 +5,7 @@ ETF sector flow, and fundamental data into a unified feature set.
 """
 import logging
 import os
+import re
 
 import pandas as pd
 import numpy as np
@@ -474,8 +475,14 @@ class FeaturePipeline:
         pledge_df: pd.DataFrame | None = None,
         market_env_df: pd.DataFrame | None = None,
         index_membership_df: pd.DataFrame | None = None,
+        panel_mode: bool = False,
     ) -> str:
-        """Engineer features and save to parquet. Returns output_path."""
+        """Engineer features and save to parquet. Returns output_path.
+
+        panel_mode=True emits panel-format features (skip_temporal + calendar)
+        matching what ``build_panel_features`` consumes, so a prebuilt parquet
+        can be replayed through it with identical model input semantics.
+        """
         feats = self._engineer_features(
             df, sentiment_df, margin_df, northbound_df,
             dragon_tiger_df, fundamental_df, earnings_df, valuation_df, etf_flow_df,
@@ -485,7 +492,10 @@ class FeaturePipeline:
             macro_df=macro_df, industry_df=industry_df,
             limit_up_df=limit_up_df, pledge_df=pledge_df,
             market_env_df=market_env_df, index_membership_df=index_membership_df,
+            skip_temporal=panel_mode,
         )
+        if panel_mode:
+            feats = add_calendar_features(feats)
         tmp_path = f"{output_path}.tmp"
         feats.to_parquet(tmp_path, index=False, compression="lz4")
         os.replace(tmp_path, output_path)
@@ -1566,6 +1576,7 @@ class FeaturePipeline:
         target_col: str = "close",
         aux_data: dict[str, dict[str, pd.DataFrame]] | None = None,
         horizon: int = 1,
+        prebuilt_dir: str | None = None,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -1582,6 +1593,12 @@ class FeaturePipeline:
                       "shareholder", "lockup", "dividend", "board", "sector", "concept".
             horizon: forward return horizon in days (1/5/20). Direction
                      threshold scales as 0.003 * sqrt(horizon).
+            prebuilt_dir: optional dir of panel-mode feature parquets
+                      (``save_features(panel_mode=True)``).  When set, per-stock
+                      features are loaded from ``{prebuilt_dir}/{code}.parquet``
+                      instead of being engineered live; ``aux_data`` is ignored.
+                      This makes the training input byte-identical to a
+                      ``build_features.py --panel-mode`` run.
 
         Returns:
             dict with numpy arrays: static_features, past_known, past_observed,
@@ -1594,35 +1611,52 @@ class FeaturePipeline:
         # Engineer features per stock (reuses existing pipeline)
         all_feat_dfs = []
         for code in codes:
-            mask = panel["stock_code"] == code
-            df_stock = panel[mask].sort_values("date").reset_index(drop=True)
-            stock_aux = aux_data.get(code, {})
-            feats = self._engineer_features(
-                df_stock,
-                sentiment_df=stock_aux.get("sentiment"),
-                guba_df=stock_aux.get("guba"),
-                comment_df=stock_aux.get("comment"),
-                announcement_df=stock_aux.get("announcement"),
-                margin_df=stock_aux.get("margin"),
-                northbound_df=stock_aux.get("northbound"),
-                dragon_tiger_df=stock_aux.get("dragon_tiger"),
-                fundamental_df=stock_aux.get("fundamental"),
-                valuation_df=stock_aux.get("valuation"),
-                etf_flow_df=stock_aux.get("etf_flow"),
-                capital_flow_df=stock_aux.get("capital_flow"),
-                block_trade_df=stock_aux.get("block_trade"),
-                shareholder_df=stock_aux.get("shareholder"),
-                lockup_df=stock_aux.get("lockup"),
-                dividend_df=stock_aux.get("dividend"),
-                board_df=stock_aux.get("board"),
-                sector_df=stock_aux.get("sector"),
-                concept_df=stock_aux.get("concept"),
-                skip_temporal=True,  # xLSTM learns temporal patterns natively
-            )
-            # Calendar features are normally added by the temporal path;
-            # we still want them when skip_temporal=True (panel model benefits
-            # from day-of-week/month/quarter signals for seasonality).
-            feats = add_calendar_features(feats)
+            if prebuilt_dir:
+                path = os.path.join(prebuilt_dir, f"{code}.parquet")
+                feats = self.load_features(path)
+                feats["date"] = pd.to_datetime(feats["date"])
+                # Flat prebuilt (data/features/) carries temporal lag columns
+                # (skip_temporal=False).  Panel training uses skip_temporal=True
+                # (xLSTM learns the time structure itself), so drop *_lag{N}
+                # columns — the remainder is byte-identical to a --panel-mode
+                # build (3815 - 2064 lag cols = 1751).
+                lag_cols = [c for c in feats.columns if re.search(r"_lag\d+$", c)]
+                if lag_cols:
+                    feats = feats.drop(columns=lag_cols)
+                # Calendar features are idempotent (overwrite in place); safe
+                # to re-apply even though save_features(panel_mode=True) already
+                # added them — guards against hand-built parquets.
+                feats = add_calendar_features(feats)
+            else:
+                mask = panel["stock_code"] == code
+                df_stock = panel[mask].sort_values("date").reset_index(drop=True)
+                stock_aux = aux_data.get(code, {})
+                feats = self._engineer_features(
+                    df_stock,
+                    sentiment_df=stock_aux.get("sentiment"),
+                    guba_df=stock_aux.get("guba"),
+                    comment_df=stock_aux.get("comment"),
+                    announcement_df=stock_aux.get("announcement"),
+                    margin_df=stock_aux.get("margin"),
+                    northbound_df=stock_aux.get("northbound"),
+                    dragon_tiger_df=stock_aux.get("dragon_tiger"),
+                    fundamental_df=stock_aux.get("fundamental"),
+                    valuation_df=stock_aux.get("valuation"),
+                    etf_flow_df=stock_aux.get("etf_flow"),
+                    capital_flow_df=stock_aux.get("capital_flow"),
+                    block_trade_df=stock_aux.get("block_trade"),
+                    shareholder_df=stock_aux.get("shareholder"),
+                    lockup_df=stock_aux.get("lockup"),
+                    dividend_df=stock_aux.get("dividend"),
+                    board_df=stock_aux.get("board"),
+                    sector_df=stock_aux.get("sector"),
+                    concept_df=stock_aux.get("concept"),
+                    skip_temporal=True,  # xLSTM learns temporal patterns natively
+                )
+                # Calendar features are normally added by the temporal path;
+                # we still want them when skip_temporal=True (panel model benefits
+                # from day-of-week/month/quarter signals for seasonality).
+                feats = add_calendar_features(feats)
             # Defragment after many df["col"] = ... assignments in merge methods.
             # Without this, pandas emits PerformanceWarning and slows down
             # subsequent operations.
@@ -1634,7 +1668,11 @@ class FeaturePipeline:
         # columns) to relative-value space.  Targets MUST be computed from raw
         # prices — using z-score changes as returns distorts the signal.
         lengths = [len(df) for df in all_feat_dfs]
-        max_T = min(max(lengths), 3000)
+        # Panel uses the full history (backfilled to 2000).  No truncation to a
+        # hard cap: per-stock T_i is the stock's own length, shorter stocks pad
+        # with -100 mask.  GPU memory is unaffected (batches are sliced on CPU,
+        # moved to device per-batch); only CPU RAM and epoch time scale with T.
+        max_T = max(lengths)
 
         N_stocks = len(all_feat_dfs)
         y_dir_arr = np.full((N_stocks, max_T), -100, dtype=np.int64)  # CE ignore_index
