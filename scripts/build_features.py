@@ -161,6 +161,7 @@ def build_one(args: dict) -> tuple[str, str]:
             limit_up_df=None,  # deferred (top scope note)
             pledge_df=pledge_df if not pledge_df.empty else None,
             index_membership_df=index_membership_df if not index_membership_df.empty else None,
+            panel_mode=args["panel_mode"],
         )
         return code, "built"
     except Exception:
@@ -176,8 +177,19 @@ def main():
         help="Build for a single stock (default: all available)",
     )
     parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Build only the first N stocks (sorted by code), matching "
+             "train_panel.py --stocks for the same stock set",
+    )
+    parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Features output directory (default: data/features/)",
+    )
+    parser.add_argument(
+        "--panel-mode", action="store_true",
+        help="Emit panel-format features (skip_temporal + calendar) consumable "
+             "by train_panel.py --prebuilt; default output dir becomes "
+             "data/features_panel/",
     )
     parser.add_argument(
         "--no-guba", action="store_true", help="Exclude Guba forum sentiment",
@@ -243,6 +255,8 @@ def main():
     sector_mapper = StockSectorMapper()
 
     codes = [args.stock] if args.stock else available_stocks(storage)
+    if args.limit:
+        codes = codes[: args.limit]
 
     if not codes:
         logger.error("No stock data found. Run a data downloader first.")
@@ -258,7 +272,10 @@ def main():
             parser.error("--shard: k in [0, n) and n >= 1")
         codes = [c for i, c in enumerate(codes) if i % n == k]
 
-    output_dir = args.output_dir or os.path.join(data_dir, "features")
+    default_features_dir = (
+        "features_panel" if args.panel_mode else "features"
+    )
+    output_dir = args.output_dir or os.path.join(data_dir, default_features_dir)
     os.makedirs(output_dir, exist_ok=True)
 
     use_gb = not args.no_guba
@@ -299,6 +316,7 @@ def main():
         "start": date_start,
         "end": date_end,
         "force": args.force,
+        "panel_mode": args.panel_mode,
     }
 
     tasks = [{**worker_args, "code": c} for c in codes]
