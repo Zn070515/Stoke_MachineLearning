@@ -155,7 +155,7 @@
 | 方向分类 (3类) | CrossEntropyLoss | 下跌(0) / 横盘(1) / 上涨(2)，阈值 ±0.003×√horizon |
 | 涨跌幅回归 | AdjMSELoss (γ=0.1) | 符号感知MSE：符号错误惩罚11倍，符号正确仅0.1倍权重 |
 | 波动率回归 | MSE | 未来horizon日波动率 (std of daily returns) |
-| 截面排序 | RankICLoss (T=0.5, weight=0.1) | 可微Spearman秩相关系数，soft-rank trick |
+| 截面排序 | PairwiseRankingLoss (tau=0.1, rank_weight=0.1) | 可微成对排序 hinge 损失（同日期内成对比较）+ spread 惩罚 |
 
 ### Panel Model 损失加权
 
@@ -171,7 +171,7 @@
 | Panel | (N_stocks, T_timesteps, D_features) 三维数组，区别于单stock (T, D) |
 | Static features | 时不变特征 (4维)：上市天数、所属交易所等 |
 | Past Known (PK) | 已知历史特征 (221维)：价格、技术指标、情感、资金流等，含close用于target计算 |
-| Past Observed (PO) | 观测历史特征 (29维)：换手率、振幅、涨跌幅等，不含close |
+| Past Observed (PO) | 观测历史特征 (70维)：换手率、振幅、涨跌幅等，不含close |
 | Cross-sectional normalization | 跨股票截面归一化：按日期 groupby → z-score，解决不同股票量纲差异 |
 | Per-stock target normalization | 按股票z-score归一化回归target，使各股票在MSE loss中等权重 |
 
@@ -179,7 +179,7 @@
 
 | 术语 | 含义 |
 |------|------|
-| Purged Walk-Forward | 504天训练 / 63天验证 / 63天步长，训练和验证之间有 seq_len=60 的 purge gap |
+| Growing-Window Walk-Backward | 训练窗口从 [0, val_start−purge) 增长，验证 126 天 / 步长 63 天，训练和验证之间有 seq_len 的 purge gap（从最新数据向过去倒排 fold） |
 | horizon | 前向回报窗口（交易日），默认5天。方向阈值缩放 √horizon |
 | Grad Accum | 梯度累加 (默认4步)，等效增大batch size |
 | AMP (Automatic Mixed Precision) | 混合精度训练，BF16/FP16前向+FP32权重 |
@@ -193,10 +193,10 @@
 |------|------|
 | **MCC** (Matthews Correlation Coefficient) | 主要评估指标，适用于不平衡二分类 (XGBoost/LSTM) |
 | **IC** (Information Coefficient) | Spearman Rank IC — 截面排序能力，Panel Model的主要评估指标。每日计算 pred vs actual 的秩相关，取均值 |
-| **RankICLoss** | 可微Spearman秩相关损失，soft-rank trick：pairwise diff → sigmoid → Pearson corr |
+| **PairwiseRankingLoss** | 可微成对排序 hinge 损失：同日期内 pairwise 比较 sign(Δtarget)·Δpred，hinge(max(0, margin−…)) + spread 惩罚（防预测坍缩） |
 | 方向分类 (3类) | Panel: 下跌(0) / 横盘(1) / 上涨(2)，阈值 ±0.003×√horizon |
 | Walk-Forward 验证 | 固定窗口滑动验证，严格时序拆分，**绝不打乱** |
-| Purged Walk-Forward | Panel: 504天训练 / 63天验证 / 63天步长 + seq_len purge gap |
+| Growing-Window Walk-Backward | Panel: 训练窗口增长 / 126天验证 / 63天步长 + seq_len purge gap |
 | Sharpe Ratio | 年化夏普 = (期均收益/期收益标准差) × √(252/horizon)，评估时 stride=horizon 避免回报重叠 |
 | Max Drawdown | 最大回撤 |
 | Win Rate | 胜率 = 正收益交易占比 |
@@ -205,7 +205,7 @@
 
 **Walk-Forward 参数**: 
 - XGBoost/LSTM: 2年训练 / 3月验证 / 3月步长
-- Panel: 504天训练 / 63天验证 / 63天步长 / 60天purge
+- Panel: 增长式训练窗口（[0, val_start−purge) 逐 fold 增长）/ 126天验证 / 63天步长 / purge=seq_len（walk-backward，从最新数据倒排）
 
 ---
 
@@ -236,8 +236,8 @@
 | seq_len | 60 | config.yaml → features.seq_len |
 | target_horizon | 1 (XGBoost), 5 (Panel default) | config.yaml / PanelConfig.horizon |
 | Panel hidden_dim | 128 | PanelConfig.hidden_dim |
-| Panel xlstm_num_blocks | 3 | PanelConfig.xlstm_num_blocks |
-| Panel batch_size | 256 (RTX 4090) | PanelConfig.batch_size |
+| Panel xlstm_num_blocks | 2 | PanelConfig.xlstm_num_blocks（train_panel CLI 默认） |
+| Panel batch_size | 128 | PanelConfig.batch_size（train_panel CLI 默认） |
 | Panel lr_warmup_epochs | 5 | PanelConfig.lr_warmup_epochs |
 | 情感正面阈值 | > 0.2 | news_nlp.py |
 | 情感负面阈值 | < -0.2 | news_nlp.py |

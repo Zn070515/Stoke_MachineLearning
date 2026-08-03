@@ -147,7 +147,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type concep
 
 ## 特征维度
 
-FeaturePipeline 支持 **18个辅助维度**（见表；全部左连接 + ZI填充 + PIT lag(1)；FE v2 新增 4 维标 ★）：
+FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_up` 未接线；见表；全部左连接 + ZI填充 + PIT lag(1)；FE v2 新增 4 维标 ★）：
 
 | 维度 | 开关 | 列数 | 密度 | 数据源 |
 |------|------|------|------|--------|
@@ -157,25 +157,33 @@ FeaturePipeline 支持 **18个辅助维度**（见表；全部左连接 + ZI填�
 | announcement (公告) | `use_announcements` | 6 | 低 | AKShare |
 | margin (融资融券) | `use_margin` | 4 | 高 | AKShare |
 | northbound (北向) | `use_northbound` | 2 | 中 | AKShare |
-| dragon_tiger (龙虎榜) | `use_dragon_tiger` | 7 (3+4席别) | 低 | AKShare |
+| dragon_tiger (龙虎榜+席别) | `use_dragon_tiger` | 7 (3+4) | 低 | AKShare |
 | fundamental (基本面) | `use_fundamental` | 8 | 低(季频) | AKShare |
+| earnings (业绩预告) | `use_earnings` | 6 | 低 | 数据中心 |
+| valuation (估值) | `use_valuation` | 4 | 高 | 东方财富 |
 | ETF flow (资金流) | `use_etf_flow` | 2 | 高(行业级) | 东方财富 |
-| capital flow (资金流向) | `use_capital_flow` | 6 | 高 | 新浪财经 |
-| block trade (大宗交易) | `use_block_trade` | 5 | 低 | 东方财富 |
-| board (打板) | `use_board` | 9 | 低 | 东方财富 |
-| concept (概念板块) | `use_concept` | 100+ | 中 | 东方财富 |
+| capital flow (资金流向) | `use_capital_flow` | 9 | 高 | 新浪财经 |
+| block trade (大宗交易) | `use_block_trade` | 7 | 低 | 东方财富 |
+| shareholder (股东户数) | `use_shareholder` | 6 | 低 | 数据中心 |
+| lockup (限售解禁) | `use_lockup` | 5 | 低 | 数据中心 |
+| dividend (分红送转) | `use_dividend` | 3 | 低 | 数据中心 |
+| board (打板) | `use_board` | 12 | 低 | 东方财富 |
+| sector (行业) | `use_sector` | 5 | 高 | 东方财富 |
+| concept (概念板块) | `use_concept` | 5 (编码后多热展开 100+) | 中 | 东方财富 |
+| industry (行业排名) | `use_industry` | 9 | 高 | 数据中心 |
 | macro (宏观) | `use_macro` | 28 | 高(日频) | macro_daily.parquet |
 | pledge (股权质押) ★ | `use_pledge` | 5 | 中 | 数据中心 (FE v2) |
 | index_membership (指数成分) ★ | `use_index_membership` | 3 | 低 | Baostock月度重建 (FE v2) |
 | market_env (市场环境) ★ | `use_market_env` | 7 | 高(全市场日频) | market_breadth (FE v2) |
 | macro regime (宏观制度) ★ | `use_market_env_refine` | 49 | 高(日频) | MarketEnvRefiner (FE v2) |
+| limit-up ecology (涨停生态) | `use_limit_up` | 20 | 低 | 数据中心 — **未接线** (DEFERRED) |
 
 > FE v2 维度开关默认全开，由 `scripts/build_features.py` CLI 关闭（`--no-pledge` / `--no-market-env` / `--no-market-env-refine` / `--no-index-membership`），不读 config.yaml。
 > limit-up 生态（涨停/炸板/跌停，19 列）已定义但**未接线**（`use_limit_up=False`，待后续启用）。
 
 **预构建特征**: 5530 只股票 × 3744 列/股（516 基础 + 3228 时序展开），共 109GB，存于 `data/features/{code}.parquet`。XGBoost flat 模式再按窗口展平，维度极易爆炸——建议按 IC 预筛 top-K 特征。
 
-**TFT Panel 格式**: 221 PastKnown + 29 PastObserved + 4 Static = 254 features × 60 seq_len. 跨股票截面归一化 (per-date z-score).
+**Panel 格式**: 221 PastKnown + 70 PastObserved + 4 Static = 295 features × 60 seq_len. 跨股票截面归一化 (per-date z-score).
 
 ### 预构建特征 (data/features/)
 
@@ -191,6 +199,9 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --jobs 4 --shard 0
 
 # FE v2 维度开关 (默认全开)
 PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --no-pledge --no-market-env
+
+# Panel 联合训练预构建 (跨股票截面 z-score, 输出到 features_panel/)
+PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --panel-mode
 ```
 
 ## 模型训练
@@ -198,8 +209,8 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --no-pledge --no-m
 ### Panel 联合训练 (主力模型, VSN+xLSTM, RTX 4090)
 
 ```bash
-# 500只股票 Panel 联合训练 (多任务: 方向+涨跌幅+波动率)
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --horizon 5 --epochs 20 --max-folds 3
+# 500只股票 Panel 联合训练 (多任务: 方向+涨跌幅+波动率) — 读预构建特征
+PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --prebuilt data/features_panel --horizon 5 --epochs 20 --max-folds 3
 
 # 少量股票快速测试
 PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 50 --epochs 5 --max-folds 1
@@ -214,9 +225,9 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --no-aux
 Panel (VSN + xLSTM) 配置:
 - **输入**: Static + PastKnown + PastObserved × seq_len=60 (维度由特征面板自动推导)
 - **架构**: Variable Selection Network (VSN) + xLSTM backbone (sLSTM + mLSTM)
-- **多任务**: CrossEntropy(方向3类) + AdjMSE(涨跌幅) + MSE(波动率) + RankICLoss(截面排序)
+- **多任务**: CrossEntropy(方向3类) + AdjMSE(涨跌幅) + MSE(波动率) + PairwiseRankingLoss(截面排序)
 - **损失加权**: UncertaintyLoss (Kendall et al. 2018) 自适应任务权重
-- **验证**: Purged Walk-Forward (756天训练 / 126天验证 / 63天步长 / purge=seq_len)
+- **验证**: Growing-Window Walk-Backward (训练窗口 [0, val_start−purge) 逐 fold 增长 / 126天验证 / 63天步长 / purge=seq_len，从最新数据倒排)
 - **评估指标**: 年化Sharpe + Spearman Rank IC (截面排序能力)
 
 ### XGBoost 基线
@@ -310,6 +321,16 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 | Playwright browser 在WAF绕过时可能无限挂起 | `threading.Timer(timeout, os._exit)` 硬杀 |
 | TFT UncertaintyLoss 收敛后 train loss 变负 | 正常 (log_var → ln(task_loss)), 已收紧clamp |
 | TFT multi-horizon Sharpe 年化虚高 | 已修复: stride=horizon去重叠 + sqrt(252/horizon)年化 |
+
+## 测试
+
+~29 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历。用 venv 解释器运行：
+
+```bash
+PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q
+```
+
+文档漂移由 `scripts/check_docs_consistency.py` 守卫（检查股票数 / 测试数 / aux 维度数 / PanelConfig 常量是否与代码一致，不一致退出码 1）。
 
 ## 设计文档
 
