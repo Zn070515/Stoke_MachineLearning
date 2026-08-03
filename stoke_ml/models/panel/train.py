@@ -142,7 +142,9 @@ def train_panel(
     loss_fn = UncertaintyLoss(num_tasks=3).to(device)
     ce_loss = nn.CrossEntropyLoss()
     ret_loss = AdjMSELoss(gamma=0.1)
-    rank_loss = PairwiseRankingLoss(margin=0.0, tau=0.1)
+    rank_loss = PairwiseRankingLoss(
+        margin=0.0, tau=0.1, spread_target=1.0, spread_weight=0.5,
+    )
 
     optimizer = torch.optim.AdamW([
         {"params": model.parameters()},
@@ -151,7 +153,7 @@ def train_panel(
     scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
     train_ds = PanelDataset(train_data, seq_len=config.seq_len)
-    train_sampler = DateGroupedSampler(train_ds.n_stocks, train_ds.n_windows)
+    train_sampler = DateGroupedSampler(train_ds.valid_mask)
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
         sampler=train_sampler, collate_fn=panel_collate,

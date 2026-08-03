@@ -39,7 +39,9 @@ class ReturnHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         last = x[:, -1, :]
         last = F.elu(self.fc1(self.dropout(last)))
-        return self.fc2(self.dropout(last))
+        # Clamp keeps fp16 AMP from overflowing the head on padded/zero
+        # windows (all-zero features → huge pre-activations → ±Inf → NaN).
+        return torch.clamp(self.fc2(self.dropout(last)), -10.0, 10.0)
 
 
 class VolatilityHead(nn.Module):
@@ -60,5 +62,7 @@ class VolatilityHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         last = x[:, -1, :]
         last = F.elu(self.fc1(self.dropout(last)))
-        raw = self.fc2(self.dropout(last))
+        # Same fp16 overflow guard as ReturnHead: clamp raw pre-activation
+        # before softplus so padded windows can't drive softplus to ±Inf.
+        raw = torch.clamp(self.fc2(self.dropout(last)), -10.0, 10.0)
         return F.softplus(raw) + 1e-6

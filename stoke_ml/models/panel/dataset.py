@@ -36,6 +36,12 @@ class PanelDataset(Dataset):
         self.n_timesteps = self.past_known.shape[1]
         self.n_windows = self.n_timesteps - seq_len
 
+        # valid_mask[stock, window] = 1.0 iff the target at end of that window
+        # is a real observation.  Stocks with shorter listing history are padded
+        # with y_direction == -100; windows whose target lands in the pad region
+        # must never be sampled (they are all-zero features → garbage gradients).
+        self.valid_mask = (self.y_direction[:, self.seq_len:] != -100)
+
         # date_idx[t] = t for each window position — used by PairwiseRankingLoss
         # to group samples from the same calendar date for cross-sectional ranking.
         date_indices = data.get("date_indices")
@@ -83,17 +89,21 @@ class DateGroupedSampler(Sampler):
     batch naturally contains multiple stocks from the same date(s) —
     PairwiseRankingLoss then has meaningful same-date pairs to compare.
 
+    Only (stock, window) pairs with a valid target are emitted — padded windows
+    whose target is -100 (short listing history) are skipped, so batches never
+    contain all-zero feature rows for the ranking loss to trip on.
+
     Args:
-        n_stocks: number of stocks in the panel.
-        n_windows: number of time windows (dates - seq_len).
+        valid_mask: (N_stocks, N_windows) bool tensor — True where the window's
+            target is a real observation.  Built by PanelDataset.
     """
 
-    def __init__(self, n_stocks: int, n_windows: int):
-        self.n_stocks = n_stocks
-        self.n_windows = n_windows
+    def __init__(self, valid_mask: torch.Tensor):
+        self.valid_mask = valid_mask.bool()
+        self.n_stocks, self.n_windows = self.valid_mask.shape
 
     def __len__(self) -> int:
-        return self.n_stocks * self.n_windows
+        return int(self.valid_mask.sum().item())
 
     def __iter__(self):
         # Shuffle dates
@@ -102,7 +112,8 @@ class DateGroupedSampler(Sampler):
         for window_idx in date_order:
             stock_order = torch.randperm(self.n_stocks).tolist()
             for stock_idx in stock_order:
-                indices.append(stock_idx * self.n_windows + window_idx)
+                if self.valid_mask[stock_idx, window_idx]:
+                    indices.append(stock_idx * self.n_windows + window_idx)
         return iter(indices)
 
 

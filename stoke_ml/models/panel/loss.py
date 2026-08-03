@@ -80,10 +80,18 @@ class PairwiseRankingLoss(nn.Module):
     Temperature τ controls the soft-sign steepness for gradient flow.
     """
 
-    def __init__(self, margin: float = 0.0, tau: float = 1.0):
+    def __init__(
+        self,
+        margin: float = 0.0,
+        tau: float = 1.0,
+        spread_target: float = 1.0,
+        spread_weight: float = 0.5,
+    ):
         super().__init__()
         self.margin = margin
         self.tau = tau
+        self.spread_target = spread_target
+        self.spread_weight = spread_weight
 
     def forward(
         self,
@@ -120,12 +128,18 @@ class PairwiseRankingLoss(nn.Module):
         if n_pairs == 0:
             return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
 
+        # Guard against non-finite predictions: a padded/zero window can
+        # overflow the heads under fp16 AMP, and one Inf/NaN must not poison
+        # the whole batch (NaN * 0 == NaN propagates through the masked sum).
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Scale-invariant pairwise differences: normalize predictions
         # within the batch so the loss magnitude doesn't depend on
         # model output scale (which is tiny at initialization).
-        pred_std = pred[valid].std() + 1e-8
-        pd = (pred.unsqueeze(0) - pred.unsqueeze(1)) / pred_std    # pd[i,j]
-        td = (target.unsqueeze(0) - target.unsqueeze(1))           # td[i,j]
+        pred_std = pred[valid].std()
+        pred_std_safe = pred_std + 1e-8
+        pd = (pred.unsqueeze(0) - pred.unsqueeze(1)) / pred_std_safe  # pd[i,j]
+        td = (target.unsqueeze(0) - target.unsqueeze(1))             # td[i,j]
 
         # Soft sign for gradient flow: sign(td) ≈ tanh(td / τ)
         sign_td = torch.tanh(td / (self.tau + 1e-8))
@@ -135,4 +149,12 @@ class PairwiseRankingLoss(nn.Module):
         # trigger illegal-memory-access with CUDA AMP on some drivers.
         pair_loss = F.relu(self.margin - sign_td * pd)
         eligible_f = eligible.float()
-        return (pair_loss * eligible_f).sum() / eligible_f.sum().clamp(min=1)
+        hinge = (pair_loss * eligible_f).sum() / eligible_f.sum().clamp(min=1)
+
+        # Spread-preservation penalty: the scale-invariant normalization above
+        # has a trivial minimum at constant predictions — the model can shrink
+        # |pred| toward 0 and the margin=0 hinge still vanishes (pd ≈ 0), so
+        # rank IC collapses while the scalar losses keep falling.  Penalize
+        # predictions collapsing below the z-scored target scale (~1.0).
+        spread = F.relu(self.spread_target - pred_std)
+        return hinge + self.spread_weight * spread

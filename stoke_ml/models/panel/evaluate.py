@@ -110,14 +110,25 @@ def compute_bootstrap_sharpe_ci(
     return lo, hi
 
 
-def _compute_daily_ic(preds_np: np.ndarray, actuals_np: np.ndarray) -> list[float]:
-    """Per-day Spearman rank IC."""
+def _compute_daily_ic(
+    preds_np: np.ndarray,
+    actuals_np: np.ndarray,
+    mask_np: np.ndarray | None = None,
+) -> list[float]:
+    """Per-day Spearman rank IC.
+
+    mask_np: (n_stocks, n_windows) bool — stocks with a non-padded target on
+    each day. Without it, zero-feature padded rows (short listing history) get
+    garbage predictions that drag down the rank correlation.
+    """
     daily_ics = []
     n_windows = preds_np.shape[1]
     for t in range(n_windows):
         p = preds_np[:, t]
         a = actuals_np[:, t]
         mask = np.isfinite(p) & np.isfinite(a)
+        if mask_np is not None:
+            mask = mask & mask_np[:, t]
         if mask.sum() >= 10:
             ic, _ = spearmanr(p[mask], a[mask])
             if np.isfinite(ic):
@@ -146,19 +157,37 @@ def _build_portfolio_returns(
     n_windows: int,
     horizon: int,
     top_k: int,
+    mask: torch.Tensor | None = None,
 ) -> tuple[list[float], list[float], list[float]]:
-    """Build long-only top-K, short bottom-K, and long-short spread returns."""
-    n_stocks = preds.shape[0]
-    k = min(top_k, max(1, n_stocks // 2))
+    """Build long-only top-K, short bottom-K, and long-short spread returns.
 
+    mask: (n_stocks, n_windows) bool — only stocks with a valid (non-padded)
+    target on day t are selection candidates; a day with <2 valid stocks is
+    skipped. Padded rows would otherwise sort to the bottom (all-zero features)
+    and corrupt the short book.
+    """
     long_rets, short_rets, spread_rets = [], [], []
     for t in range(0, n_windows, horizon):
-        sorted_idx = torch.argsort(preds[:, t], descending=True)
+        if mask is not None:
+            day_mask = mask[:, t]
+            valid_idx = day_mask.nonzero(as_tuple=False).squeeze(-1)
+            if valid_idx.numel() < 2:
+                continue
+            p_day = preds[valid_idx, t]
+            a_day = actuals[valid_idx, t]
+            n_candidates = valid_idx.numel()
+        else:
+            p_day = preds[:, t]
+            a_day = actuals[:, t]
+            n_candidates = preds.shape[0]
+
+        k = min(top_k, max(1, n_candidates // 2))
+        sorted_idx = torch.argsort(p_day, descending=True)
         top_idx = sorted_idx[:k]
         bot_idx = sorted_idx[-k:]
 
-        long_r = actuals[top_idx, t].mean().item()
-        short_r = actuals[bot_idx, t].mean().item()
+        long_r = a_day[top_idx].mean().item()
+        short_r = a_day[bot_idx].mean().item()
         if np.isfinite(long_r) and np.isfinite(short_r):
             long_rets.append(long_r)
             short_rets.append(short_r)
@@ -256,12 +285,17 @@ def evaluate_portfolio(
         )
         return _empty_result()
 
+    # Valid-position mask: window t's target lives at calendar position
+    # seq_len + t, where -100 marks a padded (short-listing) stock.
+    y_dir = torch.as_tensor(val_data["y_direction"])
+    mask_win = (y_dir[:, config.seq_len:config.seq_len + n_windows] != -100)
+    mask_np = mask_win.numpy()
+
     preds_np = preds.numpy()
     actuals_np = actuals.numpy()
 
-    k = min(top_k, max(1, n_stocks // 2))
     long_rets, short_rets, spread_rets = _build_portfolio_returns(
-        preds, actuals, n_windows, horizon, k,
+        preds, actuals, n_windows, horizon, top_k, mask=mask_win,
     )
 
     n_periods = len(spread_rets)
@@ -269,7 +303,7 @@ def evaluate_portfolio(
         return _empty_result()
 
     # ── IC diagnostics ──
-    daily_ics = _compute_daily_ic(preds_np, actuals_np)
+    daily_ics = _compute_daily_ic(preds_np, actuals_np, mask_np)
     ic_summary = compute_ic_summary(daily_ics)
 
     # ── Long-only top-K ──
@@ -289,13 +323,16 @@ def evaluate_portfolio(
     )
 
     # ── Quintile analysis ──
-    quintile_metrics = _quintile_analysis(preds, actuals, n_windows, horizon, n_stocks)
+    quintile_metrics = _quintile_analysis(
+        preds, actuals, n_windows, horizon, n_stocks, mask=mask_win,
+    )
 
     # ── Equal-weight baseline ──
     ew_rets = []
     for t in range(0, n_windows, horizon):
         col = actuals[:, t]
-        r = col[torch.isfinite(col)].mean().item()
+        keep = mask_win[:, t] & torch.isfinite(col)
+        r = col[keep].mean().item()
         if np.isfinite(r):
             ew_rets.append(r)
     ew_sharpe = compute_sharpe(
@@ -339,20 +376,37 @@ def _quintile_analysis(
     n_windows: int,
     horizon: int,
     n_stocks: int,
+    mask: torch.Tensor | None = None,
 ) -> dict:
     """Group stocks into 5 equal-sized quintiles each day, track mean return.
 
     Q1 = lowest predicted, Q5 = highest predicted.
     A healthy signal shows monotonic increase from Q1→Q5.
+
+    mask: (n_stocks, n_windows) bool — only valid (non-padded) stocks are
+    bucketed; days with <5 valid stocks are skipped. Without the mask, padded
+    stocks (zero predictions) all land in Q1 and fake the spread.
     """
     q_rets = {1: [], 2: [], 3: [], 4: [], 5: []}
-    q_size = max(1, n_stocks // 5)
 
     for t in range(0, n_windows, horizon):
-        sorted_idx = torch.argsort(preds[:, t], descending=False)
+        if mask is not None:
+            valid_idx = mask[:, t].nonzero(as_tuple=False).squeeze(-1)
+            if valid_idx.numel() < 5:
+                continue
+            p_day = preds[valid_idx, t]
+            a_day = actuals[valid_idx, t]
+            n_valid = valid_idx.numel()
+        else:
+            p_day = preds[:, t]
+            a_day = actuals[:, t]
+            n_valid = n_stocks
+
+        q_size = max(1, n_valid // 5)
+        sorted_idx = torch.argsort(p_day, descending=False)
         for qi, q_start in enumerate([0, q_size, 2*q_size, 3*q_size, 4*q_size], 1):
             q_idx = sorted_idx[q_start:q_start + q_size]
-            q_r = actuals[q_idx, t].mean().item()
+            q_r = a_day[q_idx].mean().item()
             if np.isfinite(q_r):
                 q_rets[qi].append(q_r)
 
