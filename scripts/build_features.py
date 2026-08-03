@@ -28,6 +28,7 @@ from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.fundamental_storage import FundamentalStorage
+from stoke_ml.data.earnings_storage import EarningsStorage
 from stoke_ml.data.etf_storage import ETFStorage
 from stoke_ml.data.stock_sector_mapper import StockSectorMapper
 from stoke_ml.data.guba_storage import GubaStorage
@@ -143,6 +144,7 @@ def build_one(args: dict) -> tuple[str, str]:
             northbound_df=_load_opt(args, "nb_storage", "load", code),
             dragon_tiger_df=_load_opt(args, "dt_storage", "load", code),
             fundamental_df=_load_opt(args, "fund_storage", "forward_fill_to_daily", code),
+            earnings_df=_load_opt(args, "earnings_storage", "load_daily", code),
             valuation_df=_load_stock_parquet(os.path.join(a_shares, "valuation"), code),
             capital_flow_df=_load_stock_parquet(os.path.join(a_shares, "capital_flow_processed"), code),
             board_df=_load_stock_parquet(os.path.join(a_shares, "board_processed"), code),
@@ -218,6 +220,10 @@ def main():
     parser.add_argument(
         "--force", action="store_true", help="Overwrite existing feature files",
     )
+    parser.add_argument(
+        "--quality-gate", action="store_true",
+        help="Run data_quality_gate.py (quick) after the build; exit non-zero on failure",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -229,6 +235,7 @@ def main():
     nb_storage = MarketWideStorage(data_dir, "northbound")
     dt_storage = MarketWideStorage(data_dir, "dragon_tiger")
     fund_storage = FundamentalStorage(data_dir)
+    earnings_storage = EarningsStorage(data_dir)
     etf_storage = ETFStorage(data_dir)
     guba_storage = GubaStorage(data_dir)
     comment_storage = CommentStorage(data_dir)
@@ -281,6 +288,7 @@ def main():
         "nb_storage": nb_storage,
         "dt_storage": dt_storage,
         "fund_storage": fund_storage,
+        "earnings_storage": earnings_storage,
         "etf_storage": etf_storage,
         "guba_storage": guba_storage,
         "comment_storage": comment_storage,
@@ -308,6 +316,17 @@ def main():
 
     counts = Counter(s for _, s in results)
     logger.info("Done: %s (out of %d stocks)", dict(counts), len(codes))
+
+    if args.quality_gate:
+        import subprocess
+        gate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_quality_gate.py")
+        cmd = [sys.executable, gate, "--quick"]
+        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        logger.info("Running data quality gate (quick)...")
+        rc = subprocess.call(cmd, env=env)
+        if rc != 0:
+            logger.error("Data quality gate FAILED (exit %d)", rc)
+            sys.exit(rc)
 
 
 if __name__ == "__main__":
