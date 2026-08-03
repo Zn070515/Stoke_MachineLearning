@@ -197,8 +197,13 @@ def train_panel(
 
     best_val_loss = float("inf")
     best_state = None
+    best_epoch_idx = 0
     patience_counter = 0
-    history = {"train_loss": [], "val_loss": [], "val_ls_sharpe": [], "val_ic": []}
+    history = {
+        "train_loss": [], "val_loss": [],
+        "val_ls_sharpe": [], "val_ic": [],
+        "val_eval_epochs": [],  # 1-based epoch of each val_metrics entry
+    }
     use_amp = config.use_amp and device.type == "cuda"
 
     for epoch in range(config.max_epochs):
@@ -303,6 +308,7 @@ def train_panel(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch_idx = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
@@ -322,6 +328,7 @@ def train_panel(
             history["val_ic"].append(ic_mean)
             history.setdefault("val_metrics", [])
             history["val_metrics"].append(m)
+            history["val_eval_epochs"].append(epoch + 1)
             logger.info(
                 "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.3f) rank=%.6f "
                 "IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
@@ -347,4 +354,5 @@ def train_panel(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    history["best_epoch_idx"] = best_epoch_idx
     return model, history

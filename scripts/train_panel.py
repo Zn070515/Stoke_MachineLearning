@@ -2,10 +2,16 @@
 
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --epochs 30 --max-folds 1
+  PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --universe csi300 --stocks 300 --outdir reports/exp/csi300
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stock-list 600519,000001,000858
   PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --no-aux  # skip auxiliary data for quick test
+
+Universe modes (--universe): first / random / stratified / all / csi300 / csi500 / csi800.
+Artifacts (args.json, universe_resolved.txt, universe_used.txt, summary.json)
+are saved to --outdir (default reports/experiments/<timestamp>).
 """
 import argparse
+import json
 import logging
 import os
 import sys
@@ -36,6 +42,117 @@ def _discover_stocks(data_dir: str, limit: int | None = None) -> list[str]:
         for f in os.listdir(daily_dir) if f.endswith(".parquet")
     )
     return stocks[:limit] if limit else stocks
+
+
+def _exchange_group(stock_code: str) -> str:
+    """Exchange bucket by code prefix: SH=6, SZ=0/3, BJ=4/8."""
+    if stock_code.startswith("6"):
+        return "SH"
+    if stock_code.startswith(("0", "3")):
+        return "SZ"
+    return "BJ"
+
+
+def _load_index_universe(data_dir: str, index_codes: set[str]) -> list[str]:
+    """Stocks ever in the given indices (PIT in_date/out_date union).
+
+    Any stock that was a member at any point in history is included — the
+    training span runs 2000-2026, so a fixed-date snapshot would silently
+    drop stocks that left the index mid-period.
+    """
+    path = os.path.join(
+        data_dir, "a_shares", "index_constituents_hist", "membership.parquet",
+    )
+    if not os.path.isfile(path):
+        return []
+    df = pd.read_parquet(path)
+    members = df[df["index_code"].isin(index_codes)]["stock_code"].unique()
+    return sorted(members)
+
+
+def _resolve_universe(
+    all_stocks: list[str],
+    universe: str,
+    limit: int | None,
+    seed: int,
+    data_dir: str,
+) -> tuple[list[str], str]:
+    """Select the training universe by name.
+
+    Returns (resolved_stocks, description).  The description records exactly
+    what was selected (mode / seed / count) for the experiment artifacts.
+
+    Modes:
+      first      — first N by code (legacy behaviour, alphabetical bias)
+      random     — seeded sample of N from all stocks (no code-order bias)
+      stratified — seeded sample targeting N, balanced across SH/SZ/BJ
+      all        — every stock (ignores --stocks)
+      csi300/500/800 — index constituents (PIT union), --stocks caps count
+    """
+    if limit is None:
+        limit = len(all_stocks)
+    all_sorted = sorted(all_stocks)
+    if universe == "all":
+        return all_sorted, f"all ({len(all_sorted)} stocks)"
+    if universe == "first":
+        chosen = all_sorted[:limit]
+        return chosen, f"first {len(chosen)} (sorted by code)"
+    if universe == "random":
+        rng = np.random.RandomState(seed)
+        k = min(limit, len(all_stocks))
+        chosen = rng.choice(all_sorted, size=k, replace=False).tolist()
+        return chosen, f"random {len(chosen)} (seed={seed})"
+    if universe == "stratified":
+        rng = np.random.RandomState(seed)
+        by_group: dict[str, list[str]] = {"SH": [], "SZ": [], "BJ": []}
+        for code in all_sorted:
+            by_group[_exchange_group(code)].append(code)
+        chosen: list[str] = []
+        remaining = limit
+        for group, codes in by_group.items():
+            share = min(remaining // 3, len(codes))
+            chosen.extend(rng.choice(codes, size=share, replace=False).tolist())
+            remaining -= share
+        if remaining > 0:
+            used = set(chosen)
+            leftover = [c for codes in by_group.values() for c in codes if c not in used]
+            chosen.extend(
+                rng.choice(leftover, size=min(remaining, len(leftover)), replace=False).tolist()
+            )
+        rng.shuffle(chosen)
+        return chosen, f"stratified {len(chosen)} (seed={seed}, SH/SZ/BJ balanced)"
+    if universe in ("csi300", "csi500", "csi800"):
+        idx_map = {"csi300": {"000300"}, "csi500": {"000905"}, "csi800": {"000300", "000905"}}
+        members = _load_index_universe(data_dir, idx_map[universe])
+        if not members:
+            return [], f"{universe}: no membership data"
+        # Keep only members we actually have daily K-line for — the membership
+        # file includes codes with no data (delisted / not downloaded).
+        have = set(all_stocks)
+        members = [c for c in members if c in have]
+        chosen = members[:limit] if limit else members
+        return chosen, f"{universe} {len(chosen)} (PIT union, cap={limit})"
+    raise ValueError(f"unknown --universe: {universe}")
+
+
+def _best_eval_metrics(history: dict) -> tuple[dict, int]:
+    """Eval metrics at the epoch closest to the deployed (best-val-loss) checkpoint.
+
+    Portfolio metrics are computed every 5 epochs, but the model saved and
+    returned is the best-val_loss checkpoint.  Taking max() across all evals
+    peeks at the best post-hoc (optimistic); taking the last eval mislabels a
+    different epoch's performance.  Return the single eval nearest to
+    best_epoch_idx — an honest, deterministic proxy for the deployed model.
+    """
+    metrics = history.get("val_metrics") or []
+    if not metrics:
+        return {}, 0
+    eval_epochs = history.get("val_eval_epochs")
+    if not eval_epochs or len(eval_epochs) != len(metrics):
+        eval_epochs = [5 * (i + 1) for i in range(len(metrics))]
+    best_epoch = history.get("best_epoch_idx", 0) + 1
+    nearest = min(range(len(metrics)), key=lambda i: abs(eval_epochs[i] - best_epoch))
+    return metrics[nearest], eval_epochs[nearest]
 
 
 def load_aux_data(
@@ -371,10 +488,50 @@ def _augment_sequence(
     return pk_aug, po_aug
 
 
+def _save_artifacts(
+    outdir: str,
+    args: argparse.Namespace,
+    resolved: list[str],
+    used: list[str],
+    universe_desc: str,
+    summary: dict | None,
+) -> str:
+    """Persist the experiment: args, resolved/used universes, fold summary."""
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "args.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, ensure_ascii=False)
+    with open(os.path.join(outdir, "universe_resolved.txt"), "w", encoding="utf-8") as f:
+        f.write(f"# {universe_desc}\n# n={len(resolved)}\n")
+        f.write("\n".join(resolved))
+        f.write("\n")
+    with open(os.path.join(outdir, "universe_used.txt"), "w", encoding="utf-8") as f:
+        f.write(f"# {universe_desc} (after quality filter)\n# n={len(used)}\n")
+        f.write("\n".join(used))
+        f.write("\n")
+    if summary is not None:
+        with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+    logger.info("Experiment artifacts saved to %s", outdir)
+    return outdir
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train VSN+xLSTM panel model")
     parser.add_argument("--stocks", type=int, default=500,
-                        help="Limit to first N stocks (default: 500)")
+                        help="Universe size / cap (default: 500; with "
+                             "--universe first: first N sorted; random/stratified: "
+                             "N sampled; csi*: N cap)")
+    parser.add_argument("--universe", type=str, default="random",
+                        choices=["first", "random", "stratified", "all",
+                                 "csi300", "csi500", "csi800"],
+                        help="Stock universe selection (default: random; "
+                             "csi* = index constituents, PIT ever-held union)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="RNG seed for universe sampling and data "
+                             "augmentation (default: 42)")
+    parser.add_argument("--outdir", type=str, default=None,
+                        help="Experiment artifact dir (default: "
+                             "reports/experiments/<timestamp>)")
     parser.add_argument("--stock-list", type=str, default=None,
                         help="Comma-separated stock codes")
     parser.add_argument("--start", type=str, default="2000-01-01")
@@ -425,17 +582,24 @@ def main():
 
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
+        universe_desc = f"stock-list (explicit, n={len(stock_list)})"
     elif args.minute:
         from stoke_ml.data.minute_storage import MinuteStorage
         stock_list = MinuteStorage(data_dir).list_stocks(args.minute_frequency)
         if args.stocks:
             stock_list = stock_list[:args.stocks]
+        universe_desc = f"minute-mode (n={len(stock_list)})"
     else:
-        stock_list = _discover_stocks(data_dir, args.stocks)
+        all_stocks = _discover_stocks(data_dir, None)
+        stock_list, universe_desc = _resolve_universe(
+            all_stocks, args.universe, args.stocks, args.seed, data_dir,
+        )
 
     if not stock_list:
         logger.error("No stocks found")
         sys.exit(1)
+
+    universe_resolved = list(stock_list)
 
     # Data quality filter (daily only — minute data validated at download time)
     if not args.minute:
@@ -443,7 +607,9 @@ def main():
         if len(stock_list) < 20:
             logger.error("Too few stocks pass quality filter (%d)", len(stock_list))
             sys.exit(1)
+    universe_used = list(stock_list)
 
+    logger.info("Universe: %s", universe_desc)
     logger.info("Loading K-line data for %d stocks from %s to %s...",
                 len(stock_list), args.start, args.end)
 
@@ -543,7 +709,7 @@ def main():
     all_sharpes = []
     fold_histories = []
 
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(args.seed)
     fold = 0
     # Walk BACKWARD from the most recent data so the (max_folds) validation
     # windows cover the newest period instead of the earliest.  The training
@@ -645,21 +811,18 @@ def main():
         elapsed = time.time() - t0
 
         if history["val_ls_sharpe"]:
-            best_ls = max(history["val_ls_sharpe"])
-            if history.get("val_metrics"):
-                last = history["val_metrics"][-1]
-            else:
-                last = {}
+            best_m, best_eval_epoch = _best_eval_metrics(history)
+            best_ls = best_m.get("ls_sharpe", 0)
             all_sharpes.append(best_ls)
             fold_histories.append(history)
             logger.info(
-                "  Fold %d: best LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
+                "  Fold %d: eval@epoch%d LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
                 "Long_Sharpe=%.2f Q5-Q1=%.1fbp EW_Sharpe=%.2f (%.1fs)",
-                fold, best_ls,
-                last.get("ic_mean", 0), last.get("ic_ir", 0),
-                last.get("long_sharpe", 0),
-                last.get("q5mq1_ret", 0) * 10000,
-                last.get("ew_sharpe", 0),
+                fold, best_eval_epoch, best_ls,
+                best_m.get("ic_mean", 0), best_m.get("ic_ir", 0),
+                best_m.get("long_sharpe", 0),
+                best_m.get("q5mq1_ret", 0) * 10000,
+                best_m.get("ew_sharpe", 0),
                 elapsed,
             )
         else:
@@ -667,14 +830,49 @@ def main():
 
         val_start -= step
 
+    outdir = args.outdir or os.path.join(
+        "reports", "experiments", datetime.now().strftime("%Y%m%d_%H%M%S"),
+    )
+
+    summary_data = None
     if all_sharpes:
         logger.info("=== %d-Fold Summary ===", len(all_sharpes))
         logger.info("LS_Sharpe mean: %.2f ± %.2f", np.mean(all_sharpes), np.std(all_sharpes))
-        all_ics = [h["val_ic"][-1] for h in fold_histories if h.get("val_ic")]
+        all_ics = [
+            _best_eval_metrics(h)[0].get("ic_mean", float("nan"))
+            for h in fold_histories if h.get("val_metrics")
+        ]
+        all_ics = [x for x in all_ics if not np.isnan(x)]
         if all_ics:
             logger.info("IC mean: %.4f ± %.4f", np.mean(all_ics), np.std(all_ics))
+        summary_data = {
+            "n_folds": len(all_sharpes),
+            "ls_sharpe_mean": float(np.mean(all_sharpes)),
+            "ls_sharpe_std": float(np.std(all_sharpes)),
+            "ic_mean": float(np.mean(all_ics)) if all_ics else None,
+            "ic_std": float(np.std(all_ics)) if all_ics else None,
+            "universe": universe_desc,
+            "folds": [],
+        }
+        for i, h in enumerate(fold_histories):
+            m, eval_epoch = _best_eval_metrics(h)
+            summary_data["folds"].append({
+                "fold": i + 1,
+                "best_epoch": h.get("best_epoch_idx", 0) + 1,
+                "eval_epoch": eval_epoch,
+                "ls_sharpe": m.get("ls_sharpe"),
+                "ic_mean": m.get("ic_mean"),
+                "ic_ir": m.get("ic_ir"),
+                "long_sharpe": m.get("long_sharpe"),
+                "q5mq1_ret": m.get("q5mq1_ret"),
+                "ew_sharpe": m.get("ew_sharpe"),
+            })
     else:
         logger.warning("No valid folds completed")
+
+    _save_artifacts(
+        outdir, args, universe_resolved, universe_used, universe_desc, summary_data,
+    )
 
 
 if __name__ == "__main__":
