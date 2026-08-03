@@ -170,3 +170,147 @@ class TestMergeHelpers:
         assert result["sentiment_mean"].iloc[0] == 0.0
         # Second row should have first row's pre-shift sentiment (value 1.0)
         assert result["sentiment_mean"].iloc[1] == 1.0
+
+
+def _make_panel_kl(dates, seed):
+    """Synthetic OHLCV K-line for one stock on a given date list."""
+    rng = np.random.RandomState(seed)
+    close = 10.0 + np.cumsum(rng.randn(len(dates)) * 0.2)
+    close = np.clip(close, 1.0, None)
+    open_ = np.roll(close, 1)
+    open_[0] = close[0]
+    high = np.maximum(open_, close) * 1.01
+    low = np.minimum(open_, close) * 0.99
+    vol = rng.randint(1_000_000, 5_000_000, size=len(dates))
+    return pd.DataFrame({
+        "date": dates, "open": open_, "high": high, "low": low,
+        "close": close, "volume": vol,
+    })
+
+
+class TestPanelCalendarAlignment:
+    """P0-1: build_panel_features aligns every stock to ONE global calendar.
+
+    Column t of every array must be the SAME trading date for every stock;
+    otherwise cross-sectional IC / Top-K / long-short evaluation (which index
+    by column) mixes dates across stocks.
+    """
+
+    @staticmethod
+    def _make_panel():
+        base = pd.bdate_range("2020-01-01", "2020-08-31")
+        A = _make_panel_kl(list(base), seed=1)
+        A["stock_code"] = "000001"
+        b_dates = base[base >= "2020-04-01"]
+        B = _make_panel_kl(list(b_dates), seed=2)
+        B["stock_code"] = "000002"
+        c_dates = [x for x in base if not ("2020-05-11" <= str(x.date()) <= "2020-05-29")]
+        C = _make_panel_kl(c_dates, seed=3)
+        C["stock_code"] = "000003"
+        return pd.concat([A, B, C], ignore_index=True)
+
+    def _build(self):
+        return FeaturePipeline(seq_len=60).build_panel_features(
+            self._make_panel(), aux_data={}, horizon=5)
+
+    def test_all_columns_share_one_calendar_date(self):
+        pdata = self._build()
+        di = pdata["date_indices"]
+        T = pdata["past_known"].shape[1]
+        assert di.shape == (3, T)
+        for t in range(0, T, 10):
+            assert len(set(di[:, t].tolist())) == 1, f"column {t} mixes dates"
+
+    def test_late_listing_masked_before_listing(self):
+        pdata = self._build()
+        y_dir = pdata["y_direction"]
+        first_A = int(np.where(y_dir[0] != -100)[0].min())
+        first_B = int(np.where(y_dir[1] != -100)[0].min())
+        assert first_B > first_A  # B lists 2020-04-01, A from 2020-01-01
+
+    def test_suspension_produces_masked_hole(self):
+        pdata = self._build()
+        y_dir = pdata["y_direction"]
+        hole = [t for t in range(y_dir.shape[1])
+                if y_dir[2, t] == -100 and y_dir[0, t] != -100]
+        assert len(hole) >= 5  # 3-week suspension
+
+    def test_valid_positions_have_nonzero_return(self):
+        pdata = self._build()
+        y_dir = pdata["y_direction"]
+        y_ret = pdata["y_return"]
+        n_zero_valid = int(((y_dir != -100) & (y_ret == 0)).sum())
+        assert n_zero_valid == 0
+
+
+class TestPanelTruncationInvariance:
+    """Review §五 anti-cheat test #2: features must not see the future.
+
+    Build the panel twice — once truncated at 2020-12-31, once with the full
+    history through 2026 — and assert the pre-2021 feature columns are
+    BIT-IDENTICAL.  Any feature that differs when later data exists is using
+    future information (look-ahead bias).
+
+    Only the *features* are compared: y_return/y_volatility are targets and
+    are ALLOWED to look ahead (predicting the future is the model's job).
+    """
+
+    @staticmethod
+    def _make_panel(dates_full):
+        base = list(pd.to_datetime(dates_full))
+        A = _make_panel_kl(base, seed=1)
+        A["stock_code"] = "000001"
+        # B has a 3-week suspension in 2020-05 — exercises the mask/pad path
+        # in BOTH builds, so a late suspension can't masquerade as truncation.
+        b_dates = [x for x in base if not ("2020-05-11" <= str(x.date()) <= "2020-05-29")]
+        B = _make_panel_kl(b_dates, seed=2)
+        B["stock_code"] = "000002"
+        return pd.concat([A, B], ignore_index=True)
+
+    def _build(self, panel):
+        return FeaturePipeline(seq_len=60).build_panel_features(
+            panel, aux_data={}, horizon=5)
+
+    def test_features_invariant_to_future_data(self):
+        full = self._make_panel(pd.bdate_range("2019-01-01", "2026-01-01"))
+        trunc = full[pd.to_datetime(full["date"]) <= "2020-12-31"].copy()
+
+        p_full = self._build(full)
+        p_trunc = self._build(trunc)
+
+        # Same 2 stocks in both builds → arrays align stock-for-stock, and the
+        # truncated calendar is a strict prefix of the full one (same stocks,
+        # same start date), so feature column t is the same calendar day.
+        T_trunc = p_trunc["past_known"].shape[1]
+        assert p_full["past_known"].shape[0] == p_trunc["past_known"].shape[0] == 2
+        assert p_full["past_known"].shape[1] > T_trunc
+
+        for key in ("static_features", "past_known", "past_observed"):
+            a = p_trunc[key]
+            b = p_full[key][:, :T_trunc]
+            assert a.shape == b.shape, f"{key} shape {a.shape} vs {b.shape}"
+            # Tolerance (not bit-exact): at the data-start warm-up boundary
+            # (window < 60 rows) rolling features resolve their "not-yet-nan"
+            # sentinel to ~0 through different float accumulation order, so the
+            # two builds differ by ~1e-15 there — pure float32 rounding, far
+            # below the model's usable precision and NOT future information.
+            # A real look-ahead feature (value fed from a future row) changes by
+            # the feature's own magnitude (~1e-3..1), far above this tolerance.
+            assert np.allclose(a, b, rtol=0.0, atol=1e-10), (
+                f"{key} changes when future data is available — look-ahead bias"
+            )
+
+    def test_targets_may_depend_on_future_but_features_not(self):
+        """The vol target IS forward-looking; the invariant is feature-only."""
+        full = self._make_panel(pd.bdate_range("2019-01-01", "2026-01-01"))
+        trunc = full[pd.to_datetime(full["date"]) <= "2020-12-31"].copy()
+        p_full = self._build(full)
+        p_trunc = self._build(trunc)
+        T = p_trunc["y_volatility"].shape[1]
+        # Vol target near the truncation boundary is forward-looking: in the
+        # full build the window past 2020-12-31 exists, so these differ.
+        tail_full = p_full["y_volatility"][:, T - 5:T]
+        tail_trunc = p_trunc["y_volatility"][:, T - 5:T]
+        assert not np.array_equal(tail_full, tail_trunc), (
+            "expected forward-looking vol target to differ at the boundary"
+        )

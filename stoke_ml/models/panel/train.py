@@ -268,6 +268,12 @@ def train_panel(
                     )
                 scaler.step(optimizer)
                 scaler.update()
+                # Snapshot gradients BEFORE zero_grad — the old epoch-end call
+                # read already-zeroed grads and reported meaningless norms.
+                # Log once per epoch (on its final optimizer step) so a long
+                # run doesn't flood the log or pay a device-sync every batch.
+                if config.log_gradient_flow and batch_idx == len(train_loader) - 1:
+                    _log_gradient_norms(model, epoch + 1)
                 optimizer.zero_grad()
 
             epoch_loss += total_loss.item() * config.grad_accum_steps
@@ -288,14 +294,13 @@ def train_panel(
                 torch.nn.utils.clip_grad_norm_(head_params, config.head_grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            if config.log_gradient_flow:
+                _log_gradient_norms(model, epoch + 1)
             optimizer.zero_grad()
 
         n_batches = max(len(train_loader), 1)
         avg_loss = epoch_loss / n_batches
         history["train_loss"].append(avg_loss)
-
-        if config.log_gradient_flow:
-            _log_gradient_norms(model, epoch + 1)
 
         val_loss, v_ce, v_ret, v_vol = _compute_val_loss(
             model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
@@ -330,7 +335,7 @@ def train_panel(
             history["val_metrics"].append(m)
             history["val_eval_epochs"].append(epoch + 1)
             logger.info(
-                "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.3f) rank=%.6f "
+                "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f "
                 "IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
                 "Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
                 epoch + 1, config.max_epochs, avg_loss, val_loss,
@@ -341,7 +346,7 @@ def train_panel(
                 m["long_sharpe"], m["q5mq1_ret"] * 10000,
                 optimizer.param_groups[0]["lr"])
         else:
-            logger.info("Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.3f) rank=%.6f lr=%.2e",
+            logger.info("Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f lr=%.2e",
                         epoch + 1, config.max_epochs, avg_loss, val_loss,
                         v_ce, v_ret, v_vol,
                         epoch_rank_loss / n_batches,
@@ -355,4 +360,16 @@ def train_panel(
     if best_state is not None:
         model.load_state_dict(best_state)
     history["best_epoch_idx"] = best_epoch_idx
+    # Exact portfolio evaluation on the deployed best-val-loss checkpoint.
+    # The in-loop val_metrics snapshots are taken at each eval epoch from
+    # whatever model was current then, which may differ from best_state —
+    # reporting those is the "nearest epoch proxy" the review flags.  Compute
+    # the true IC/Sharpe of the checkpoint that is actually returned/saved.
+    try:
+        history["best_metrics"] = evaluate_portfolio(
+            model, val_data, config, device,
+            horizon=config.horizon, raw_returns=raw_val_returns,
+        )
+    except Exception:
+        logger.exception("best-checkpoint portfolio evaluation failed")
     return model, history

@@ -136,14 +136,18 @@ def _resolve_universe(
 
 
 def _best_eval_metrics(history: dict) -> tuple[dict, int]:
-    """Eval metrics at the epoch closest to the deployed (best-val-loss) checkpoint.
+    """Metrics of the exact deployed (best-val-loss) checkpoint.
 
-    Portfolio metrics are computed every 5 epochs, but the model saved and
-    returned is the best-val_loss checkpoint.  Taking max() across all evals
-    peeks at the best post-hoc (optimistic); taking the last eval mislabels a
-    different epoch's performance.  Return the single eval nearest to
-    best_epoch_idx — an honest, deterministic proxy for the deployed model.
+    train_panel evaluates the best checkpoint once after loading best_state
+    and stores it under history["best_metrics"].  Use that directly instead of
+    the nearest-eval-epoch proxy — the in-loop val_metrics snapshots come from
+    whatever model was current at that eval epoch, which can differ from the
+    checkpoint that is actually returned and saved.  Fall back to the nearest
+    eval only if best_metrics is unavailable (e.g. evaluation failed).
     """
+    best = history.get("best_metrics")
+    if best:
+        return best, history.get("best_epoch_idx", 0) + 1
     metrics = history.get("val_metrics") or []
     if not metrics:
         return {}, 0
@@ -551,6 +555,9 @@ def main():
                         help="Ranking loss weight (0=disable, default: 0.1)")
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable time-series data augmentation")
+    parser.add_argument("--log-gradient-flow", action="store_true",
+                        help="Log per-parameter-group gradient norms each epoch "
+                             "(after optimizer.step, before zero_grad)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
@@ -693,6 +700,8 @@ def main():
         num_workers=0,
         horizon=args.horizon,
         rank_loss_weight=args.rank_weight,
+        seed=args.seed,
+        log_gradient_flow=args.log_gradient_flow,
     )
     logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e rank_w=%.2f",
                 config.hidden_dim, config.xlstm_num_blocks, config.xlstm_num_heads,
@@ -760,29 +769,27 @@ def main():
             "date_indices": panel_data["date_indices"][:, val_slice].copy(),
         }
 
-        # Cross-sectional z-score normalization per date.
-        # Preserves relative ordering across stocks (unlike per-stock norm)
-        # so ranking losses and IC evaluation work on consistent scales.
+        # y_return: cross-sectional z-score per date — preserves relative
+        # ordering across stocks so ranking loss and IC evaluation work on a
+        # consistent scale.  y_volatility: kept as the raw positive future-vol
+        # target (std of the next-horizon daily returns).  VolatilityHead
+        # outputs softplus > 0, so z-scoring the target would reintroduce the
+        # negative-target-vs-positive-output contradiction — it must stay in
+        # original units.
         train_data["y_return"] = _cross_sectional_normalize(
             train_data["y_return"], train_mask,
-        )
-        train_data["y_volatility"] = _cross_sectional_normalize(
-            train_data["y_volatility"], train_mask,
         )
         # Save raw returns BEFORE normalization for portfolio evaluation.
         raw_val_y_return = val_data["y_return"].copy()
         val_data["y_return"] = _cross_sectional_normalize(
             val_data["y_return"], val_mask,
         )
-        val_data["y_volatility"] = _cross_sectional_normalize(
-            val_data["y_volatility"], val_mask,
-        )
         # Clip normalized targets to [-5, 5] — same band for train and val so
         # the model is never asked to fit z-scores beyond the eval range.
+        # (Only y_return is z-scored; y_volatility stays in original units,
+        # well below 5, so the clip applies to y_return only.)
         np.clip(val_data["y_return"], -5.0, 5.0, out=val_data["y_return"])
-        np.clip(val_data["y_volatility"], -5.0, 5.0, out=val_data["y_volatility"])
         np.clip(train_data["y_return"], -5.0, 5.0, out=train_data["y_return"])
-        np.clip(train_data["y_volatility"], -5.0, 5.0, out=train_data["y_volatility"])
 
         # Time-series data augmentation on training data.
         # Each stock's sequence gets independent noise/masking/dropout

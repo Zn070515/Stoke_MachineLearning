@@ -50,6 +50,12 @@ class PanelDataset(Dataset):
         else:
             self.date_indices = None
 
+        if self.date_indices is not None and self.date_indices.shape[1] < self.n_timesteps:
+            raise ValueError(
+                f"date_indices width ({self.date_indices.shape[1]}) < n_timesteps "
+                f"({self.n_timesteps}) — cannot index target date at window end"
+            )
+
         if self.n_windows <= 0:
             raise ValueError(
                 f"n_timesteps ({self.n_timesteps}) must be > seq_len ({seq_len})"
@@ -65,7 +71,11 @@ class PanelDataset(Dataset):
         start = window_idx
         end = start + self.seq_len
 
-        date_idx = (self.date_indices[stock_idx, end - 1].item()
+        # Target is at `end` (the step after the window [start, end)), so the
+        # date used to group this sample cross-sectionally is the TARGET date,
+        # not the last feature date (`end - 1`).  Ranking pairs must compare
+        # stocks' outcomes on the SAME future day.
+        date_idx = (self.date_indices[stock_idx, end].item()
                      if self.date_indices is not None else 0)
 
         return (

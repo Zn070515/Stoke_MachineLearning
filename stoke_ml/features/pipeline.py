@@ -1698,18 +1698,29 @@ class FeaturePipeline:
         # Cross-sectional z-score normalization mutates close (and all PK/PO
         # columns) to relative-value space.  Targets MUST be computed from raw
         # prices — using z-score changes as returns distorts the signal.
-        lengths = [len(df) for df in all_feat_dfs]
-        # Panel uses the full history (backfilled to 2000).  No truncation to a
-        # hard cap: per-stock T_i is the stock's own length, shorter stocks pad
-        # with -100 mask.  GPU memory is unaffected (batches are sliced on CPU,
-        # moved to device per-batch); only CPU RAM and epoch time scale with T.
-        max_T = max(lengths)
+        # ── Global trading-calendar alignment ──
+        # Every stock is aligned to the UNION of all stock dates (sorted), so
+        # array column t is the SAME calendar date for every stock.  Without
+        # this, a short-history stock would start at position 0 and its column
+        # t would be a different date than a long-history stock's column t —
+        # corrupting cross-sectional IC / Top-K / long-short evaluation (which
+        # index by column) and walk-forward fold boundaries.
+        all_dates = sorted({d for df in all_feat_dfs for d in pd.to_datetime(df["date"])})
+        max_T = len(all_dates)
+        global_dates = np.array(all_dates, dtype="datetime64[ns]")
+        # `all_dates` holds pandas Timestamps (which have .date()); iterating
+        # the numpy global_dates array would yield datetime64 scalars instead.
+        date_to_pos = {str(d.date()): i for i, d in enumerate(all_dates)}
 
         N_stocks = len(all_feat_dfs)
         y_dir_arr = np.full((N_stocks, max_T), -100, dtype=np.int64)  # CE ignore_index
         y_ret_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         y_vol_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         stock_T = np.zeros(N_stocks, dtype=np.int32)
+
+        # Row i of a stock's feature df → its column on the global calendar.
+        # Computed once here and reused by the feature-array scatter below.
+        stock_pos: list[np.ndarray] = [np.empty(0, dtype=np.int32) for _ in range(N_stocks)]
 
         # Direction noise threshold — scale by sqrt(horizon)
         # (0.003 per day, 1.0% / 5-day, 1.3% / 20-day)
@@ -1719,35 +1730,55 @@ class FeaturePipeline:
             if len(df) == 0:
                 continue
             df_sorted = df.sort_values("date").reset_index(drop=True)
-            T_i = min(len(df_sorted), max_T)
+            dates = pd.to_datetime(df_sorted["date"])
+            pos = np.array([date_to_pos[str(d.date())] for d in dates], dtype=np.int32)
+            stock_pos[i] = pos
+            T_i = len(pos)
             stock_T[i] = T_i
-            close_raw = df_sorted[target_col].values[:T_i]
+            close_full = np.full(max_T, np.nan, dtype=np.float64)
+            close_full[pos] = df_sorted[target_col].to_numpy(dtype=np.float64)
 
-            # Forward return over `horizon` days
-            # ret[t] = (close[t+horizon] - close[t]) / close[t]
-            ret_fwd = np.full(T_i, np.nan, dtype=np.float32)
-            if T_i > horizon:
-                ret_fwd[:T_i - horizon] = (
-                    (close_raw[horizon:] - close_raw[:T_i - horizon])
-                    / (close_raw[:T_i - horizon] + 1e-8)
-                )
-            # Direction label with scaled noise threshold.
-            # Only label positions where forward return is valid
-            # (last `horizon` positions are NaN → stay -100 masked).
-            valid_len = max(0, T_i - horizon)
-            y_dir_arr[i, :valid_len] = np.where(
-                ret_fwd[:valid_len] > dir_threshold, 2,
-                np.where(ret_fwd[:valid_len] < -dir_threshold, 0, 1),
-            ).astype(np.int64)
-            y_ret_arr[i, :T_i] = ret_fwd
+            # Forward return over `horizon` calendar days.  Only valid where
+            # close[t] and close[t+horizon] are BOTH real observations —
+            # not-yet-listed / suspended days (NaN close) never yield a label.
+            ret_fwd = np.full(max_T, np.nan, dtype=np.float32)
+            close_valid = ~np.isnan(close_full)
+            if max_T > horizon:
+                both = close_valid[:-horizon] & close_valid[horizon:]
+                num = close_full[horizon:][both] - close_full[:-horizon][both]
+                ret_fwd[:max_T - horizon][both] = (num / (close_full[:-horizon][both] + 1e-8)).astype(np.float32)
+            # Direction label with scaled noise threshold.  Positions without a
+            # valid forward return stay -100 (CE ignore_index → excluded).
+            valid = np.isfinite(ret_fwd)
+            y_dir_arr[i, valid] = np.where(
+                ret_fwd[valid] > dir_threshold, 2,
+                np.where(ret_fwd[valid] < -dir_threshold, 0, 1),
+            )
+            y_ret_arr[i] = np.nan_to_num(ret_fwd, nan=0.0)
 
-            # Backward-looking realized volatility from actual daily returns.
-            # Uses historical returns (close-to-close) — NOT forward returns —
-            # to avoid leaking future close prices into the volatility target.
-            # 5-day window for stability; independent of prediction horizon.
-            ret_hist = np.diff(close_raw) / (close_raw[:-1] + 1e-8)
-            for t in range(6, T_i):
-                y_vol_arr[i, t] = float(np.std(ret_hist[max(0, t-5):t]))
+            # FORWARD-looking realized volatility: std of the NEXT `horizon`
+            # daily returns (return[t+1 : t+horizon+1]).  This is a genuine
+            # prediction task — what inputs foreshadow elevated future risk —
+            # not a reconstruction of a known statistic already present in the
+            # technical features.  The target is strictly positive, matching
+            # the VolatilityHead's softplus output, so train_panel must NOT
+            # cross-sectionally z-score it (negative z-scores are inexpressible
+            # by softplus — the deterministic contradiction this replaces).
+            # Suspension gaps make a daily return NaN; they are skipped and a
+            # window with <2 valid returns stays 0 (those positions have
+            # y_dir=-100 so they never enter the vol loss).  Needs horizon>=2
+            # to be meaningful (a 1-day window has std 0).
+            ret_daily = np.full(max_T, np.nan, dtype=np.float32)
+            adj = close_valid[:-1] & close_valid[1:]
+            ret_daily[:-1][adj] = (
+                (close_full[1:] - close_full[:-1]) / (close_full[:-1] + 1e-8)
+            )[adj]
+            for t in range(max_T - horizon):
+                win = ret_daily[t + 1:t + 1 + horizon]
+                finite = win[np.isfinite(win)]
+                if len(finite) < 2:
+                    continue
+                y_vol_arr[i, t] = float(np.std(finite))
 
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
@@ -1910,7 +1941,10 @@ class FeaturePipeline:
         pk_dim = len(pk_cols_available)
         po_dim = len(po_cols_available)
 
-        # Pre-allocate feature arrays
+        # Pre-allocate feature arrays aligned to the GLOBAL calendar (column t
+        # is the same date for every stock).  Days before listing or during a
+        # suspension keep zero features; the y-direction -100 mask tells
+        # training & evaluation which positions are genuinely tradable.
         static_arr = np.zeros((N_stocks, static_dim), dtype=np.float32)
         pk_arr = np.zeros((N_stocks, max_T, pk_dim), dtype=np.float32)
         po_arr = np.zeros((N_stocks, max_T, po_dim), dtype=np.float32)
@@ -1920,17 +1954,17 @@ class FeaturePipeline:
                 continue
 
             df_sorted = df.sort_values("date").reset_index(drop=True)
-            T_i = min(len(df_sorted), max_T)
+            pos = stock_pos[i]
+            if len(pos) == 0:
+                continue
 
             # Static: take first row values
             if static_dim > 0:
                 static_arr[i] = df_sorted[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
 
-            # Past known
-            pk_arr[i, :T_i] = df_sorted[pk_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
-
-            # Past observed
-            po_arr[i, :T_i] = df_sorted[po_cols_available].fillna(0.0).values[:T_i].astype(np.float32)
+            # Past known / observed — scattered onto global-calendar columns.
+            pk_arr[i, pos] = df_sorted[pk_cols_available].fillna(0.0).values.astype(np.float32)
+            po_arr[i, pos] = df_sorted[po_cols_available].fillna(0.0).values.astype(np.float32)
 
         # ── Limit-up/down bias correction (horizon=1 only) ──
         # On days where a stock hits limit-up, positive returns are
@@ -1943,17 +1977,10 @@ class FeaturePipeline:
         # Reference: ml-quant-trading bias.py (see docs/research-findings.md §6.9).
         if horizon == 1:
             LIMIT_THRESHOLD = 0.095
-            T_max = y_dir_arr.shape[1]
             for i in range(N_stocks):
-                T_i = int(stock_T[i])
-                if T_i < 2:
-                    continue
-                ret = y_ret_arr[i, :T_i]
-                zt_mask = (ret > LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 2)
-                dt_mask = (ret < -LIMIT_THRESHOLD) & (y_dir_arr[i, :T_i] == 0)
-                full_mask = np.zeros(T_max, dtype=bool)
-                full_mask[:T_i] = zt_mask | dt_mask
-                y_dir_arr[i, full_mask] = -100  # PyTorch CE ignore_index
+                zt_mask = (y_ret_arr[i] > LIMIT_THRESHOLD) & (y_dir_arr[i] == 2)
+                dt_mask = (y_ret_arr[i] < -LIMIT_THRESHOLD) & (y_dir_arr[i] == 0)
+                y_dir_arr[i, zt_mask | dt_mask] = -100  # PyTorch CE ignore_index
 
         # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
         # Alpha158 factors can produce Inf from near-zero divisors (e.g.
@@ -1975,23 +2002,10 @@ class FeaturePipeline:
         # which is naturally balanced with CE loss (~1.0).
 
         # Per-stock date indices — maps each time step to its absolute
-        # position in the global trading calendar so that PairwiseRankingLoss
-        # can group samples from the same calendar date.
-        all_dates: list[str] = []
-        for df in all_feat_dfs:
-            if "date" in df.columns:
-                all_dates.extend(df["date"].astype(str).tolist())
-        unique_dates = sorted(set(all_dates))
-        date_to_idx = {d: i for i, d in enumerate(unique_dates)}
-        date_idx_arr = np.zeros((N_stocks, max_T), dtype=np.int32)
-        for i, df in enumerate(all_feat_dfs):
-            T_i = min(len(df), max_T)
-            if "date" in df.columns:
-                for t in range(T_i):
-                    d = str(df["date"].iloc[t])
-                    date_idx_arr[i, t] = date_to_idx.get(d, t)
-            else:
-                date_idx_arr[i, :T_i] = np.arange(T_i, dtype=np.int32)
+        # position in the global trading calendar.  With global alignment the
+        # mapping is IDENTICAL for every stock (column t == global_dates[t]),
+        # so PairwiseRankingLoss groups true same-day cross-sections.
+        date_idx_arr = np.tile(np.arange(max_T, dtype=np.int32), (N_stocks, 1))
 
         return {
             "static_features": static_arr,
