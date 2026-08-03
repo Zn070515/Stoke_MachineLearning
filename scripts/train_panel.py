@@ -534,11 +534,9 @@ def main():
 
     # Purged walk-forward splits
     if args.minute:
-        train_len = 1500   # ~375 trading days at 4 bars/day
         val_len = 250      # ~62 trading days
         step = 125          # ~31 trading days
     else:
-        train_len = 756    # ~3 years daily
         val_len = 126      # ~6 months daily
         step = 63          # ~3 months daily
     purge = config.seq_len
@@ -548,21 +546,26 @@ def main():
     rng = np.random.RandomState(42)
     fold = 0
     # Walk BACKWARD from the most recent data so the (max_folds) validation
-    # windows cover the newest period instead of the earliest.  Training data
-    # ranges from --start (2000-01-01) to the validation window regardless,
-    # so the 2000-2015 history is genuinely usable rather than truncated.
-    last_train_start = n_timesteps - train_len - purge - val_len
-    train_start = last_train_start
-    while train_start >= 0:
+    # windows cover the newest period instead of the earliest.  The training
+    # window GROWS from position 0 out to (val_start - purge) each fold, so
+    # the 2000-2015 history is genuinely in the training set — the old
+    # fixed-width 756-day scheme left [0, n_timesteps-train_len-purge-val_len)
+    # permanently unused and put short-history stocks' data entirely before
+    # every fold window.
+    last_val_start = n_timesteps - val_len
+    val_start = last_val_start
+    while val_start >= 0:
         if args.max_folds and fold >= args.max_folds:
             break
+        train_end = val_start - purge
+        if train_end < config.seq_len:
+            break  # not enough rows left to form even one training window
         fold += 1
-        train_end = train_start + train_len
-        val_start = train_end + purge
+        train_start = 0
         val_end = min(val_start + val_len, n_timesteps)
 
         train_slice = slice(train_start, train_end)
-        val_context_start = max(0, val_start - config.seq_len)
+        val_context_start = val_start - config.seq_len
         val_slice = slice(val_context_start, val_end)
 
         # Build a validity mask: position (i,t) is valid if y_direction != -100
@@ -606,9 +609,12 @@ def main():
         val_data["y_volatility"] = _cross_sectional_normalize(
             val_data["y_volatility"], val_mask,
         )
-        # Clip normalized targets to [-5, 5].
+        # Clip normalized targets to [-5, 5] — same band for train and val so
+        # the model is never asked to fit z-scores beyond the eval range.
         np.clip(val_data["y_return"], -5.0, 5.0, out=val_data["y_return"])
         np.clip(val_data["y_volatility"], -5.0, 5.0, out=val_data["y_volatility"])
+        np.clip(train_data["y_return"], -5.0, 5.0, out=train_data["y_return"])
+        np.clip(train_data["y_volatility"], -5.0, 5.0, out=train_data["y_volatility"])
 
         # Time-series data augmentation on training data.
         # Each stock's sequence gets independent noise/masking/dropout
@@ -657,7 +663,7 @@ def main():
         else:
             logger.warning("  Fold %d: no valid metrics (%.1fs)", fold, elapsed)
 
-        train_start -= step
+        val_start -= step
 
     if all_sharpes:
         logger.info("=== %d-Fold Summary ===", len(all_sharpes))
