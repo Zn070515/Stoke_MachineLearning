@@ -43,8 +43,8 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --stocks 600519 --m
 PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --stock 000001
 PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py  # all stocks
 
-# LSTM (sequence model, PyTorch Lightning)
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_lstm.py --stock 000001 --epochs 50
+# Panel (VSN+xLSTM, main model)
+PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --epochs 30 --max-folds 3
 ```
 
 ### Testing
@@ -128,13 +128,10 @@ Pipeline steps:
 
 ### Model Layer (`stoke_ml/models/`)
 
+- `PanelModel` (`models/panel/`): VSN (Variable Selection Network) + xLSTM backbone (sLSTM+mLSTM), multi-task heads (direction/return/volatility). Trained via `scripts/train_panel.py`
 - `XGBoostBaseline` (`models/baseline/`): Flat mode classifier, sklearn-compatible `fit/predict/save`
-- `LSTMModel` (`models/dl/`): 2-layer LSTM, hidden_dim=128, dropout=0.3
-- `TransformerModel` (`models/dl/`): 3-layer Transformer encoder, d_model=128, nhead=8
-- `SimpleAttentionModel` (`models/dl/`): Single self-attention + learnable query pooling, d_model=64
-- `StockLightningModule`: PyTorch Lightning wrapper, class-weighted CrossEntropyLoss, ReduceLROnPlateau, records val_mcc
 
-Existing checkpoints: `lstm_000001_final.ckpt`, `lstm_601318_final.ckpt`, `xgboost_000001_best.json`, `xgboost_600519_best.json`
+Existing checkpoints: `xgboost_000001_best.json`, `xgboost_600519_best.json`
 
 ### Evaluation (`stoke_ml/evaluation/`)
 
