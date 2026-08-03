@@ -8,7 +8,8 @@ project:
 markets:
   a_shares:
     enabled: true
-    stock_universe: [csi300, csi500]
+    # 说明性字段，无代码读取。实际股票池由 data/a_shares/daily/ 扫描决定：5530 只，2000-01-04 起。
+    stock_universe: [all]
     start_date: "2000-01-01"
   us:
     enabled: false
@@ -57,6 +58,10 @@ features:
   temporal_features: true
   use_sentiment: true
   target_horizon: 1
+  # FE v2 特征家族开关 (use_pledge / use_market_env / use_index_membership /
+  # use_market_env_refine) 不在 config.yaml 中设置——由 scripts/build_features.py
+  # CLI 控制 (--no-pledge / --no-market-env / --no-index-membership /
+  # --no-market-env-refine)，默认全开。预构建特征存于 data/features/{code}.parquet。
 
 # Model configuration
 model:

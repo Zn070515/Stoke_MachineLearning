@@ -148,15 +148,13 @@ def main():
     success, fail, empty = 0, 0, 0
 
     if args.concurrent:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         from stoke_ml.crawler.rate_limiter import RateLimiter
-        from stoke_ml.crawler.concurrent import ConcurrentDownloader
 
         rate_limiter = RateLimiter(
             base_delay_sec=0,
             daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
-        )
-        downloader = ConcurrentDownloader(
-            rate_limiter=rate_limiter, max_workers=args.workers,
         )
 
         def _fetch_one(code: str):
@@ -171,42 +169,57 @@ def main():
                 df = compute_raw_sentiment(df, analyzer)
             return df
 
-        results = downloader.download_all(codes, _fetch_one)
+        def _worker(code: str):
+            rate_limiter.wait()
+            return code, _fetch_one(code)
 
-        for i, code in enumerate(codes):
-            logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
-            df = results.get(code)
-            if df is None:
-                logger.error("  %s: fetch failed (exception in worker)", code)
-                fail += 1
-                continue
+        # Stream: save each stock as its fetch completes, so a mid-run
+        # crash keeps everything already downloaded (no all-or-nothing buffer).
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_worker, code): code for code in codes}
+            done = 0
+            for future in as_completed(futures):
+                code = futures[future]
+                done += 1
+                logger.info("[%d/%d] %s ...", done, len(codes), code)
+                try:
+                    _code, df = future.result()
+                except Exception as e:
+                    logger.error("  %s: fetch failed: %s", code, e)
+                    fail += 1
+                    continue
 
-            if df.empty:
-                logger.info("  %s: no news found", code)
-                empty += 1
-                continue
+                if df is None:
+                    logger.error("  %s: fetch failed (no data)", code)
+                    fail += 1
+                    continue
 
-            # Save raw (Bronze)
-            news_storage.save_raw_news(code, df)
-            logger.info("  %s: %d articles saved (raw)", code, len(df))
-            total_articles += len(df)
+                if df.empty:
+                    logger.info("  %s: no news found", code)
+                    empty += 1
+                    continue
 
-            if not args.raw_only:
-                # PIT-align -> Silver
-                silver = news_storage.bronze_to_silver(code)
-                if not silver.empty:
-                    news_storage.save_silver_news(code, silver)
+                # Save raw (Bronze)
+                news_storage.save_raw_news(code, df)
+                logger.info("  %s: %d articles saved (raw)", code, len(df))
+                total_articles += len(df)
 
-                # Daily aggregation -> Gold
-                if not args.skip_sentiment:
-                    gold = news_storage.silver_to_gold(code, analyzer)
-                    if not gold.empty:
-                        news_storage.save_daily_sentiment(gold)
-                        news_days = gold["has_news"].sum()
-                        logger.info("  %s: %d sentiment days (%d with news)",
-                                    code, len(gold), news_days)
+                if not args.raw_only:
+                    # PIT-align -> Silver
+                    silver = news_storage.bronze_to_silver(code)
+                    if not silver.empty:
+                        news_storage.save_silver_news(code, silver)
 
-            success += 1
+                    # Daily aggregation -> Gold
+                    if not args.skip_sentiment:
+                        gold = news_storage.silver_to_gold(code, analyzer)
+                        if not gold.empty:
+                            news_storage.save_daily_sentiment(gold)
+                            news_days = gold["has_news"].sum()
+                            logger.info("  %s: %d sentiment days (%d with news)",
+                                        code, len(gold), news_days)
+
+                success += 1
     else:
         for i, code in enumerate(codes):
             if i > 0:

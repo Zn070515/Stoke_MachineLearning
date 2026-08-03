@@ -8,8 +8,7 @@ build/
 venv/
 
 # Data (large files)
-data/raw/
-data/processed/
+data/a_shares/
 *.parquet
 
 # IDE
@@ -36,6 +35,10 @@ wandb/
 # Logs
 logs/
 *.log
-
+    
+# Lightning logs
 lightning_logs/models/
 lightning_logs/
+
+.pytest_cache/
+.ruff_cache/

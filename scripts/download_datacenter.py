@@ -122,6 +122,8 @@ def main():
                         help="Use concurrent downloader")
     parser.add_argument("--workers", type=int, default=2,
                         help="Concurrent workers (default: 2, keep low for EastMoney)")
+    parser.add_argument("--shard", type=str, default=None,
+                        help="Shard spec k/N (e.g. 0/3 processes first third of stocks)")
     args = parser.parse_args()
 
     if args.end is None:
@@ -138,6 +140,11 @@ def main():
         if not stock_list:
             logger.error("No stock codes found. Run download_data.py first.")
             sys.exit(1)
+
+    if args.shard:
+        k, n = args.shard.split("/")
+        k, n = int(k), int(n)
+        stock_list = [c for i, c in enumerate(stock_list) if i % n == k]
 
     # Determine which types to download
     if args.type == "all":

@@ -99,7 +99,9 @@ class TencentMinuteSource:
         Note: column order differs from standard (close before high/low).
         """
         columns = ["time_str", "open", "close", "high", "low", "volume"]
-        df = pd.DataFrame(raw, columns=columns)
+        # Tencent bars carry two trailing metadata fields after the 6 core
+        # columns; drop them so the frame columns match.
+        df = pd.DataFrame([bar[:6] for bar in raw], columns=columns)
 
         # Parse time: YYYYMMDDHHMM → datetime
         df["datetime"] = pd.to_datetime(df["time_str"], format="%Y%m%d%H%M")

@@ -38,6 +38,8 @@
 | turnover | 换手率 | % |
 | amplitude | 振幅 | % |
 
+> **pct_change 语义**：当日值（`pct_change[t]` = t 日收盘已知的当日涨跌幅，**不 lag**）。它是 PK 列（`_discover_pk_columns`），`_engineer_features` 在 technical 计算前后保留/恢复 K 线 pct_change，`_merge_daily_aux` 的 skip 集显式排除 `pct_change`/`vol_change`——K 线派生列永不来自 aux 注入。
+
 ---
 
 ## 存储架构
@@ -53,6 +55,10 @@
 ### K线存储
 
 `data/a_shares/daily/{year}/{month}/{stock_code}.parquet` — 与 Gold 层相同的年/月分区。
+
+### 预构建特征存储
+
+`data/features/{stock_code}.parquet` — `scripts/build_features.py` 一次性构建的全市场特征：5530 只 × 3744 列/股（516 基础 + 3228 时序展开），109GB。训练脚本直接读盘，特征工程与训练解耦。
 
 ### 格式
 
@@ -106,6 +112,11 @@
 | 趋势评分 (scoring) | 规则型 trend_level（0-6）/ buy_signal（0-5）/ bias |
 | 时序特征 (temporal) | 滞后项 lag(1/2/3/5/10/20) + 滚动统计 rolling(5/10/20/60) + 日历特征 |
 | 情感特征 (sentiment) | SENTIMENT_COLS 全部加入 lag 和 rolling |
+| 股权质押 (pledge) | PLEDGE_COLS 5列：pledge_ratio / pledge_margin_dist / pledge_risk / pledge_count_20d / has_pledge。公告日期 keyed，PIT lag(1) |
+| 指数成分 (index_membership) | INDEX_MEMBER_COLS 3列：is_index_member / n_indexes / idx_change_30d。无 index_weight（Baostock 无历史权重） |
+| 市场环境 (market_env) | MARKET_ENV_COLS 7列：high_low_ratio / mkt_cap_total_z / avg_account_cap_z / investor_new_num / investor_new_z / market_adv_ratio / market_turnover_z。全市场日频，无涨停温度列 |
+| 宏观制度 (macro regime) | MarketEnvRefiner 产出 menv_* 49列：shibor_z / fx_z / cpi_z / 期限利差 / M1-M2 扩散 / regime_z |
+| 龙虎榜席别 (seat) | DRAGON_TIGER_SEAT_COLS 4列：lhb_is_wave / lhb_is_sustained / lhb_is_drop / lhb_count_5d，属 `use_dragon_tiger` 维度 |
 
 **特征工程顺序**（不可改变）：
 1. 合并情感列（左连接 date）
@@ -113,6 +124,7 @@
 3. 技术指标
 4. 趋势评分
 5. 时序特征（滞后+滚动+日历）
+6. （FE v2）新家族（pledge / index_membership / market_env / macro regime）与其它辅助维度同一管道：步骤 1 左连接合并，步骤 2 ZI 填充，统一 PIT lag(1)
 
 ---
 
@@ -238,6 +250,11 @@
 | Session Pool 上限 | 50 | config.yaml → crawler.session_pool.max_sessions |
 | Walk-Forward train | 2 年 | config.yaml → training.validation.train_years |
 | Walk-Forward val | 3 月 | config.yaml → training.validation.val_months |
+| use_pledge / use_market_env / use_index_membership / use_market_env_refine | 默认 True | pipeline.py 构造器；build_features.py CLI 控制 |
+| PLEDGE_COLS / INDEX_MEMBER_COLS / MARKET_ENV_COLS / DRAGON_TIGER_SEAT_COLS | 5 / 3 / 7 / 4 列 | pipeline.py |
+| use_limit_up | False（deferred） | pipeline.py 构造器 |
+| market_env 源文件 | market_breadth/market_env_daily.parquet | pipeline.py → _merge_market_env |
+| macro 源文件 | macro/macro_daily.parquet | pipeline.py → _merge_macro |
 
 ---
 
@@ -248,3 +265,5 @@
 - ~~在全部数据上 fit StandardScaler~~ → 只在训练窗口上 fit，验证窗口仅 transform
 - ~~"情绪分析"~~ → 统一用"情感分析"（sentiment）
 - ~~裸 `python`~~ → 必须 `PYTHONPATH=. ./.venv/Scripts/python`（系统 Anaconda 缺依赖）
+- ~~用 `use_limit_up=True`~~ → limit-up 生态 19 列已定义但未接线（`use_limit_up=False`），勿在训练中开启
+- ~~让 aux 注入 K 线派生列~~ → `technical.compute_all` 会丢弃 pct_change/vol_change 中间列；若不恢复，`_merge_daily_aux` 会把 aux（如 board/industry ranking）自带的同名 stale 列注入当个股涨跌。主 K 线可派生的列，合并前必须在主 df 上恢复，并在 merge skip 集显式排除
