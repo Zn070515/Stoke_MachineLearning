@@ -14,7 +14,7 @@ PYTHONPATH=. ./.venv/Scripts/python <script>
 ### Data Pipeline
 
 ```bash
-# Download K-line for all CSI 300+500 stocks (798 stocks, 2015–2026)
+# Download K-line for all A-shares (5530 stocks, 2000–2026)
 PYTHONPATH=. ./.venv/Scripts/python scripts/download_data.py
 
 # Download news + sentiment (multi-source: EastMoney THS + Sina)
@@ -43,13 +43,26 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --stocks 600519 --m
 PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --stock 000001
 PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py  # all stocks
 
-# Panel (VSN+xLSTM, main model)
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --epochs 30 --max-folds 3
+# Prebuild features once (decouples feature engineering from training)
+PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py                 # flat → data/features/ (5530 × ~3744 cols)
+PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --panel-mode    # panel → data/features_panel/ (cross-sectional z-score)
+
+# Panel (VSN+xLSTM, main model) — read prebuilt features directly
+PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --prebuilt data/features_panel --epochs 30 --max-folds 3
+
+# Docs-vs-code drift guard (exit 1 on mismatch)
+PYTHONPATH=. ./.venv/Scripts/python scripts/check_docs_consistency.py
 ```
 
 ### Testing
 
-Tests directory exists but is empty (`tests/{crawler,data,evaluation,features,models}/`). No pytest config yet. `pytest` is available in the system Anaconda but tests must run under `.venv/Scripts/python -m pytest`.
+~29 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
+
+```bash
+PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q
+```
+
+Docs drift is guarded by `scripts/check_docs_consistency.py` (see Commands).
 
 ## Architecture
 
@@ -96,7 +109,7 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
                 use_guba=False, use_comment=False)
 ```
 
-**9 auxiliary dimensions** (all lagged 1 day to prevent leakage, merged via left-join ZI):
+**26 `use_*` data dimensions** (25 active + `use_limit_up` deferred; all lagged 1 day to prevent leakage, merged via left-join ZI):
 | Dimension | switch | Columns | Data density |
 |---|---|---|---|
 | sentiment (news) | `use_sentiment` | 6 | medium |
@@ -105,9 +118,28 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
 | announcement | `use_announcements` | 6 | low |
 | margin trading | `use_margin` | 4 | high |
 | northbound | `use_northbound` | 2 | medium |
-| dragon tiger | `use_dragon_tiger` | 3 | low |
+| dragon tiger (+ seat) | `use_dragon_tiger` | 7 (3+4) | low |
 | fundamental | `use_fundamental` | 8 | low (quarterly) |
+| earnings forecast | `use_earnings` | 6 | low |
+| valuation | `use_valuation` | 4 | high |
 | ETF flow | `use_etf_flow` | 2 | high (sector-level) |
+| capital flow | `use_capital_flow` | 9 | high |
+| block trade | `use_block_trade` | 7 | low |
+| shareholder | `use_shareholder` | 6 | low |
+| lockup | `use_lockup` | 5 | low |
+| dividend | `use_dividend` | 3 | low |
+| board (打板) | `use_board` | 12 | low |
+| sector (行业) | `use_sector` | 5 | high |
+| concept (概念) | `use_concept` | 5 | medium |
+| industry ranking | `use_industry` | 9 | high |
+| macro | `use_macro` | 28 | high (daily) |
+| pledge | `use_pledge` | 5 | medium |
+| index membership | `use_index_membership` | 3 | low |
+| market env | `use_market_env` | 7 | high (all-market) |
+| macro regime refine | `use_market_env_refine` | 49 | high (daily) |
+| limit-up ecology | `use_limit_up` | 20 | low — **DEFERRED** |
+
+(Plus pipeline-switch flags that toggle processing rather than data: `use_technical`, `use_scoring`, `use_temporal`, `use_interaction`, `use_feature_selection`, `use_new_preprocessing`, `use_emotion_refine`, `use_fundamental_refine`, `use_temporal_stats`.)
 
 Pipeline steps:
 1. Merge all auxiliary DataFrames (ZI fill for missing days/lags)
@@ -116,7 +148,7 @@ Pipeline steps:
 4. Microstructure: is_limit_up/down, gap_up/down_pct, volume_anomaly, limit_up_streak
 5. Temporal features (`temporal.py`): lags (1/2/3/5/10/20), rolling stats (5/10/20/60), calendar features
 6. Sequence creation: `seq_len=60` windows → `(n, seq_len, n_features)` or flat `(n, n_features*seq_len)` for XGBoost
-7. ALL config dimensionality: ~405 features × 60 seq_len = 24,300 flat dimensions
+7. Prebuild: `scripts/build_features.py` engineers the full market once (5530 × ~3744 cols, 109GB flat; `features_panel/` for panel z-score mode) — training reads prebuilt parquet instead of re-engineering in-loop. Flat ALL-mode dimensionality (~24,300) is why panel mode + IC pre-filtering is preferred.
 
 **News NLP** (`news_nlp.py`) — 3-tier sentiment:
 - L1: FinBERT Chinese (`yiyanghkust/finbert-tone-chinese`) via HF mirror (`hf-mirror.com`) or local cache
@@ -128,7 +160,7 @@ Pipeline steps:
 
 ### Model Layer (`stoke_ml/models/`)
 
-- `PanelModel` (`models/panel/`): VSN (Variable Selection Network) + xLSTM backbone (sLSTM+mLSTM), multi-task heads (direction/return/volatility). Trained via `scripts/train_panel.py`
+- `PanelModel` (`models/panel/`): VSN (Variable Selection Network) + xLSTM backbone (sLSTM+mLSTM), multi-task heads (direction/return/volatility). Trained via `scripts/train_panel.py` — reads prebuilt panel features (`--prebuilt data/features_panel`) so feature engineering runs once offline, not in the training loop.
 - `XGBoostBaseline` (`models/baseline/`): Flat mode classifier, sklearn-compatible `fit/predict/save`
 
 Existing checkpoints: `xgboost_000001_best.json`, `xgboost_600519_best.json`

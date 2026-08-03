@@ -29,13 +29,13 @@ class PanelConfig:
     head_dropout: float = 0.35  # output-head dropout (higher → anti-collapse)
 
     # xLSTM backbone
-    xlstm_num_blocks: int = 3
+    xlstm_num_blocks: int = 2
     xlstm_slstm_ratio: float = 0.67  # 2 sLSTM : 1 mLSTM
     xlstm_num_heads: int = 2
     grn_layers: int = 2  # decoder GRN stack after xLSTM
 
     # Training
-    batch_size: int = 64
+    batch_size: int = 128
     grad_accum_steps: int = 4
     learning_rate: float = 1e-3
     weight_decay: float = 1e-3       # 3e-4 → 1e-3 (stronger L2 for financial noise)
