@@ -175,11 +175,19 @@ def _build_portfolio_returns(
                 continue
             p_day = preds[valid_idx, t]
             a_day = actuals[valid_idx, t]
-            n_candidates = valid_idx.numel()
         else:
             p_day = preds[:, t]
             a_day = actuals[:, t]
-            n_candidates = preds.shape[0]
+
+        # Drop non-finite predictions.  Head clamps bound magnitudes but pass
+        # NaN through, and descending argsort sorts NaN to the head — that
+        # would inject garbage rows into the top-K long / bottom-K short books.
+        keep = torch.isfinite(p_day) & torch.isfinite(a_day)
+        p_day = p_day[keep]
+        a_day = a_day[keep]
+        n_candidates = p_day.numel()
+        if n_candidates < 2:
+            continue
 
         k = min(top_k, max(1, n_candidates // 2))
         sorted_idx = torch.argsort(p_day, descending=True)
@@ -396,11 +404,18 @@ def _quintile_analysis(
                 continue
             p_day = preds[valid_idx, t]
             a_day = actuals[valid_idx, t]
-            n_valid = valid_idx.numel()
         else:
             p_day = preds[:, t]
             a_day = actuals[:, t]
-            n_valid = n_stocks
+
+        # Same NaN guard as _build_portfolio_returns — a NaN prediction must
+        # not silently bucket into Q1.
+        keep = torch.isfinite(p_day) & torch.isfinite(a_day)
+        p_day = p_day[keep]
+        a_day = a_day[keep]
+        n_valid = p_day.numel()
+        if n_valid < 5:
+            continue
 
         q_size = max(1, n_valid // 5)
         sorted_idx = torch.argsort(p_day, descending=False)

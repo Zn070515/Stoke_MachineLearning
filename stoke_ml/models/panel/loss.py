@@ -155,6 +155,11 @@ class PairwiseRankingLoss(nn.Module):
         # has a trivial minimum at constant predictions — the model can shrink
         # |pred| toward 0 and the margin=0 hinge still vanishes (pd ≈ 0), so
         # rank IC collapses while the scalar losses keep falling.  Penalize
-        # predictions collapsing below the z-scored target scale (~1.0).
-        spread = F.relu(self.spread_target - pred_std)
+        # predictions collapsing below the target's own dispersion.  The
+        # threshold is tied to target_std rather than a fixed 1.0 because
+        # cross-sectional z-scored targets have std ~1 but sparse-date raw
+        # returns (std ~0.02) are left unnormalized — a fixed target would
+        # over-disperse those batches.
+        target_std = target[valid].std() + 1e-8
+        spread = F.relu(self.spread_target * target_std - pred_std)
         return hinge + self.spread_weight * spread

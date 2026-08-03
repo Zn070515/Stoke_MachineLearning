@@ -1597,9 +1597,10 @@ class FeaturePipeline:
                       (``save_features(panel_mode=True)``).  When set, per-stock
                       features are loaded from ``{prebuilt_dir}/{code}.parquet``
                       instead of being engineered live; ``aux_data`` is ignored.
-                      All parquets must have been built with the SAME ``--use-*``
-                      flags (same column schema); the column set is verified
-                      against the first stock and a mismatch raises ValueError.
+                      Parquets must be built with the SAME ``--use-*`` flags, but
+                      column SETS may legitimately differ per stock (merge
+                      methods skip columns a stock has no data for) — those gaps
+                      are reconciled by the all_cols ZI-alignment block below.
 
         Returns:
             dict with numpy arrays: static_features, past_known, past_observed,
@@ -1633,7 +1634,6 @@ class FeaturePipeline:
 
         # Engineer features per stock (reuses existing pipeline)
         all_feat_dfs = []
-        expected_cols: set[str] | None = None
         for code in codes:
             if prebuilt_dir:
                 path = os.path.join(prebuilt_dir, f"{code}.parquet")
@@ -1650,22 +1650,14 @@ class FeaturePipeline:
                 # to re-apply even though save_features(panel_mode=True) already
                 # added them — guards against hand-built parquets.
                 feats = add_calendar_features(feats)
-                # Schema check: every prebuilt parquet must carry the same
-                # column set (same --use-* flags during build).  A stock built
-                # with different flags would silently shift every feature's
-                # meaning in the panel.
-                if expected_cols is None:
-                    expected_cols = set(feats.columns)
-                else:
-                    missing_cols = expected_cols - set(feats.columns)
-                    extra_cols = set(feats.columns) - expected_cols
-                    if missing_cols or extra_cols:
-                        raise ValueError(
-                            f"Prebuilt feature column mismatch for {code}: "
-                            f"missing {sorted(missing_cols)}, extra {sorted(extra_cols)}. "
-                            "All parquets must be built with the same --use-* "
-                            "flags in build_features.py."
-                        )
+                # Schema note: parquets must be built with the SAME --use-*
+                # flags (build_features.py).  Column SETS still legitimately
+                # differ per stock — merge methods skip columns when a stock
+                # has no data for a sparse aux type (block_trade, dividend,
+                # valuation, ...).  No strict equality check here: those gaps
+                # are reconciled by the all_cols ZI-alignment block after the
+                # loop, and PK/PO columns are discovered BY NAME (never by
+                # position), so a missing column simply becomes all-zero.
             else:
                 mask = panel["stock_code"] == code
                 df_stock = panel[mask].sort_values("date").reset_index(drop=True)
@@ -1876,10 +1868,34 @@ class FeaturePipeline:
             # moments are stable even when the daily cross-section is tiny.
             sparse = stats["count"] < 5
             if sparse.any():
-                pooled_mean = float(np.nanmean(all_feat[col].values))
-                pooled_std = max(float(np.nanstd(all_feat[col].values)), 1e-8)
-                stats.loc[sparse, "mean"] = pooled_mean
-                stats.loc[sparse, "std"] = pooled_std
+                # Full-panel pooled moments would leak future dates' statistics
+                # into early dates' z-scores (the exact bias the per-date
+                # cross-section avoids).  Use expanding moments over dates <=
+                # the sparse date — strictly point-in-time.  Cumulative sums
+                # give O(dates) per column instead of O(dates^2).
+                sdf = all_feat[["date", col]].sort_values("date")
+                col_vals = sdf[col].to_numpy(dtype=np.float64)
+                # Treat inf as invalid too (np.nanmean/np.nanstd choke on it
+                # and would leak NaN through the z-score).
+                valid_vals = np.isfinite(col_vals)
+                x = np.where(valid_vals, col_vals, 0.0)
+                ccount = np.cumsum(valid_vals.astype(np.float64))
+                csum = np.cumsum(x)
+                csq = np.cumsum(x * x)
+                sdates = pd.to_datetime(sdf["date"]).to_numpy(dtype="datetime64[ns]")
+                sparse_dates = pd.to_datetime(stats.index[sparse]).to_numpy(dtype="datetime64[ns]")
+                pos = np.clip(
+                    np.searchsorted(sdates, sparse_dates, side="right") - 1,
+                    0, len(sdates) - 1,
+                )
+                cnt = np.maximum(ccount[pos], 1.0)
+                mean = csum[pos] / cnt
+                var = np.maximum(csq[pos] / cnt - mean * mean, 0.0)
+                std = np.maximum(np.sqrt(var), 1e-8)
+                # groupby agg returns float32 columns; the float64 arrays must
+                # be cast back or pandas raises LossySetitemError.
+                stats.loc[sparse, "mean"] = mean.astype(stats["mean"].dtype)
+                stats.loc[sparse, "std"] = std.astype(stats["std"].dtype)
             date_stats[col] = stats
 
         for df in all_feat_dfs:

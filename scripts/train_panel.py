@@ -558,8 +558,10 @@ def main():
         if args.max_folds and fold >= args.max_folds:
             break
         train_end = val_start - purge
-        if train_end < config.seq_len:
-            break  # not enough rows left to form even one training window
+        if train_end < config.seq_len + 1:
+            # PanelDataset needs at least seq_len+1 rows for one window
+            # (n_windows = n_timesteps - seq_len must be >= 1).
+            break
         fold += 1
         train_start = 0
         val_end = min(val_start + val_len, n_timesteps)
