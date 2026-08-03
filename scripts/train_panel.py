@@ -377,7 +377,7 @@ def main():
                         help="Limit to first N stocks (default: 500)")
     parser.add_argument("--stock-list", type=str, default=None,
                         help="Comma-separated stock codes")
-    parser.add_argument("--start", type=str, default="2015-01-01")
+    parser.add_argument("--start", type=str, default="2000-01-01")
     parser.add_argument("--end", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--max-folds", type=int, default=3,
@@ -398,6 +398,12 @@ def main():
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
                         help="Skip auxiliary data loading (faster startup)")
+    parser.add_argument("--prebuilt", type=str, default=None,
+                        help="Load panel-mode prebuilt features from this dir "
+                             "(built via build_features.py --panel-mode). "
+                             "Skips aux data loading and live feature "
+                             "engineering — the panel is built from the "
+                             "prebuilt parquets")
     parser.add_argument("--minute", action="store_true",
                         help="Use minute-frequency K-line data instead of daily")
     parser.add_argument("--minute-frequency", type=str, default="60",
@@ -473,9 +479,9 @@ def main():
     panel = pd.concat(frames, ignore_index=True)
     logger.info("Panel shape: %s", panel.shape)
 
-    # Load auxiliary data (unless --no-aux)
+    # Load auxiliary data (unless --no-aux or --prebuilt)
     aux_data = None
-    if not args.no_aux:
+    if not args.no_aux and not args.prebuilt:
         logger.info("Loading auxiliary data...")
         t_aux = time.time()
         aux_data = load_aux_data(stock_list, data_dir, args.start, args.end)
@@ -495,7 +501,9 @@ def main():
         use_valuation=True,
         use_board=False, use_sector=False, use_concept=False,
     )
-    panel_data = fp.build_panel_features(panel, aux_data=aux_data, horizon=args.horizon)
+    panel_data = fp.build_panel_features(
+        panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
+    )
 
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
@@ -539,8 +547,13 @@ def main():
 
     rng = np.random.RandomState(42)
     fold = 0
-    train_start = 0
-    while train_start + train_len + purge + val_len < n_timesteps:
+    # Walk BACKWARD from the most recent data so the (max_folds) validation
+    # windows cover the newest period instead of the earliest.  Training data
+    # ranges from --start (2000-01-01) to the validation window regardless,
+    # so the 2000-2015 history is genuinely usable rather than truncated.
+    last_train_start = n_timesteps - train_len - purge - val_len
+    train_start = last_train_start
+    while train_start >= 0:
         if args.max_folds and fold >= args.max_folds:
             break
         fold += 1
@@ -644,7 +657,7 @@ def main():
         else:
             logger.warning("  Fold %d: no valid metrics (%.1fs)", fold, elapsed)
 
-        train_start += step
+        train_start -= step
 
     if all_sharpes:
         logger.info("=== %d-Fold Summary ===", len(all_sharpes))

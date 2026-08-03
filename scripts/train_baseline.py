@@ -64,6 +64,11 @@ def main():
         "--no-comment", action="store_true",
         help="Exclude AKShare comment sentiment"
     )
+    parser.add_argument(
+        "--prebuilt", type=str, default=None,
+        help="Load pre-built flat features from this dir (data/features/); "
+             "skips live feature engineering entirely"
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -131,62 +136,74 @@ def main():
         date_start = cfg.markets.a_shares.start_date
         date_end = datetime.now().strftime("%Y-%m-%d")
 
-        # Load daily sentiment
-        sentiment_df = news_storage.load_daily_sentiment(code, date_start, date_end)
-        if not sentiment_df.empty:
-            logger.info(
-                "  %s: loaded %d sentiment days (%d with news)",
-                code, len(sentiment_df), sentiment_df["has_news"].sum(),
+        if args.prebuilt:
+            # Pre-built flat features: skip live engineering. The parquet was
+            # written by build_features.py with the same pipeline flags, so the
+            # sequence slicing (dead-feature drop + targets) matches the live path.
+            path = os.path.join(args.prebuilt, f"{code}.parquet")
+            if not os.path.isfile(path):
+                logger.warning("  No prebuilt features for %s, skipping", code)
+                continue
+            feats = FeaturePipeline.load_features(path)
+            X, y, aligned_close = pipeline._create_sequences(feats, "close")
+            logger.info("  %s: prebuilt features (rows=%d)", code, len(feats))
+        else:
+            # Load daily sentiment
+            sentiment_df = news_storage.load_daily_sentiment(code, date_start, date_end)
+            if not sentiment_df.empty:
+                logger.info(
+                    "  %s: loaded %d sentiment days (%d with news)",
+                    code, len(sentiment_df), sentiment_df["has_news"].sum(),
+                )
+
+            # Load market-wide data
+            margin_df = margin_storage.load(code, date_start, date_end)
+            nb_df = nb_storage.load(code, date_start, date_end)
+            dt_df = dt_storage.load(code, date_start, date_end)
+
+            # Load fundamentals (forward-filled to daily)
+            fundamental_df = fund_storage.forward_fill_to_daily(code, date_start, date_end)
+
+            # Load ETF flow for this stock's sector
+            etf_df = pd.DataFrame()
+            sector = sector_mapper.get_sector(code)
+            if sector:
+                etf_df = etf_storage.load_sector_flow(sector, date_start, date_end)
+
+            # Load Guba forum sentiment
+            guba_df = guba_storage.load_daily_sentiment(code, date_start, date_end)
+
+            # Load AKShare comment sentiment
+            comment_df = comment_storage.build_features(code, date_start, date_end)
+
+            loaded = [f"K={len(df)}"]
+            if not sentiment_df.empty:
+                loaded.append(f"S={len(sentiment_df)}")
+            if not margin_df.empty:
+                loaded.append(f"M={len(margin_df)}")
+            if not nb_df.empty:
+                loaded.append(f"N={len(nb_df)}")
+            if not fundamental_df.empty:
+                loaded.append(f"F={len(fundamental_df)}")
+            if not etf_df.empty:
+                loaded.append(f"ETF={len(etf_df)}")
+            if not guba_df.empty:
+                loaded.append(f"GB={len(guba_df)}")
+            if not comment_df.empty:
+                loaded.append(f"CM={len(comment_df)}")
+            logger.info("  %s: %s", code, " ".join(loaded))
+
+            X, y, aligned_close = pipeline.build_features(
+                df,
+                sentiment_df=sentiment_df if not sentiment_df.empty else None,
+                margin_df=margin_df if not margin_df.empty else None,
+                northbound_df=nb_df if not nb_df.empty else None,
+                dragon_tiger_df=dt_df if not dt_df.empty else None,
+                fundamental_df=fundamental_df if not fundamental_df.empty else None,
+                etf_flow_df=etf_df if not etf_df.empty else None,
+                guba_df=guba_df if not guba_df.empty else None,
+                comment_df=comment_df if not comment_df.empty else None,
             )
-
-        # Load market-wide data
-        margin_df = margin_storage.load(code, date_start, date_end)
-        nb_df = nb_storage.load(code, date_start, date_end)
-        dt_df = dt_storage.load(code, date_start, date_end)
-
-        # Load fundamentals (forward-filled to daily)
-        fundamental_df = fund_storage.forward_fill_to_daily(code, date_start, date_end)
-
-        # Load ETF flow for this stock's sector
-        etf_df = pd.DataFrame()
-        sector = sector_mapper.get_sector(code)
-        if sector:
-            etf_df = etf_storage.load_sector_flow(sector, date_start, date_end)
-
-        # Load Guba forum sentiment
-        guba_df = guba_storage.load_daily_sentiment(code, date_start, date_end)
-
-        # Load AKShare comment sentiment
-        comment_df = comment_storage.build_features(code, date_start, date_end)
-
-        loaded = [f"K={len(df)}"]
-        if not sentiment_df.empty:
-            loaded.append(f"S={len(sentiment_df)}")
-        if not margin_df.empty:
-            loaded.append(f"M={len(margin_df)}")
-        if not nb_df.empty:
-            loaded.append(f"N={len(nb_df)}")
-        if not fundamental_df.empty:
-            loaded.append(f"F={len(fundamental_df)}")
-        if not etf_df.empty:
-            loaded.append(f"ETF={len(etf_df)}")
-        if not guba_df.empty:
-            loaded.append(f"GB={len(guba_df)}")
-        if not comment_df.empty:
-            loaded.append(f"CM={len(comment_df)}")
-        logger.info("  %s: %s", code, " ".join(loaded))
-
-        X, y, aligned_close = pipeline.build_features(
-            df,
-            sentiment_df=sentiment_df if not sentiment_df.empty else None,
-            margin_df=margin_df if not margin_df.empty else None,
-            northbound_df=nb_df if not nb_df.empty else None,
-            dragon_tiger_df=dt_df if not dt_df.empty else None,
-            fundamental_df=fundamental_df if not fundamental_df.empty else None,
-            etf_flow_df=etf_df if not etf_df.empty else None,
-            guba_df=guba_df if not guba_df.empty else None,
-            comment_df=comment_df if not comment_df.empty else None,
-        )
         if len(X) == 0:
             logger.warning("Not enough features for %s, skipping", code)
             continue
