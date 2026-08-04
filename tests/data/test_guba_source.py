@@ -18,7 +18,7 @@ class TestGubaSource:
 
     def test_fetch_list_page_returns_posts(self, source):
         """_fetch_list_page should return DataFrame with correct columns."""
-        df = source._fetch_list_page("600519", page=1)
+        df, _ = source._fetch_list_page("600519", page=1)
 
         assert isinstance(df, pd.DataFrame), "Should return a DataFrame"
         assert len(df) > 0, "Should return at least some posts"
@@ -44,8 +44,8 @@ class TestGubaSource:
         Small overlap (<= 5 posts) may occur when Guba features
         popular posts across multiple pages.
         """
-        p1 = source._fetch_list_page("600519", page=1)
-        p2 = source._fetch_list_page("600519", page=2)
+        p1, _ = source._fetch_list_page("600519", page=1)
+        p2, _ = source._fetch_list_page("600519", page=2)
 
         ids1 = set(p1["post_id"])
         ids2 = set(p2["post_id"])
@@ -97,7 +97,7 @@ class TestGubaSource:
     def test_fetch_post_body_returns_text(self, source):
         """_fetch_post_body should return a non-empty string for a valid post."""
         # First get a post_id from the list
-        df = source._fetch_list_page("600519", page=1)
+        df, _ = source._fetch_list_page("600519", page=1)
         if df.empty:
             pytest.skip("No posts available to test body fetch")
 

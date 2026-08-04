@@ -24,11 +24,23 @@ class UncertaintyLoss(nn.Module):
             torch.full((num_tasks,), init_log_var)
         )
 
-    def forward(self, task_losses: list[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        task_losses: list[torch.Tensor],
+        task_active_mask: list[bool] | None = None,
+    ) -> torch.Tensor:
         assert len(task_losses) == self.num_tasks
+        if task_active_mask is None:
+            task_active_mask = [True] * self.num_tasks
         log_vars = torch.clamp(self.log_vars, -2.0, 10.0)
         total = torch.tensor(0.0, device=log_vars.device, dtype=log_vars.dtype)
         for i, loss in enumerate(task_losses):
+            # Review v4 §八: a task with no labels in this batch must not
+            # contribute even its log_var regularizer — doing so pushes
+            # inactive weights toward the clamp floor and distorts the
+            # weights of batches where that task IS active.
+            if not task_active_mask[i]:
+                continue
             precision = torch.exp(-log_vars[i])
             total = total + 0.5 * (precision * loss + log_vars[i])
         return total
@@ -52,7 +64,12 @@ class AdjMSELoss(nn.Module):
             raise ValueError("gamma must be positive")
         self.gamma = gamma
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        reduction: str = "mean",
+    ) -> torch.Tensor:
         squared = (pred - target) ** 2
         same_sign = (pred * target) >= 0
         weight = torch.where(
@@ -60,7 +77,14 @@ class AdjMSELoss(nn.Module):
             torch.full_like(squared, self.gamma),
             torch.full_like(squared, 1.0 + self.gamma),
         )
-        return (squared * weight).mean()
+        elem = squared * weight
+        if reduction == "mean":
+            return elem.mean()
+        if reduction == "sum":
+            return elem.sum()
+        if reduction == "none":
+            return elem
+        raise ValueError(f"unsupported reduction: {reduction!r}")
 
 
 class PairwiseRankingLoss(nn.Module):
@@ -99,6 +123,7 @@ class PairwiseRankingLoss(nn.Module):
         target: torch.Tensor,
         mask: torch.Tensor,
         date_idx: torch.Tensor,
+        stats: list[dict] | None = None,
     ) -> torch.Tensor:
         """Compute pairwise ranking loss.
 
@@ -107,59 +132,75 @@ class PairwiseRankingLoss(nn.Module):
             target: (B,) actual returns.
             mask: (B,) valid-position mask (1.0 = valid, 0.0 = ignore).
             date_idx: (B,) integer date index for same-date grouping.
+            stats: optional list — when given, appended a dict with
+                {n_dates, stocks_per_date, n_pairs} so the caller can detect
+                when ranking signal rests on very few pairs (review v4 §十).
         """
         B = pred.shape[0]
         if B < 2:
-            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
 
         valid = mask > 0.5
         if valid.sum() < 2:
-            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-
-        # Same-date mask: (B, B) boolean — True where dates match
-        same_date = date_idx.unsqueeze(0) == date_idx.unsqueeze(1)  # (B, B)
-        same_date = same_date & valid.unsqueeze(0) & valid.unsqueeze(1)
-
-        # Upper triangular (avoid double-counting and self-pairs)
-        triu = torch.triu(torch.ones(B, B, device=pred.device), diagonal=1).bool()
-        eligible = same_date & triu
-
-        n_pairs = eligible.sum()
-        if n_pairs == 0:
-            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
 
         # Guard against non-finite predictions: a padded/zero window can
         # overflow the heads under fp16 AMP, and one Inf/NaN must not poison
         # the whole batch (NaN * 0 == NaN propagates through the masked sum).
         pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Scale-invariant pairwise differences: normalize predictions
-        # within the batch so the loss magnitude doesn't depend on
-        # model output scale (which is tiny at initialization).
-        pred_std = pred[valid].std()
-        pred_std_safe = pred_std + 1e-8
-        pd = (pred.unsqueeze(0) - pred.unsqueeze(1)) / pred_std_safe  # pd[i,j]
-        td = (target.unsqueeze(0) - target.unsqueeze(1))             # td[i,j]
+        # Review v4 §十: a batch can hold several dates' head/tail slices, so
+        # predictions are normalized PER DATE — not over the mixed batch — and
+        # each date's pairwise loss is weighted by its own pair count.  The
+        # date loop is cheap: DateGroupedSampler batches contain 1-2 dates.
+        unique_dates = torch.unique(date_idx[valid])
+        hinge_sum = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        spread_sum = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        pair_count = 0
+        stocks_per_date: list[int] = []
+        for d in unique_dates:
+            idx = (date_idx == d) & valid
+            n = int(idx.sum().item())
+            if n < 2:
+                continue
+            stocks_per_date.append(n)
+            p = pred[idx]
+            t = target[idx]
 
-        # Soft sign for gradient flow: sign(td) ≈ tanh(td / τ)
-        sign_td = torch.tanh(td / (self.tau + 1e-8))
+            # Scale-invariant pairwise differences within THIS date.
+            pred_std = p.std() + 1e-8
+            pd = (p.unsqueeze(0) - p.unsqueeze(1)) / pred_std  # pd[i,j]
+            td = t.unsqueeze(0) - t.unsqueeze(1)             # td[i,j]
 
-        # Hinge: max(0, margin - sign(td) * pd), masked element-wise.
-        # Element-wise masking avoids boolean advanced-indexing which can
-        # trigger illegal-memory-access with CUDA AMP on some drivers.
-        pair_loss = F.relu(self.margin - sign_td * pd)
-        eligible_f = eligible.float()
-        hinge = (pair_loss * eligible_f).sum() / eligible_f.sum().clamp(min=1)
+            # Soft sign for gradient flow: sign(td) ≈ tanh(td / τ)
+            sign_td = torch.tanh(td / (self.tau + 1e-8))
 
-        # Spread-preservation penalty: the scale-invariant normalization above
-        # has a trivial minimum at constant predictions — the model can shrink
-        # |pred| toward 0 and the margin=0 hinge still vanishes (pd ≈ 0), so
-        # rank IC collapses while the scalar losses keep falling.  Penalize
-        # predictions collapsing below the target's own dispersion.  The
-        # threshold is tied to target_std rather than a fixed 1.0 because
-        # cross-sectional z-scored targets have std ~1 but sparse-date raw
-        # returns (std ~0.02) are left unnormalized — a fixed target would
-        # over-disperse those batches.
-        target_std = target[valid].std() + 1e-8
-        spread = F.relu(self.spread_target * target_std - pred_std)
-        return hinge + self.spread_weight * spread
+            # Hinge: max(0, margin - sign(td) * pd), upper-triangular pairs.
+            pair_loss = F.relu(self.margin - sign_td * pd)
+            triu = torch.triu(torch.ones(n, n, device=pred.device), diagonal=1).bool()
+            n_pairs = int(triu.sum().item())
+            hinge_sum = hinge_sum + (pair_loss * triu).sum()
+
+            # Spread-preservation penalty: the scale-invariant normalization
+            # has a trivial minimum at constant predictions — the model can
+            # shrink |pred| toward 0 and the margin=0 hinge still vanishes
+            # (pd ≈ 0), so rank IC collapses while the scalar losses keep
+            # falling.  Threshold tied to this date's target_std rather than a
+            # fixed 1.0 because cross-sectional z-scored targets have std ~1
+            # but sparse-date raw returns (std ~0.02) are left unnormalized.
+            target_std = t.std() + 1e-8
+            spread = F.relu(self.spread_target * target_std - pred_std)
+            spread_sum = spread_sum + spread * n_pairs
+            pair_count += n_pairs
+
+        if pair_count == 0:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        if stats is not None:
+            stats.append({
+                "n_dates": int(len(unique_dates)),
+                "stocks_per_date": stocks_per_date,
+                "n_pairs": pair_count,
+            })
+
+        return hinge_sum / pair_count + self.spread_weight * (spread_sum / pair_count)

@@ -21,10 +21,12 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader
 
 from stoke_ml.config import load_config
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.panel import PanelConfig
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from stoke_ml.models.panel.train import train_panel
 from stoke_ml.models.panel.evaluate import evaluate_portfolio
 
@@ -433,6 +435,10 @@ def _slice_panel(panel_data: dict, tslice: slice, price_pad: int = 0) -> dict:
     `tslice.stop` (capped at the panel end).  The sleeve-account evaluation
     (review v4 §四) needs open[t+h] to liquidate a position entered at open[t],
     so the last `price_pad` sleeves get a real exit instead of a forced carry.
+
+    `y_return_raw` is a copy of the RAW open-to-open return saved BEFORE the
+    caller z-scores/clips `y_return` (review v5 §五): clean IC and quintile
+    spreads must be computed on raw returns, not on the normalized model target.
     """
     stop = tslice.stop
     out = {
@@ -440,6 +446,7 @@ def _slice_panel(panel_data: dict, tslice: slice, price_pad: int = 0) -> dict:
         "past_known": panel_data["past_known"][:, tslice],
         "past_observed": panel_data["past_observed"][:, tslice],
         "y_direction": panel_data["y_direction"][:, tslice],
+        "y_return_raw": panel_data["y_return"][:, tslice].copy(),
         "y_return": panel_data["y_return"][:, tslice].copy(),
         "y_volatility": panel_data["y_volatility"][:, tslice].copy(),
         "observation_mask": panel_data["observation_mask"][:, tslice],
@@ -553,6 +560,59 @@ def _save_artifacts(
     return outdir
 
 
+def _predict_outer(model, outer_data, config, device) -> np.ndarray | None:
+    """Run the deployed checkpoint over the outer-test panel (review v4 §十三.2).
+
+    Uses the same no-sampler DataLoader as evaluate_portfolio, so every
+    (stock, window) pair is emitted in index order and the flattened return
+    predictions reshape back to (n_stocks, n_windows).  Window d enters at
+    panel column seq_len + d — i.e. global column val_start + d of the full
+    panel.  Returns None only when the outer panel has no windows.
+    """
+    val_ds = PanelDataset(outer_data, seq_len=config.seq_len,
+                          min_history=config.min_history)
+    val_loader = DataLoader(
+        val_ds, batch_size=config.batch_size,
+        shuffle=False, collate_fn=panel_collate,
+        num_workers=0, pin_memory=False,
+    )
+    model.eval()
+    preds_parts = []
+    with torch.no_grad():
+        for batch in val_loader:
+            static, pk, po, *_ = batch
+            static = static.to(device)
+            pk = pk.to(device)
+            po = po.to(device)
+            _, pred_ret, _ = model(static, pk, po)
+            preds_parts.append(pred_ret.cpu().squeeze(-1))
+    if not preds_parts:
+        return None
+    preds = torch.cat(preds_parts)
+    n_stocks = outer_data["static_features"].shape[0]
+    return preds.reshape(n_stocks, val_ds.n_windows).numpy()
+
+
+def _best_eval_metrics(history: dict) -> tuple[dict, int]:
+    """Metrics of the inner-val eval nearest the deployed checkpoint.
+
+    Returns (metrics_dict, eval_epoch) for the evaluation whose 1-based epoch
+    sits closest to best_epoch_idx+1 — NOT the post-hoc max, which would
+    double-count hindsight.  Histories without val_eval_epochs (legacy) are
+    assumed to have evaluated on the 5,10,15,... grid.  Empty histories yield
+    ({}, 0).
+    """
+    metrics = history.get("val_metrics") or []
+    if not metrics:
+        return {}, 0
+    best = history.get("best_epoch_idx", 0) + 1  # 1-based deployed epoch
+    eval_epochs = history.get("val_eval_epochs")
+    if not eval_epochs:
+        eval_epochs = [5 + 5 * i for i in range(len(metrics))]
+    nearest = min(range(len(metrics)), key=lambda i: abs(eval_epochs[i] - best))
+    return metrics[nearest], eval_epochs[nearest]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train VSN+xLSTM panel model")
     parser.add_argument("--stocks", type=int, default=500,
@@ -577,6 +637,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--max-folds", type=int, default=3,
                         help="Limit number of walk-forward folds (default: 3)")
+    parser.add_argument("--lockbox-months", type=int, default=12,
+                        help="Reserve the last N months as an untouched lockbox "
+                             "(review v4 §十三.3) — no fold trains on or "
+                             "evaluates it; kept for a single final run once "
+                             "the design freezes (default: 12)")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--horizon", type=int, default=5,
@@ -685,6 +750,10 @@ def main():
 
     panel = pd.concat(frames, ignore_index=True)
     logger.info("Panel shape: %s", panel.shape)
+    # Panel stock order is sorted-unique (build_panel_features sorts codes);
+    # derive the code list from the panel itself so OOS artifacts stay aligned
+    # with the panel arrays even if a stock's data was dropped as empty.
+    panel_stocks = sorted(panel["stock_code"].unique())
 
     # Load auxiliary data (unless --no-aux or --prebuilt)
     aux_data = None
@@ -750,24 +819,53 @@ def main():
     # Purged walk-forward splits
     if args.minute:
         val_len = 250      # ~62 trading days
-        step = 125          # ~31 trading days
     else:
         val_len = 126      # ~6 months daily
-        step = 63          # ~3 months daily
+    # Review v4 §十三: OOS folds are NON-OVERLAPPING — step == val_len, so
+    # adjacent folds evaluate disjoint test windows.  The old step < val_len
+    # made every fold share test days with its neighbours, inflating fold
+    # count and letting mean±std masquerade as independent dispersion.
+    step = val_len
     purge = config.seq_len
     all_sharpes = []
     fold_histories = []
 
+    # Review v4 §十三.3: reserve the last N months as an untouched lockbox.
+    # No fold trains on or evaluates it; it is kept for a single final run
+    # once the design freezes.  Daily ≈ 21 bars/month; minute mode scales by
+    # bars per day so lockbox_months spans the same wall-clock time.
+    bars_per_day = {"5": 48, "15": 16, "30": 8, "60": 4}[args.minute_frequency]
+    lockbox_len = int(args.lockbox_months * 21 * (bars_per_day if args.minute else 1))
+    lockbox_start = max(0, n_timesteps - lockbox_len)
+    if lockbox_start <= 0:
+        logger.error("Lockbox (%d steps) leaves no trainable panel "
+                     "(n_timesteps=%d) — reduce --lockbox-months",
+                     lockbox_len, n_timesteps)
+        sys.exit(1)
+    logger.info("Lockbox [%d:%d] %d steps (%.1f months) — %s .. %s",
+                lockbox_start, n_timesteps, lockbox_len, args.lockbox_months,
+                _fmt_date(global_dates, lockbox_start),
+                _fmt_date(global_dates, n_timesteps - 1))
+
+    outdir = args.outdir or os.path.join(
+        "reports", "experiments", datetime.now().strftime("%Y%m%d_%H%M%S"),
+    )
+    oos_dir = os.path.join(outdir, "oos_preds")
+    os.makedirs(oos_dir, exist_ok=True)
+    oos_dates_all: list[str] = []
+    oos_stocks_all: list[str] = []
+    oos_preds_all: list[np.ndarray] = []
+
     rng = np.random.RandomState(args.seed)
     fold = 0
-    # Walk BACKWARD from the most recent data so the (max_folds) validation
+    # Walk BACKWARD from the lockbox boundary so the (max_folds) validation
     # windows cover the newest period instead of the earliest.  The training
     # window GROWS from position 0 out to (val_start - purge) each fold, so
     # the 2000-2015 history is genuinely in the training set — the old
     # fixed-width 756-day scheme left [0, n_timesteps-train_len-purge-val_len)
     # permanently unused and put short-history stocks' data entirely before
     # every fold window.
-    last_val_start = n_timesteps - val_len
+    last_val_start = n_timesteps - val_len - lockbox_len
     val_start = last_val_start
     while val_start >= 0:
         if args.max_folds and fold >= args.max_folds:
@@ -868,19 +966,60 @@ def main():
             raw_returns=outer_test_data["realized_return"],
         )
         best_epoch = history.get("best_epoch_idx", 0) + 1
+
+        # Daily OOS predictions (review v4 §十三.2): one return forecast per
+        # (stock, entry day).  A window's entry is global column val_start+d,
+        # so entry dates run global_dates[val_start .. val_start+val_len-1].
+        oos_preds = _predict_outer(model, outer_test_data, config, device)
+        if oos_preds is not None:
+            n_w = oos_preds.shape[1]
+            entry_dates = [_fmt_date(global_dates, val_start + d) for d in range(n_w)]
+            # Entry-day eligibility on the same window-day grid so downstream
+            # sleeve-account construction can filter exactly what was tradable.
+            elig = outer_test_data["entry_eligible_mask"][
+                :, config.seq_len:config.seq_len + n_w]
+            np.savez(
+                os.path.join(oos_dir, f"fold_{fold:03d}.npz"),
+                preds=oos_preds,
+                dates=np.array(entry_dates),
+                stocks=np.array(panel_stocks),
+                entry_eligible=elig,
+            )
+            for d in range(n_w):
+                oos_dates_all.extend([entry_dates[d]] * len(panel_stocks))
+                oos_stocks_all.extend(panel_stocks)
+                oos_preds_all.append(oos_preds[:, d])
+
         if outer_m["n_periods"] >= 2:
             best_ls = outer_m["ls_sharpe"]
             all_sharpes.append(best_ls)
+            # Inner-val eval nearest the deployed checkpoint — what selection
+            # actually saw, reported honestly alongside the held-out outer
+            # metrics (review v4 §十一: never report a post-hoc max).
+            inner_eval_m, inner_eval_epoch = _best_eval_metrics(history)
             # Input-context date bounds of each segment — column t of the panel
             # is global_dates[t], so a slice [a,b) covers dates [a, b-1].
+            # Semantic dates (review v4 §十三.2): entry day e buys at open[e],
+            # the signal is produced after close[e-1], and the input context is
+            # the seq_len days [e-seq_len, e).
             fold_histories.append({
                 "history": history,
                 "outer_metrics": outer_m,
                 "best_epoch": best_epoch,
+                "inner_eval_epoch": inner_eval_epoch,
+                "inner_eval_ls_sharpe": inner_eval_m.get("ls_sharpe"),
+                "inner_eval_ic": inner_eval_m.get("ic_mean"),
                 "train_start": _fmt_date(global_dates, 0),
                 "train_end": _fmt_date(global_dates, inner_train_end - 1),
                 "inner_val_start": _fmt_date(global_dates, inner_val_context_start),
                 "inner_val_end": _fmt_date(global_dates, train_end - 1),
+                "context_start": _fmt_date(global_dates, val_context_start),
+                "signal_start": _fmt_date(global_dates, val_start - 1),
+                "entry_start": _fmt_date(global_dates, val_start),
+                "entry_end": _fmt_date(global_dates, val_start + val_len - 1),
+                "exit_end": _fmt_date(
+                    global_dates,
+                    min(val_start + val_len - 1 + config.horizon, n_timesteps - 1)),
                 "test_start": _fmt_date(global_dates, val_context_start),
                 "test_end": _fmt_date(global_dates, val_end - 1),
             })
@@ -901,9 +1040,18 @@ def main():
 
         val_start -= step
 
-    outdir = args.outdir or os.path.join(
-        "reports", "experiments", datetime.now().strftime("%Y%m%d_%H%M%S"),
-    )
+    # Combined daily OOS series (review v4 §十三.2): one row per (stock, entry
+    # day) across all non-overlapping folds — the input to the sleeve-account
+    # backtest, kept separate from fold-level aggregates.
+    if oos_preds_all:
+        oos_series = pd.DataFrame({
+            "entry_date": oos_dates_all,
+            "stock_code": oos_stocks_all,
+            "pred": np.concatenate(oos_preds_all),
+        })
+        oos_series_path = os.path.join(outdir, "oos_series.parquet")
+        oos_series.to_parquet(oos_series_path)
+        logger.info("OOS series: %d rows -> %s", len(oos_series), oos_series_path)
 
     summary_data = None
     if all_sharpes:
@@ -925,18 +1073,20 @@ def main():
             "ic_mean": float(np.mean(all_ics)) if all_ics else None,
             "ic_std": float(np.std(all_ics)) if all_ics else None,
             "universe": universe_desc,
-            # Review v3 §十三: with step < val_len the outer-test folds OVERLAP
-            # (adjacent folds share test days), so mean±std across folds is NOT
-            # the dispersion of independent experiments.  Surface it instead of
-            # letting the numbers be misread; per-fold test_start/test_end make
-            # the overlap visible.
-            "folds_overlap": bool(step < val_len),
-            "fold_note": (
-                "Outer-test folds overlap (step < val_len): adjacent folds share "
-                "test days, so mean±std is the dispersion of the fold schedule, "
-                "not independent experiments."
-                if step < val_len else None
-            ),
+            # Review v4 §十三: non-overlapping folds (step == val_len) — each
+            # fold's test days are disjoint, so mean±std is the dispersion of
+            # genuinely independent OOS windows.
+            "folds_overlap": False,
+            "fold_note": None,
+            "lockbox": {
+                "months": args.lockbox_months,
+                "start": _fmt_date(global_dates, lockbox_start),
+                "end": _fmt_date(global_dates, n_timesteps - 1),
+                "n_steps": lockbox_len,
+                "note": "Reserved for a single final run once the design "
+                        "freezes — no fold trains on or evaluates it.",
+            },
+            "oos_series": "oos_series.parquet",
             "folds": [],
         }
         for i, f in enumerate(fold_histories):
@@ -945,10 +1095,18 @@ def main():
                 "fold": i + 1,
                 "best_epoch": f["best_epoch"],
                 "eval_epoch": f["best_epoch"],
+                "inner_eval_epoch": f.get("inner_eval_epoch"),
+                "inner_eval_ls_sharpe": f.get("inner_eval_ls_sharpe"),
+                "inner_eval_ic": f.get("inner_eval_ic"),
                 "train_start": f.get("train_start"),
                 "train_end": f.get("train_end"),
                 "inner_val_start": f.get("inner_val_start"),
                 "inner_val_end": f.get("inner_val_end"),
+                "context_start": f.get("context_start"),
+                "signal_start": f.get("signal_start"),
+                "entry_start": f.get("entry_start"),
+                "entry_end": f.get("entry_end"),
+                "exit_end": f.get("exit_end"),
                 "test_start": f.get("test_start"),
                 "test_end": f.get("test_end"),
                 "ls_sharpe": m.get("ls_sharpe"),

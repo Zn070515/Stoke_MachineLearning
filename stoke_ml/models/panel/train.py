@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 
@@ -39,15 +40,24 @@ def _set_seed(seed: int | None) -> None:
 def _compute_val_loss(
     model: nn.Module,
     val_loader: DataLoader,
-    ce_loss: nn.Module,
-    ret_loss: nn.Module,
+    ret_loss: AdjMSELoss,
     loss_fn: UncertaintyLoss,
     device: torch.device,
     use_amp: bool,
     vol_enabled: bool = True,
 ) -> tuple[float, float, float, float]:
+    """Validation loss accumulated per VALID SAMPLE, not per batch.
+
+    Review v4 §九: sparse batches (few clean targets) must not weigh the same
+    as dense ones — the checkpoint-selection metric v_ret is a sample-weighted
+    mean over all valid return targets across the whole validation loader.
+    """
     model.eval()
-    total, ce_sum, ret_sum, vol_sum, n = 0.0, 0.0, 0.0, 0.0, 0
+    n_batches = 0
+    ce_sum = ce_cnt = 0.0
+    ret_sum = ret_cnt = 0.0
+    vol_sum = vol_cnt = 0.0
+    uncer_num = uncer_den = 0.0
     nan_batches = 0
     skipped_batches = 0
     with torch.no_grad():
@@ -62,44 +72,100 @@ def _compute_val_loss(
             dir_mask = dir_mask.to(device).float()
             ret_mask = ret_mask.to(device).float()
             vol_mask = vol_mask.to(device).float()
+            n_batches += 1
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                if torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any() or torch.isnan(pred_vol).any():
+                if (torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any()
+                        or torch.isnan(pred_vol).any()):
                     nan_batches += 1
                     continue
-                # Return loss is the fixed checkpoint-selection objective — a
-                # batch with no clean return targets carries no selection signal.
-                if ret_mask.sum() == 0:
+                dir_valid = dir_mask > 0
+                ret_valid = ret_mask > 0
+                vol_valid = vol_mask > 0
+
+                # Per-task elementwise losses (review v4 §八/§九): each loss is
+                # computed ONLY over its valid samples, and a batch whose
+                # direction labels are all -100 must not produce NaN CE.
+                losses_elem: list[torch.Tensor] = []
+                counts: list[int] = []
+                active: list[bool] = []
+
+                if dir_valid.any():
+                    losses_elem.append(F.cross_entropy(
+                        torch.clamp(pred_dir, -5, 5)[dir_valid], y_dir[dir_valid],
+                        reduction="none",
+                    ))
+                    counts.append(int(dir_valid.sum().item()))
+                    active.append(True)
+                else:
+                    losses_elem.append(torch.zeros((), device=device))
+                    counts.append(0)
+                    active.append(False)
+
+                if ret_valid.any():
+                    losses_elem.append(ret_loss(
+                        pred_ret.squeeze(-1)[ret_valid], y_ret[ret_valid],
+                        reduction="none",
+                    ))
+                    counts.append(int(ret_valid.sum().item()))
+                    active.append(True)
+                else:
+                    losses_elem.append(torch.zeros((), device=device))
+                    counts.append(0)
+                    active.append(False)
+
+                if vol_enabled:
+                    if vol_valid.any():
+                        losses_elem.append(
+                            (pred_vol.squeeze(-1)[vol_valid] - y_vol[vol_valid]).pow(2)
+                        )
+                        counts.append(int(vol_valid.sum().item()))
+                        active.append(True)
+                    else:
+                        losses_elem.append(torch.zeros((), device=device))
+                        counts.append(0)
+                        active.append(False)
+
+                if not any(active):
                     skipped_batches += 1
                     continue
-                l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)  # ignore_index=-100
-                l_ret = ret_loss(pred_ret.squeeze(-1)[ret_mask > 0],
-                                 y_ret[ret_mask > 0])
-                losses = [l_ce, l_ret]
-                if vol_enabled:
-                    if vol_mask.sum() > 0:
-                        vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * vol_mask
-                        losses.append(vol_err.sum() / vol_mask.sum())
-                    else:
-                        losses.append(torch.zeros((), device=device))
-                loss = loss_fn(losses)
-            if torch.isnan(loss) or torch.isinf(loss):
-                nan_batches += 1
-                continue
-            total += loss.item()
-            ce_sum += l_ce.item()
-            ret_sum += l_ret.item()
-            vol_sum += losses[2].item() if vol_enabled else 0.0
-            n += 1
+
+                # Per-task sums over valid samples — sample-weighted averages.
+                if active[0]:
+                    ce_sum += float(losses_elem[0].sum())
+                    ce_cnt += counts[0]
+                if active[1]:
+                    ret_sum += float(losses_elem[1].sum())
+                    ret_cnt += counts[1]
+                if vol_enabled and active[2]:
+                    vol_sum += float(losses_elem[2].sum())
+                    vol_cnt += counts[2]
+
+                # Uncertainty-weighted total, accumulated per valid sample so
+                # the combined val_loss is independent of batch boundaries.
+                log_vars = torch.clamp(loss_fn.log_vars, -2.0, 10.0)
+                num = torch.tensor(0.0, device=device, dtype=log_vars.dtype)
+                den = 0
+                for i, (l_elem, cnt, act) in enumerate(zip(losses_elem, counts, active)):
+                    if not act:
+                        continue
+                    precision = torch.exp(-log_vars[i])
+                    num = num + 0.5 * (precision * l_elem.sum() + log_vars[i] * cnt)
+                    den += cnt
+                uncer_num += float(num)
+                uncer_den += den
     if nan_batches > 0 or skipped_batches > 0:
         logger.warning(
             "%d NaN + %d empty / %d total val batches",
-            nan_batches, skipped_batches, n + nan_batches + skipped_batches,
+            nan_batches, skipped_batches, n_batches,
         )
     model.train()
-    if n == 0:
+    if uncer_den == 0:
         return float("inf"), float("inf"), float("inf"), float("inf")
-    return total / n, ce_sum / n, ret_sum / n, vol_sum / n
+    v_ce = ce_sum / ce_cnt if ce_cnt > 0 else float("inf")
+    v_ret = ret_sum / ret_cnt if ret_cnt > 0 else float("inf")
+    v_vol = vol_sum / vol_cnt if vol_cnt > 0 else float("inf")
+    return uncer_num / uncer_den, v_ce, v_ret, v_vol
 
 
 def _log_gradient_norms(model: nn.Module, epoch: int) -> None:
@@ -229,6 +295,8 @@ def train_panel(
         model.train()
         epoch_loss = 0.0
         epoch_rank_loss = 0.0
+        epoch_rank_pairs = 0
+        epoch_rank_batches = 0
         optimizer.zero_grad()
         accum_count = 0
 
@@ -247,32 +315,51 @@ def train_panel(
 
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                # Per-task masks (review v3 §八): CE ignores -100 via
-                # ignore_index; return/vol apply their own target masks.
-                l_ce = ce_loss(torch.clamp(pred_dir, -5, 5), y_dir)
+                # Per-task masks (review v4 §八): each loss runs ONLY over its
+                # valid samples.  A batch whose direction labels are all -100
+                # must not produce NaN CrossEntropy, and an inactive task must
+                # not update its uncertainty log-var.
+                dir_valid = dir_mask > 0
+                ret_valid = ret_mask > 0
+                vol_valid = vol_mask > 0
+                l_ce = (
+                    ce_loss(torch.clamp(pred_dir, -5, 5)[dir_valid], y_dir[dir_valid])
+                    if dir_valid.any()
+                    else torch.zeros((), device=device)
+                )
                 losses = [l_ce]
-                if ret_mask.sum() > 0:
-                    losses.append(ret_loss(pred_ret.squeeze(-1)[ret_mask > 0],
-                                           y_ret[ret_mask > 0]))
+                task_active = [bool(dir_valid.any().item())]
+                if ret_valid.any():
+                    losses.append(ret_loss(pred_ret.squeeze(-1)[ret_valid],
+                                           y_ret[ret_valid]))
+                    task_active.append(True)
                 else:
                     losses.append(torch.zeros((), device=device))
+                    task_active.append(False)
                 if vol_enabled:
-                    if vol_mask.sum() > 0:
+                    if vol_valid.any():
                         vol_err = (pred_vol.squeeze(-1) - y_vol).pow(2) * vol_mask
                         losses.append(vol_err.sum() / vol_mask.sum())
+                        task_active.append(True)
                     else:
                         losses.append(torch.zeros((), device=device))
+                        task_active.append(False)
 
                 # Pairwise ranking loss — directly optimises for cross-sectional
                 # ordering (the same signal IC and Sharpe evaluate on).  Ranks
                 # clean return targets only.
+                batch_rank_stats: list[dict] = []
                 l_rank = rank_loss(
                     pred_ret.squeeze(-1), y_ret,
-                    ret_mask,
-                    date_idx,
+                    ret_mask, date_idx, stats=batch_rank_stats,
                 )
 
-                total_loss = loss_fn(losses)
+                if not any(task_active):
+                    logger.debug("Epoch %d batch %d: no active task — skipping",
+                                 epoch + 1, batch_idx)
+                    continue
+
+                total_loss = loss_fn(losses, task_active_mask=task_active)
                 total_loss = total_loss + config.rank_loss_weight * l_rank
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -308,6 +395,9 @@ def train_panel(
 
             epoch_loss += total_loss.item() * config.grad_accum_steps
             epoch_rank_loss += l_rank.item()
+            if batch_rank_stats:
+                epoch_rank_pairs += batch_rank_stats[0]["n_pairs"]
+                epoch_rank_batches += 1
 
         # Apply trailing accumulated gradients
         remaining = accum_count % config.grad_accum_steps
@@ -333,7 +423,7 @@ def train_panel(
         history["train_loss"].append(avg_loss)
 
         val_loss, v_ce, v_ret, v_vol = _compute_val_loss(
-            model, val_loader, ce_loss, ret_loss, loss_fn, device, use_amp,
+            model, val_loader, ret_loss, loss_fn, device, use_amp,
             vol_enabled=vol_enabled,
         )
         history["val_loss"].append(val_loss)
@@ -368,20 +458,22 @@ def train_panel(
             history["val_eval_epochs"].append(epoch + 1)
             logger.info(
                 "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f "
-                "IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
+                "pairs=%d IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
                 "Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
                 epoch + 1, config.max_epochs, avg_loss, val_loss,
                 v_ce, v_ret, v_vol,
                 epoch_rank_loss / n_batches,
+                epoch_rank_pairs,
                 ic_mean, m["ic_ir"],
                 ls_sharpe, m["ls_sharpe_lo"], m["ls_sharpe_hi"],
                 m["long_sharpe"], m["q5mq1_ret"] * 10000,
                 optimizer.param_groups[0]["lr"])
         else:
-            logger.info("Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f lr=%.2e",
+            logger.info("Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f pairs=%d lr=%.2e",
                         epoch + 1, config.max_epochs, avg_loss, val_loss,
                         v_ce, v_ret, v_vol,
                         epoch_rank_loss / n_batches,
+                        epoch_rank_pairs,
                         optimizer.param_groups[0]["lr"])
 
         if patience_counter >= config.early_stop_patience:

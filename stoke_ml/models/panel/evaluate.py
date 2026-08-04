@@ -38,7 +38,10 @@ def compute_sortino(
     mean = daily_returns.mean().item()
     downside = daily_returns[daily_returns < target]
     if len(downside) < 2:
-        return float("inf") if mean > target else 0.0
+        # Review v5 §十五.3: with < 2 downside samples the Sortino is undefined.
+        # NaN (not inf) so JSON summaries / means / charts don't treat a lucky
+        # no-downside stretch as an unbounded score.
+        return float("nan") if mean > target else 0.0
     down_std = downside.std().item()
     if down_std < 1e-8:
         return 0.0
@@ -67,13 +70,23 @@ def compute_calmar(
     mdd = compute_max_drawdown(equity)
     if mdd < 1e-8:
         return 0.0
-    mean = daily_returns.mean().item()
-    periods_per_year = 252 / horizon
-    ann_return = mean * periods_per_year
-    return float(ann_return / mdd)
+    # Review v5 §十五: use the actual CAGR of the NAV curve (geometric), not
+    # the arithmetic mean*252 — under volatility the two diverge materially.
+    final_nav = float(equity[-1].item())
+    if final_nav <= 0:
+        return 0.0
+    cagr = final_nav ** (252 / (horizon * len(daily_returns))) - 1.0
+    return float(cagr / mdd)
 
 
-def compute_profit_factor(daily_returns: torch.Tensor) -> float:
+def compute_daily_return_profit_factor(daily_returns: torch.Tensor) -> float:
+    """Gross profit / gross loss over *daily* return samples (review v5 §十五.2).
+
+    This is NOT a trade-level profit factor — it aggregates per-day returns of
+    a strategy equity curve, not closed-trade P&L.  A trade-level PF would need
+    per-sleeve / per-position realized P&L.  Kept distinct by name so it is not
+    mistaken for one.
+    """
     profits = daily_returns[daily_returns > 0].sum().item()
     losses = abs(daily_returns[daily_returns < 0].sum().item())
     if losses < 1e-8:
@@ -308,97 +321,136 @@ def _simulate_sleeve_account(
     cost: float,
     mode: str = "long",
 ) -> dict:
-    """Chronological sleeve-account backtest (review v4 §四 / P0-A2/A3).
+    """Chronological sleeve-account backtest (review v4 §四 / v5 §三 §四 §六).
 
-    Every calendar day d enters a new sleeve that buys the top-K (long),
+    Every signal day d (< W) enters a new sleeve that buys the top-K (long),
     shorts the bottom-K (short), or buys every pool member (ew), at open[d],
-    and liquidates at open[d+horizon].  Each sleeve carries weight 1/h of the
-    account's NAV at entry, so h sleeves are concurrently invested; the NAV is
-    marked to close each day, giving a TRUE daily return series annualized
-    with sqrt(252) — fixing the phase-concatenation bug where offset-phases
-    were glued into a fake series and annualized by sqrt(252/h).
+    and is scheduled to liquidate at open[d+horizon].  Each sleeve carries
+    weight 1/h of the account's NAV at entry, so h sleeves are concurrently
+    invested; the NAV is marked to close each day, giving a TRUE daily return
+    series annualized with sqrt(252) — fixing the phase-concatenation bug.
+
+    The simulation runs to the END of the price path (Wp columns), NOT just to
+    the last signal day — review v5 §三: the sleeve entered on the last signal
+    day W-1 must still be liquidated at open[W-1+horizon], with its exit cost
+    booked and the book reaching zero active sleeves.  Entry only happens on
+    days d < W (no signal beyond W).
+
+    Exits are TRUE delayed exits (review v5 §四): a position whose scheduled
+    exit open is missing (suspension) is NOT sold at its stale close — it keeps
+    holding, marks to its last known close, and retries the exit on every later
+    day until a real open appears (DELAYED), its last price is <= 0 (DELISTED),
+    or the price path ends with the position still open (UNRESOLVED, booked at
+    the last carried close).  exit_status covers every successfully entered
+    position, so no filled holding is ever silently dropped.
 
     Fills respect entry eligibility: a selected stock with no real open[d]
     stays unfilled (its weight remains cash) and is NEVER backfilled (review
-    v4 §三).  Suspended positions mark at their last known close; a missing
-    exit open at the horizon is carried to the last close (exit_status
-    clean/carry/delist, P0-A4).
+    v4 §三).  Long/EW entries are additionally capped at available cash
+    (review v5 §六.2) so NAV leverage cannot drift.
 
     preds_np: (N, W) predictions for entry at window column d.  close_np /
     open_np: (N, Wp) price paths aligned to the SAME window-day grid (column d
     = entry day d = panel column seq_len+d), Wp >= W.  The exit at open[d+h]
-    is the sleeve popped on day d+h reading open_np[:, d+h].
+    is the sleeve popped on day d+h reading open_np[:, d+h].  If Wp < W+horizon
+    the trailing sleeves end up UNRESOLVED.
     """
     N, W = preds_np.shape
+    Wp = close_np.shape[1]
+    if Wp < W:
+        raise ValueError(f"close path {Wp} columns < preds {W} columns")
     side = {"long": 1.0, "ew": 1.0, "short": -1.0}[mode]
     carried = _ffill_last_np(close_np)
 
     nav_prev = 1.0
     cash = 1.0
     sleeves: dict[int, dict] = {}
-    net_daily = np.zeros(W)
-    gross_daily = np.zeros(W)
-    cost_paid = np.zeros(W)
-    buy_notional = np.zeros(W)
-    sell_notional = np.zeros(W)
-    exit_counts = {"clean": 0, "carry": 0, "delist": 0, "unfilled": 0}
-    exit_pnl = {"clean": 0.0, "carry": 0.0, "delist": 0.0, "unfilled": 0.0}
+    net_daily = np.zeros(Wp)
+    gross_daily = np.zeros(Wp)
+    cost_paid = np.zeros(Wp)
+    buy_notional = np.zeros(Wp)
+    sell_notional = np.zeros(Wp)
+    nav_before_day = np.zeros(Wp)
+    exit_counts = {"clean": 0, "delayed": 0, "delisted": 0,
+                   "unresolved": 0, "unfilled": 0}
+    exit_pnl = {k: 0.0 for k in exit_counts}
 
-    for d in range(W):
-        # ── Liquidate the sleeve entered at d - horizon ──
-        exit_c = d - horizon
-        if exit_c in sleeves:
-            sl = sleeves.pop(exit_c)
-            mask = sl["mask"]
-            if mask.any():
-                ex_open = open_np[:, d]
-                ex_open_ok = np.isfinite(ex_open) & (ex_open > 0)
-                clean_mask = mask & ex_open_ok
-                carry_mask = mask & (~ex_open_ok) & (carried[:, d] > 0)
-                delist_mask = mask & (~ex_open_ok) & (carried[:, d] <= 0)
-                ex_price = np.where(clean_mask, ex_open, carried[:, d])
+    for d in range(Wp):
+        nav_before_day[d] = nav_prev
+        # ── Liquidate positions whose scheduled exit is due (or overdue) ──
+        for c, sl in list(sleeves.items()):
+            held = sl["mask"]
+            if not held.any():
+                del sleeves[c]
+                continue
+            if d < sl["scheduled_exit_day"]:
+                continue
+            ex_open = open_np[:, d]
+            ex_open_ok = np.isfinite(ex_open) & (ex_open > 0)
+            exitable = held & ex_open_ok
+            dead = held & (~ex_open_ok) & (carried[:, d] <= 0)
+            if d == sl["scheduled_exit_day"]:
+                # First attempt: positions that cannot exit become PENDING and
+                # are held (marked to last close) until a real open appears.
+                sl["pending"] |= held & (~ex_open_ok) & (carried[:, d] > 0)
+            liquidate = exitable | dead
+            if liquidate.any():
+                ex_price = np.where(ex_open_ok, ex_open, carried[:, d])
                 ex_value = sl["shares"] * ex_price
-                proceeds = side * ex_value.sum()
-                cost_here = cost * np.abs(ex_value[mask]).sum()
+                proceeds = side * ex_value[liquidate].sum()
+                cost_here = cost * np.abs(ex_value[liquidate]).sum()
                 cash += proceeds - cost_here
                 cost_paid[d] += cost_here
-                sell_notional[d] += np.abs(ex_value[mask]).sum()
-                for cls, cl_mask in (("clean", clean_mask), ("carry", carry_mask),
-                                     ("delist", delist_mask)):
-                    if cl_mask.any():
-                        cls_pnl = side * (ex_value[cl_mask].sum() - sl["entry_val"][cl_mask].sum())
+                sell_notional[d] += np.abs(ex_value[liquidate]).sum()
+                is_clean = (d == sl["scheduled_exit_day"]) & ex_open_ok & (~sl["pending"])
+                for cls, cm in (("clean", liquidate & is_clean),
+                                ("delayed", liquidate & ~is_clean & ~dead),
+                                ("delisted", dead)):
+                    if cm.any():
+                        cls_pnl = side * (ex_value[cm].sum() - sl["entry_val"][cm].sum())
                         exit_pnl[cls] += float(cls_pnl)
-                        exit_counts[cls] += int(cl_mask.sum())
+                        exit_counts[cls] += int(cm.sum())
+                sl["mask"] = held & ~liquidate
+            if not sl["mask"].any():
+                del sleeves[c]
 
-        # ── Enter the sleeve at day d ──
-        w = nav_prev / horizon
-        pool_d = select_pool[:, d] & np.isfinite(preds_np[:, d])
-        pool_idx = np.nonzero(pool_d)[0]
-        shares = np.zeros(N)
-        entry_val = np.zeros(N)
-        if pool_idx.size > 0:
-            if mode == "ew":
-                chosen = pool_idx
-            else:
-                k = max(1, min(pool_idx.size, int(round(top_fraction * pool_idx.size))))
-                order = pool_idx[np.argsort(preds_np[pool_idx, d])]
-                chosen = order[-k:] if mode == "long" else order[:k]
-            stock_mask = np.zeros(N, dtype=bool)
-            stock_mask[chosen] = True
-            fillable = stock_mask & np.isfinite(open_np[:, d]) & (open_np[:, d] > 0)
-            exit_counts["unfilled"] += int((stock_mask & ~fillable).sum())
-            n_fill = int(fillable.sum())
-            if n_fill > 0:
-                # Fixed per-stock weight w/|chosen| — the unfilled fraction stays
-                # cash (NO backfill / 递补), exactly review v4 §三.
-                per_stock = w / chosen.size
-                shares[fillable] = per_stock / open_np[fillable, d]
-                entry_val[fillable] = per_stock
-                spent = per_stock * n_fill
-                cash -= side * spent
-                cost_paid[d] += cost * spent
-                buy_notional[d] = spent
-        sleeves[d] = {"shares": shares, "mask": fillable, "entry_val": entry_val}
+        # ── Enter the sleeve at signal day d ──
+        if d < W:
+            w = nav_prev / horizon
+            pool_d = select_pool[:, d] & np.isfinite(preds_np[:, d])
+            pool_idx = np.nonzero(pool_d)[0]
+            shares = np.zeros(N)
+            entry_val = np.zeros(N)
+            if pool_idx.size > 0:
+                if mode == "ew":
+                    chosen = pool_idx
+                else:
+                    k = max(1, min(pool_idx.size, int(round(top_fraction * pool_idx.size))))
+                    order = pool_idx[np.argsort(preds_np[pool_idx, d])]
+                    chosen = order[-k:] if mode == "long" else order[:k]
+                stock_mask = np.zeros(N, dtype=bool)
+                stock_mask[chosen] = True
+                fillable = stock_mask & np.isfinite(open_np[:, d]) & (open_np[:, d] > 0)
+                exit_counts["unfilled"] += int((stock_mask & ~fillable).sum())
+                n_fill = int(fillable.sum())
+                if n_fill > 0:
+                    # Fixed per-stock weight w/|chosen| — the unfilled fraction
+                    # stays cash (NO backfill / 递补, review v4 §三).  Long/EW
+                    # cap the whole sleeve at available cash so leverage cannot
+                    # drift past what the account holds (review v5 §六.2); the
+                    # short leg is a theoretical factor book and needs no cap.
+                    per_stock = w / chosen.size
+                    if side > 0:
+                        per_stock = min(per_stock, cash / n_fill)
+                    shares[fillable] = per_stock / open_np[fillable, d]
+                    entry_val[fillable] = per_stock
+                    spent = per_stock * n_fill
+                    cash -= side * spent
+                    cost_paid[d] += cost * spent
+                    buy_notional[d] = spent
+            sleeves[d] = {"shares": shares, "mask": fillable, "entry_val": entry_val,
+                          "scheduled_exit_day": d + horizon,
+                          "pending": np.zeros(N, dtype=bool)}
 
         # ── Mark to market at close d ──
         pos_value = 0.0
@@ -411,7 +463,21 @@ def _simulate_sleeve_account(
             gross_daily[d] = net_daily[d] + cost_paid[d] / nav_prev
         nav_prev = nav_close
 
+    # ── End of price path: any holding that never found a real exit is
+    # UNRESOLVED, booked at its last carried close (review v5 §四). ──
+    for c, sl in sleeves.items():
+        held = sl["mask"]
+        if held.any():
+            last_close = carried[:, min(c + horizon, Wp - 1)]
+            ex_value = sl["shares"] * last_close
+            pnl = side * (ex_value[held].sum() - sl["entry_val"][held].sum())
+            exit_pnl["unresolved"] += float(pnl)
+            exit_counts["unresolved"] += int(held.sum())
+
     total_pnl = sum(exit_pnl.values())
+    # Turnover is the traded notional scaled by the NAV the day opened on
+    # (review v5 §六.3) — a ratio, invariant to the initial capital.
+    turnover_daily = (buy_notional + sell_notional) / np.maximum(nav_before_day, 1e-8)
     return {
         "daily": net_daily[1:],
         "gross_daily": gross_daily[1:],
@@ -421,7 +487,7 @@ def _simulate_sleeve_account(
                           for k, v in exit_pnl.items()},
         },
         "turnover": {
-            "daily_avg": float((buy_notional[1:] + sell_notional[1:]).mean()) if W > 1 else 0.0,
+            "daily_avg": float(turnover_daily[1:].mean()) if Wp > 2 else 0.0,
         },
     }
 
@@ -446,9 +512,19 @@ def _sleeve_account_metrics(
 
     long_d = np.asarray(long_a["daily"], dtype=np.float64)
     short_d = np.asarray(short_a["daily"], dtype=np.float64)
-    ls_d = long_d - short_d
     long_g = np.asarray(long_a["gross_daily"], dtype=np.float64)
     short_g = np.asarray(short_a["gross_daily"], dtype=np.float64)
+
+    # Review v5 §二: `short_d` is already the short account's REAL daily return
+    # (side=-1 applied inside), so the long-short book is long_d + short_d —
+    # NOT long_d - short_d, which cancels the legs when both sides profit.
+    # Primary metric = 100% gross (50% long + 50% short, net 0); 200% gross
+    # (100% long + 100% short) is reported alongside as ls2x.  Both are
+    # explicit so two different-leverage books are never compared as one.
+    ls_d = 0.5 * (long_d + short_d)
+    ls2x_d = long_d + short_d
+    ls_g = 0.5 * (long_g + short_g)
+    ls2x_g = long_g + short_g
 
     def _met(daily, gross):
         t = torch.tensor(daily, dtype=torch.float32)
@@ -460,17 +536,21 @@ def _sleeve_account_metrics(
             "sortino": compute_sortino(t, horizon=1),
             "calmar": compute_calmar(t, horizon=1),
             "maxdd": compute_max_drawdown(eq),
-            "pf": compute_profit_factor(t),
+            "daily_return_pf": compute_daily_return_profit_factor(t),
         }
 
     long_m = _met(long_d, long_g)
-    ls_m = _met(ls_d, long_g - short_g)
+    ls_m = _met(ls_d, ls_g)
+    ls2x_m = _met(ls2x_d, ls2x_g)
     ew_sharpe = compute_sharpe(torch.tensor(ew_a["daily"], dtype=torch.float32), horizon=1)
 
+    # Review v5 §七: no forced block_len=horizon — when horizon=1 that would
+    # degenerate to iid resampling.  The default block (ceil(n^(1/3))) keeps
+    # autocorrelation and volatility clustering in the CI.
     long_lo, long_hi = compute_bootstrap_sharpe_ci(
-        long_d, horizon=1, n_boot=n_boot, block_len=max(1, horizon))
+        long_d, horizon=1, n_boot=n_boot)
     ls_lo, ls_hi = compute_bootstrap_sharpe_ci(
-        ls_d, horizon=1, n_boot=n_boot, block_len=max(1, horizon))
+        ls_d, horizon=1, n_boot=n_boot)
 
     return {
         "n_periods": int(long_d.size),
@@ -481,7 +561,7 @@ def _sleeve_account_metrics(
         "long_sortino": long_m["sortino"],
         "long_calmar": long_m["calmar"],
         "long_maxdd": long_m["maxdd"],
-        "long_pf": long_m["pf"],
+        "long_daily_return_pf": long_m["daily_return_pf"],
         "ls_sharpe": ls_m["sharpe"],
         "ls_gross_sharpe": ls_m["gross_sharpe"],
         "ls_sharpe_lo": ls_lo,
@@ -489,6 +569,20 @@ def _sleeve_account_metrics(
         "ls_sortino": ls_m["sortino"],
         "ls_calmar": ls_m["calmar"],
         "ls_maxdd": ls_m["maxdd"],
+        "ls2x_sharpe": ls2x_m["sharpe"],
+        "ls2x_gross_sharpe": ls2x_m["gross_sharpe"],
+        "ls2x_maxdd": ls2x_m["maxdd"],
+        # The short leg is a theoretical bottom-quantile factor book (A-share
+        # stocks cannot be shorted directly) — the exposure metadata keeps the
+        # leverage assumption explicit (review v5 §六.1).
+        "exposure": {
+            "gross_exposure": 1.0,
+            "net_exposure": 0.0,
+            "long_exposure": 0.5,
+            "short_exposure": 0.5,
+            "note": "ls_sharpe is 100% gross (50% long / 50% short); "
+                    "ls2x_* is 200% gross (100% / 100%).",
+        },
         "ew_sharpe": ew_sharpe,
         "long_turnover": long_a["turnover"]["daily_avg"],
         "ls_turnover": (long_a["turnover"]["daily_avg"]
@@ -524,7 +618,7 @@ def evaluate_sharpe(
         "sortino": result["long_sortino"],
         "calmar": result["long_calmar"],
         "max_drawdown": result["long_maxdd"],
-        "profit_factor": result["long_pf"],
+        "daily_return_profit_factor": result["long_daily_return_pf"],
         "ic": result["ic_mean"],
         "n_periods": result["n_periods"],
     }
@@ -560,7 +654,7 @@ def evaluate_portfolio(
     Returns a flat dict with these keys:
       — IC (clean): ic_mean, ic_std, ic_ir, ic_pos_rate, ic_newey_west_t
       — Long-only top-K: long_sharpe, long_gross_sharpe, long_sharpe_lo/hi,
-          long_sortino, long_calmar, long_maxdd, long_pf
+          long_sortino, long_calmar, long_maxdd, long_daily_return_pf
       — Market-neutral long-short: ls_sharpe, ls_gross_sharpe, ls_sharpe_lo/hi,
           ls_sortino, ls_calmar, ls_maxdd
       — Costs/turnover: long_turnover, ls_turnover, ew_turnover
@@ -603,16 +697,23 @@ def evaluate_portfolio(
     pool_np = pool.numpy()
 
     # ── Clean IC (review v4 §七): rank correlation of preds vs the CLEAN
-    # y_return (open->open), over decision & history & return_target.  This is
-    # the pure-signal diagnostic.  The exec P&L below (sleeve account) uses
-    # fills + costs + carry instead — the two are deliberately separated so a
-    # carry/suspension bias in realized returns can't masquerade as signal.
+    # open->open return, over decision & history & return_target.  This is the
+    # pure-signal diagnostic.  The exec P&L below (sleeve account) uses fills +
+    # costs + delayed exits instead — the two are deliberately separated so a
+    # suspension bias in realized returns can't masquerade as signal.
+    #
+    # The actuals must be the RAW open->open return (review v5 §五): train_panel
+    # z-scores + clips y_return per fold for the model, and Spearman on the
+    # clipped tails produces spurious ties while quintile "bp" would be in
+    # cross-sectional-std units.  y_return_raw (saved before the z-score) is
+    # preferred; fall back to y_return for data that has no raw copy.
     ic_pool = pool
     if "return_target_mask" in val_data:
         rt = torch.as_tensor(val_data["return_target_mask"])
         ic_pool = ic_pool & rt[:, config.seq_len:config.seq_len + n_windows]
-    if "y_return" in val_data:
-        clean_actuals = torch.as_tensor(val_data["y_return"], dtype=torch.float32)[
+    clean_key = "y_return_raw" if "y_return_raw" in val_data else "y_return"
+    if clean_key in val_data:
+        clean_actuals = torch.as_tensor(val_data[clean_key], dtype=torch.float32)[
             :, config.seq_len:config.seq_len + n_windows]
         daily_ics = _compute_daily_ic(preds_np, clean_actuals.numpy(), ic_pool.numpy())
     else:
@@ -636,13 +737,16 @@ def evaluate_portfolio(
     if has_prices:
         # Price columns are global-calendar indexed like every mask; a window
         # prediction is for ENTRY at panel column seq_len+d, so slice prices to
-        # the same window-day grid the pool / preds use (review v4 §四).  Exit
-        # opens for d<horizon..W-1 all fall inside [seq_len, seq_len+W).
+        # the same window-day grid the pool / preds use (review v4 §四).  Take
+        # horizon EXTRA columns so the sleeve entered on the last signal day
+        # W-1 can still liquidate at open[W-1+horizon] (review v5 §三) — the
+        # pad comes from _slice_panel(price_pad=horizon).  NumPy clips the stop
+        # to the array width, so data without the pad simply runs unresolved.
         p0 = config.seq_len
         close_np = np.asarray(val_data["close_price"], dtype=np.float32)[
-            :, p0:p0 + n_windows]
+            :, p0:p0 + n_windows + horizon]
         open_np = np.asarray(val_data["open_price"], dtype=np.float32)[
-            :, p0:p0 + n_windows]
+            :, p0:p0 + n_windows + horizon]
         pm = _sleeve_account_metrics(
             preds_np, close_np, open_np, pool_np,
             horizon, top_fraction, config.txn_cost, n_boot,
@@ -670,7 +774,7 @@ def evaluate_portfolio(
             "long_sortino": pm["long_sortino"],
             "long_calmar": pm["long_calmar"],
             "long_maxdd": pm["long_maxdd"],
-            "long_pf": pm["long_pf"],
+            "long_daily_return_pf": pm["long_daily_return_pf"],
             "ls_sharpe": pm["ls_sharpe"],
             "ls_gross_sharpe": pm["ls_gross_sharpe"],
             "ls_sharpe_lo": pm["ls_sharpe_lo"],
@@ -678,6 +782,10 @@ def evaluate_portfolio(
             "ls_sortino": pm["ls_sortino"],
             "ls_calmar": pm["ls_calmar"],
             "ls_maxdd": pm["ls_maxdd"],
+            "ls2x_sharpe": pm["ls2x_sharpe"],
+            "ls2x_gross_sharpe": pm["ls2x_gross_sharpe"],
+            "ls2x_maxdd": pm["ls2x_maxdd"],
+            "exposure": pm["exposure"],
             "ew_sharpe": pm["ew_sharpe"],
             "long_turnover": pm["long_turnover"],
             "ls_turnover": pm["ls_turnover"],
@@ -751,7 +859,7 @@ def evaluate_portfolio(
         "long_sortino": compute_sortino(long_t, horizon=horizon),
         "long_calmar": compute_calmar(long_t, horizon=horizon),
         "long_maxdd": compute_max_drawdown(long_equity),
-        "long_pf": compute_profit_factor(long_t),
+        "long_daily_return_pf": compute_daily_return_profit_factor(long_t),
         "ls_sharpe": ls_sharpe,
         "ls_sharpe_lo": ls_lo,
         "ls_sharpe_hi": ls_hi,
@@ -837,18 +945,25 @@ def _quintile_analysis(
 
 
 def _empty_result() -> dict:
-    empty_exit = {"counts": {"clean": 0, "carry": 0, "delist": 0, "unfilled": 0},
-                  "pnl_share": {"clean": 0.0, "carry": 0.0, "delist": 0.0, "unfilled": 0.0}}
+    empty_exit = {
+        "counts": {"clean": 0, "delayed": 0, "delisted": 0,
+                   "unresolved": 0, "unfilled": 0},
+        "pnl_share": {"clean": 0.0, "delayed": 0.0, "delisted": 0.0,
+                      "unresolved": 0.0, "unfilled": 0.0},
+    }
     return {
         "n_periods": 0, "n_stocks": 0, "n_days": 0,
         "ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_pos_rate": 0.0,
         "ic_newey_west_t": 0.0,
         "long_sharpe": 0.0, "long_gross_sharpe": 0.0,
         "long_sharpe_lo": float("nan"), "long_sharpe_hi": float("nan"),
-        "long_sortino": 0.0, "long_calmar": 0.0, "long_maxdd": 0.0, "long_pf": 0.0,
+        "long_sortino": 0.0, "long_calmar": 0.0, "long_maxdd": 0.0, "long_daily_return_pf": 0.0,
         "ls_sharpe": 0.0, "ls_gross_sharpe": 0.0,
         "ls_sharpe_lo": float("nan"), "ls_sharpe_hi": float("nan"),
         "ls_sortino": 0.0, "ls_calmar": 0.0, "ls_maxdd": 0.0,
+        "ls2x_sharpe": 0.0, "ls2x_gross_sharpe": 0.0, "ls2x_maxdd": 0.0,
+        "exposure": {"gross_exposure": 1.0, "net_exposure": 0.0,
+                     "long_exposure": 0.5, "short_exposure": 0.5},
         "long_turnover": 0.0, "ls_turnover": 0.0, "ew_turnover": 0.0,
         "exit_status": empty_exit,
         "q1_ret": 0.0, "q2_ret": 0.0, "q3_ret": 0.0, "q4_ret": 0.0, "q5_ret": 0.0,

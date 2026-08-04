@@ -18,10 +18,13 @@ class PanelConfig:
     - Cosine LR schedule with warmup (transformer-training standard)
     """
 
-    # Input dimensions (overridden at runtime from actual data)
-    static_dim: int = 4
-    past_known_dim: int = 221
-    past_observed_dim: int = 70
+    # Input dimensions (overridden at runtime from actual data).  Defaults track
+    # the current prebuilt panel (review v5 §十六): S=5 PIT static, PK=255,
+    # PO=1418 — the docs guard (check_docs_consistency.py) enforces README /
+    # CONTEXT against these, so update all three together.
+    static_dim: int = 5
+    past_known_dim: int = 255
+    past_observed_dim: int = 1418
 
     # Core model
     hidden_dim: int = 128

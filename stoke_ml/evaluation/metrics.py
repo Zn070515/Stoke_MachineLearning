@@ -129,11 +129,15 @@ def compute_financial_metrics(
 
     gross_profit = float(np.sum(strategy_returns[strategy_returns > 0]))
     gross_loss = float(abs(np.sum(strategy_returns[strategy_returns < 0])))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    # Daily-return-level gross profit factor (review v5 §十五.2): aggregates
+    # per-day strategy returns, NOT closed-trade P&L — named accordingly.
+    daily_return_profit_factor = (
+        gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    )
 
     return {
         "sharpe": float(sharpe),
         "max_drawdown": float(max_dd),
         "win_rate": float(win_rate),
-        "profit_factor": float(profit_factor),
+        "daily_return_profit_factor": float(daily_return_profit_factor),
     }

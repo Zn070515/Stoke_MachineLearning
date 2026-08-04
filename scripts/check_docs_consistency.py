@@ -138,13 +138,17 @@ def main():
                   f"expect {n_stocks} in {doc_key}")
 
     # ── Fold schedule → train_panel.py + docs ──
+    # Review v4 §十三 / v5: non-overlapping OOS folds (step = val_len), inner_val
+    # carve selects best epoch, outer_test evaluated once, lockbox reserved.
     tp = read_src(os.path.join("scripts", "train_panel.py"))
-    val_ok = "val_len = 126" in tp and "step = 63" in tp
-    check("train_panel fold", val_ok, "expect val_len=126 / step=63 in train_panel.py")
+    val_ok = "inner_val" in tp and "step = val_len" in tp
+    check("train_panel fold", val_ok,
+          "expect inner_val carve + step=val_len (non-overlapping folds) in train_panel.py")
     for doc_key in ("CONTEXT.md", "README.md"):
-        check(f"{doc_key} fold schedule",
-              re.search(r"126\s*天", docs[doc_key]) is not None and re.search(r"63\s*天", docs[doc_key]) is not None,
-              f"expect 126天验证 / 63天步长 in {doc_key}")
+        ok = (re.search(r"inner[ _]val", docs[doc_key], re.IGNORECASE) is not None
+              and re.search(r"63\s*天", docs[doc_key]) is None)
+        check(f"{doc_key} fold schedule", ok,
+              "expect inner_val/outer_test described, no stale 63天 step in " + doc_key)
 
     # ── Report ──
     width = max(len(n) for n, _, _ in results)

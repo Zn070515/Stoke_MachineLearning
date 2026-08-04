@@ -169,9 +169,9 @@
 | 术语 | 含义 |
 |------|------|
 | Panel | (N_stocks, T_timesteps, D_features) 三维数组，区别于单stock (T, D) |
-| Static features | 时不变特征 (4维)：上市天数、所属交易所等 |
-| Past Known (PK) | 已知历史特征 (221维)：价格、技术指标、情感、资金流等，含close用于target计算 |
-| Past Observed (PO) | 观测历史特征 (70维)：换手率、振幅、涨跌幅等，不含close |
+| Static features | 时不变特征 (5维)：上市天数、所属交易所等 |
+| Past Known (PK) | 已知历史特征 (255维)：价格、技术指标、情感、资金流等，含close用于target计算 |
+| Past Observed (PO) | 观测历史特征 (1418维)：换手率、振幅、涨跌幅等，不含close。维度由当前预构建特征面板动态决定 |
 | Cross-sectional normalization | 跨股票截面归一化：按日期 groupby → z-score，解决不同股票量纲差异 |
 | Per-stock target normalization | 按股票z-score归一化回归target，使各股票在MSE loss中等权重 |
 
@@ -179,7 +179,7 @@
 
 | 术语 | 含义 |
 |------|------|
-| Growing-Window Walk-Backward | 训练窗口从 [0, val_start−purge) 增长，验证 126 天 / 步长 63 天，训练和验证之间有 seq_len 的 purge gap（从最新数据向过去倒排 fold） |
+| Growing-Window Walk-Backward | 训练窗口从 [0, val_start−purge) 逐 fold 增长，非重叠验证 fold（step=val_len），训练和验证之间有 seq_len 的 purge gap（从最新数据向过去倒排 fold + 末尾 lockbox 保留） |
 | horizon | 前向回报窗口（交易日），默认5天。方向阈值缩放 √horizon |
 | Grad Accum | 梯度累加 (默认4步)，等效增大batch size |
 | AMP (Automatic Mixed Precision) | 混合精度训练，BF16/FP16前向+FP32权重 |
@@ -196,8 +196,8 @@
 | **PairwiseRankingLoss** | 可微成对排序 hinge 损失：同日期内 pairwise 比较 sign(Δtarget)·Δpred，hinge(max(0, margin−…)) + spread 惩罚（防预测坍缩） |
 | 方向分类 (3类) | Panel: 下跌(0) / 横盘(1) / 上涨(2)，阈值 ±0.003×√horizon |
 | Walk-Forward 验证 | 固定窗口滑动验证，严格时序拆分，**绝不打乱** |
-| Growing-Window Walk-Backward | Panel: 训练窗口增长 / 126天验证 / 63天步长 + seq_len purge gap |
-| Sharpe Ratio | 年化夏普 = (期均收益/期收益标准差) × √(252/horizon)，评估时 stride=horizon 避免回报重叠 |
+| Growing-Window Walk-Backward | Panel: 训练窗口增长 / 非重叠 fold（step=val_len）/ inner_val 选择最佳 epoch + outer_test 单次评估 / seq_len purge gap |
+| Sharpe Ratio | 年化夏普 = (期均收益/期收益标准差) × √(252)，sleeve 账户按日历日收益年化（交错 sleeve 去重叠） |
 | Max Drawdown | 最大回撤 |
 | Win Rate | 胜率 = 正收益交易占比 |
 | Profit Factor | 盈亏比 = 总盈利/总亏损 |
@@ -205,7 +205,7 @@
 
 **Walk-Forward 参数**: 
 - XGBoost/LSTM: 2年训练 / 3月验证 / 3月步长
-- Panel: 增长式训练窗口（[0, val_start−purge) 逐 fold 增长）/ 126天验证 / 63天步长 / purge=seq_len（walk-backward，从最新数据倒排）
+- Panel: 增长式训练窗口（[0, val_start−purge) 逐 fold 增长）/ 非重叠 fold（step=val_len）/ inner_val 选择最佳 epoch + outer_test 单次评估 / purge=seq_len（walk-backward，从最新数据倒排 + 末尾 lockbox 保留）
 
 ---
 

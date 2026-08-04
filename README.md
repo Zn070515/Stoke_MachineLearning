@@ -183,7 +183,7 @@ FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_u
 
 **预构建特征**: 5530 只股票 × 3744 列/股（516 基础 + 3228 时序展开），共 109GB，存于 `data/features/{code}.parquet`。XGBoost flat 模式再按窗口展平，维度极易爆炸——建议按 IC 预筛 top-K 特征。
 
-**Panel 格式**: 221 PastKnown + 70 PastObserved + 4 Static = 295 features × 60 seq_len. 跨股票截面归一化 (per-date z-score).
+**Panel 格式**: 255 PastKnown + 1418 PastObserved + 5 Static = 1678 features × 60 seq_len. 跨股票截面归一化 (per-date z-score). 维度由当前预构建特征面板决定，训练时从数据自动推导。
 
 ### 预构建特征 (data/features/)
 
@@ -227,7 +227,7 @@ Panel (VSN + xLSTM) 配置:
 - **架构**: Variable Selection Network (VSN) + xLSTM backbone (sLSTM + mLSTM)
 - **多任务**: CrossEntropy(方向3类) + AdjMSE(涨跌幅) + MSE(波动率) + PairwiseRankingLoss(截面排序)
 - **损失加权**: UncertaintyLoss (Kendall et al. 2018) 自适应任务权重
-- **验证**: Growing-Window Walk-Backward (训练窗口 [0, val_start−purge) 逐 fold 增长 / 126天验证 / 63天步长 / purge=seq_len，从最新数据倒排)
+- **验证**: Growing-Window Walk-Backward (训练窗口 [0, val_start−purge) 逐 fold 增长 / 非重叠 fold (step=val_len) / inner_val 选择最佳 epoch + outer_test 单次评估 / purge=seq_len / 从最新数据倒排 + 末尾 lockbox 保留)
 - **评估指标**: 年化Sharpe + Spearman Rank IC (截面排序能力)
 
 ### XGBoost 基线
@@ -320,7 +320,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 | BERTopic 依赖链 (umap/hdbscan/sentence-transformers) | 可选安装, 缺失时降级为TF-IDF |
 | Playwright browser 在WAF绕过时可能无限挂起 | `threading.Timer(timeout, os._exit)` 硬杀 |
 | TFT UncertaintyLoss 收敛后 train loss 变负 | 正常 (log_var → ln(task_loss)), 已收紧clamp |
-| TFT multi-horizon Sharpe 年化虚高 | 已修复: stride=horizon去重叠 + sqrt(252/horizon)年化 |
+| TFT multi-horizon Sharpe 年化虚高 | 已修复: 日历化交错 sleeve 账户，日收益用 sqrt(252) 年化 |
 
 ## 测试
 

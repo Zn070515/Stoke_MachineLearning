@@ -8,7 +8,7 @@ from stoke_ml.models.panel.evaluate import (
     compute_sortino,
     compute_max_drawdown,
     compute_calmar,
-    compute_profit_factor,
+    compute_daily_return_profit_factor,
     compute_equity_curve,
     compute_bootstrap_sharpe_ci,
     compute_ic_summary,
@@ -52,8 +52,9 @@ class TestSortino:
     def test_all_positive(self):
         ret = torch.tensor([0.01, 0.02, 0.015, 0.01])
         sortino = compute_sortino(ret, annualize=False)
-        # No downside → infinite Sortino (all returns above target)
-        assert sortino == float("inf")
+        # No downside (< 2 downside samples) → Sortino is undefined → NaN
+        # (review v5 §十五.3), so summaries/JSON don't show an unbounded inf.
+        assert np.isnan(sortino)
 
 
 class TestMaxDrawdown:
@@ -76,22 +77,22 @@ class TestCalmar:
         assert calmar > 0
 
 
-class TestProfitFactor:
+class TestDailyReturnProfitFactor:
     def test_profitable(self):
         ret = torch.tensor([0.02, -0.01, 0.03, -0.005, 0.01])
-        pf = compute_profit_factor(ret)
+        pf = compute_daily_return_profit_factor(ret)
         # profits = 0.02+0.03+0.01=0.06, losses = 0.01+0.005=0.015 → PF=4.0
         assert pf > 1.0
 
     def test_losing(self):
         ret = torch.tensor([-0.02, 0.01, -0.03, -0.01])
-        pf = compute_profit_factor(ret)
+        pf = compute_daily_return_profit_factor(ret)
         # profits = 0.01, losses = 0.06 → PF ≈ 0.167
         assert pf < 1.0
 
     def test_all_positive(self):
         ret = torch.tensor([0.01, 0.02, 0.005])
-        pf = compute_profit_factor(ret)
+        pf = compute_daily_return_profit_factor(ret)
         assert pf == float("inf")
 
 
@@ -421,9 +422,15 @@ class TestEvaluateAntiCheat:
 
     def test_constant_predictions_produce_no_systematic_spread(self):
         """#4: averaged over seeds, constant predictions show no long-short
-        or quintile alpha (selection degenerates to stock order = random)."""
+        or quintile alpha (selection degenerates to stock order = random).
+
+        NOTE on seed count: the annualized Sharpe of a zero-true-signal book
+        is an estimate with std ≈ sqrt(252/n_periods) ≈ 1.0 per seed (here the
+        book is a single top/bottom stock on 12 names → std ~0.9).  3 seeds
+        give a mean std of ~0.5, so `< 1.0` is only ~2σ — flaky.  10 seeds cut
+        it to ~0.28 → ~3.5σ, a genuine no-alpha assertion."""
         lss, q5s = [], []
-        for seed in range(3):
+        for seed in range(10):
             m = self._eval(_ConstantReturnModel(), seed=seed)
             lss.append(m["ls_sharpe"])
             q5s.append(m["q5mq1_ret"])
@@ -432,13 +439,14 @@ class TestEvaluateAntiCheat:
 
     def test_random_predictions_yield_near_zero_ic(self):
         """#3: label-shuffle proxy — noise predictions must show |IC|≈0."""
-        ics = [self._eval(_RandomReturnModel(), s)["ic_mean"] for s in range(3)]
+        ics = [self._eval(_RandomReturnModel(), s)["ic_mean"] for s in range(10)]
         assert abs(np.mean(ics)) < 0.03, f"random preds mean IC={np.mean(ics):+.4f}"
 
     def test_random_predictions_produce_no_systematic_alpha(self):
-        """#3: noise predictions must not generate portfolio alpha."""
+        """#3: noise predictions must not generate portfolio alpha (10 seeds —
+        see the power note on test_constant_predictions_produce_no_systematic_spread)."""
         lss, q5s = [], []
-        for seed in range(3):
+        for seed in range(10):
             m = self._eval(_RandomReturnModel(), seed=seed)
             lss.append(m["ls_sharpe"])
             q5s.append(m["q5mq1_ret"])
@@ -655,9 +663,11 @@ class TestSleeveCosts:
 
 
 class TestSleeveExitStatus:
-    """review v4 §六 / P0-A4: exits are classified clean/carry/delist/unfilled
-    with P&L shares; a selected stock with a missing entry open is counted
-    unfilled, never silently traded."""
+    """review v4 §六 / P0-A4 + v5 §四: exits are classified
+    clean/delayed/delisted/unresolved/unfilled with P&L shares; a selected
+    stock with a missing entry open is counted unfilled, never silently traded.
+    v5 renamed the old "carry" into a true DELAYED exit and split delist
+    (close<=0) from unresolved (price path ends with the position still open)."""
 
     def test_exit_status_keys_and_unfilled(self):
         panel = _make_priced_panel(
@@ -667,32 +677,41 @@ class TestSleeveExitStatus:
         m = evaluate_portfolio(
             _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
         es = m["exit_status"]
-        assert set(es["counts"].keys()) == {"clean", "carry", "delist", "unfilled"}
-        assert set(es["pnl_share"].keys()) == {"clean", "carry", "delist", "unfilled"}
+        assert set(es["counts"].keys()) == {
+            "clean", "delayed", "delisted", "unresolved", "unfilled"}
+        assert set(es["pnl_share"].keys()) == {
+            "clean", "delayed", "delisted", "unresolved", "unfilled"}
         assert es["counts"]["clean"] > 0, "fully-trading stocks should exit clean"
         assert es["counts"]["unfilled"] > 0, (
             "top-marker no-open stock is selected but unfilled → must be counted")
         assert np.isclose(sum(es["pnl_share"].values()), 1.0, atol=1e-6)
 
 
-class TestSleeveCarryDelist:
-    """review v4 §六 / P0-A4 unit checks on _simulate_sleeve_account: a missing
-    exit open carries to the last close; a zero close at exit is a delist."""
+class TestSleeveDelayedDelist:
+    """review v5 §四: a missing exit open is a TRUE delayed exit — the position
+    keeps holding and retries on later days, NOT a same-day "carry" sale at the
+    stale close.  A zero close at exit is a delist; missing data with no resume
+    is unresolved, never a delist."""
 
-    def test_carry_on_missing_exit_open(self):
+    def test_delayed_on_missing_exit_open(self):
+        # W=4 signal days, horizon=2, price path padded to Wp=6 (= W+horizon) so
+        # every sleeve reaches its scheduled exit and none is left unresolved.
         preds = np.array([[0.9, 0.9, 0.9, 0.9],
                           [0.1, 0.1, 0.1, 0.1]], dtype=np.float32)
-        close = np.array([[10.0, 11.0, 12.0, 13.0],
-                          [20.0, 21.0, 22.0, 23.0]], dtype=np.float32)
-        open_ = np.array([[10.5, 11.5, np.nan, 12.5],  # stock 0 exit open d=2 missing
-                          [20.5, 21.5, 22.5, 23.5]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+                          [20.0, 21.0, 22.0, 23.0, 24.0, 25.0]], dtype=np.float32)
+        open_ = np.array([[10.5, 11.5, np.nan, 12.5, 13.5, 14.5],
+                          [20.5, 21.5, 22.5, 23.5, 24.5, 25.5]], dtype=np.float32)
         pool = np.ones((2, 4), dtype=bool)
         res = _simulate_sleeve_account(
             preds, close, open_, pool, horizon=2, top_fraction=0.5,
             cost=0.0, mode="long")
         counts = res["exit_stats"]["counts"]
-        assert counts["carry"] >= 1, f"expected a carry exit, got {counts}"
+        # Stock 0's scheduled exit at d=2 has no open → retried and sold at the
+        # d=3 open → DELAYED.  Stock 1 exits on schedule → CLEAN.
+        assert counts["delayed"] >= 1, f"expected a delayed exit, got {counts}"
         assert counts["clean"] >= 1, f"expected a clean exit, got {counts}"
+        assert counts["unresolved"] == 0, f"no position should dangle: {counts}"
 
     def test_delist_on_zero_close_at_exit(self):
         preds = np.array([[0.9, 0.9, 0.9],
@@ -706,7 +725,203 @@ class TestSleeveCarryDelist:
             preds, close, open_, pool, horizon=2, top_fraction=0.5,
             cost=0.0, mode="long")
         counts = res["exit_stats"]["counts"]
-        assert counts["delist"] >= 1, f"expected a delist exit, got {counts}"
+        assert counts["delisted"] >= 1, f"expected a delist exit, got {counts}"
+
+    def test_delayed_exit_holds_and_captures_resumed_open(self):
+        """v5 §十七.4: scheduled exit day has no open, trading resumes 2 days
+        later.  The position is NOT liquidated on the scheduled day, keeps being
+        marked to close (funds occupied), and is actually sold at the resumed
+        open → DELAYED."""
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)  # top = stock 0
+        close = np.array([[10.0, 11.0, 12.0, 13.0, 14.0],
+                          [20.0, 21.0, 22.0, 23.0, 24.0]], dtype=np.float32)
+        # stock 0: open missing on the scheduled exit day (d=1) and d=2, resumes d=3
+        open_ = np.array([[10.5, np.nan, np.nan, 13.5, 14.5],
+                          [20.5, 21.5, 22.5, 23.5, 24.5]], dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=1, top_fraction=0.5,
+            cost=0.0, mode="long")
+        counts = res["exit_stats"]["counts"]
+        assert counts["delayed"] == 1, f"expected exactly one delayed exit, got {counts}"
+        assert counts["clean"] == 0 and counts["unresolved"] == 0
+        daily = np.asarray(res["daily"])
+        # Held through the suspension (d=1, d=2): NAV tracked close 11 then 12
+        # — funds stayed occupied instead of being dumped at the stale close on
+        # the scheduled day.
+        assert daily[0] > 0 and daily[1] > 0, (
+            f"position was liquidated on the scheduled day: {daily}")
+        # The delayed liquidation at the resumed open 13.5 captured the gap
+        # 12 → 13.5.
+        assert np.isclose(daily[2], 13.5 / 12.0 - 1.0, atol=1e-4), (
+            f"delayed exit did not capture the resumed open: {daily[2]:.4f}")
+
+    def test_missing_data_is_unresolved_not_delisted(self):
+        """v5 §四 / §十七.5: a stock whose price path just ENDS (NaN, no resume)
+        is UNRESOLVED at the end — never auto-interpreted as a same-price sale
+        and never a delist.  Only a carried close <= 0 is a delist."""
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, np.nan],
+                          [20.0, 21.0, 22.0]], dtype=np.float32)
+        open_ = np.array([[10.5, np.nan, np.nan],
+                          [20.5, 21.5, 22.5]], dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=1, top_fraction=0.5,
+            cost=0.0, mode="long")
+        counts = res["exit_stats"]["counts"]
+        assert counts["unresolved"] == 1, f"expected unresolved, got {counts}"
+        assert counts["delisted"] == 0, f"missing data must not be a delist: {counts}"
+        assert counts["clean"] == 0
+
+
+class TestLsAlgebra:
+    """review v5 §二 / §十七.1-2: `short_d` is ALREADY the short account's real
+    daily return (side=-1 applied inside the simulator), so the long-short book
+    is a SUM of the legs, NOT `long - short`.  When both legs profit the LS
+    book must profit too — the old formula cancelled simultaneous success to
+    ~0."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def test_both_legs_profit_does_not_cancel(self):
+        """End-to-end: the up stock (top marker) makes the long leg money and
+        the down stock (bottom marker) makes the short leg money → long_sharpe
+        AND ls_sharpe must both be clearly positive.  `long - short` would
+        cancel them to ≈0."""
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=8)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+            horizon=self.HORIZON)
+        assert m["long_sharpe"] > 0.3, f"long leg should profit: {m['long_sharpe']}"
+        assert m["ls_sharpe"] > 0.3, (
+            f"both legs profit → LS must be positive, got {m['ls_sharpe']}")
+        # The exposure metadata keeps the leverage assumption explicit.
+        assert m["exposure"]["gross_exposure"] == 1.0
+        assert m["exposure"]["net_exposure"] == 0.0
+        assert m["exposure"]["long_exposure"] == 0.5
+        assert m["exposure"]["short_exposure"] == 0.5
+
+    def test_short_leg_rises_when_bottom_falls(self):
+        """§十七.2: the short-only NAV must RISE when the bottom stock falls —
+        `short_d` carries the + sign into the LS book, it is not re-subtracted."""
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, down_stocks=(2,), seed=9)
+        n_windows = self.N_TS - self.SEQ_LEN
+        p0 = self.SEQ_LEN
+        close = panel["close_price"][:, p0:p0 + n_windows + self.HORIZON]
+        open_ = panel["open_price"][:, p0:p0 + n_windows + self.HORIZON]
+        pool = _candidate_pool(panel, n_windows, self.SEQ_LEN).numpy()
+        preds = np.zeros((12, n_windows), dtype=np.float32)
+        preds[2] = -2.0  # bottom marker → short picks the falling stock
+        short_a = _simulate_sleeve_account(
+            preds, close, open_, pool, self.HORIZON, 0.1, 0.0, "short")
+        short_d = np.asarray(short_a["daily"])
+        assert short_d.mean() > 0.003, (
+            f"short NAV must rise when the bottom falls: {short_d.mean():+.4f}")
+
+
+class TestLastSleeveExit:
+    """review v5 §三 / §十七.3: the simulation runs to the END of the price path
+    (Wp columns), so the sleeve entered on the last signal day W-1 liquidates at
+    open[W-1+horizon] with its exit cost booked and no position left active."""
+
+    def test_last_sleeve_exits_with_cost_booked(self):
+        # W=3 signal days, horizon=2 → the d=2 sleeve exits at d=4 (W-1+h).
+        # Price path padded to Wp=5 so the exit is real, not unresolved.
+        preds = np.array([[0.9, 0.9, 0.9],
+                          [0.1, 0.1, 0.1]], dtype=np.float32)  # top = stock 0
+        close = np.array([[10.0, 11.0, 12.0, 13.0, 14.0],
+                          [20.0, 21.0, 22.0, 23.0, 24.0]], dtype=np.float32)
+        open_ = np.array([[10.5, 11.5, 12.5, 13.5, 14.5],
+                          [20.5, 21.5, 22.5, 23.5, 24.5]], dtype=np.float32)
+        pool = np.ones((2, 3), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=2, top_fraction=0.5,
+            cost=0.001, mode="long")
+        # Simulated through the last exit day W-1+h = Wp-1 → 4 daily periods.
+        assert len(res["daily"]) == 5 - 1, f"len={len(res['daily'])}"
+        counts = res["exit_stats"]["counts"]
+        # 3 sleeves × 1 filled stock each, all exiting exactly on schedule.
+        assert counts["clean"] == 3, f"clean={counts['clean']}"
+        assert counts["unresolved"] == 0, "no sleeve may dangle at the end"
+        assert counts["delayed"] == 0 and counts["delisted"] == 0
+        # The final exit (d=4) booked a sell cost → gross return exceeds net.
+        gross = np.asarray(res["gross_daily"])
+        net = np.asarray(res["daily"])
+        assert gross[-1] > net[-1], "final sleeve exit cost was not booked"
+
+
+class TestRawReturnUnits:
+    """review v5 §五 / §十七.6: Q5−Q1 "bp" and clean IC must be in RAW return
+    units even when the training label y_return is z-scored + clipped per fold.
+    y_return_raw (saved before normalization) must be preferred for both."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def test_quintile_and_ic_use_raw_returns(self):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=4)
+        raw = panel["y_return"].astype(np.float32).copy()
+        panel["y_return_raw"] = raw
+        # Simulate train_panel's per-fold normalization of the LABEL only; the
+        # raw copy above must survive untouched for evaluation.
+        z = np.zeros_like(raw)
+        for t in range(raw.shape[1]):
+            col = raw[:, t]
+            s = float(col.std())
+            z[:, t] = (col - float(col.mean())) / s if s > 1e-8 else 0.0
+        panel["y_return"] = np.clip(z, -5.0, 5.0).astype(np.float32)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+            horizon=self.HORIZON)
+        # Clean IC computed on the RAW actuals → strong, as in the
+        # un-normalized control test.
+        assert m["ic_mean"] > 0.3, f"clean IC lost on raw path: {m['ic_mean']}"
+        # q5-q1 in raw units (~±0.8% legs → tens of bp), far below the z-score
+        # scale — if the normalized label leaked, this would be ~1-2.
+        assert 0.001 < m["q5mq1_ret"] < 0.10, (
+            f"quintile spread in wrong units: {m['q5mq1_ret']:.4f}")
+
+
+class TestTurnoverScaleInvariant:
+    """review v5 §六.3 / §十七.7: turnover is traded notional normalized by the
+    day's opening NAV — a ratio, so a 1M account reports the same turnover as
+    a 1 account.  Scaling the whole price level (equivalent to a bigger account,
+    since sleeve weights are NAV fractions) must leave daily returns and the
+    turnover ratio unchanged."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def _run(self, price_scale):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), seed=6)
+        n_windows = self.N_TS - self.SEQ_LEN
+        p0 = self.SEQ_LEN
+        close = panel["close_price"][:, p0:p0 + n_windows + self.HORIZON]
+        open_ = panel["open_price"][:, p0:p0 + n_windows + self.HORIZON]
+        pool = _candidate_pool(panel, n_windows, self.SEQ_LEN).numpy()
+        preds = np.zeros((12, n_windows), dtype=np.float32)
+        preds[1] = 2.0
+        return _simulate_sleeve_account(
+            preds, close * price_scale, open_ * price_scale, pool,
+            self.HORIZON, 0.1, cost=0.001, mode="long")
+
+    def test_turnover_and_returns_invariant_to_capital_scale(self):
+        small = self._run(1.0)
+        big = self._run(1e6)
+        # Mathematically identical; float32 shares = w/(price*1e6) leave only
+        # ~1e-8 rounding, so compare at float32 epsilon scale.
+        assert np.allclose(small["daily"], big["daily"], atol=1e-6)
+        assert np.isclose(small["turnover"]["daily_avg"],
+                          big["turnover"]["daily_avg"], rtol=1e-6)
 
 
 class TestCleanICSeparation:
@@ -743,8 +958,11 @@ class TestSleeveAntiCheat:
             model, panel, cfg, torch.device("cpu"), horizon=self.HORIZON)
 
     def test_constant_preds_no_alpha(self):
+        # 10 seeds — the annualized Sharpe of a zero-signal book has per-seed
+        # std ≈ sqrt(252/n_periods) ≈ 1.0; 3 seeds left the mean at ~2σ and the
+        # test flaky.  See TestEvaluateAntiCheat for the power note.
         ics, lss, q5s = [], [], []
-        for seed in range(3):
+        for seed in range(10):
             m = self._eval(_ConstantReturnModel(), seed)
             ics.append(m["ic_mean"])
             lss.append(m["ls_sharpe"])
@@ -755,7 +973,7 @@ class TestSleeveAntiCheat:
 
     def test_random_preds_no_alpha(self):
         ics, lss, q5s = [], [], []
-        for seed in range(3):
+        for seed in range(10):
             m = self._eval(_RandomReturnModel(), seed)
             ics.append(m["ic_mean"])
             lss.append(m["ls_sharpe"])
