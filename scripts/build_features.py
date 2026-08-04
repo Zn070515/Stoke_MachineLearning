@@ -34,6 +34,7 @@ from stoke_ml.data.stock_sector_mapper import StockSectorMapper
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.data.announcement_storage import AnnouncementStorage
+from stoke_ml.features import cache_manifest
 from stoke_ml.features.pipeline import FeaturePipeline
 
 logging.basicConfig(
@@ -127,7 +128,18 @@ def build_one(args: dict) -> tuple[str, str]:
             use_index_membership=args["use_index_membership"],
         )
         output_path = os.path.join(args["output_dir"], f"{code}.parquet")
-        if not args["force"] and _is_valid_feature(output_path):
+        manifest_path = os.path.join(
+            args["output_dir"], ".manifests", f"{code}.json"
+        )
+        # Cache hit: file non-empty AND sidecar manifest still matches the
+        # current code/config/schema/source data (v6 §十二).  Existence alone
+        # would silently reuse a feature built by an older config or data.
+        if not args["force"] and _is_valid_feature(output_path) and (
+            cache_manifest.manifest_matches(
+                manifest_path, code, args, output_path, args["data_dir"],
+                args["_git_commit"], args["_config_hash"],
+            )
+        ):
             return code, "exists"
         df = args["storage"].load_daily(code, start_date=args["start"], end_date=args["end"])
         if df.empty:
@@ -162,6 +174,13 @@ def build_one(args: dict) -> tuple[str, str]:
             pledge_df=pledge_df if not pledge_df.empty else None,
             index_membership_df=index_membership_df if not index_membership_df.empty else None,
             panel_mode=args["panel_mode"],
+        )
+        cache_manifest.write_manifest(
+            cache_manifest.make_manifest(
+                code, args, output_path, args["data_dir"],
+                args["_git_commit"], args["_config_hash"],
+            ),
+            manifest_path,
         )
         return code, "built"
     except Exception:
@@ -318,6 +337,11 @@ def main():
         "force": args.force,
         "panel_mode": args.panel_mode,
     }
+
+    # Code + config signatures for the sidecar manifest (v6 §十二).  Precomputed
+    # once so parallel workers don't each shell out to git / re-hash config.
+    worker_args["_git_commit"] = cache_manifest.git_head()
+    worker_args["_config_hash"] = cache_manifest.config_hash(worker_args)
 
     tasks = [{**worker_args, "code": c} for c in codes]
 

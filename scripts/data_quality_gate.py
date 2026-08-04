@@ -10,7 +10,12 @@ Checks:
   aux_pct_aligned  : board/industry processed pct_change == daily pct_change (stale-0)
   aux_close_aligned: processed OHLC == canonical daily close (调整基准漂移)
   feature_pct      : built feature pct_change == daily (feature-layer pollution)
-  sparsity         : per-feature non-zero coverage — flags event-sparse columns
+  sparsity         : per-feature effective non-zero coverage (NaN-excluded)
+  ohlc_sanity      : dates unique/sorted/no-weekend, code==filename, prices>0,
+                     low<=open/close<=high, volume/amount>=0
+
+Any read error or missing column FAILS its check — a problem recorded in the
+report must also flip the gate (v6 §九).
 
 Output: reports/data_quality_gate.json (machine-readable) + console summary.
 
@@ -30,6 +35,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from stoke_ml.data.contract import get_contract, validate_contract
 
 PROJECT = Path(__file__).resolve().parent.parent
 A_SHARES = PROJECT / "data" / "a_shares"
@@ -62,16 +69,28 @@ class CheckResult:
     issues: list = field(default_factory=list)  # list of (file, detail)
 
 
+# Union of columns every _load_daily caller needs; cached once per code so the
+# aux-alignment checks (which hit the same daily file once per aux file, ~3万×)
+# don't re-read it from disk every time — cold-cache runs took ~35 min.
+_DAILY_CACHE_COLS = ("date", "open", "high", "low", "close", "pct_change")
+_DAILY_CACHE: dict[str, pd.DataFrame] = {}
+
+
 def _load_daily(code: str, cols: list[str]) -> pd.DataFrame | None:
-    p = DAILY_DIR / f"{code}.parquet"
-    if not p.exists():
-        return None
-    try:
-        d = pd.read_parquet(p, columns=cols)
-    except Exception:
-        return None
-    d["date"] = pd.to_datetime(d["date"])
-    return d.drop_duplicates("date", keep="last")
+    """Canonical daily OHLCV frame for ``code`` (cached; returns a safe copy)."""
+    cached = _DAILY_CACHE.get(code)
+    if cached is None:
+        p = DAILY_DIR / f"{code}.parquet"
+        if not p.exists():
+            return None
+        try:
+            d = pd.read_parquet(p, columns=list(_DAILY_CACHE_COLS))
+        except Exception:
+            return None
+        d["date"] = pd.to_datetime(d["date"])
+        cached = d.drop_duplicates("date", keep="last").reset_index(drop=True)
+        _DAILY_CACHE[code] = cached
+    return cached[list(cols)].copy()
 
 
 # ── checks ──────────────────────────────────────────────────────────────
@@ -90,6 +109,7 @@ def check_daily_internal(sample: int) -> CheckResult:
         d = _load_daily(code, ["date", "close", "pct_change"])
         if d is None or "pct_change" not in d or "close" not in d:
             res.issues.append((code, "missing_col/read_err"))
+            res.passed = False
             continue
         close = d["close"].astype("float64")
         pc = d["pct_change"].astype("float64")
@@ -127,13 +147,17 @@ def check_aux_pct_aligned(sample: int) -> CheckResult:
         daily = _load_daily(code, ["date", "pct_change"])
         if daily is None:
             res.issues.append((f"{d}/{code}", "no_daily"))
+            res.passed = False
             continue
         try:
             a = pd.read_parquet(fp, columns=["date", "pct_change"])
         except Exception:
             res.issues.append((f"{d}/{code}", "read_err"))
+            res.passed = False
             continue
         if "pct_change" not in a:
+            res.issues.append((f"{d}/{code}", "missing_col"))
+            res.passed = False
             continue
         a["date"] = pd.to_datetime(a["date"])
         daily["pct_change"] = daily["pct_change"].fillna(0.0)
@@ -167,12 +191,23 @@ def check_aux_close_aligned(sample: int) -> CheckResult:
         try:
             a = pd.read_parquet(fp, columns=["date"] + OHLC)
         except Exception:
-            continue  # file lacks OHLC entirely — not in scope
+            # Some event dirs embed only close (no open/high/low); retry that.
+            try:
+                a = pd.read_parquet(fp, columns=["date", "close"])
+            except Exception:
+                res.issues.append((f"{d}/{code}", "no_ohlc/read_err"))
+                res.passed = False
+                continue
         if "close" not in a or "date" not in a:
+            res.issues.append((f"{d}/{code}", "missing_col"))
+            res.passed = False
             continue
-        daily = _load_daily(code, ["date"] + OHLC)
+        daily = _load_daily(
+            code, ["date"] + [c for c in ["open", "high", "low", "close"] if c in a]
+        )
         if daily is None:
             res.issues.append((f"{d}/{code}", "no_daily"))
+            res.passed = False
             continue
         a["date"] = pd.to_datetime(a["date"])
         daily_idx = daily.set_index("date")
@@ -206,14 +241,17 @@ def check_feature_pct(sample: int) -> CheckResult:
         daily = _load_daily(code, ["date", "pct_change"])
         if daily is None:
             res.issues.append((code, "no_daily"))
+            res.passed = False
             continue
         try:
             f = pd.read_parquet(fp, columns=["date", "pct_change"])
         except Exception:
             res.issues.append((code, "read_err"))
+            res.passed = False
             continue
         if "pct_change" not in f:
             res.issues.append((code, "no_feat_pc"))
+            res.passed = False
             continue
         f["date"] = pd.to_datetime(f["date"])
         daily = daily.set_index("date")["pct_change"].fillna(0.0)
@@ -237,13 +275,20 @@ def check_feature_pct(sample: int) -> CheckResult:
 
 
 def check_sparsity(sample: int) -> CheckResult:
-    """Per-feature non-zero coverage across a sampled panel (event-sparse canary)."""
+    """Per-feature non-zero coverage across a sampled panel (event-sparse canary).
+
+    v6 §九: ``(x != 0).mean()`` counts NaN as non-zero (NaN != 0 is True), which
+    inflates coverage for missing-heavy features. Report finite-excluded ratios:
+      finite_cov        = np.isfinite(x).mean()
+      effective_nonzero = (np.isfinite(x) & (x != 0)).mean()
+    """
     res = CheckResult("sparsity", True, "")
     feats = sorted(glob.glob(str(FEAT_DIR / "*.parquet")))
     if sample:
         feats = feats[:sample]
     res.files_scanned = len(feats)
-    counts: dict[str, list] = {}
+    finite: dict[str, list] = {}
+    nz: dict[str, list] = {}
     for fp in feats:
         try:
             df = pd.read_parquet(fp)
@@ -255,20 +300,150 @@ def check_sparsity(sample: int) -> CheckResult:
             x = df[c].to_numpy()
             if x.size == 0:
                 continue
-            counts.setdefault(c, []).append(float((x != 0).mean()))
+            finite.setdefault(c, []).append(float(np.isfinite(x).mean()))
+            nz.setdefault(c, []).append(float((np.isfinite(x) & (x != 0)).mean()))
     sparse = []
-    for c, vals in counts.items():
-        nz = float(np.mean(vals))
-        if nz < SPARSE_NONZERO_RATIO:
-            sparse.append((c, round(nz, 5)))
+    for c, vals in nz.items():
+        eff = float(np.mean(vals))
+        if eff < SPARSE_NONZERO_RATIO:
+            sparse.append((c, round(eff, 5)))
     sparse.sort(key=lambda t: t[1])
+    finite_covs = [float(np.mean(vals)) for vals in finite.values()]
+    avg_finite_cov = float(np.mean(finite_covs)) if finite_covs else 0.0
     if len(sparse) > 200:
         res.issues = [(f"{c}", f"nz={nz}") for c, nz in sparse[:200]]
-        res.summary = f"event-sparse features={len(sparse)} (showing 200) min_nz={sparse[0][1] if sparse else 0}"
+        res.summary = (
+            f"event-sparse features={len(sparse)} (showing 200) "
+            f"min_nz={sparse[0][1] if sparse else 0} avg_finite_cov={avg_finite_cov:.3f}"
+        )
     else:
         res.issues = [(f"{c}", f"nz={nz}") for c, nz in sparse]
-        res.summary = f"event-sparse features={len(sparse)} (non_zero_ratio<{SPARSE_NONZERO_RATIO})"
+        res.summary = (
+            f"event-sparse features={len(sparse)} (non_zero_ratio<{SPARSE_NONZERO_RATIO}) "
+            f"avg_finite_cov={avg_finite_cov:.3f}"
+        )
     # Sparsity is informational — never fails the gate by itself.
+    return res
+
+
+def check_ohlc_sanity(sample: int) -> CheckResult:
+    """Raw daily files must be internally consistent (v6 §九).
+
+    Dates unique / sorted / no-weekend (A-shares never trade weekends, even on
+    调休 makeup days), stock_code == filename, prices > 0, low <= open/close <=
+    high, volume/amount >= 0. Any violation fails the gate.
+    """
+    res = CheckResult("ohlc_sanity", True, "")
+    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
+    if sample:
+        files = files[:sample]
+    res.files_scanned = len(files)
+    TOL = 1e-9
+    dup_total = 0
+    weekend_total = 0
+    OHLC = ["open", "high", "low", "close"]
+    for fp in files:
+        code = Path(fp).stem
+        try:
+            d = pd.read_parquet(fp)
+        except Exception:
+            res.issues.append((code, "read_err"))
+            res.passed = False
+            continue
+        if "date" not in d:
+            res.issues.append((code, "missing_date"))
+            res.passed = False
+            continue
+        dates = pd.to_datetime(d["date"], errors="coerce")
+        if dates.isna().any():
+            res.issues.append((code, f"na_dates={int(dates.isna().sum())}"))
+            res.passed = False
+            continue
+        res.rows_scanned += int(len(dates))
+        n_dup = int(dates.duplicated().sum())
+        dup_total += n_dup
+        if n_dup:
+            res.passed = False
+            res.issues.append((code, f"dup_dates={n_dup}"))
+        if not dates.is_monotonic_increasing:
+            res.passed = False
+            res.issues.append((code, "unsorted_dates"))
+        wk = int(dates.dt.dayofweek.isin([5, 6]).sum())
+        weekend_total += wk
+        if wk:
+            res.passed = False
+            res.issues.append((code, f"weekend_rows={wk}"))
+        if "stock_code" in d:
+            sc = d["stock_code"].astype(str).str.strip()
+            mism = int((sc != code).sum())
+            if mism:
+                res.passed = False
+                res.issues.append((code, f"stock_code_mismatch={mism}"))
+        else:
+            res.passed = False
+            res.issues.append((code, "missing_stock_code"))
+        missing_ohlc = [c for c in OHLC if c not in d]
+        if missing_ohlc:
+            res.passed = False
+            res.issues.append((code, f"missing_ohlc={','.join(missing_ohlc)}"))
+            continue
+        o = d["open"].astype("float64").to_numpy()
+        h = d["high"].astype("float64").to_numpy()
+        l = d["low"].astype("float64").to_numpy()
+        cl = d["close"].astype("float64").to_numpy()
+        for c, v in (("open", o), ("high", h), ("low", l), ("close", cl)):
+            n_neg = int((v <= 0).sum())
+            if n_neg:
+                res.passed = False
+                res.issues.append((code, f"{c}<=0 n={n_neg}"))
+        # NaN comparisons are False, so NaN cells don't false-trigger here.
+        if int((l > h + TOL).sum()):
+            res.passed = False
+            res.issues.append((code, "low>high"))
+        outside = ((cl < l - TOL) | (cl > h + TOL) | (o < l - TOL) | (o > h + TOL)).sum()
+        if int(outside):
+            res.passed = False
+            res.issues.append((code, f"ohlc_outside n={int(outside)}"))
+        for c in ("volume", "amount"):
+            if c not in d:
+                continue
+            n_neg = int((pd.to_numeric(d[c], errors="coerce").to_numpy() < 0).sum())
+            if n_neg:
+                res.passed = False
+                res.issues.append((code, f"{c}<0 n={n_neg}"))
+    res.summary = (
+        f"dup_dates={dup_total} weekend_rows={weekend_total} "
+        f"problem_files={len(res.issues)}"
+    )
+    return res
+
+
+def check_contract_schema(sample: int) -> CheckResult:
+    """Every daily file must satisfy the frozen DAILY_EQUITY contract (v6 §十六).
+
+    Schema, primary-key uniqueness, date rules and unit sign constraints all
+    come from ``stoke_ml.data.contract`` instead of ad-hoc local checks, so the
+    gate and the storage/downloader layers share one source of truth.
+    """
+    res = CheckResult("contract_schema", True, "")
+    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
+    if sample:
+        files = files[:sample]
+    res.files_scanned = len(files)
+    contract = get_contract("daily_equity")
+    for fp in files:
+        code = Path(fp).stem
+        try:
+            d = pd.read_parquet(fp)
+        except Exception:
+            res.issues.append((code, "read_err"))
+            res.passed = False
+            continue
+        violations = validate_contract(d, contract, code=code)
+        if violations:
+            res.passed = False
+            res.issues.append((code, ";".join(violations[:8])))
+    res.summary = f"problem_files={len(res.issues)}"
     return res
 
 
@@ -278,6 +453,8 @@ CHECKS = {
     "aux_close_aligned": check_aux_close_aligned,
     "feature_pct": check_feature_pct,
     "sparsity": check_sparsity,
+    "ohlc_sanity": check_ohlc_sanity,
+    "contract_schema": check_contract_schema,
 }
 
 

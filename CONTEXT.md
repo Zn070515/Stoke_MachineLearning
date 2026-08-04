@@ -60,6 +60,12 @@
 
 `data/features/{stock_code}.parquet` — `scripts/build_features.py` 一次性构建的全市场特征：5530 只 × 3744 列/股（516 基础 + 3228 时序展开），109GB。训练脚本直接读盘，特征工程与训练解耦。
 
+### 数据契约与特征缓存
+
+**数据契约** `stoke_ml/data/contract.py`（v6 §十六）— 每个数据集（daily_equity / margin / northbound / dragon_tiger / fundamentals）用一份冻结的 `DataContract` 描述 schema、主键、单位、复权口径、时区、日历与源优先级，下载器 / 存储 / 质量门禁 / 特征构建器共享同一份契约。质量门禁的 `contract_schema` 检查按 `DAILY_EQUITY` 验证每个 daily 文件（必需列、主键唯一、日期规则、单位符号），任一违反即 fail。
+
+**特征缓存 manifest** `stoke_ml/features/cache_manifest.py`（v6 §十二）— 每个预构建特征 parquet 携带 sidecar JSON manifest（`data/features/.manifests/{code}.json`），记录 git_commit、config_hash、feature_schema_hash、horizon、seq_len、panel_mode 与逐通道源文件指纹。`build_features.py` 缓存命中必须比较这些 hash；训练侧 `FeaturePipeline` 对 prebuilt 目录做 lineage 警告式校验。
+
 ### 格式
 
 全链路 Parquet（列存，压缩，pandas 原生读写）。

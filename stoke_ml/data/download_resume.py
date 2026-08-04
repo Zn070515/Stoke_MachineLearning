@@ -1,86 +1,281 @@
-"""Download resume helpers.
+"""Download resume helpers — manifest-based completion (v6 §八).
 
-Common pattern for download scripts: skip already-downloaded stocks (or date
-ranges) by checking existing raw data on disk.  This avoids re-fetching data
-that was already downloaded before an interruption (OOM, timeout, rate-limit).
+A download is *complete* only when a written manifest says so.  Resume must
+never decide "this stock/year is complete" by guessing from file presence or a
+small sample: an existing parquet can start at the right date yet be missing the
+middle, carry a changed schema, or come from a different source/adjustment, and
+a year directory with one partial file does not make the whole year complete.
+
+Every successful download writes ``<base>/.manifests/<name>.json`` via
+``mark_stock_result`` / ``write_year_manifest``.  ``skip_completed_stocks`` and
+``skip_completed_years`` trust ONLY a COMPLETE manifest that matches the current
+request (range / schema / explicit coverage).  Anything else — missing manifest,
+PARTIAL / FAILED / DEGRADED status, schema mismatch, or a request the manifest
+does not cover — is re-downloaded.
 """
-
+import hashlib
+import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+STATUS_COMPLETE = "COMPLETE"
+STATUS_PARTIAL = "PARTIAL"
+STATUS_FAILED = "FAILED"
+STATUS_DEGRADED = "DEGRADED"
+
+
+def schema_hash(df: pd.DataFrame) -> str:
+    """Stable short hash of a DataFrame's column set (schema-change detector)."""
+    cols = "|".join(sorted(str(c) for c in df.columns))
+    return hashlib.sha1(cols.encode("utf-8")).hexdigest()[:16]
+
+
+def _iso(value) -> str | None:
+    if value is None:
+        return None
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+def _manifest_path(base_dir: str, name: str) -> str:
+    return os.path.join(base_dir, ".manifests", f"{name}.json")
+
+
+def _read_json(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# per-stock manifests
+# ---------------------------------------------------------------------------
+
+def write_stock_manifest(
+    raw_dir: str,
+    stock_code: str,
+    *,
+    dataset: str | None = None,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    actual_start=None,
+    actual_end=None,
+    expected_rows: int | None = None,
+    actual_rows: int | None = None,
+    missing_intervals: list | None = None,
+    source: str | None = None,
+    adjustment: str | None = None,
+    schema_hash: str | None = None,
+    covers_request: bool | None = None,
+    status: str = STATUS_COMPLETE,
+) -> str:
+    """Atomically write a per-stock completion manifest. Returns its path."""
+    payload = {
+        "dataset": dataset,
+        "stock_code": stock_code,
+        "requested_start": _iso(requested_start),
+        "requested_end": _iso(requested_end),
+        "actual_start": _iso(actual_start),
+        "actual_end": _iso(actual_end),
+        "expected_rows": expected_rows,
+        "actual_rows": actual_rows,
+        "missing_intervals": missing_intervals or [],
+        "source": source,
+        "adjustment": adjustment,
+        "schema_hash": schema_hash,
+        "status": status,
+        "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    # covers_request is only recorded when the writer decided it; absence means
+    # coverage falls back to actual_start/actual_end comparison (legacy).
+    if covers_request is not None:
+        payload["covers_request"] = covers_request
+    path = _manifest_path(raw_dir, stock_code)
+    _write_json(path, payload)
+    return path
+
+
+def read_stock_manifest(raw_dir: str, stock_code: str) -> dict | None:
+    return _read_json(_manifest_path(raw_dir, stock_code))
+
+
+def mark_stock_result(
+    raw_dir: str,
+    stock_code: str,
+    df: pd.DataFrame,
+    *,
+    dataset: str | None = None,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    expected_rows: int | None = None,
+    source: str | None = None,
+    adjustment: str | None = None,
+    covers_request: bool | None = None,
+    status: str | None = None,
+    date_col: str = "date",
+) -> str:
+    """Record one stock's download outcome from the fetched frame.
+
+    Derives actual coverage, row count and schema hash from ``df``.  A
+    non-empty ``df`` defaults to COMPLETE and ``covers_request=True`` (the
+    downloader just fetched and saved it successfully — trust the fetch); an
+    empty one defaults to DEGRADED — recorded so the attempt is visible, but
+    never trusted by ``skip_completed_stocks``.  Pass ``covers_request=None``
+    to fall back to date-range coverage comparison instead.
+    """
+    if status is None:
+        status = STATUS_COMPLETE if not df.empty else STATUS_DEGRADED
+    if covers_request is None:
+        covers_request = not df.empty
+    if date_col in df.columns and not df.empty:
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        actual_start = dates.min()
+        actual_end = dates.max()
+    else:
+        actual_start = actual_end = None
+    return write_stock_manifest(
+        raw_dir, stock_code,
+        dataset=dataset,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=actual_start,
+        actual_end=actual_end,
+        expected_rows=expected_rows,
+        actual_rows=len(df),
+        source=source,
+        adjustment=adjustment,
+        schema_hash=schema_hash(df),
+        covers_request=covers_request,
+        status=status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# year-level manifests
+# ---------------------------------------------------------------------------
+
+def write_year_manifest(
+    storage_base: str,
+    data_type: str,
+    year: int,
+    *,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    actual_start=None,
+    actual_end=None,
+    expected_rows: int | None = None,
+    actual_rows: int | None = None,
+    n_stocks: int | None = None,
+    source: str | None = None,
+    adjustment: str | None = None,
+    schema_hash: str | None = None,
+    covers_request: bool | None = None,
+    status: str = STATUS_COMPLETE,
+) -> str:
+    """Atomically write a year-level completion manifest. Returns its path."""
+    base = os.path.join(storage_base, data_type)
+    payload = {
+        "dataset": data_type,
+        "year": year,
+        "requested_start": _iso(requested_start),
+        "requested_end": _iso(requested_end),
+        "actual_start": _iso(actual_start),
+        "actual_end": _iso(actual_end),
+        "expected_rows": expected_rows,
+        "actual_rows": actual_rows,
+        "n_stocks": n_stocks,
+        "source": source,
+        "adjustment": adjustment,
+        "schema_hash": schema_hash,
+        "covers_request": covers_request,
+        "status": status,
+        "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    path = _manifest_path(base, str(year))
+    _write_json(path, payload)
+    return path
+
+
+def read_year_manifest(storage_base: str, data_type: str, year: int) -> dict | None:
+    return _read_json(_manifest_path(os.path.join(storage_base, data_type), str(year)))
+
+
+# ---------------------------------------------------------------------------
+# matching + skip logic
+# ---------------------------------------------------------------------------
+
+def _manifest_matches(
+    manifest: dict | None,
+    *,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    schema_hash: str | None = None,
+) -> bool:
+    """A manifest satisfies the request only when it is COMPLETE and covers it."""
+    if not manifest or manifest.get("status") != STATUS_COMPLETE:
+        return False
+    if schema_hash and manifest.get("schema_hash") != schema_hash:
+        return False
+    # New manifests declare coverage explicitly (handles empty-but-successful
+    # windows and bounded sources).  Legacy manifests fall back to dates.
+    if "covers_request" in manifest:
+        return manifest["covers_request"] is True
+    if requested_start:
+        a = manifest.get("actual_start")
+        if not a or pd.Timestamp(a) > pd.Timestamp(requested_start):
+            return False
+    if requested_end:
+        b = manifest.get("actual_end")
+        if not b or pd.Timestamp(b) < pd.Timestamp(requested_end):
+            return False
+    return True
 
 
 def skip_completed_stocks(
     raw_dir: str,
     codes: list[str],
     start_date: str | None = None,
-    date_col: str = "date",
-    suffix: str = ".parquet",
+    end_date: str | None = None,
+    schema_hash: str | None = None,
 ) -> tuple[list[str], int]:
-    """Filter out stocks whose raw data already covers the requested date range.
+    """Filter out stocks whose download is recorded COMPLETE for this request.
 
-    Returns ``(pending_codes, n_skipped)``.
-
-    A stock is *complete* (skipped) when:
-    1. ``{raw_dir}/{code}{suffix}`` exists, is readable, and non-empty
-    2. If *start_date* is given, the oldest date in *date_col* reaches back
-       to *start_date* or earlier
-
-    Corrupted / unreadable files are silently deleted so the stock is
-    re-downloaded.  Files that have data but donʼt reach *start_date* are
-    treated as complete and kept (bounded-pagination sources only have a
-    limited history) — never deleted on resume.
+    Returns ``(pending_codes, n_skipped)``.  A stock is skipped ONLY when
+    ``<raw_dir>/.manifests/{code}.json`` says COMPLETE and matches the requested
+    range / schema.  File presence alone is never trusted (v6 §八).
     """
     pending: list[str] = []
     skipped = 0
-    start_ts = pd.Timestamp(start_date) if start_date else None
-
     for code in codes:
-        path = os.path.join(raw_dir, f"{code}{suffix}")
-        if not os.path.exists(path):
-            pending.append(code)
-            continue
-
-        try:
-            existing = pd.read_parquet(path)
-        except Exception:
-            logger.debug("  %s: unreadable file, re-downloading", code)
-            _safe_unlink(path)
-            pending.append(code)
-            continue
-
-        if existing.empty:
-            pending.append(code)
-            continue
-
-        if start_ts is not None and date_col in existing.columns:
-            dates = pd.to_datetime(existing[date_col], errors="coerce")
-            oldest = dates.min()
-            if pd.isna(oldest):
-                # dates are garbled → re-download to be safe
-                _safe_unlink(path)
-                pending.append(code)
-                continue
-            if oldest <= start_ts:
-                skipped += 1
-                continue
-            # Data exists but doesn't reach start_date (e.g. bounded
-            # pagination on news).  Do NOT delete — just skip this run so
-            # we don't destroy existing data and re-fetch it next time.
+        manifest = read_stock_manifest(raw_dir, code)
+        if _manifest_matches(
+            manifest,
+            requested_start=start_date,
+            requested_end=end_date,
+            schema_hash=schema_hash,
+        ):
             skipped += 1
-            logger.debug(
-                "  %s: oldest %s is after %s — treating as complete (bounded source)",
-                code, str(oldest.date()), str(start_ts.date()),
-            )
-            continue
         else:
-            # No date-column or no date filter — existing file is enough
-            skipped += 1
-            continue
-
+            pending.append(code)
     if skipped:
         logger.info(
             "Skipping %d already-complete stocks, %d remaining", skipped, len(pending),
@@ -93,107 +288,24 @@ def skip_completed_years(
     years: list[int],
     data_type: str,
 ) -> tuple[list[int], int]:
-    """For year-by-year downloads, check which years already have data saved.
+    """Filter out years recorded COMPLETE for the given data type.
 
-    Returns ``(pending_years, n_skipped)``.
-
-    Supports two storage layouts:
-
-    *Partitioned* — ``{storage_base}/{data_type}/{year}/`` contains parquet files.
-    *Flat* — ``{storage_base}/{data_type}/*.parquet`` are per-stock flat files
-      (all years merged).  In this mode the function reads a few files to
-      determine the latest date on disk, then skips all years before it.
+    Returns ``(pending_years, n_skipped)``.  A year is skipped ONLY when its
+    ``{data_type}/.manifests/{year}.json`` says COMPLETE.  Detecting a parquet
+    file in a year directory — or sampling a few flat files — is never enough
+    to call a year complete (v6 §八).
     """
     pending: list[int] = []
     skipped = 0
-    type_dir = os.path.join(storage_base, data_type)
-
-    # --- partitioned layout (year subdirs) ---
-    if _has_year_dirs(type_dir):
-        for year in years:
-            year_dir = os.path.join(type_dir, str(year))
-            if _dir_has_parquet(year_dir):
-                skipped += 1
-            else:
-                pending.append(year)
-        if skipped:
-            logger.info(
-                "Skipping %d already-complete years for %s, %d remaining",
-                skipped, data_type, len(pending),
-            )
-        return pending, skipped
-
-    # --- flat layout (per-stock files, all years merged) ---
-    parquet_files = [f for f in os.listdir(type_dir) if f.endswith(".parquet")]
-    if not parquet_files:
-        return years, 0
-
-    max_date = _max_date_in_dir(type_dir, parquet_files)
-    if max_date is None:
-        return years, 0
-
     for year in years:
-        if year < max_date.year:
+        manifest = read_year_manifest(storage_base, data_type, year)
+        if _manifest_matches(manifest):
             skipped += 1
         else:
             pending.append(year)
-
     if skipped:
         logger.info(
-            "Skipping %d already-complete years for %s (latest data: %s), %d remaining",
-            skipped, data_type, max_date.date(), len(pending),
+            "Skipping %d already-complete years for %s, %d remaining",
+            skipped, data_type, len(pending),
         )
     return pending, skipped
-
-
-# ---------------------------------------------------------------------------
-# internal helpers
-# ---------------------------------------------------------------------------
-
-def _safe_unlink(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
-def _has_year_dirs(type_dir: str) -> bool:
-    """Return True if the directory has year-named (4-digit) subdirectories."""
-    if not os.path.isdir(type_dir):
-        return False
-    for name in os.listdir(type_dir):
-        if name.isdigit() and len(name) == 4 and os.path.isdir(
-            os.path.join(type_dir, name)
-        ):
-            return True
-    return False
-
-
-def _dir_has_parquet(dir_path: str) -> bool:
-    if not os.path.isdir(dir_path):
-        return False
-    for _root, _dirs, files in os.walk(dir_path):
-        if any(f.endswith(".parquet") for f in files):
-            return True
-    return False
-
-
-def _max_date_in_dir(
-    type_dir: str, parquet_files: list[str], date_col: str = "date", sample: int = 5
-) -> pd.Timestamp | None:
-    """Read a sample of flat parquet files and return the latest date found."""
-    import random
-
-    random.shuffle(parquet_files)
-    max_ts = pd.Timestamp.min
-    for fname in parquet_files[:sample]:
-        try:
-            df = pd.read_parquet(os.path.join(type_dir, fname), columns=[date_col])
-        except Exception:
-            continue
-        if df.empty or date_col not in df.columns:
-            continue
-        dates = pd.to_datetime(df[date_col], errors="coerce")
-        if not dates.empty and dates.max() > max_ts:
-            max_ts = dates.max()
-    return None if max_ts is pd.Timestamp.min else max_ts

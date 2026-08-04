@@ -2,10 +2,12 @@
 
 Partitions: data/a_shares/{data_type}/{year}/{month}/{stock_code}.parquet
 """
+import json
 import logging
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -13,6 +15,12 @@ logger = logging.getLogger(__name__)
 
 _LOCK_TIMEOUT = 600.0
 _LOCK_STALE = 900.0
+
+# v6 §十一: destructive window replacement must reject if the new output would
+# drop too many previously-present dates, or silently remove columns that
+# downstream readers depend on.  Allow up to 20% date loss by default.
+DEFAULT_DEGRADE_THRESHOLD = 0.2
+_SCHEMA_RESERVED = frozenset({"date", "stock_code"})
 
 
 def _acquire_lock(target: str, timeout: float = _LOCK_TIMEOUT) -> str:
@@ -71,8 +79,20 @@ class MarketWideStorage:
         os.makedirs(p, exist_ok=True)
         return p
 
-    def save(self, df: pd.DataFrame, replace_range: bool = False) -> None:
+    def save(
+        self,
+        df: pd.DataFrame,
+        replace_range: bool = False,
+        *,
+        degrade_threshold: float = DEFAULT_DEGRADE_THRESHOLD,
+        provenance: dict | None = None,
+        force: bool = False,
+        replace_window: tuple | None = None,
+    ) -> int:
         """Save per-stock market data to flat files, merging with existing.
+
+        Returns the number of stocks whose replace_range write was rejected by
+        the degradation guard.
 
         Loads existing flat file, concatenates new rows, drops duplicate
         rows (identical across all columns), and writes back atomically.
@@ -85,16 +105,33 @@ class MarketWideStorage:
         yields exactly the current transform output for that range instead of
         accumulating stale rows (e.g. after a logic fix changes values for the
         same date). Rows outside the range are preserved for partial runs.
+
+        ``replace_window`` overrides the [min, max] used to derive the replaced
+        range (default: the new rows' own extent).  Pass the intended coverage
+        range so a partial output (e.g. only a few dates regenerated because the
+        upstream raw load came back short) is measured against the full range
+        and rejected instead of slipping through a narrow default window.
+
+        v6 §十一 degradation guard: a destructive replace is REJECTED (the old
+        file is left untouched) when it would delete more than
+        ``degrade_threshold`` of the dates previously present inside the
+        window, or when it drops columns the old file carried — either signals
+        an upstream failure that produced a partial output.  Pass ``force=True``
+        to bypass the guard for an intentional rewrite.  When ``provenance`` is
+        given, a sidecar manifest recording the write (run_id / source_snapshot
+        / config_hash / git_commit / coverage_report / decision) is written to
+        ``{base}/.manifests/{code}.json`` for both accepted and rejected writes.
         """
         if df.empty:
-            return
+            return 0
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"])
         if df.empty:
-            return
+            return 0
 
         base = self._base_dir()
+        rejected = 0
         for code, group in df.groupby("stock_code"):
             out_path = os.path.join(base, f"{code}.parquet")
             # Read-modify-write must be exclusive: atomic rename alone only
@@ -103,6 +140,8 @@ class MarketWideStorage:
             lock_dir = _acquire_lock(out_path)
             try:
                 new_rows = group.sort_values("date")
+                decision = "accepted"
+                report: dict = {}
                 if os.path.isfile(out_path):
                     existing = pd.read_parquet(out_path)
                     existing["date"] = pd.to_datetime(existing["date"])
@@ -110,29 +149,133 @@ class MarketWideStorage:
                     if "stock_code" not in existing.columns:
                         existing["stock_code"] = code
                     if replace_range:
-                        lo = new_rows["date"].min()
-                        hi = new_rows["date"].max()
-                        existing = existing[
-                            (existing["date"] < lo) | (existing["date"] > hi)
-                        ]
+                        if replace_window is not None:
+                            lo = pd.Timestamp(replace_window[0])
+                            hi = pd.Timestamp(replace_window[1])
+                        else:
+                            lo = new_rows["date"].min()
+                            hi = new_rows["date"].max()
+                        report = self._replace_range_report(existing, new_rows, lo, hi)
+                        dropped_cols = report["schema"]["dropped_cols"]
+                        if (
+                            not force
+                            and report["degradation_ratio"] > degrade_threshold
+                        ):
+                            decision = "rejected"
+                            rejected += 1
+                            self._log_rejection(code, report, degrade_threshold, reason="date")
+                        elif not force and dropped_cols:
+                            decision = "rejected"
+                            rejected += 1
+                            self._log_rejection(
+                                code, report, degrade_threshold,
+                                reason=f"columns={dropped_cols}",
+                            )
+                        if decision == "accepted":
+                            existing = existing[
+                                (existing["date"] < lo) | (existing["date"] > hi)
+                            ]
                     new_rows = pd.concat([existing, new_rows], ignore_index=True)
                 # Dedup identical rows (not by date only — block_trade has
                 # multiple trades per day that must all be preserved).
                 new_rows = new_rows.drop_duplicates(keep="last")
                 new_rows = new_rows.sort_values("date")
-                fd, tmp_path = tempfile.mkstemp(
-                    suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
-                )
-                os.close(fd)
-                try:
-                    new_rows.to_parquet(tmp_path, index=False, compression='lz4')
-                    os.replace(tmp_path, out_path)
-                except Exception:
-                    if os.path.isfile(tmp_path):
-                        os.unlink(tmp_path)
-                    raise
+                if decision == "accepted":
+                    fd, tmp_path = tempfile.mkstemp(
+                        suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
+                    )
+                    os.close(fd)
+                    try:
+                        new_rows.to_parquet(tmp_path, index=False, compression='lz4')
+                        os.replace(tmp_path, out_path)
+                    except Exception:
+                        if os.path.isfile(tmp_path):
+                            os.unlink(tmp_path)
+                        raise
+                if provenance is not None:
+                    self._write_manifest(code, provenance, report, decision, new_rows)
             finally:
                 _release_lock(lock_dir)
+        return rejected
+
+    @staticmethod
+    def _replace_range_report(
+        existing: pd.DataFrame, new_rows: pd.DataFrame, lo, hi,
+    ) -> dict:
+        """Coverage + schema diff for the [lo, hi] window being replaced."""
+        old_in_window = existing[
+            (existing["date"] >= lo) & (existing["date"] <= hi)
+        ]
+        old_dates = set(pd.to_datetime(old_in_window["date"]).dt.date)
+        new_in_window = new_rows[
+            (new_rows["date"] >= lo) & (new_rows["date"] <= hi)
+        ]
+        new_dates = set(pd.to_datetime(new_in_window["date"]).dt.date)
+        missing = sorted(old_dates - new_dates)
+        degradation = (
+            len(missing) / len(old_dates) if old_dates else 0.0
+        )
+        old_cols = set(existing.columns)
+        new_cols = set(new_rows.columns)
+        dropped = sorted(old_cols - new_cols - _SCHEMA_RESERVED)
+        added = sorted(new_cols - old_cols - _SCHEMA_RESERVED)
+        return {
+            "window_lo": pd.Timestamp(lo).strftime("%Y-%m-%d"),
+            "window_hi": pd.Timestamp(hi).strftime("%Y-%m-%d"),
+            "old_dates_in_window": len(old_dates),
+            "new_dates_in_window": len(new_dates),
+            "missing_dates": len(missing),
+            "missing_date_list": [d.isoformat() for d in missing[:20]],
+            "degradation_ratio": round(degradation, 4),
+            "schema": {
+                "dropped_cols": dropped,
+                "added_cols": added,
+                "old_columns": sorted(old_cols),
+            },
+        }
+
+    def _log_rejection(
+        self, code: str, report: dict, threshold: float, *, reason: str,
+    ) -> None:
+        logger.error(
+            "MarketWideStorage[%s] REJECTED replace_range for %s "
+            "(degradation %.1f%% > %.0f%%, %d dates lost, %s): file left "
+            "untouched",
+            self._data_type, code, report["degradation_ratio"] * 100,
+            threshold * 100, report["missing_dates"], reason,
+        )
+
+    def _write_manifest(
+        self, code: str, provenance: dict, report: dict, decision: str,
+        rows: pd.DataFrame,
+    ) -> None:
+        """Record a replace_range write outcome as a sidecar JSON manifest."""
+        base = self._base_dir()
+        manifest_dir = os.path.join(base, ".manifests")
+        os.makedirs(manifest_dir, exist_ok=True)
+        payload = {
+            "data_type": self._data_type,
+            "stock_code": code,
+            "run_id": provenance.get("run_id"),
+            "source_snapshot": provenance.get("source_snapshot"),
+            "config_hash": provenance.get("config_hash"),
+            "git_commit": provenance.get("git_commit"),
+            "replace_range": True,
+            "decision": decision,
+            "coverage": report,
+            "rows_written": int(len(rows)),
+            "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        path = os.path.join(manifest_dir, f"{code}.json")
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.isfile(tmp):
+                os.unlink(tmp)
+            raise
 
     def load(
         self, stock_code: str, start_date: str, end_date: str

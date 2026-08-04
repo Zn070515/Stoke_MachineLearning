@@ -17,7 +17,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.download_resume import skip_completed_stocks
+from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.sources.a_shares.guba_source import GubaSource
 from stoke_ml.features.news_nlp import (
@@ -119,9 +119,10 @@ def main():
     success, fail, empty, skipped = 0, 0, 0, 0
 
     # Resume: skip stocks whose raw data already covers start_date
+    raw_dir = os.path.join(data_dir, "a_shares", "guba_raw")
     if not args.no_resume:
         codes, skipped = skip_completed_stocks(
-            os.path.join(data_dir, "a_shares", "guba_raw"),
+            raw_dir,
             codes,
             start_date=args.start,
         )
@@ -132,6 +133,10 @@ def main():
     def _save_stock(code: str, df: pd.DataFrame) -> int:
         """Save one stock through the full medallion pipeline. Returns post count."""
         guba_storage.save_raw(code, df)
+        mark_stock_result(
+            raw_dir, code, df, dataset="guba_raw",
+            requested_start=args.start, requested_end=args.end,
+        )
         post_count = len(df)
         silver = guba_storage.bronze_to_silver(code)
         if not silver.empty:
@@ -189,6 +194,11 @@ def main():
 
                 if df is None or df.empty:
                     logger.info("  %s: no posts found", code)
+                    if df is not None:
+                        mark_stock_result(
+                            raw_dir, code, df, dataset="guba_raw",
+                            requested_start=args.start, requested_end=args.end,
+                        )
                     empty += 1
                     continue
 
@@ -216,6 +226,10 @@ def main():
 
             if df.empty:
                 logger.info("  %s: no posts found", code)
+                mark_stock_result(
+                    raw_dir, code, df, dataset="guba_raw",
+                    requested_start=args.start, requested_end=args.end,
+                )
                 empty += 1
                 continue
 
@@ -225,6 +239,10 @@ def main():
 
             # Save raw (Bronze)
             guba_storage.save_raw(code, df)
+            mark_stock_result(
+                raw_dir, code, df, dataset="guba_raw",
+                requested_start=args.start, requested_end=args.end,
+            )
             logger.info("  %s: %d posts saved (raw)", code, len(df))
             total_posts += len(df)
 

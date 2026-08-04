@@ -16,6 +16,27 @@ from stoke_ml.preprocessing.base import PreprocessingChain
 logger = logging.getLogger(__name__)
 
 
+class PreprocessingQualityError(Exception):
+    """Raised in strict mode when a chain's output fails error-level quality checks.
+
+    Carries the full quality report (``.report``) and the staged output
+    DataFrame (``.df``) so callers can persist the partial result rather than
+    losing it (v6 §十: 禁止 commit，保留 staging 输出).
+    """
+
+    def __init__(self, chain_name: str, report: list[dict], df: pd.DataFrame):
+        self.chain_name = chain_name
+        self.report = report
+        self.df = df
+        n_errors = sum(1 for r in report if r["level"] == "ERROR")
+        messages = " | ".join(
+            r.get("message", str(r)) for r in report if r["level"] == "ERROR"
+        )
+        super().__init__(
+            f"QualityMonitor[{chain_name}] {n_errors} error-level issue(s): {messages}"
+        )
+
+
 class PreprocessingPipeline:
     """Register and run named preprocessing chains.
 
@@ -31,8 +52,14 @@ class PreprocessingPipeline:
     def register_chain(self, name: str, chain: PreprocessingChain) -> None:
         self._chains[name] = chain
 
-    def run(self, chain_name: str, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
-        """Run a named chain on *df*, returning transformed DataFrame."""
+    def run(self, chain_name: str, df: pd.DataFrame, *, strict: bool = False,
+            **kwargs) -> pd.DataFrame:
+        """Run a named chain on *df*, returning transformed DataFrame.
+
+        With ``strict=True``, error-level quality problems raise
+        :class:`PreprocessingQualityError` instead of degrading silently —
+        the caller must decide whether to persist the staged output.
+        """
         chain = self._chains.get(chain_name)
         if chain is None:
             raise KeyError(
@@ -54,6 +81,8 @@ class PreprocessingPipeline:
                 logger.warning(
                     "QualityMonitor[%s] errors: %s", chain_name, errors[:3]
                 )
+            if strict and errors:
+                raise PreprocessingQualityError(chain_name, report, out)
         return out
 
     def get_chain(self, name: str):

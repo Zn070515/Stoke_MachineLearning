@@ -339,15 +339,23 @@ def _simulate_sleeve_account(
     Exits are TRUE delayed exits (review v5 §四): a position whose scheduled
     exit open is missing (suspension) is NOT sold at its stale close — it keeps
     holding, marks to its last known close, and retries the exit on every later
-    day until a real open appears (DELAYED), its last price is <= 0 (DELISTED),
-    or the price path ends with the position still open (UNRESOLVED, booked at
-    the last carried close).  exit_status covers every successfully entered
-    position, so no filled holding is ever silently dropped.
+    day until a real open appears (DELAYED) or the price path ends with the
+    position still open (UNRESOLVED_AT_END, booked at the last carried close,
+    capital left locked — no fake exit, no fictitious sell cost, review v6
+    §十四.1).  A carried close <= 0 is treated as DATA-MISSING, NOT an
+    executable delist (review v6 §十四.4): after ffill a zero price cannot
+    distinguish a real delisting from a dead data row, so the position is never
+    force-sold at 0.  exit_status covers every successfully entered position.
 
     Fills respect entry eligibility: a selected stock with no real open[d]
     stays unfilled (its weight remains cash) and is NEVER backfilled (review
-    v4 §三).  Long/EW entries are additionally capped at available cash
-    (review v5 §六.2) so NAV leverage cannot drift.
+    v4 §三).  Long/EW entries are additionally capped so total spend (notional
+    + entry cost) never exceeds available cash (review v6 §四) — the old cap
+    booked the cost AFTER sizing, so a full-buy at 10bp went cash-negative.
+
+    The account starts at nav 1.0 on the close BEFORE the first price day, so
+    the returned daily series INCLUDES day 0 (review v6 §三).  An internal
+    assertion enforces the account identity np.prod(1+daily) == final_nav.
 
     preds_np: (N, W) predictions for entry at window column d.  close_np /
     open_np: (N, Wp) price paths aligned to the SAME window-day grid (column d
@@ -374,6 +382,7 @@ def _simulate_sleeve_account(
     exit_counts = {"clean": 0, "delayed": 0, "delisted": 0,
                    "unresolved": 0, "unfilled": 0}
     exit_pnl = {k: 0.0 for k in exit_counts}
+    exit_days = {k: 0.0 for k in exit_counts}
 
     for d in range(Wp):
         nav_before_day[d] = nav_prev
@@ -388,12 +397,16 @@ def _simulate_sleeve_account(
             ex_open = open_np[:, d]
             ex_open_ok = np.isfinite(ex_open) & (ex_open > 0)
             exitable = held & ex_open_ok
-            dead = held & (~ex_open_ok) & (carried[:, d] <= 0)
             if d == sl["scheduled_exit_day"]:
                 # First attempt: positions that cannot exit become PENDING and
                 # are held (marked to last close) until a real open appears.
                 sl["pending"] |= held & (~ex_open_ok) & (carried[:, d] > 0)
-            liquidate = exitable | dead
+            # A held position whose carried close is <= 0 is DATA-MISSING, not
+            # an executable delist (review v6 §十四.4): price<=0 after ffill
+            # cannot tell a real delisting from a dead data row, so it is never
+            # force-sold at 0.  It stays held at its (zero) carried mark and
+            # resolves as UNRESOLVED_AT_END at the path end.
+            liquidate = exitable
             if liquidate.any():
                 ex_price = np.where(ex_open_ok, ex_open, carried[:, d])
                 ex_value = sl["shares"] * ex_price
@@ -404,12 +417,12 @@ def _simulate_sleeve_account(
                 sell_notional[d] += np.abs(ex_value[liquidate]).sum()
                 is_clean = (d == sl["scheduled_exit_day"]) & ex_open_ok & (~sl["pending"])
                 for cls, cm in (("clean", liquidate & is_clean),
-                                ("delayed", liquidate & ~is_clean & ~dead),
-                                ("delisted", dead)):
+                                ("delayed", liquidate & ~is_clean)):
                     if cm.any():
                         cls_pnl = side * (ex_value[cm].sum() - sl["entry_val"][cm].sum())
                         exit_pnl[cls] += float(cls_pnl)
                         exit_counts[cls] += int(cm.sum())
+                        exit_days[cls] += float((d - c) * int(cm.sum()))
                 sl["mask"] = held & ~liquidate
             if not sl["mask"].any():
                 del sleeves[c]
@@ -441,11 +454,17 @@ def _simulate_sleeve_account(
                     # short leg is a theoretical factor book and needs no cap.
                     per_stock = w / chosen.size
                     if side > 0:
-                        per_stock = min(per_stock, cash / n_fill)
+                        # Cap total spend (notional + entry cost) at available
+                        # cash (review v6 §四): per_stock*n_fill*(1+cost) <= cash
+                        # so the entry cost can never push cash negative.
+                        per_stock = min(per_stock, cash / ((1.0 + cost) * n_fill))
                     shares[fillable] = per_stock / open_np[fillable, d]
                     entry_val[fillable] = per_stock
                     spent = per_stock * n_fill
-                    cash -= side * spent
+                    # The entry cost is deducted from cash along with the
+                    # notional (review v6 §三) — previously only the notional
+                    # left cash, so net returns excluded the entry cost.
+                    cash -= side * spent + cost * spent
                     cost_paid[d] += cost * spent
                     buy_notional[d] = spent
             sleeves[d] = {"shares": shares, "mask": fillable, "entry_val": entry_val,
@@ -458,13 +477,18 @@ def _simulate_sleeve_account(
             if sl["mask"].any():
                 pos_value += side * float((sl["shares"] * carried[:, d]).sum())
         nav_close = cash + pos_value
-        if d > 0:
+        # review v6 §三: the account starts at nav 1.0 on the close BEFORE the
+        # first price day, so day-0's open->close P&L IS part of the return
+        # series — dropping it broke the identity prod(1+daily) == final_nav.
+        if nav_prev > 0:
             net_daily[d] = nav_close / nav_prev - 1.0
             gross_daily[d] = net_daily[d] + cost_paid[d] / nav_prev
         nav_prev = nav_close
 
     # ── End of price path: any holding that never found a real exit is
-    # UNRESOLVED, booked at its last carried close (review v5 §四). ──
+    # UNRESOLVED_AT_END, booked at its last carried close (review v5 §四): the
+    # capital stays locked in the position — no fake exit, no fictitious sell
+    # cost (review v6 §十四.1). ──
     for c, sl in sleeves.items():
         held = sl["mask"]
         if held.any():
@@ -473,21 +497,45 @@ def _simulate_sleeve_account(
             pnl = side * (ex_value[held].sum() - sl["entry_val"][held].sum())
             exit_pnl["unresolved"] += float(pnl)
             exit_counts["unresolved"] += int(held.sum())
+            exit_days["unresolved"] += float((Wp - 1 - c) * int(held.sum()))
 
     total_pnl = sum(exit_pnl.values())
+    abs_total = sum(abs(v) for v in exit_pnl.values())
     # Turnover is the traded notional scaled by the NAV the day opened on
     # (review v5 §六.3) — a ratio, invariant to the initial capital.
     turnover_daily = (buy_notional + sell_notional) / np.maximum(nav_before_day, 1e-8)
+
+    # review v6 §十四.3: the signed PnL share explodes when the book's total
+    # PnL is near zero, so alongside the signed share (kept for compat) report
+    # the signed PnL, an ABSOLUTE-PnL share, capital-occupancy days, and the
+    # mean delay of delayed exits.
+    avg_delayed_days = (exit_days["delayed"] / exit_counts["delayed"]
+                        if exit_counts["delayed"] else 0.0)
+
+    # Enforce the account identity without relying on manual inspection
+    # (review v6 §三): np.prod(1+daily) must equal final_nav / initial_nav.
+    if np.isfinite(nav_close) and nav_close > 0 and np.all(nav_before_day > 0):
+        cum = float(np.prod(1.0 + net_daily))
+        if not np.isclose(cum, nav_close, rtol=1e-5, atol=1e-8):
+            raise AssertionError(
+                f"sleeve account identity violated: prod(1+daily)={cum:.8f} != "
+                f"final_nav={nav_close:.8f}")
+
     return {
-        "daily": net_daily[1:],
-        "gross_daily": gross_daily[1:],
+        "daily": net_daily,
+        "gross_daily": gross_daily,
         "exit_stats": {
             "counts": exit_counts,
+            "pnl": {k: float(v) for k, v in exit_pnl.items()},
             "pnl_share": {k: (float(v) / total_pnl if total_pnl != 0.0 else 0.0)
                           for k, v in exit_pnl.items()},
+            "abs_pnl_share": {k: (float(abs(v)) / abs_total if abs_total != 0.0 else 0.0)
+                              for k, v in exit_pnl.items()},
+            "capital_days": {k: float(v) for k, v in exit_days.items()},
+            "avg_delayed_days": float(avg_delayed_days),
         },
         "turnover": {
-            "daily_avg": float(turnover_daily[1:].mean()) if Wp > 2 else 0.0,
+            "daily_avg": float(turnover_daily.mean()) if Wp > 0 else 0.0,
         },
     }
 
@@ -589,6 +637,13 @@ def _sleeve_account_metrics(
                         + short_a["turnover"]["daily_avg"]) / 2.0,
         "ew_turnover": ew_a["turnover"]["daily_avg"],
         "exit_status": long_a["exit_stats"],
+        # Per-leg exit status (review v6 §十四.2): the long leg alone cannot
+        # reveal whether the short book's abnormal returns come from more
+        # unfillable or trailing positions — each leg must be auditable on its
+        # own.  `exit_status` stays as the long-leg alias for backward compat.
+        "long_exit_status": long_a["exit_stats"],
+        "short_exit_status": short_a["exit_stats"],
+        "benchmark_exit_status": ew_a["exit_stats"],
     }
 
 
@@ -633,6 +688,7 @@ def evaluate_portfolio(
     horizon: int = 5,
     raw_returns: np.ndarray | None = None,
     n_boot: int = 2000,
+    require_price_path: bool = False,
 ) -> dict:
     """Multi-angle portfolio evaluation.
 
@@ -649,7 +705,11 @@ def evaluate_portfolio(
     return_target_mask (review v4 §七).
 
     Without price paths (synthetic tests) it falls back to the legacy
-    phase-concatenated top-K over realized returns.
+    phase-concatenated top-K over realized returns.  Formal training MUST pass
+    require_price_path=True (review v6 §十五.2): the two estimators measure
+    different things, and two experiments that silently used different ones
+    would not be comparable — missing price paths should then fail loudly
+    instead of quietly downgrading to the legacy estimator.
 
     Returns a flat dict with these keys:
       — IC (clean): ic_mean, ic_std, ic_ir, ic_pos_rate, ic_newey_west_t
@@ -791,11 +851,20 @@ def evaluate_portfolio(
             "ls_turnover": pm["ls_turnover"],
             "ew_turnover": pm["ew_turnover"],
             "exit_status": pm["exit_status"],
+            "long_exit_status": pm["long_exit_status"],
+            "short_exit_status": pm["short_exit_status"],
+            "benchmark_exit_status": pm["benchmark_exit_status"],
             **quintile_metrics,
         }
 
     # ── Legacy path (no price paths — synthetic tests): phase-concatenated
     # long/short over realized/raw actuals, annualized by sqrt(252/h) as before.
+    if require_price_path:
+        raise ValueError(
+            "evaluate_portfolio(require_price_path=True) called without "
+            "close_price/open_price price paths — formal training must use the "
+            "chronological sleeve account, not the legacy phase-concatenation "
+            "fallback (review v6 §十五.2)")
     if "realized_return" in val_data:
         actuals = _build_raw_actuals(
             torch.as_tensor(val_data["realized_return"]),
@@ -948,8 +1017,15 @@ def _empty_result() -> dict:
     empty_exit = {
         "counts": {"clean": 0, "delayed": 0, "delisted": 0,
                    "unresolved": 0, "unfilled": 0},
+        "pnl": {"clean": 0.0, "delayed": 0.0, "delisted": 0.0,
+                "unresolved": 0.0, "unfilled": 0.0},
         "pnl_share": {"clean": 0.0, "delayed": 0.0, "delisted": 0.0,
                       "unresolved": 0.0, "unfilled": 0.0},
+        "abs_pnl_share": {"clean": 0.0, "delayed": 0.0, "delisted": 0.0,
+                          "unresolved": 0.0, "unfilled": 0.0},
+        "capital_days": {"clean": 0.0, "delayed": 0.0, "delisted": 0.0,
+                         "unresolved": 0.0, "unfilled": 0.0},
+        "avg_delayed_days": 0.0,
     }
     return {
         "n_periods": 0, "n_stocks": 0, "n_days": 0,
@@ -966,6 +1042,9 @@ def _empty_result() -> dict:
                      "long_exposure": 0.5, "short_exposure": 0.5},
         "long_turnover": 0.0, "ls_turnover": 0.0, "ew_turnover": 0.0,
         "exit_status": empty_exit,
+        "long_exit_status": empty_exit,
+        "short_exit_status": empty_exit,
+        "benchmark_exit_status": empty_exit,
         "q1_ret": 0.0, "q2_ret": 0.0, "q3_ret": 0.0, "q4_ret": 0.0, "q5_ret": 0.0,
         "q5mq1_ret": 0.0, "q_monotonic": 0.0,
         "ew_sharpe": 0.0,

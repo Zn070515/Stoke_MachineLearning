@@ -4,13 +4,17 @@ import numpy as np
 import tempfile
 from pathlib import Path
 import pytest
-from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
+from stoke_ml.preprocessing.pipeline import (
+    PreprocessingPipeline,
+    PreprocessingQualityError,
+)
 from stoke_ml.preprocessing.base import PreprocessingChain
 from stoke_ml.preprocessing.text.bipolar import BipolarClassifier
 from stoke_ml.preprocessing.text.decay import TimeDecayWeighter
 from stoke_ml.preprocessing.text.aggregation import DailyAggregator
 from stoke_ml.preprocessing.numeric.outlier import OutlierDetector
 from stoke_ml.preprocessing.numeric.missing import MissingImputer
+from stoke_ml.preprocessing.monitor.quality import QualityMonitor
 
 
 class TestPreprocessingPipeline:
@@ -120,3 +124,62 @@ class TestPreprocessingPipeline:
             [BipolarClassifier()], name="guba"
         ))
         assert set(pp.list_chains()) == {"guba", "news"}
+
+
+class TestStrictMode:
+    """v6 §十: strict mode blocks error-level quality issues instead of
+    degrading silently.  The raised exception keeps the staging output and
+    full quality report for the caller to persist / audit."""
+
+    def _pipeline_with_monitor(self, **qm_kwargs):
+        pp = PreprocessingPipeline()
+        pp.register_chain("numeric", PreprocessingChain([], name="numeric"))
+        pp._quality_monitor = QualityMonitor(**qm_kwargs)
+        return pp
+
+    def test_strict_raises_on_error_level(self):
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        df = pd.DataFrame({"x": [1.0] + [np.inf] * 9})
+        with pytest.raises(PreprocessingQualityError):
+            pp.run("numeric", df, strict=True)
+
+    def test_error_carries_report_and_staging_df(self):
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        df = pd.DataFrame({"x": [1.0] + [np.inf] * 9})
+        try:
+            pp.run("numeric", df, strict=True)
+            raise AssertionError("expected PreprocessingQualityError")
+        except PreprocessingQualityError as exc:
+            assert exc.chain_name == "numeric"
+            assert any(r["level"] == "ERROR" for r in exc.report)
+            assert isinstance(exc.df, pd.DataFrame)
+            assert len(exc.df) == len(df)
+
+    def test_strict_clean_data_no_raise(self):
+        pp = self._pipeline_with_monitor()
+        df = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+        result = pp.run("numeric", df, strict=True)
+        assert len(result) == len(df)
+
+    def test_non_strict_returns_despite_errors(self):
+        """Legacy behavior preserved: without strict, errors log but don't block."""
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        df = pd.DataFrame({"x": [1.0] + [np.inf] * 9})
+        result = pp.run("numeric", df, strict=False)
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == len(df)
+
+    def test_strict_defaults_to_false(self):
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        df = pd.DataFrame({"x": [1.0] + [np.inf] * 9})
+        # No strict kwarg → behaves like strict=False (returns, does not raise).
+        result = pp.run("numeric", df)
+        assert isinstance(result, pd.DataFrame)
+
+    def test_no_monitor_strict_is_noop(self):
+        """Strict without a monitor attached cannot detect issues — returns."""
+        pp = PreprocessingPipeline()
+        pp.register_chain("numeric", PreprocessingChain([], name="numeric"))
+        df = pd.DataFrame({"x": [1.0] + [np.inf] * 9})
+        result = pp.run("numeric", df, strict=True)
+        assert isinstance(result, pd.DataFrame)

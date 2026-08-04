@@ -63,6 +63,8 @@ class AKShareSource(AShareSourceBase):
             df["pct_change"] = df["close"].pct_change() * 100.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date
+        df.attrs["source"] = self.SOURCE_NAME
+        df.attrs["adjustment_mode"] = "qfq"
         return df
 
     def is_available(self) -> bool:

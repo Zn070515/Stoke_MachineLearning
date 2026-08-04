@@ -56,7 +56,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/check_docs_consistency.py
 
 ### Testing
 
-~29 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
+~39 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q

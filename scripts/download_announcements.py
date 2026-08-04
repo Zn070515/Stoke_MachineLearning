@@ -17,7 +17,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.announcement_storage import AnnouncementStorage
-from stoke_ml.data.download_resume import skip_completed_stocks
+from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
 from stoke_ml.data.sources.a_shares.announcement_source import AnnouncementSource
 from stoke_ml.features.news_nlp import compute_raw_sentiment, NewsSentimentAnalyzer
 
@@ -98,6 +98,10 @@ def main():
         try:
             df = source.fetch_announcements(code, args.start, end_date)
             if df.empty:
+                mark_stock_result(
+                    raw_dir, code, df, dataset="announcements",
+                    requested_start=args.start, requested_end=end_date,
+                )
                 if (i + 1) % 250 == 0:
                     logger.info("[%d/%d] %s: 0 announcements", i + 1, len(codes), code)
                 continue
@@ -108,6 +112,10 @@ def main():
                 df = compute_raw_sentiment(df, analyzer)
 
             storage.save_raw(code, df)
+            mark_stock_result(
+                raw_dir, code, df, dataset="announcements",
+                requested_start=args.start, requested_end=end_date,
+            )
             storage.build_daily_sentiment(code)
             success += 1
 

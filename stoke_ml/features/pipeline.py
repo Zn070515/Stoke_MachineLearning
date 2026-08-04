@@ -3,12 +3,14 @@
 Integrates K-line, sentiment, market-wide (margin/northbound/dragon-tiger),
 ETF sector flow, and fundamental data into a unified feature set.
 """
+import json
 import logging
 import os
 import re
 
 import pandas as pd
 import numpy as np
+from stoke_ml.features import cache_manifest
 from stoke_ml.features.technical import TechnicalIndicators
 from stoke_ml.features.scoring import TrendScorer
 from stoke_ml.features.interaction import InteractionFeatures
@@ -1624,6 +1626,60 @@ class FeaturePipeline:
                     len(missing), len(codes), missing[:20],
                 )
                 codes = [c for c in codes if c not in set(missing)]
+
+            # v6 §十二 lineage guard: surface prebuilt features that lack a
+            # sidecar manifest, or whose manifest no longer matches the file
+            # (schema drift) or the current code (built by another git commit).
+            # Warning-only — legacy un-manifested dirs still train — so stale
+            # features are flagged instead of silently reused.
+            manifest_dir = os.path.join(prebuilt_dir, ".manifests")
+            if os.path.isdir(manifest_dir) and os.listdir(manifest_dir):
+                commit = cache_manifest.git_head()
+                missing_manifest = []
+                stale_manifest = []
+                for code in codes:
+                    mp = os.path.join(manifest_dir, f"{code}.json")
+                    if not os.path.isfile(mp):
+                        missing_manifest.append(code)
+                        continue
+                    try:
+                        with open(mp, encoding="utf-8") as f:
+                            m = json.load(f)
+                    except Exception:
+                        stale_manifest.append(code)
+                        continue
+                    if (
+                        m.get("feature_schema_hash")
+                        != cache_manifest.schema_hash(
+                            os.path.join(prebuilt_dir, f"{code}.parquet")
+                        )
+                        or m.get("git_commit") != commit
+                    ):
+                        stale_manifest.append(code)
+                if missing_manifest:
+                    logger.warning(
+                        "prebuilt_dir %s: %d/%d stocks lack sidecar manifests "
+                        "(first 10: %s) — regenerate with build_features.py for "
+                        "verifiable lineage",
+                        prebuilt_dir, len(missing_manifest), len(codes),
+                        missing_manifest[:10],
+                    )
+                if stale_manifest:
+                    logger.warning(
+                        "prebuilt_dir %s: %d/%d stocks have STALE manifests "
+                        "(schema drift or built by a different git commit; "
+                        "first 10: %s) — rebuild features before trusting "
+                        "training output",
+                        prebuilt_dir, len(stale_manifest), len(codes),
+                        stale_manifest[:10],
+                    )
+            else:
+                logger.warning(
+                    "prebuilt_dir %s has no sidecar manifests — feature lineage "
+                    "cannot be verified; run build_features.py to regenerate "
+                    "with manifests (v6 §十二)",
+                    prebuilt_dir,
+                )
 
         N = len(codes)
 

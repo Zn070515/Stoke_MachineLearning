@@ -15,7 +15,12 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.download_resume import skip_completed_stocks, skip_completed_years
+from stoke_ml.data.download_resume import (
+    mark_stock_result,
+    skip_completed_stocks,
+    skip_completed_years,
+    write_year_manifest,
+)
 from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.sources.a_shares.dragon_tiger_source import DragonTigerSource
 from stoke_ml.data.sources.a_shares.margin_source import MarginTradingSource
@@ -102,8 +107,8 @@ def main():
             start_dt = pd.Timestamp(args.start).date()
             end_dt = pd.Timestamp(args.end).date()
             years = list(range(start_dt.year, end_dt.year + 1))
+            a_shares_dir = os.path.join(data_dir, "a_shares")
             if not args.no_resume:
-                a_shares_dir = os.path.join(data_dir, "a_shares")
                 years, _skipped = skip_completed_years(a_shares_dir, years, storage_type)
             if not years:
                 logger.info("  margin: all years already downloaded, skipping")
@@ -120,6 +125,14 @@ def main():
                 y_df = source.fetch_daily(y_start, y_end)
                 if y_df is not None and not y_df.empty:
                     storage.save(y_df)
+                    write_year_manifest(
+                        a_shares_dir, storage_type, year,
+                        requested_start=y_start, requested_end=y_end,
+                        actual_start=y_df["date"].min(), actual_end=y_df["date"].max(),
+                        actual_rows=len(y_df),
+                        n_stocks=y_df["stock_code"].nunique(),
+                        source=label, covers_request=True,
+                    )
                     all_frames.append(y_df)
                     logger.info("  margin saved %d rows for year %d", len(y_df), year)
                 else:
@@ -218,6 +231,13 @@ def main():
 
         if df is not None and not df.empty:
             storage.save(df)
+            if label == "northbound":
+                northbound_dir = os.path.join(data_dir, "a_shares", "northbound")
+                for code, group in df.groupby("stock_code"):
+                    mark_stock_result(
+                        northbound_dir, code, group, dataset="northbound",
+                        requested_start=args.start, requested_end=args.end,
+                    )
             logger.info(
                 "  %s: %d rows saved (%.1fs)",
                 label, len(df), time.time() - t0,

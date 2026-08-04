@@ -19,7 +19,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.comment_storage import CommentStorage
-from stoke_ml.data.download_resume import skip_completed_stocks
+from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
 from stoke_ml.data.sources.a_shares.comment_source import CommentSource
 
 logging.basicConfig(
@@ -111,8 +111,16 @@ def main():
             df = source.fetch_stock_history(code)
             if df.empty:
                 logger.debug("[%d/%d] %s: no data", i + 1, len(codes), code)
+                mark_stock_result(
+                    comment_dir, code, df, dataset="comment_sentiment",
+                    source="efinance",
+                )
                 continue
             storage.save_daily(df)
+            mark_stock_result(
+                comment_dir, code, df, dataset="comment_sentiment",
+                source="efinance",
+            )
             success += 1
             if success % 100 == 0:
                 logger.info("[%d/%d] %s: %d days", i + 1, len(codes), code, len(df))

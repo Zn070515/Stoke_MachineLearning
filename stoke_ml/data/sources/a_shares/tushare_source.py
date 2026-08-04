@@ -51,12 +51,16 @@ class TushareSource(AShareSourceBase):
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
         try:
-            pro = self._get_pro()
-            if pro is None:
+            if self._get_pro() is None:
                 return pd.DataFrame()
+            import tushare as ts
             ts_code = self._to_ts_code(stock_code)
-            df = pro.daily(
+            # pro_bar(adj="qfq") returns 前复权 prices, matching efinance /
+            # akshare / baostock.  Plain pro.daily() returns UNadjusted bars
+            # which would inject a fake 涨跌 seam on failover (v6 §六).
+            df = ts.pro_bar(
                 ts_code=ts_code,
+                adj="qfq",
                 start_date=start_date.replace("-", ""),
                 end_date=end_date.replace("-", ""),
             )
@@ -79,6 +83,15 @@ class TushareSource(AShareSourceBase):
                 "pct_change", "turnover"]
         available = [c for c in cols if c in df.columns]
         df = df[available].copy()
+        # Tushare units differ from the stored convention (v6 §六):
+        #   vol    手 → ×100 股
+        #   amount 千元 → ×1000 元
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce") * 100.0
+        if "amount" in df.columns:
+            df["amount"] = pd.to_numeric(df["amount"], errors="coerce") * 1000.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"], format="%Y%m%d").dt.date
+        df.attrs["source"] = self.SOURCE_NAME
+        df.attrs["adjustment_mode"] = "qfq"
         return df

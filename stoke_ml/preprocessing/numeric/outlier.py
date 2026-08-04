@@ -1,7 +1,13 @@
-"""MAD-based outlier detection and winsorization.
+"""MAD-based outlier detection and winsorization (PIT-safe).
 
 Uses Median Absolute Deviation (robust to skewed financial data).
 Limit-up/down moves (+-9.5% daily change) are real signals, not outliers.
+
+v6 §十: bounds are computed per row from a *trailing* window (expanding until
+``window_days`` is reached), so each clip uses only data known up to that day.
+The previous implementation estimated per-column median/MAD on the full sample
+and clipped the entire history with those future-informed bounds — a look-ahead
+leak whenever the step ran over full history.
 """
 
 import numpy as np
@@ -11,7 +17,7 @@ from stoke_ml.preprocessing.base import PreprocessingStep
 
 
 class OutlierDetector(PreprocessingStep):
-    """Detect and clip outliers via MAD method.
+    """Detect and clip outliers via trailing-window MAD.
 
     |x - median| > threshold * MAD -> clip to [median +- threshold * MAD].
     Default threshold=5.0 is conservative (only extreme outliers).
@@ -20,47 +26,62 @@ class OutlierDetector(PreprocessingStep):
     _LIMIT_COLS = frozenset({"pct_change", "is_limit_up", "is_limit_down",
                               "gap_up_pct", "gap_down_pct"})
 
-    def __init__(self, threshold: float = 5.0, clip: bool = True):
+    def __init__(self, threshold: float = 5.0, clip: bool = True,
+                 window_days: int = 252, min_periods: int = 10):
         self.threshold = threshold
         self.clip = clip
+        self.window_days = window_days
+        self.min_periods = min_periods
         self._bounds: dict[str, tuple[float, float]] = {}
 
     def fit(self, df, **kwargs):
-        """Compute the per-column clip set (which columns get winsorized).
-
-        NOTE: fit() uses FULL-SAMPLE statistics to decide the clip column-set,
-        and skips columns whose full-sample MAD < 1e-10.  transform() is causal
-        (trailing window), but the *include-set* decided here can leak the
-        future: a column constant for most of history then volatile late would
-        only be included because of that later data.  Call fit() on TRAINING
-        windows only — never on a window that includes the evaluation period.
-        """
-        self._bounds = {}
-        for col in df.select_dtypes(include=[np.number]).columns:
-            if col in self._LIMIT_COLS:
-                continue
-            values = df[col].dropna().values
-            if len(values) < 10:
-                continue
-            median = np.median(values)
-            mad = np.median(np.abs(values - median))
-            if mad < 1e-10:
-                continue
-            lower = median - self.threshold * mad
-            upper = median + self.threshold * mad
-            self._bounds[col] = (lower, upper)
+        """Stateless — bounds are computed point-in-time inside transform()."""
         return self
 
     def transform(self, df, **kwargs):
-        if df.empty or not self._bounds:
+        if df.empty:
             return df.copy()
         df = df.copy()
-        for col, (lower, upper) in self._bounds.items():
-            if col not in df.columns:
+        for col in df.select_dtypes(include=[np.number]).columns:
+            if col in self._LIMIT_COLS or not self.clip:
                 continue
-            if self.clip:
-                if df[col].dtype.kind == "i":
-                    df[col] = df[col].astype(np.float64)
-                mask = df[col].notna()
-                df.loc[mask, col] = df.loc[mask, col].clip(lower, upper)
+            values = df[col].to_numpy(dtype=np.float64)
+            if len(values) < self.min_periods:
+                continue
+            df[col] = df[col].astype(np.float64)
+            lower, upper = self._trailing_bounds(values)
+            clipped = np.clip(values, lower, upper)
+            # Keep rows with insufficient history or zero MAD (constant window):
+            # clipping those to a point bound would destroy them.
+            keep = np.isnan(lower) | np.isnan(upper) | ((upper - lower) < 1e-10)
+            if keep.any():
+                df.loc[~keep, col] = clipped[~keep]
+            else:
+                df[col] = clipped
         return df
+
+    def _trailing_bounds(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per-row trailing-window median±threshold*MAD bounds (look-back only)."""
+        n = len(values)
+        w = self.window_days
+        lower = np.full(n, np.nan, dtype=np.float64)
+        upper = np.full(n, np.nan, dtype=np.float64)
+
+        # Expanding fallback for early positions (before the first full window).
+        for i in range(self.min_periods - 1, min(w - 1, n)):
+            past = values[:i + 1]
+            med = float(np.median(past))
+            mad = float(np.median(np.abs(past - med)))
+            if mad < 1e-10:
+                continue
+            lower[i] = med - self.threshold * mad
+            upper[i] = med + self.threshold * mad
+
+        if n >= w:
+            from numpy.lib.stride_tricks import sliding_window_view
+            win = sliding_window_view(values, w)
+            med = np.median(win, axis=1)
+            mad = np.median(np.abs(win - med[:, None]), axis=1)
+            lower[w - 1:] = med - self.threshold * mad
+            upper[w - 1:] = med + self.threshold * mad
+        return lower, upper

@@ -82,4 +82,6 @@ class BaostockSource(AShareSourceBase):
         df["pct_change"] = pd.to_numeric(df["pct_change"], errors="coerce")
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date
+        df.attrs["source"] = self.SOURCE_NAME
+        df.attrs["adjustment_mode"] = "qfq"
         return df

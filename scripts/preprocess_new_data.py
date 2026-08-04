@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+import hashlib
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -21,7 +23,10 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.market_wide_storage import MarketWideStorage
-from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
+from stoke_ml.preprocessing.pipeline import (
+    PreprocessingPipeline,
+    PreprocessingQualityError,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -39,6 +44,35 @@ TYPE_MAP = {
     "sector": ("industry_ranking", "sector"),
     "concept": ("concept_blocks", "concept"),
 }
+
+
+def _build_provenance(cfg) -> dict:
+    """Run-level provenance bound to every replace_range write (v6 §十一).
+
+    Each stock's write manifest carries run_id / git_commit / config_hash so a
+    later reader can tell exactly which code + config produced the data.
+    """
+    git_commit = "unknown"
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        pass
+    config_hash = "unknown"
+    try:
+        from omegaconf import OmegaConf
+        config_hash = hashlib.sha1(
+            OmegaConf.to_yaml(cfg).encode("utf-8")
+        ).hexdigest()[:16]
+    except Exception:
+        pass
+    return {
+        "run_id": f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}",
+        "git_commit": git_commit,
+        "config_hash": config_hash,
+    }
 
 
 def get_stocks_from_disk(data_dir: str, storage_key: str) -> list[str]:
@@ -87,6 +121,14 @@ def main():
                         help="Comma-separated stock codes")
     parser.add_argument("--save-to", type=str, default=None,
                         help="Override output storage key (default: {storage_key}_processed)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Block stocks whose output fails error-level quality "
+                             "checks or whose daily K-line context cannot be loaded; "
+                             "never persist degraded output")
+    parser.add_argument("--degrade-threshold", type=float, default=0.2,
+                        help="Max fraction of previously-present dates a "
+                             "replace_range write may drop before it is rejected "
+                             "(default 0.2)")
     args = parser.parse_args()
 
     if args.end is None:
@@ -107,6 +149,7 @@ def main():
     # Build pipeline from config
     pp_cfg = cfg.get("preprocessing", {}) if hasattr(cfg, "get") else {}
     pp = PreprocessingPipeline.from_config(pp_cfg)
+    provenance = _build_provenance(cfg)
 
     # Determine types to process
     if args.type == "all":
@@ -130,14 +173,18 @@ def main():
             continue
 
         if dtype == "board":
-            _process_board(chain, stock_list, data_dir, args)
+            _process_board(pp, chain_name, stock_list, data_dir, args, provenance)
         elif dtype == "sector":
-            _process_sector(chain, stock_list, data_dir, args)
+            _process_sector(pp, chain_name, stock_list, data_dir, args, provenance)
         elif storage_key:
-            _process_standard(dtype, storage_key, chain, stock_list, data_dir, args)
+            _process_standard(
+                dtype, storage_key, pp, chain_name, stock_list, data_dir,
+                args, provenance,
+            )
 
 
-def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
+def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
+                      args, provenance):
     """Process standard per-stock data: load → transform → save.
 
     Passes K-line data as ``close_prices`` + ``trading_dates`` so that
@@ -145,6 +192,14 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     features (dual-concentration, MCap normalization, etc.).
     ``daily_data`` is also passed for block_trade amount_ratio which
     accesses it separately via **kwargs.
+
+    Under ``--strict`` a stock whose daily K-line context fails to load, or
+    whose transformed output trips error-level quality checks, is BLOCKED —
+    nothing is persisted and the failure is counted (v6 §十: 禁止 commit,
+    保留 staging 输出, 记录失败 manifest).
+
+    Every replace_range write carries ``provenance`` and is guarded by the
+    degradation check in MarketWideStorage.save() (v6 §十一).
     """
     logger.info("=== %s: %d stocks (%s to %s) ===",
                 dtype, len(stock_list), args.start, args.end)
@@ -152,6 +207,10 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     source = MarketWideStorage(data_dir, storage_key)
     output_key = args.save_to or f"{storage_key}_processed"
     dest = MarketWideStorage(data_dir, output_key)
+    prov = {
+        **provenance,
+        "source_snapshot": f"raw:{storage_key}:{len(stock_list)}stocks",
+    }
 
     from stoke_ml.data.calendar import TradingCalendar
     from stoke_ml.data.storage import DataStorage
@@ -162,6 +221,8 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
     )
 
     total = 0
+    blocked = 0
+    rejected = 0
     for code in stock_list:
         try:
             raw = source.load(code, args.start, args.end)
@@ -178,27 +239,62 @@ def _process_standard(dtype, storage_key, chain, stock_list, data_dir, args):
                 daily_data = ds.load_daily(code, args.start, args.end)
                 if not daily_data.empty and "stock_code" not in daily_data.columns:
                     daily_data["stock_code"] = code
-            except Exception:
-                pass
-            processed = chain.fit_transform(
-                raw,
+            except Exception as exc:
+                if args.strict:
+                    logger.error(
+                        "%s: daily K-line load failed for %s — blocking under "
+                        "--strict (%s)", dtype, code, exc,
+                    )
+                    blocked += 1
+                    continue
+                logger.warning(
+                    "%s: daily K-line load failed for %s — price-dependent "
+                    "features degraded (%s)", dtype, code, exc,
+                )
+            processed = pp.run(
+                chain_name, raw, strict=args.strict,
                 daily_data=daily_data,
                 close_prices=daily_data,
                 trading_dates=trading_dates,
             )
             if not processed.empty:
-                dest.save(processed, replace_range=True)
+                rejected += dest.save(
+                    processed, replace_range=True,
+                    provenance=prov, degrade_threshold=args.degrade_threshold,
+                    replace_window=(args.start, args.end),
+                )
                 total += len(processed)
+        except PreprocessingQualityError as exc:
+            blocked += 1
+            logger.error(
+                "%s: quality gate blocked %s: %s "
+                "(staging output retained, nothing persisted)",
+                dtype, code, exc,
+            )
         except Exception:
             logger.warning("%s preprocessing failed for %s", dtype, code, exc_info=True)
 
+    if blocked:
+        logger.warning(
+            "  %s: %d stocks blocked by quality gate / daily-load failure "
+            "(not persisted)", dtype, blocked,
+        )
+    if rejected:
+        logger.error(
+            "  %s: %d stocks rejected by replace_range degradation guard "
+            "(old files preserved)", dtype, rejected,
+        )
     logger.info("  %s: %d rows saved (%.1fs)", dtype, total, time.time() - t0)
 
 
-def _process_board(chain, stock_list, data_dir, args):
+def _process_board(pp, chain_name, stock_list, data_dir, args, provenance):
     """Process board data: load limit_up pools → broadcast to stocks."""
     logger.info("=== board: %d stocks ===", len(stock_list))
     t0 = time.time()
+    prov = {
+        **provenance,
+        "source_snapshot": f"raw:limit_up_pools:{len(stock_list)}stocks",
+    }
 
     # Load all 4 limit-up pools
     pools = {}
@@ -259,28 +355,54 @@ def _process_board(chain, stock_list, data_dir, args):
     ds = DataStorage(data_dir)
     dest = MarketWideStorage(data_dir, args.save_to or "board_processed")
     total = 0
+    blocked = 0
+    rejected = 0
     for code in stock_list:
         try:
             base = ds.load_daily(code, args.start, args.end)
             if base.empty:
                 continue
-            processed = chain.fit_transform(
-                base, pools=pools, sentiment=sentiment,
+            processed = pp.run(
+                chain_name, base, strict=args.strict,
+                pools=pools, sentiment=sentiment,
                 concept_map=concept_map if concept_map else None,
             )
             if not processed.empty:
-                dest.save(processed, replace_range=True)
+                rejected += dest.save(
+                    processed, replace_range=True,
+                    provenance=prov, degrade_threshold=args.degrade_threshold,
+                    replace_window=(args.start, args.end),
+                )
                 total += len(processed)
+        except PreprocessingQualityError as exc:
+            blocked += 1
+            logger.error(
+                "board: quality gate blocked %s: %s "
+                "(staging output retained, nothing persisted)", code, exc,
+            )
         except Exception:
             logger.warning("board preprocessing failed for %s", code, exc_info=True)
 
+    if blocked:
+        logger.warning(
+            "  board: %d stocks blocked by quality gate (not persisted)", blocked
+        )
+    if rejected:
+        logger.error(
+            "  board: %d stocks rejected by replace_range degradation guard "
+            "(old files preserved)", rejected,
+        )
     logger.info("  board: %d rows saved (%.1fs)", total, time.time() - t0)
 
 
-def _process_sector(chain, stock_list, data_dir, args):
+def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance):
     """Process sector data: load industry ranking + sector map → broadcast to stocks."""
     logger.info("=== sector: %d stocks ===", len(stock_list))
     t0 = time.time()
+    prov = {
+        **provenance,
+        "source_snapshot": f"raw:industry_ranking:{len(stock_list)}stocks",
+    }
 
     # Load industry ranking from single market-wide parquet
     ir_path = os.path.join(data_dir, "a_shares", "industry_ranking.parquet")
@@ -338,6 +460,7 @@ def _process_sector(chain, stock_list, data_dir, args):
     # then broadcast to every stock — avoids ~N recomputations of momentum /
     # RRG / breadth_z / relative_strength / alpha inside SectorBroadcaster.
     from stoke_ml.preprocessing.cross_sectional.sector import SectorBroadcaster
+    chain = pp.get_chain(chain_name)
     sector_step = next(
         (s for s in chain.steps if isinstance(s, SectorBroadcaster)), None
     )
@@ -352,24 +475,46 @@ def _process_sector(chain, stock_list, data_dir, args):
     )
 
     total = 0
+    blocked = 0
+    rejected = 0
     for i, code in enumerate(stock_list):
         try:
             base = ds.load_daily(code, args.start, args.end)
             if base.empty:
                 continue
-            processed = chain.fit_transform(
-                base, industry_ranking=industry_ranking, sector_map=sector_map,
+            processed = pp.run(
+                chain_name, base, strict=args.strict,
+                industry_ranking=industry_ranking, sector_map=sector_map,
                 sector_features=sector_features,
             )
             if not processed.empty:
-                dest.save(processed, replace_range=True)
+                rejected += dest.save(
+                    processed, replace_range=True,
+                    provenance=prov, degrade_threshold=args.degrade_threshold,
+                    replace_window=(args.start, args.end),
+                )
                 total += len(processed)
             if (i + 1) % 500 == 0:
                 logger.info("  sector progress: %d/%d stocks, %d rows",
                             i + 1, len(stock_list), total)
+        except PreprocessingQualityError as exc:
+            blocked += 1
+            logger.error(
+                "sector: quality gate blocked %s: %s "
+                "(staging output retained, nothing persisted)", code, exc,
+            )
         except Exception:
-            logger.debug("sector preprocessing failed for %s", code, exc_info=True)
+            logger.warning("sector preprocessing failed for %s", code, exc_info=True)
 
+    if blocked:
+        logger.warning(
+            "  sector: %d stocks blocked by quality gate (not persisted)", blocked
+        )
+    if rejected:
+        logger.error(
+            "  sector: %d stocks rejected by replace_range degradation guard "
+            "(old files preserved)", rejected,
+        )
     logger.info("  sector: %d rows saved (%.1fs)", total, time.time() - t0)
 
 

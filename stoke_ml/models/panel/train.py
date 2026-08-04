@@ -448,6 +448,9 @@ def train_panel(
             m = evaluate_portfolio(
                 model, val_data, config, device,
                 horizon=config.horizon, raw_returns=raw_val_returns,
+                # review v6 §十五.2: formal training requires price paths — no
+                # silent fallback to the legacy phase-concatenation estimator.
+                require_price_path=True,
             )
             ls_sharpe = m["ls_sharpe"]
             ic_mean = m["ic_mean"]
@@ -493,6 +496,7 @@ def train_panel(
         history["best_metrics"] = evaluate_portfolio(
             model, val_data, config, device,
             horizon=config.horizon, raw_returns=raw_val_returns,
+            require_price_path=True,
         )
     except Exception:
         logger.exception("best-checkpoint portfolio evaluation failed")

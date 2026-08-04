@@ -1,7 +1,11 @@
 """Trading calendar for A-shares and US markets.
 
-Generates trading day lists with weekend/holiday exclusion and makeup
-weekend trading days (调休补班) included.
+A-shares NEVER trade on weekends — not even on 调休 makeup workdays
+(State Council 调休 applies to banks/government offices; the SSE/SZSE/BSE
+do not follow it).  Verified against stored market data (all makeup weekend
+dates are absent from every stock's daily bars) and against the official
+exchange holiday notices.  The calendar is therefore just: weekdays MINUS
+official holiday closures.  Review v6 §五.
 """
 import datetime as dt
 import pandas as pd
@@ -10,67 +14,89 @@ import pandas as pd
 class TradingCalendar:
     """Trading day calendar for a specific market."""
 
-    # Weekend makeup trading days (调休补班日) — Saturdays/Sundays that
-    # become regular trading days to compensate for extended holidays.
-    # Source: State Council holiday schedule announcements, 2015-2026.
-    A_SHARES_MAKEUP = {
-        # 2015
-        dt.date(2015, 2, 15), dt.date(2015, 2, 28),
-        dt.date(2015, 9, 6), dt.date(2015, 10, 10),
-        # 2016
-        dt.date(2016, 2, 6), dt.date(2016, 2, 14),
-        dt.date(2016, 6, 12), dt.date(2016, 9, 18),
-        dt.date(2016, 10, 8), dt.date(2016, 10, 9),
-        # 2017
-        dt.date(2017, 1, 22), dt.date(2017, 2, 4),
-        dt.date(2017, 4, 1), dt.date(2017, 5, 27),
-        dt.date(2017, 9, 30),
-        # 2018
-        dt.date(2018, 2, 11), dt.date(2018, 2, 24),
-        dt.date(2018, 4, 8), dt.date(2018, 4, 28),
-        dt.date(2018, 9, 29), dt.date(2018, 9, 30),
-        dt.date(2018, 12, 29),
-        # 2019
-        dt.date(2019, 2, 2), dt.date(2019, 2, 3),
-        dt.date(2019, 4, 28), dt.date(2019, 5, 5),
-        dt.date(2019, 9, 29), dt.date(2019, 10, 12),
-        # 2020
-        dt.date(2020, 1, 19), dt.date(2020, 2, 1),
-        dt.date(2020, 4, 26), dt.date(2020, 5, 9),
-        dt.date(2020, 6, 28), dt.date(2020, 9, 27),
-        dt.date(2020, 10, 10),
-        # 2021
-        dt.date(2021, 2, 7), dt.date(2021, 2, 20),
-        dt.date(2021, 4, 25), dt.date(2021, 5, 8),
-        dt.date(2021, 9, 18), dt.date(2021, 9, 26),
-        dt.date(2021, 10, 9),
-        # 2022
-        dt.date(2022, 1, 29), dt.date(2022, 1, 30),
-        dt.date(2022, 4, 2), dt.date(2022, 4, 24),
-        dt.date(2022, 5, 7), dt.date(2022, 10, 8),
-        dt.date(2022, 10, 9),
-        # 2023
-        dt.date(2023, 1, 28), dt.date(2023, 1, 29),
-        dt.date(2023, 4, 23), dt.date(2023, 5, 6),
-        dt.date(2023, 6, 25), dt.date(2023, 10, 7),
-        dt.date(2023, 10, 8),
-        # 2024
-        dt.date(2024, 2, 4), dt.date(2024, 2, 18),
-        dt.date(2024, 4, 7), dt.date(2024, 4, 28),
-        dt.date(2024, 5, 11), dt.date(2024, 9, 14),
-        dt.date(2024, 9, 29), dt.date(2024, 10, 12),
-        # 2025
-        dt.date(2025, 1, 26), dt.date(2025, 2, 8),
-        dt.date(2025, 4, 27),
-        dt.date(2025, 9, 28), dt.date(2025, 10, 11),
-        # 2026 (published schedule)
-        dt.date(2026, 2, 14), dt.date(2026, 2, 22),
-        dt.date(2026, 4, 25), dt.date(2026, 5, 9),
-        dt.date(2026, 6, 14), dt.date(2026, 9, 19),
-        dt.date(2026, 10, 10),
-    }
-
+    # Holiday closures (weekday dates only).  Weekends are never trading days
+    # and are excluded unconditionally by `is_trading_day`.
+    # - 2001-2014: derived from the union of all-stock daily bars (a weekday
+    #   with zero bars market-wide but active neighbors = closure) and verified
+    #   to match the SSE official trading calendar EXACTLY (265 closures, 0
+    #   false +/-, via akshare tool_trade_date_hist_sina).  Review v6 §五.
+    # - 2015-2026: SSE/SZSE published notices (上证公告〔2025〕45号 etc.),
+    #   verified against stored daily bars (incl. 2018-12-31).
+    # - 2027-2028: forward estimates, pending official publication.
     A_SHARES_HOLIDAYS = {
+        # 2001
+        dt.date(2001, 1, 1), dt.date(2001, 1, 22), dt.date(2001, 1, 23), dt.date(2001, 1, 24), dt.date(2001, 1, 25),
+        dt.date(2001, 1, 26), dt.date(2001, 1, 29), dt.date(2001, 1, 30), dt.date(2001, 1, 31), dt.date(2001, 2, 1),
+        dt.date(2001, 2, 2), dt.date(2001, 5, 1), dt.date(2001, 5, 2), dt.date(2001, 5, 3), dt.date(2001, 5, 4),
+        dt.date(2001, 5, 7), dt.date(2001, 10, 1), dt.date(2001, 10, 2), dt.date(2001, 10, 3), dt.date(2001, 10, 4),
+        dt.date(2001, 10, 5),
+        # 2002
+        dt.date(2002, 1, 1), dt.date(2002, 1, 2), dt.date(2002, 1, 3), dt.date(2002, 2, 11), dt.date(2002, 2, 12),
+        dt.date(2002, 2, 13), dt.date(2002, 2, 14), dt.date(2002, 2, 15), dt.date(2002, 2, 18), dt.date(2002, 2, 19),
+        dt.date(2002, 2, 20), dt.date(2002, 2, 21), dt.date(2002, 2, 22), dt.date(2002, 5, 1), dt.date(2002, 5, 2),
+        dt.date(2002, 5, 3), dt.date(2002, 5, 6), dt.date(2002, 5, 7), dt.date(2002, 9, 30), dt.date(2002, 10, 1),
+        dt.date(2002, 10, 2), dt.date(2002, 10, 3), dt.date(2002, 10, 4), dt.date(2002, 10, 7),
+        # 2003
+        dt.date(2003, 1, 1), dt.date(2003, 1, 30), dt.date(2003, 1, 31), dt.date(2003, 2, 3), dt.date(2003, 2, 4),
+        dt.date(2003, 2, 5), dt.date(2003, 2, 6), dt.date(2003, 2, 7), dt.date(2003, 5, 1), dt.date(2003, 5, 2),
+        dt.date(2003, 5, 5), dt.date(2003, 5, 6), dt.date(2003, 5, 7), dt.date(2003, 5, 8), dt.date(2003, 5, 9),
+        dt.date(2003, 10, 1), dt.date(2003, 10, 2), dt.date(2003, 10, 3), dt.date(2003, 10, 6), dt.date(2003, 10, 7),
+        # 2004
+        dt.date(2004, 1, 1), dt.date(2004, 1, 19), dt.date(2004, 1, 20), dt.date(2004, 1, 21), dt.date(2004, 1, 22),
+        dt.date(2004, 1, 23), dt.date(2004, 1, 26), dt.date(2004, 1, 27), dt.date(2004, 1, 28), dt.date(2004, 5, 3),
+        dt.date(2004, 5, 4), dt.date(2004, 5, 5), dt.date(2004, 5, 6), dt.date(2004, 5, 7), dt.date(2004, 10, 1),
+        dt.date(2004, 10, 4), dt.date(2004, 10, 5), dt.date(2004, 10, 6), dt.date(2004, 10, 7),
+        # 2005
+        dt.date(2005, 1, 3), dt.date(2005, 2, 7), dt.date(2005, 2, 8), dt.date(2005, 2, 9), dt.date(2005, 2, 10),
+        dt.date(2005, 2, 11), dt.date(2005, 2, 14), dt.date(2005, 2, 15), dt.date(2005, 5, 2), dt.date(2005, 5, 3),
+        dt.date(2005, 5, 4), dt.date(2005, 5, 5), dt.date(2005, 5, 6), dt.date(2005, 10, 3), dt.date(2005, 10, 4),
+        dt.date(2005, 10, 5), dt.date(2005, 10, 6), dt.date(2005, 10, 7),
+        # 2006
+        dt.date(2006, 1, 2), dt.date(2006, 1, 3), dt.date(2006, 1, 26), dt.date(2006, 1, 27), dt.date(2006, 1, 30),
+        dt.date(2006, 1, 31), dt.date(2006, 2, 1), dt.date(2006, 2, 2), dt.date(2006, 2, 3), dt.date(2006, 5, 1),
+        dt.date(2006, 5, 2), dt.date(2006, 5, 3), dt.date(2006, 5, 4), dt.date(2006, 5, 5), dt.date(2006, 10, 2),
+        dt.date(2006, 10, 3), dt.date(2006, 10, 4), dt.date(2006, 10, 5), dt.date(2006, 10, 6),
+        # 2007
+        dt.date(2007, 1, 1), dt.date(2007, 1, 2), dt.date(2007, 1, 3), dt.date(2007, 2, 19), dt.date(2007, 2, 20),
+        dt.date(2007, 2, 21), dt.date(2007, 2, 22), dt.date(2007, 2, 23), dt.date(2007, 5, 1), dt.date(2007, 5, 2),
+        dt.date(2007, 5, 3), dt.date(2007, 5, 4), dt.date(2007, 5, 7), dt.date(2007, 10, 1), dt.date(2007, 10, 2),
+        dt.date(2007, 10, 3), dt.date(2007, 10, 4), dt.date(2007, 10, 5), dt.date(2007, 12, 31),
+        # 2008
+        dt.date(2008, 1, 1), dt.date(2008, 2, 6), dt.date(2008, 2, 7), dt.date(2008, 2, 8), dt.date(2008, 2, 11),
+        dt.date(2008, 2, 12), dt.date(2008, 4, 4), dt.date(2008, 5, 1), dt.date(2008, 5, 2), dt.date(2008, 6, 9),
+        dt.date(2008, 9, 15), dt.date(2008, 9, 29), dt.date(2008, 9, 30), dt.date(2008, 10, 1), dt.date(2008, 10, 2),
+        dt.date(2008, 10, 3),
+        # 2009
+        dt.date(2009, 1, 1), dt.date(2009, 1, 2), dt.date(2009, 1, 26), dt.date(2009, 1, 27), dt.date(2009, 1, 28),
+        dt.date(2009, 1, 29), dt.date(2009, 1, 30), dt.date(2009, 4, 6), dt.date(2009, 5, 1), dt.date(2009, 5, 28),
+        dt.date(2009, 5, 29), dt.date(2009, 10, 1), dt.date(2009, 10, 2), dt.date(2009, 10, 5), dt.date(2009, 10, 6),
+        dt.date(2009, 10, 7), dt.date(2009, 10, 8),
+        # 2010
+        dt.date(2010, 1, 1), dt.date(2010, 2, 15), dt.date(2010, 2, 16), dt.date(2010, 2, 17), dt.date(2010, 2, 18),
+        dt.date(2010, 2, 19), dt.date(2010, 4, 5), dt.date(2010, 5, 3), dt.date(2010, 6, 14), dt.date(2010, 6, 15),
+        dt.date(2010, 6, 16), dt.date(2010, 9, 22), dt.date(2010, 9, 23), dt.date(2010, 9, 24), dt.date(2010, 10, 1),
+        dt.date(2010, 10, 4), dt.date(2010, 10, 5), dt.date(2010, 10, 6), dt.date(2010, 10, 7),
+        # 2011
+        dt.date(2011, 1, 3), dt.date(2011, 2, 2), dt.date(2011, 2, 3), dt.date(2011, 2, 4), dt.date(2011, 2, 7),
+        dt.date(2011, 2, 8), dt.date(2011, 4, 4), dt.date(2011, 4, 5), dt.date(2011, 5, 2), dt.date(2011, 6, 6),
+        dt.date(2011, 9, 12), dt.date(2011, 10, 3), dt.date(2011, 10, 4), dt.date(2011, 10, 5), dt.date(2011, 10, 6),
+        dt.date(2011, 10, 7),
+        # 2012
+        dt.date(2012, 1, 2), dt.date(2012, 1, 3), dt.date(2012, 1, 23), dt.date(2012, 1, 24), dt.date(2012, 1, 25),
+        dt.date(2012, 1, 26), dt.date(2012, 1, 27), dt.date(2012, 4, 2), dt.date(2012, 4, 3), dt.date(2012, 4, 4),
+        dt.date(2012, 4, 30), dt.date(2012, 5, 1), dt.date(2012, 6, 22), dt.date(2012, 10, 1), dt.date(2012, 10, 2),
+        dt.date(2012, 10, 3), dt.date(2012, 10, 4), dt.date(2012, 10, 5),
+        # 2013
+        dt.date(2013, 1, 1), dt.date(2013, 1, 2), dt.date(2013, 1, 3), dt.date(2013, 2, 11), dt.date(2013, 2, 12),
+        dt.date(2013, 2, 13), dt.date(2013, 2, 14), dt.date(2013, 2, 15), dt.date(2013, 4, 4), dt.date(2013, 4, 5),
+        dt.date(2013, 4, 29), dt.date(2013, 4, 30), dt.date(2013, 5, 1), dt.date(2013, 6, 10), dt.date(2013, 6, 11),
+        dt.date(2013, 6, 12), dt.date(2013, 9, 19), dt.date(2013, 9, 20), dt.date(2013, 10, 1), dt.date(2013, 10, 2),
+        dt.date(2013, 10, 3), dt.date(2013, 10, 4), dt.date(2013, 10, 7),
+        # 2014
+        dt.date(2014, 1, 1), dt.date(2014, 1, 31), dt.date(2014, 2, 3), dt.date(2014, 2, 4), dt.date(2014, 2, 5),
+        dt.date(2014, 2, 6), dt.date(2014, 4, 7), dt.date(2014, 5, 1), dt.date(2014, 5, 2), dt.date(2014, 6, 2),
+        dt.date(2014, 9, 8), dt.date(2014, 10, 1), dt.date(2014, 10, 2), dt.date(2014, 10, 3), dt.date(2014, 10, 6),
+        dt.date(2014, 10, 7),
         # 2015
         dt.date(2015, 1, 1), dt.date(2015, 1, 2),
         dt.date(2015, 2, 18), dt.date(2015, 2, 19), dt.date(2015, 2, 20),
@@ -110,6 +136,7 @@ class TradingCalendar:
         dt.date(2018, 9, 24),
         dt.date(2018, 10, 1), dt.date(2018, 10, 2), dt.date(2018, 10, 3),
         dt.date(2018, 10, 4), dt.date(2018, 10, 5),
+        dt.date(2018, 12, 31),  # 2019 元旦 arrangement: 12/30-1/1 closed
         # 2019
         dt.date(2019, 1, 1),
         dt.date(2019, 2, 4), dt.date(2019, 2, 5), dt.date(2019, 2, 6),
@@ -179,14 +206,19 @@ class TradingCalendar:
         dt.date(2025, 6, 2),
         dt.date(2025, 10, 1), dt.date(2025, 10, 2), dt.date(2025, 10, 3),
         dt.date(2025, 10, 6), dt.date(2025, 10, 7), dt.date(2025, 10, 8),
-        # 2026
-        dt.date(2026, 1, 1),
-        dt.date(2026, 2, 17), dt.date(2026, 2, 18), dt.date(2026, 2, 19),
-        dt.date(2026, 2, 20), dt.date(2026, 2, 23),
+        # 2026 — 上证公告〔2025〕45号 (2025-12-22 沪深北联合发布):
+        # 元旦 1/1-1/3 | 春节 2/15-2/23 | 清明 4/4-4/6 | 劳动节 5/1-5/5 |
+        # 端午 6/19-6/21 | 中秋 9/25-9/27 | 国庆 10/1-10/7.
+        # Weekday closures only; resume days (1/5, 2/24, 6/22, 9/28, 10/8)
+        # are trading days and are NOT listed.  Verified: 6/19 closed /
+        # 6/22 open in stored daily bars.
+        dt.date(2026, 1, 1), dt.date(2026, 1, 2),
+        dt.date(2026, 2, 16), dt.date(2026, 2, 17), dt.date(2026, 2, 18),
+        dt.date(2026, 2, 19), dt.date(2026, 2, 20), dt.date(2026, 2, 23),
         dt.date(2026, 4, 6),
         dt.date(2026, 5, 1), dt.date(2026, 5, 4), dt.date(2026, 5, 5),
-        dt.date(2026, 6, 22),
-        dt.date(2026, 9, 28),
+        dt.date(2026, 6, 19),
+        dt.date(2026, 9, 25),
         dt.date(2026, 10, 1), dt.date(2026, 10, 2), dt.date(2026, 10, 5),
         dt.date(2026, 10, 6), dt.date(2026, 10, 7),
         # 2027
@@ -225,7 +257,6 @@ class TradingCalendar:
             raise ValueError(f"Unknown market: {market}. Choose: a_shares, us")
         self.market = market
         self._holidays = self.HOLIDAYS[market]
-        self._makeup_days = self.A_SHARES_MAKEUP if market == "a_shares" else set()
 
     def get_trading_days(
         self, start: str | dt.date, end: str | dt.date
@@ -234,16 +265,13 @@ class TradingCalendar:
             start = dt.date.fromisoformat(start)
         if isinstance(end, str):
             end = dt.date.fromisoformat(end)
+        # Weekdays only (pd.bdate_range already drops weekends); A-shares never
+        # trade on weekends, even on 调休 makeup workdays.  Then drop official
+        # holiday closures.
         dates = pd.bdate_range(start=start, end=end).date
-        trading_days = [d for d in dates if d not in self._holidays]
-        for d in sorted(self._makeup_days):
-            if start <= d <= end and d not in trading_days:
-                trading_days.append(d)
-        return sorted(trading_days)
+        return [d for d in dates if d not in self._holidays]
 
     def is_trading_day(self, date: dt.date) -> bool:
-        if date in self._makeup_days:
-            return True
         if date.weekday() >= 5:
             return False
         if date in self._holidays:

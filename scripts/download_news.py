@@ -19,7 +19,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.download_resume import skip_completed_stocks
+from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.sources.a_shares.news_pipeline import NewsPipeline
 from stoke_ml.data.storage import DataStorage
@@ -196,11 +196,21 @@ def main():
 
                 if df.empty:
                     logger.info("  %s: no news found", code)
+                    mark_stock_result(
+                        raw_dir, code, df, dataset="news_raw",
+                        requested_start=args.start, requested_end=args.end,
+                        source=source_label,
+                    )
                     empty += 1
                     continue
 
                 # Save raw (Bronze)
                 news_storage.save_raw_news(code, df)
+                mark_stock_result(
+                    raw_dir, code, df, dataset="news_raw",
+                    requested_start=args.start, requested_end=args.end,
+                    source=source_label,
+                )
                 logger.info("  %s: %d articles saved (raw)", code, len(df))
                 total_articles += len(df)
 
@@ -242,6 +252,11 @@ def main():
 
             if df.empty:
                 logger.info("  %s: no news found", code)
+                mark_stock_result(
+                    raw_dir, code, df, dataset="news_raw",
+                    requested_start=args.start, requested_end=args.end,
+                    source=source_label,
+                )
                 empty += 1
                 continue
 
@@ -251,6 +266,11 @@ def main():
 
             # Save raw (Bronze)
             news_storage.save_raw_news(code, df)
+            mark_stock_result(
+                raw_dir, code, df, dataset="news_raw",
+                requested_start=args.start, requested_end=args.end,
+                source=source_label,
+            )
             logger.info("  %s: %d articles saved (raw)", code, len(df))
             total_articles += len(df)
 

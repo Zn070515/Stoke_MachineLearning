@@ -141,8 +141,13 @@ class EfinanceSource(AShareSourceBase):
                      "pct_change", "turnover", "amplitude"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+        # EastMoney kline volume is 手 (lots of 100 shares) — normalize to 股
+        # so all providers share one unit (v6 §六). amount is already 元.
+        df["volume"] = df["volume"] * 100.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date
+        df.attrs["source"] = self.SOURCE_NAME
+        df.attrs["adjustment_mode"] = "qfq"
         return df
 
     def is_available(self) -> bool:

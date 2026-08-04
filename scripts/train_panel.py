@@ -964,6 +964,10 @@ def main():
             model, outer_test_data, config, device,
             horizon=config.horizon,
             raw_returns=outer_test_data["realized_return"],
+            # review v6 §十五.2: formal training must use the chronological
+            # sleeve account — a prebuilt panel without price paths is a data
+            # bug, not a reason to silently downgrade to the legacy estimator.
+            require_price_path=True,
         )
         best_epoch = history.get("best_epoch_idx", 0) + 1
 

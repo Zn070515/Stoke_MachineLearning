@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 
@@ -549,9 +550,10 @@ def _make_priced_panel(
 
 
 class TestSleeveTrueDailySeries:
-    """review v4 §四 / P0-A2: the priced evaluation returns a TRUE daily return
-    series (n_periods == W-1), NOT the phase-concatenated W/h — the sleeve
-    account marks to close every calendar day."""
+    """review v4 §四 / P0-A2 + v6 §三: the priced evaluation returns a TRUE
+    daily return series over the whole price path (n_periods == W+horizon,
+    day 0 included), NOT the phase-concatenated W/h — the sleeve account marks
+    to close every calendar day."""
 
     SEQ_LEN, HORIZON, N_TS = 60, 5, 320
 
@@ -567,9 +569,14 @@ class TestSleeveTrueDailySeries:
     def test_sleeve_series_is_true_daily(self):
         m = self._eval()
         n_windows = self.N_TS - self.SEQ_LEN
-        assert m["n_periods"] == n_windows - 1, (
-            f"n_periods={m['n_periods']} != {n_windows-1} — sleeve series must "
-            f"be TRUE daily (W-1), not the phase-concatenated W/h")
+        # The series is TRUE daily over the available price path (each sleeve
+        # marks to close every calendar day incl. day 0's open->close — review
+        # v6 §三), NOT the phase-concatenated W/h.  The synthetic panel holds
+        # exactly n_windows price columns after the seq_len slice (no trailing
+        # horizon pad), so the sleeve series spans n_windows periods here.
+        assert m["n_periods"] == n_windows, (
+            f"n_periods={m['n_periods']} != {n_windows} — sleeve "
+            f"series must be TRUE daily over the whole available price path")
         assert m["n_periods"] > self.HORIZON * 40, (
             f"series too short: {m['n_periods']}")
 
@@ -636,11 +643,15 @@ class TestSleeveNoBackfill:
             cost=0.0, mode="long")
         counts = res["exit_stats"]["counts"]
         assert counts["unfilled"] == 1, f"unfilled={counts['unfilled']}"
-        # day-0 slot was NOT handed to stock 1 — its +30% move never shows up;
-        # the day-1 return is only stock 0's open->close (10.5 -> 11).
-        assert np.isclose(res["daily"][0], 11.0 / 10.5 - 1.0, atol=1e-4), (
-            f"backfilled stock 1 into the day-0 sleeve: "
-            f"daily[0]={res['daily'][0]:.4f}")
+        # Day 0 is now part of the series (review v6 §三): the day-0 sleeve is
+        # unfilled, so its return is exactly 0 — the slot was NOT handed to
+        # stock 1, whose +30% move never shows up.  The day-1 return is only
+        # stock 0's open->close (10.5 -> 11).
+        assert np.isclose(res["daily"][0], 0.0, atol=1e-6), (
+            f"unfilled day-0 sleeve must return 0: daily[0]={res['daily'][0]:.4f}")
+        assert np.isclose(res["daily"][1], 11.0 / 10.5 - 1.0, atol=1e-4), (
+            f"backfilled stock 1 into the day-1 sleeve: "
+            f"daily[1]={res['daily'][1]:.4f}")
 
 
 class TestSleeveCosts:
@@ -686,6 +697,44 @@ class TestSleeveExitStatus:
             "top-marker no-open stock is selected but unfilled → must be counted")
         assert np.isclose(sum(es["pnl_share"].values()), 1.0, atol=1e-6)
 
+    def test_three_leg_exit_status(self):
+        """review v6 §十四.2: the priced report must expose per-leg exit status
+        for long / short / benchmark (equal-weight), so the short book's
+        unfillable/trailing positions can be audited independently of the long
+        leg.  Each leg carries the full stable schema (review v6 §十四.3)."""
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+            up_stocks=(1,), down_stocks=(2,), no_open_stocks=(4,), seed=3)
+        cfg = PanelConfig(seq_len=60, horizon=5)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
+        keys = {"clean", "delayed", "delisted", "unresolved", "unfilled"}
+        for leg in ("long_exit_status", "short_exit_status",
+                    "benchmark_exit_status"):
+            assert leg in m, f"missing per-leg exit status {leg}"
+            es = m[leg]
+            assert set(es["counts"].keys()) == keys
+            assert set(es["pnl"].keys()) == keys
+            assert set(es["pnl_share"].keys()) == keys
+            assert set(es["abs_pnl_share"].keys()) == keys
+            assert set(es["capital_days"].keys()) == keys
+            assert "avg_delayed_days" in es
+        # backward-compat alias still points at the long leg.
+        assert m["exit_status"] == m["long_exit_status"]
+
+    def test_require_price_path_fails_without_prices(self):
+        """review v6 §十五.2: formal training must fail loudly when price paths
+        are missing, instead of silently downgrading to the legacy estimator."""
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5, seed=4)
+        del panel["close_price"]
+        del panel["open_price"]
+        cfg = PanelConfig(seq_len=60, horizon=5)
+        with pytest.raises(ValueError, match="require_price_path"):
+            evaluate_portfolio(
+                _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+                horizon=5, require_price_path=True)
+
 
 class TestSleeveDelayedDelist:
     """review v5 §四: a missing exit open is a TRUE delayed exit — the position
@@ -713,10 +762,14 @@ class TestSleeveDelayedDelist:
         assert counts["clean"] >= 1, f"expected a clean exit, got {counts}"
         assert counts["unresolved"] == 0, f"no position should dangle: {counts}"
 
-    def test_delist_on_zero_close_at_exit(self):
+    def test_zero_close_is_unresolved_not_delist(self):
+        """review v6 §十四.4: a carried close <= 0 after ffill cannot
+        distinguish a real delisting from a dead data row, so the position is
+        NEVER force-sold at 0 — it stays held and books as UNRESOLVED at the
+        path end."""
         preds = np.array([[0.9, 0.9, 0.9],
                           [0.1, 0.1, 0.1]], dtype=np.float32)
-        close = np.array([[10.0, 11.0, 0.0],   # stock 0 delists at d=2
+        close = np.array([[10.0, 11.0, 0.0],   # stock 0 price data dies at d=2
                           [20.0, 21.0, 22.0]], dtype=np.float32)
         open_ = np.array([[10.5, 11.5, np.nan],
                           [20.5, 21.5, 22.5]], dtype=np.float32)
@@ -725,7 +778,10 @@ class TestSleeveDelayedDelist:
             preds, close, open_, pool, horizon=2, top_fraction=0.5,
             cost=0.0, mode="long")
         counts = res["exit_stats"]["counts"]
-        assert counts["delisted"] >= 1, f"expected a delist exit, got {counts}"
+        assert counts["delisted"] == 0, (
+            f"price<=0 must NOT auto-classify as a delist: {counts}")
+        assert counts["unresolved"] >= 1, (
+            f"expected DATA-MISSING positions booked unresolved: {counts}")
 
     def test_delayed_exit_holds_and_captures_resumed_open(self):
         """v5 §十七.4: scheduled exit day has no open, trading resumes 2 days
@@ -746,15 +802,18 @@ class TestSleeveDelayedDelist:
         assert counts["delayed"] == 1, f"expected exactly one delayed exit, got {counts}"
         assert counts["clean"] == 0 and counts["unresolved"] == 0
         daily = np.asarray(res["daily"])
+        # review v6 §三: day 0's open->close (10.5 -> 10.0) is now part of the
+        # series, so the entry-day return is a loss.
+        assert daily[0] < 0, f"day-0 open->close (10.5→10.0) should lose: {daily}"
         # Held through the suspension (d=1, d=2): NAV tracked close 11 then 12
         # — funds stayed occupied instead of being dumped at the stale close on
         # the scheduled day.
-        assert daily[0] > 0 and daily[1] > 0, (
+        assert daily[1] > 0 and daily[2] > 0, (
             f"position was liquidated on the scheduled day: {daily}")
         # The delayed liquidation at the resumed open 13.5 captured the gap
         # 12 → 13.5.
-        assert np.isclose(daily[2], 13.5 / 12.0 - 1.0, atol=1e-4), (
-            f"delayed exit did not capture the resumed open: {daily[2]:.4f}")
+        assert np.isclose(daily[3], 13.5 / 12.0 - 1.0, atol=1e-4), (
+            f"delayed exit did not capture the resumed open: {daily[3]:.4f}")
 
     def test_missing_data_is_unresolved_not_delisted(self):
         """v5 §四 / §十七.5: a stock whose price path just ENDS (NaN, no resume)
@@ -843,8 +902,9 @@ class TestLastSleeveExit:
         res = _simulate_sleeve_account(
             preds, close, open_, pool, horizon=2, top_fraction=0.5,
             cost=0.001, mode="long")
-        # Simulated through the last exit day W-1+h = Wp-1 → 4 daily periods.
-        assert len(res["daily"]) == 5 - 1, f"len={len(res['daily'])}"
+        # Simulated through the last exit day W-1+h = Wp-1 → 5 daily periods,
+        # day 0's open->close now included (review v6 §三).
+        assert len(res["daily"]) == 5, f"len={len(res['daily'])}"
         counts = res["exit_stats"]["counts"]
         # 3 sleeves × 1 filled stock each, all exiting exactly on schedule.
         assert counts["clean"] == 3, f"clean={counts['clean']}"
@@ -953,7 +1013,13 @@ class TestSleeveAntiCheat:
         panel = _make_priced_panel(
             n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
             horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=seed)
-        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        # txn_cost=0.0: this class tests "no manufactured SELECTION alpha".
+        # Since review v6 §四 the sleeve account deducts entry costs from cash,
+        # a zero-alpha book honestly shows a systematic negative LS drag that
+        # would trip the abs()<1.0 bound calibrated when costs were
+        # under-counted.  Cost drag is covered separately by TestSleeveCosts.
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
+                          txn_cost=0.0)
         return evaluate_portfolio(
             model, panel, cfg, torch.device("cpu"), horizon=self.HORIZON)
 
