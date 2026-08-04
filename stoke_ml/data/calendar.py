@@ -14,6 +14,11 @@ import pandas as pd
 class TradingCalendar:
     """Trading day calendar for a specific market."""
 
+    # Version stamp (v7 §十一 P1: experiments freeze the calendar version they
+    # were scheduled on).  Bump whenever the holiday set or its derivation
+    # changes.
+    CALENDAR_VERSION = "2026-08-04"
+
     # Holiday closures (weekday dates only).  Weekends are never trading days
     # and are excluded unconditionally by `is_trading_day`.
     # - 2001-2014: derived from the union of all-stock daily bars (a weekday

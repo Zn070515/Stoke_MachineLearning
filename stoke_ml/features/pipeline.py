@@ -1827,8 +1827,13 @@ class FeaturePipeline:
             open_col = "open" if "open" in df_sorted.columns else target_col
             open_full = np.full(max_T, np.nan, dtype=np.float64)
             open_full[pos] = df_sorted[open_col].to_numpy(dtype=np.float64)
-            close_valid = ~np.isnan(close_full)
-            open_valid = ~np.isnan(open_full)
+            # review v7 §六.1: row-level quality = REPAIR/MASK, not stock
+            # ejection.  A non-positive price is DATA-MISSING (a dead data row,
+            # indistinguishable from a delisting, review v6 §十四.4) — mask it
+            # like a suspension so it never becomes a training observation or an
+            # entry, instead of ejecting the whole stock because of one bad row.
+            close_valid = ~np.isnan(close_full) & (close_full > 0)
+            open_valid = ~np.isnan(open_full) & (open_full > 0)
             obs_arr[i] = close_valid
             entry_arr[i] = open_valid
             close_price_arr[i] = close_full.astype(np.float32)
@@ -2199,6 +2204,12 @@ class FeaturePipeline:
             "history_eligible_mask": history_arr,
             "close_price": close_price_arr,
             "open_price": open_price_arr,
+            # Column order of the feature grids (axis 2) — lets consumers probe
+            # per-channel presence via the has_* flags (v7 §六.2 coverage
+            # manifest).  Both are the post-union, post-dead-drop order actually
+            # used to build pk_arr / po_arr.
+            "past_known_cols": list(pk_cols_available),
+            "past_observed_cols": list(po_cols_available),
         }
 
 

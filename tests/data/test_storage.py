@@ -1,12 +1,12 @@
-"""DataStorage partition merge / flat-shadowing tests (v6 §七).
+"""DataStorage flat-canonical tests (review v7 §五).
 
-save_daily must be NON-destructive: read the existing month partition, merge by
-date, dedup, sort, then atomically replace.  load_daily must never let a stale
-flat ``daily/{code}.parquet`` shadow a fresher partitioned increment — the
-partition wins per-date while the flat still supplies dates partitions lack.
+The canonical store is a single flat ``daily/{code}.parquet`` per stock.
+``save_daily`` is NON-destructive: read existing flat, merge by date, dedup,
+sort, atomically replace under a per-file lock.  ``load_daily`` reads only the
+flat file; legacy year/month partition directories on disk are ignored (never
+read, never written).  ``list_stocks`` discovers codes from flat files only.
 """
 import os
-import time
 
 import numpy as np
 import pandas as pd
@@ -33,12 +33,10 @@ def _frame(dates, closes=None, code="000001"):
 
 
 def _write_flat(tmp_path, code, dates, closes):
-    """Simulate the legacy flat file, with an mtime older than any partition."""
     base = os.path.join(str(tmp_path), "a_shares", "daily")
     os.makedirs(base, exist_ok=True)
     path = os.path.join(base, f"{code}.parquet")
     _frame(dates, closes=closes, code=code).to_parquet(path, index=False)
-    os.utime(path, (time.time() - 3600.0,) * 2)
 
 
 class TestSaveDaily:
@@ -83,28 +81,17 @@ class TestSaveDaily:
 
 
 class TestLoadDaily:
-    def test_flat_fast_path_when_flat_fresh(self, tmp_path):
+    def test_reads_flat_file(self, tmp_path):
         _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])
         out = DataStorage(str(tmp_path)).load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["close"].tolist() == pytest.approx([10.0, 11.0])
 
-    def test_partition_wins_over_stale_flat(self, tmp_path):
+    def test_merge_appends_to_existing_flat(self, tmp_path):
         _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])
         store = DataStorage(str(tmp_path))
-        # fresh partition increment lands after the stale flat file
-        store.save_daily(_frame(
-            ["2024-01-05", "2024-01-06", "2024-01-07"], closes=[20.0, 21.0, 22.0]
-        ))
+        store.save_daily(_frame(["2024-01-07"], closes=[12.0]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
-        assert out["close"].tolist() == pytest.approx([20.0, 21.0, 22.0])
-
-    def test_flat_supplies_dates_partitions_lack(self, tmp_path):
-        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06", "2024-01-07"],
-                    closes=[10.0, 11.0, 12.0])
-        store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-07"], closes=[99.0]))
-        out = store.load_daily("000001", "2024-01-01", "2024-01-31")
-        assert out["close"].tolist() == pytest.approx([10.0, 11.0, 99.0])
+        assert out["close"].tolist() == pytest.approx([10.0, 11.0, 12.0])
 
     def test_date_range_filter(self, tmp_path):
         _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06", "2024-01-07"],
@@ -117,11 +104,48 @@ class TestLoadDaily:
         out = DataStorage(str(tmp_path)).load_daily("000001", "2024-01-01", "2024-01-31")
         assert out.empty
 
-    def test_partition_only_when_no_flat(self, tmp_path):
+    def test_save_load_roundtrip(self, tmp_path):
         store = DataStorage(str(tmp_path))
         store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["date"].tolist() == pd.to_datetime(["2024-01-05", "2024-01-06"]).tolist()
+
+    def test_stale_partition_dirs_ignored(self, tmp_path):
+        # Legacy year/month partition dirs must never be read or shadow the flat file
+        legacy = os.path.join(str(tmp_path), "a_shares", "daily", "2024", "01")
+        os.makedirs(legacy, exist_ok=True)
+        _frame(["2024-01-05"], closes=[42.0]).to_parquet(
+            os.path.join(legacy, "000001.parquet"), index=False
+        )
+        store = DataStorage(str(tmp_path))
+        assert store.load_daily("000001", "2024-01-01", "2024-01-31").empty
+        store.save_daily(_frame(["2024-01-06"], closes=[11.0]))
+        out = store.load_daily("000001", "2024-01-01", "2024-01-31")
+        assert out["close"].tolist() == pytest.approx([11.0])
+
+
+class TestListStocks:
+    def test_empty_when_no_daily_dir(self, tmp_path):
+        assert DataStorage(str(tmp_path)).list_stocks() == []
+
+    def test_lists_flat_codes_only(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05"], code="000001"))
+        store.save_daily(_frame(["2024-01-05"], code="600519"))
+        legacy = os.path.join(str(tmp_path), "a_shares", "daily", "2024", "01")
+        os.makedirs(legacy, exist_ok=True)
+        _frame(["2024-01-05"], code="000002").to_parquet(
+            os.path.join(legacy, "000002.parquet"), index=False
+        )
+        assert store.list_stocks() == ["000001", "600519"]
+
+    def test_ignores_non_parquet_files(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05"], code="000001"))
+        base = os.path.join(str(tmp_path), "a_shares", "daily")
+        with open(os.path.join(base, "README.txt"), "w", encoding="utf-8") as f:
+            f.write("x")
+        assert store.list_stocks() == ["000001"]
 
 
 class TestPartitionLock:

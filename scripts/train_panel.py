@@ -11,6 +11,7 @@ Artifacts (args.json, universe_resolved.txt, universe_used.txt, summary.json)
 are saved to --outdir (default reports/experiments/<timestamp>).
 """
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -24,11 +25,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from stoke_ml.config import load_config
+from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.features import cache_manifest
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from stoke_ml.models.panel.train import train_panel
-from stoke_ml.models.panel.evaluate import evaluate_portfolio
+from stoke_ml.models.panel.evaluate import EVALUATOR_VERSION, evaluate_portfolio
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -37,13 +40,8 @@ logger = logging.getLogger(__name__)
 
 
 def _discover_stocks(data_dir: str, limit: int | None = None) -> list[str]:
-    daily_dir = os.path.join(data_dir, "a_shares", "daily")
-    if not os.path.isdir(daily_dir):
-        return []
-    stocks = sorted(
-        f.replace(".parquet", "")
-        for f in os.listdir(daily_dir) if f.endswith(".parquet")
-    )
+    from stoke_ml.data.storage import DataStorage
+    stocks = DataStorage(data_dir).list_stocks()
     return stocks[:limit] if limit else stocks
 
 
@@ -138,140 +136,190 @@ def _resolve_universe(
     raise ValueError(f"unknown --universe: {universe}")
 
 
+# Channel coverage manifest (review v7 §六.2): every aux channel is loaded
+# per-stock with per-stock error counting, so an experiment that silently lost a
+# whole channel (storage schema update, missing dir) is caught instead of
+# finishing quietly.  `status` distinguishes three empty states:
+#   MISSING — channel absent from disk (loaded 0, errors 0)
+#   FAILED  — storage construction/read broke (errors == n_stocks)
+#   PARTIAL — some stocks loaded, some errored
+_HAS_FLAG_CHANNELS = {
+    "has_news": "sentiment",
+    "has_guba_post": "guba",
+    "has_comment": "comment",
+    "has_announce": "announcement",
+    "has_forecast": "earnings",
+    "has_pledge": "pledge",
+    "has_hot_board": "concept",
+}
+
+
+def _new_channel_entry(requested: bool, required: bool) -> dict:
+    return {
+        "requested": requested,
+        "required": required,
+        "loaded_stocks": 0,
+        "coverage": 0.0,
+        "errors": 0,
+        "status": "MISSING",
+    }
+
+
+def _finalize_channel(entry: dict, name: str, loaded: int, errors: int, n: int) -> None:
+    entry["loaded_stocks"] = loaded
+    entry["errors"] = errors
+    entry["coverage"] = round(loaded / n, 4) if n else 0.0
+    entry["status"] = (
+        "FAILED" if loaded == 0 and errors > 0 else
+        "MISSING" if loaded == 0 else
+        "PARTIAL" if loaded < n else "OK"
+    )
+    logger.info("[%s] loaded %d/%d stocks (errors=%d) %s",
+                name, loaded, n, errors, entry["status"])
+
+
+def _load_channel_aux(
+    name: str,
+    stock_list: list[str],
+    result: dict[str, dict[str, pd.DataFrame]],
+    manifest: dict[str, dict],
+    make_storage,      # Callable[[], object] — storage construction (raises → channel FAILED)
+    load_one,          # Callable[[object, str], pd.DataFrame | None]
+    required: bool = False,
+) -> None:
+    """Per-stock aux load with per-stock error counting (review v7 §六.2)."""
+    entry = _new_channel_entry(True, required)
+    manifest[name] = entry
+    n = len(stock_list)
+    try:
+        storage = make_storage()
+    except Exception as exc:
+        entry["errors"] = n
+        entry["status"] = "FAILED"
+        entry["note"] = f"storage construction failed: {exc}"
+        logger.warning("[%s] storage unavailable — %s", name, exc)
+        return
+    loaded = 0
+    errors = 0
+    for code in stock_list:
+        try:
+            df = load_one(storage, code)
+            if df is not None and not df.empty:
+                result[code][name] = df
+                loaded += 1
+        except Exception:
+            errors += 1
+    _finalize_channel(entry, name, loaded, errors, n)
+
+
 def load_aux_data(
     stock_list: list[str],
     data_dir: str,
     start_date: str,
     end_date: str,
-) -> dict[str, dict[str, pd.DataFrame]]:
+    required_channels: set[str] | None = None,
+) -> tuple[dict[str, dict[str, pd.DataFrame]], dict]:
     """Load auxiliary data (sentiment, guba, margin, etc.) per stock.
 
-    Returns: {stock_code: {"sentiment": df, "guba": df, ...}}
-    Only loads data types that exist on disk.
+    Returns (result, manifest):
+      result   — {stock_code: {"sentiment": df, "guba": df, ...}}
+      manifest — per-channel coverage (requested/required/loaded_stocks/
+                 coverage/errors/status) for review v7 §六.2.
     """
     from stoke_ml.data.news_storage import NewsStorage
     from stoke_ml.data.guba_storage import GubaStorage
     from stoke_ml.data.market_wide_storage import MarketWideStorage
     from stoke_ml.data.fundamental_storage import FundamentalStorage
     from stoke_ml.data.comment_storage import CommentStorage
+    from stoke_ml.data.announcement_storage import AnnouncementStorage
 
     result: dict[str, dict[str, pd.DataFrame]] = {c: {} for c in stock_list}
+    manifest: dict[str, dict] = {}
+    required_set = set(required_channels or ())
 
-    # --- Sentiment (news) ---
-    try:
-        ns = NewsStorage(data_dir)
-        for code in stock_list:
-            df = ns.load_daily_sentiment(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["sentiment"] = df
-    except Exception:
-        logger.warning("Sentiment data not available, skipping")
+    # Sentiment (news)
+    _load_channel_aux(
+        "sentiment", stock_list, result, manifest,
+        make_storage=lambda: NewsStorage(data_dir),
+        load_one=lambda ns, code: ns.load_daily_sentiment(code, start_date, end_date),
+        required=("sentiment" in required_set),
+    )
 
-    # --- Announcements (CNINFO PDF body sentiment preferred, EastMoney fallback) ---
-    try:
+    # Announcements (CNINFO PDF body sentiment preferred, EastMoney fallback)
+    def _make_ann():
         cninfo_dir = os.path.join(data_dir, "a_shares", "cninfo_announcements", "sentiment")
-        em_loaded = False
-        if os.path.isdir(cninfo_dir):
-            for code in stock_list:
-                path = os.path.join(cninfo_dir, f"{code}.parquet")
-                if os.path.isfile(path):
-                    df = pd.read_parquet(path)
-                    df["date"] = pd.to_datetime(df["date"])
-                    if start_date:
-                        df = df[df["date"] >= pd.Timestamp(start_date)]
-                    if end_date:
-                        df = df[df["date"] <= pd.Timestamp(end_date)]
-                    if not df.empty:
-                        result[code]["announcement"] = df.sort_values("date").reset_index(drop=True)
-            cninfo_count = sum(1 for c in result if "announcement" in result[c])
-            if cninfo_count > 0:
-                logger.info("CNINFO announcements loaded for %d stocks", cninfo_count)
-                em_loaded = True
+        return (cninfo_dir, AnnouncementStorage(data_dir))
 
-        # Fallback: EastMoney for stocks without CNINFO data
-        if not em_loaded or len([c for c in stock_list if "announcement" not in result.get(c, {})]) > 0:
-            from stoke_ml.data.announcement_storage import AnnouncementStorage
-            a_store = AnnouncementStorage(data_dir)
-            for code in stock_list:
-                if "announcement" in result.get(code, {}):
-                    continue
-                df = a_store.load_daily_sentiment(code, start_date, end_date)
-                if df is not None and not df.empty:
-                    result[code]["announcement"] = df
-    except Exception:
-        logger.warning("Announcement data not available, skipping")
+    def _load_ann(storage_tuple, code):
+        cninfo_dir, a_store = storage_tuple
+        path = os.path.join(cninfo_dir, f"{code}.parquet")
+        if os.path.isfile(path):
+            df = pd.read_parquet(path)
+            df["date"] = pd.to_datetime(df["date"])
+            if start_date:
+                df = df[df["date"] >= pd.Timestamp(start_date)]
+            if end_date:
+                df = df[df["date"] <= pd.Timestamp(end_date)]
+            if not df.empty:
+                return df.sort_values("date").reset_index(drop=True)
+            return None
+        return a_store.load_daily_sentiment(code, start_date, end_date)
 
-    # --- Guba ---
+    _load_channel_aux(
+        "announcement", stock_list, result, manifest,
+        make_storage=_make_ann,
+        load_one=_load_ann,
+        required=("announcement" in required_set),
+    )
+
+    # Guba
+    _load_channel_aux(
+        "guba", stock_list, result, manifest,
+        make_storage=lambda: GubaStorage(data_dir),
+        load_one=lambda gs, code: gs.load_daily_sentiment(code, start_date, end_date),
+        required=("guba" in required_set),
+    )
+
+    # Comment
+    _load_channel_aux(
+        "comment", stock_list, result, manifest,
+        make_storage=lambda: CommentStorage(data_dir),
+        load_one=lambda cs, code: cs.build_features(code, start_date, end_date),
+        required=("comment" in required_set),
+    )
+
+    # Fundamental (quarterly, backfilled from 2010 so the forward-fill spans)
+    _load_channel_aux(
+        "fundamental", stock_list, result, manifest,
+        make_storage=lambda: FundamentalStorage(data_dir),
+        load_one=lambda fs, code: fs.load(code, "2010-01-01", end_date),
+        required=("fundamental" in required_set),
+    )
+
+    # MarketWideStorage channels (margin/northbound/dragon_tiger/capital_flow/
+    # block_trade/shareholder/lockup/dividend/valuation) — identical pattern.
+    for ch in (
+        "margin", "northbound", "dragon_tiger", "capital_flow", "block_trade",
+        "shareholder", "lockup", "dividend", "valuation",
+    ):
+        _load_channel_aux(
+            ch, stock_list, result, manifest,
+            make_storage=lambda ch=ch: MarketWideStorage(data_dir, ch),
+            load_one=lambda st, code, ch=ch: st.load(code, start_date, end_date),
+            required=(ch in required_set),
+        )
+
+    # ETF Flow (sector-level, aggregated to market-wide per date, broadcast to
+    # every stock — not a per-stock channel).
+    entry = _new_channel_entry(True, "etf_flow" in required_set)
+    manifest["etf_flow"] = entry
     try:
-        gs = GubaStorage(data_dir)
-        for code in stock_list:
-            df = gs.load_daily_sentiment(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["guba"] = df
-    except Exception:
-        logger.warning("Guba data not available, skipping")
-
-    # --- Comment ---
-    try:
-        cs = CommentStorage(data_dir)
-        for code in stock_list:
-            df = cs.build_features(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["comment"] = df
-    except Exception:
-        logger.warning("Comment data not available, skipping")
-
-    # --- Margin ---
-    try:
-        margin_storage = MarketWideStorage(data_dir, "margin")
-        for code in stock_list:
-            df = margin_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["margin"] = df
-    except Exception:
-        logger.warning("Margin data not available, skipping")
-
-    # --- Fundamental ---
-    try:
-        fs = FundamentalStorage(data_dir)
-        for code in stock_list:
-            df = fs.load(code, "2010-01-01", end_date)
-            if df is not None and not df.empty:
-                result[code]["fundamental"] = df
-    except Exception:
-        logger.warning("Fundamental data not available, skipping")
-
-    # --- Northbound ---
-    try:
-        nb_storage = MarketWideStorage(data_dir, "northbound")
-        for code in stock_list:
-            df = nb_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["northbound"] = df
-    except Exception:
-        logger.warning("Northbound data not available, skipping")
-
-    # --- Dragon Tiger ---
-    try:
-        dt_storage = MarketWideStorage(data_dir, "dragon_tiger")
-        for code in stock_list:
-            df = dt_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["dragon_tiger"] = df
-    except Exception:
-        logger.warning("Dragon Tiger data not available, skipping")
-
-    # --- ETF Flow (sector-level, aggregated to market-wide per date) ---
-    try:
-        from stoke_ml.data.etf_storage import ETFStorage
-        etf = ETFStorage(data_dir)
         etf_base = os.path.join(data_dir, "a_shares", "etf_flow")
         etf_frames = []
         if os.path.isdir(etf_base):
             for f in os.listdir(etf_base):
                 if f.startswith("sector_") and f.endswith(".parquet"):
-                    sector_df = pd.read_parquet(os.path.join(etf_base, f))
-                    etf_frames.append(sector_df)
+                    etf_frames.append(pd.read_parquet(os.path.join(etf_base, f)))
         if etf_frames:
             etf_all = pd.concat(etf_frames, ignore_index=True)
             etf_all["date"] = pd.to_datetime(etf_all["date"])
@@ -281,120 +329,114 @@ def load_aux_data(
             ).reset_index()
             for code in stock_list:
                 result[code]["etf_flow"] = etf_agg
-            logger.info("ETF flow aggregated from %d sector files", len(etf_frames))
-    except Exception:
-        logger.warning("ETF flow data not available, skipping")
-
-    # --- Capital Flow ---
-    try:
-        cf_storage = MarketWideStorage(data_dir, "capital_flow")
-        for code in stock_list:
-            df = cf_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["capital_flow"] = df
-    except Exception:
-        logger.warning("Capital flow data not available, skipping")
-
-    # --- Block Trade ---
-    try:
-        bt_storage = MarketWideStorage(data_dir, "block_trade")
-        for code in stock_list:
-            df = bt_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["block_trade"] = df
-    except Exception:
-        logger.warning("Block trade data not available, skipping")
-
-    # --- Shareholder ---
-    try:
-        sh_storage = MarketWideStorage(data_dir, "shareholder")
-        for code in stock_list:
-            df = sh_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["shareholder"] = df
-    except Exception:
-        logger.warning("Shareholder data not available, skipping")
-
-    # --- Lockup ---
-    try:
-        lu_storage = MarketWideStorage(data_dir, "lockup")
-        for code in stock_list:
-            df = lu_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["lockup"] = df
-    except Exception:
-        logger.warning("Lockup data not available, skipping")
-
-    # --- Dividend ---
-    try:
-        dv_storage = MarketWideStorage(data_dir, "dividend")
-        for code in stock_list:
-            df = dv_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["dividend"] = df
-    except Exception:
-        logger.warning("Dividend data not available, skipping")
-
-    # --- Valuation (daily PE/PB/PS/PCF from Baostock) ---
-    try:
-        val_storage = MarketWideStorage(data_dir, "valuation")
-        for code in stock_list:
-            df = val_storage.load(code, start_date, end_date)
-            if df is not None and not df.empty:
-                result[code]["valuation"] = df
-    except Exception:
-        logger.warning("Valuation data not available, skipping")
+            entry["loaded_stocks"] = len(stock_list)
+            entry["coverage"] = 1.0 if stock_list else 0.0
+            entry["status"] = "OK"
+            logger.info("[etf_flow] aggregated from %d sector files "
+                        "(broadcast to %d stocks)", len(etf_frames), len(stock_list))
+        else:
+            logger.info("[etf_flow] no sector files found — MISSING")
+    except Exception as exc:
+        entry["errors"] = len(stock_list)
+        entry["status"] = "FAILED"
+        entry["note"] = str(exc)
+        logger.warning("[etf_flow] aggregation failed — %s", exc)
 
     loaded = sum(1 for v in result.values() if v)
     logger.info("Aux data loaded for %d/%d stocks", loaded, len(stock_list))
-    return result
+    return result, manifest
 
 
-def _filter_quality(stock_list: list[str], data_dir: str) -> list[str]:
-    """Filter out stocks with corrupted price data.
+def _prebuilt_channel_coverage(panel_data: dict) -> dict:
+    """Channel coverage probed from a prebuilt panel's has_* flags (v7 §六.2).
 
-    Checks: close > 0, daily-return std < 50 %, no obviously bogus prices.
-    Returns only the codes that pass all checks.
+    past_observed is (N, T, D); each has_* flag is True on exactly the
+    (stock, day) cells where that aux channel delivered data (the pipeline
+    ZI-fills absent cells, so False == no data).  Coverage = fraction of grid
+    cells with the flag set, across the whole loaded panel.  Channels without
+    a has_* flag carry no presence marker in the arrays, so their coverage is
+    left null (not decodable).
     """
-    import pandas as pd
-    import numpy as np
-    from stoke_ml.data.storage import DataStorage
+    po = panel_data.get("past_observed")
+    col_names = panel_data.get("past_observed_cols") or []
+    index = {name: i for i, name in enumerate(col_names)}
+    channels: dict[str, dict] = {}
+    if po is None or po.ndim != 3:
+        channels["_note"] = {
+            "status": "UNKNOWN",
+            "message": "panel lacks a past_observed grid",
+        }
+        return channels
+    for flag, channel in _HAS_FLAG_CHANNELS.items():
+        if flag not in index:
+            continue
+        mask = po[:, :, index[flag]] > 0
+        present = int(np.count_nonzero(mask))
+        channels[channel] = {
+            "requested": True,
+            "required": False,
+            "loaded_stocks": None,  # cell-level probe, not per-stock
+            "coverage": round(float(mask.mean()), 4),
+            "errors": 0,
+            "status": "OK" if present else "MISSING",
+            "cells": int(mask.size),
+            "flag": flag,
+        }
+    return channels
 
-    ds = DataStorage(data_dir)
-    ok: list[str] = []
-    n_neg, n_vol, n_nan, n_low, n_fwd = 0, 0, 0, 0, 0
-    for code in stock_list:
-        df = ds.load_daily(code, "2015-01-01", "2099-12-31")
-        if df is None or df.empty:
-            continue
-        close = df["close"].values
-        if np.isnan(close).all():
-            n_nan += 1
-            continue
-        if (close <= 0).any():
-            n_neg += 1
-            continue
-        if close.min() < 0.001:
-            n_low += 1
-            continue
-        ret = np.diff(close) / (close[:-1] + 1e-8)
-        if np.nanstd(ret) > 0.50:  # >50 % daily vol = data error
-            n_vol += 1
-            continue
-        if len(close) > 5:
-            fwd_ret = (close[5:] - close[:-5]) / (close[:-5] + 1e-8)
-            if np.nanmax(np.abs(fwd_ret)) > 10.0:
-                n_fwd += 1
-                continue
-        ok.append(code)
-    n_total = n_neg + n_vol + n_nan + n_low + n_fwd
-    if n_total:
-        logger.warning(
-            "Data quality: %d stocks filtered out "
-            "(negative=%d, hi_vol=%d, all_nan=%d, low_close=%d, extreme_fwd=%d) -> %d kept",
-            n_total, n_neg, n_vol, n_nan, n_low, n_fwd, len(ok),
-        )
-    return ok
+
+def _quality_fail_reason(close: np.ndarray) -> str | None:
+    """Structural quality check on a stock's CLOSE prefix.
+
+    `close` must be ONLY the rows up to the fold's train_end (caller slices the
+    panel) — the check is inherently PIT.  Returns a reason string if the stock
+    is unusable on that prefix, else None.  Row-level badness (a non-positive
+    close, a dead row) is NOT a reason to eject the stock — the pipeline masks
+    those rows (review v7 §六.1); only structural corruption (all-NaN prefix,
+    >50 % daily vol, >1000 % forward move) excludes the stock from THAT fold.
+    """
+    if close.size == 0 or np.isnan(close).all():
+        return "all_nan"
+    ret = np.diff(close) / (close[:-1] + 1e-8)
+    if np.nanstd(ret) > 0.50:  # >50 % daily vol = data error
+        return "hi_vol"
+    if len(close) > 5:
+        fwd_ret = (close[5:] - close[:-5]) / (close[:-5] + 1e-8)
+        if np.nanmax(np.abs(fwd_ret)) > 10.0:
+            return "extreme_fwd"
+    return None
+
+
+def _fold_eligible_stocks(panel_data: dict, train_end: int) -> np.ndarray:
+    """Per-fold PIT stock-level eligibility (review v7 §六.1).
+
+    A stock is eligible for a fold iff its close path is structurally clean on
+    columns [0, train_end) — ONLY data before the fold's train boundary.  The
+    old global `_filter_quality` loaded 2015→2099 once and ejected a stock from
+    EVERY fold if a 2025 row was bad; this judges each fold on its own past, so
+    real-market volatility can no longer masquerade as a "bad stock".
+
+    Uses the panel's close_price grid (N, T), aligned to panel_stocks order, so
+    no per-fold DataFrame regroup is needed.
+    """
+    close_price = panel_data["close_price"]  # (N, T) float32, NaN = no data
+    n_stocks = close_price.shape[0]
+    keep = np.ones(n_stocks, dtype=bool)
+    for i in range(n_stocks):
+        if _quality_fail_reason(close_price[i, :train_end]) is not None:
+            keep[i] = False
+    return keep
+
+
+def _mask_stocks(data: dict, keep: np.ndarray) -> dict:
+    """Drop ineligible stocks (axis 0) from every panel slice array."""
+    out = {}
+    for k, v in data.items():
+        if isinstance(v, np.ndarray) and v.ndim >= 1:
+            out[k] = v[keep]
+        else:
+            out[k] = v
+    return out
 
 
 def _cross_sectional_normalize(
@@ -533,6 +575,85 @@ def _augment_sequence(
     return pk_aug, po_aug
 
 
+def _experiment_version(
+    data_dir: str,
+    universe_used: list[str],
+    prebuilt_dir: str | None,
+    static_dim: int,
+    past_known_dim: int,
+    past_observed_dim: int,
+    config: PanelConfig,
+    start: str,
+    end: str,
+    seed: int,
+) -> dict:
+    """Freeze the data/code/feature versions an experiment consumed (v7 §十一 P1).
+
+    Every hash is content-addressed and deterministic — the same commit +
+    source files + feature schemas + universe must yield the same digest, so a
+    days-old run stays explainable.  `data_manifest_hash` covers the raw source
+    files actually fed to feature engineering; `feature_schema_hash` covers the
+    feature column set (prebuilt sidecar manifests when available, else the
+    panel dims).
+    """
+    def _sha1(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+    src = hashlib.sha1()
+    feat = hashlib.sha1()
+    feat.update(f"S={static_dim}|PK={past_known_dim}|PO={past_observed_dim}|".encode())
+
+    manifest_dir = os.path.join(prebuilt_dir, ".manifests") if prebuilt_dir else None
+    for code in sorted(universe_used):
+        src.update(code.encode())
+        src.update(b":")
+        if manifest_dir is not None:
+            mp = os.path.join(manifest_dir, f"{code}.json")
+            m = None
+            if os.path.isfile(mp):
+                try:
+                    with open(mp, encoding="utf-8") as f:
+                        m = json.load(f)
+                except Exception:
+                    m = None
+            if m:
+                for name in sorted(m.get("source_files") or {}):
+                    src.update(name.encode())
+                    src.update(b"=")
+                    src.update(str(m["source_files"][name].get("hash")).encode())
+                    src.update(b";")
+                feat.update(str(m.get("feature_schema_hash", "")).encode())
+                feat.update(b";")
+                continue
+            # No readable manifest → fingerprint the prebuilt feature file.
+            p = os.path.join(prebuilt_dir, f"{code}.parquet")
+            src.update(b"prebuilt=")
+            src.update(str(cache_manifest.file_fingerprint(p)).encode())
+            src.update(b";")
+            feat.update(str(cache_manifest.schema_hash(p)).encode())
+            feat.update(b";")
+        else:
+            _, source_files = cache_manifest.channels_and_source_files(
+                data_dir, code, start, end,
+            )
+            for name in sorted(source_files):
+                src.update(name.encode())
+                src.update(b"=")
+                src.update(str(source_files[name].get("hash")).encode())
+                src.update(b";")
+
+    return {
+        "git_commit": cache_manifest.git_head(),
+        "data_manifest_hash": src.hexdigest()[:16],
+        "calendar_version": TradingCalendar.CALENDAR_VERSION,
+        "feature_schema_hash": feat.hexdigest()[:16],
+        "universe_hash": _sha1("\n".join(sorted(universe_used))),
+        "evaluator_version": EVALUATOR_VERSION,
+        "cost_model": f"sleeve per-side txn_cost={config.txn_cost}, top_fraction=0.1",
+        "random_seed": seed,
+    }
+
+
 def _save_artifacts(
     outdir: str,
     args: argparse.Namespace,
@@ -540,20 +661,40 @@ def _save_artifacts(
     used: list[str],
     universe_desc: str,
     summary: dict | None,
+    channel_manifest: dict | None = None,
+    version: dict | None = None,
 ) -> str:
-    """Persist the experiment: args, resolved/used universes, fold summary."""
+    """Persist the experiment: args, resolved/used universes, fold summary,
+    the channel-coverage manifest (review v7 §六.2), and the frozen data/code
+    versions (review v7 §十一 P1)."""
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "args.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
+    if version is not None:
+        with open(os.path.join(outdir, "version.json"), "w", encoding="utf-8") as f:
+            json.dump(version, f, indent=2, ensure_ascii=False)
     with open(os.path.join(outdir, "universe_resolved.txt"), "w", encoding="utf-8") as f:
         f.write(f"# {universe_desc}\n# n={len(resolved)}\n")
         f.write("\n".join(resolved))
         f.write("\n")
     with open(os.path.join(outdir, "universe_used.txt"), "w", encoding="utf-8") as f:
-        f.write(f"# {universe_desc} (after quality filter)\n# n={len(used)}\n")
+        f.write(f"# {universe_desc}\n"
+                f"# n={len(used)} (per-fold PIT eligibility applied inside the "
+                f"fold loop — review v7 §六.1)\n")
         f.write("\n".join(used))
         f.write("\n")
+    if channel_manifest is not None:
+        with open(os.path.join(outdir, "channel_coverage.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump(channel_manifest, f, indent=2, ensure_ascii=False)
     if summary is not None:
+        if channel_manifest:
+            summary["channel_coverage"] = {
+                k: {"status": v.get("status"),
+                    "coverage": v.get("coverage")}
+                for k, v in sorted(channel_manifest.items())
+                if not k.startswith("_")
+            }
         with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
     logger.info("Experiment artifacts saved to %s", outdir)
@@ -661,6 +802,10 @@ def main():
                         help="Disable torch.compile")
     parser.add_argument("--no-aux", action="store_true",
                         help="Skip auxiliary data loading (faster startup)")
+    parser.add_argument("--require-aux-channels", type=str, default="",
+                        help="Comma-separated aux channels that must have "
+                             "loaded_stocks>0 (review v7 §六.2); experiment "
+                             "FAILS otherwise. Default: none required")
     parser.add_argument("--prebuilt", type=str, default=None,
                         help="Load panel-mode prebuilt features from this dir "
                              "(built via build_features.py --panel-mode). "
@@ -707,12 +852,10 @@ def main():
 
     universe_resolved = list(stock_list)
 
-    # Data quality filter (daily only — minute data validated at download time)
-    if not args.minute:
-        stock_list = _filter_quality(stock_list, data_dir)
-        if len(stock_list) < 20:
-            logger.error("Too few stocks pass quality filter (%d)", len(stock_list))
-            sys.exit(1)
+    # Stock-level quality is judged per-fold, point-in-time, inside the fold
+    # loop (_fold_eligible_stocks uses only columns before train_end) — review
+    # v7 §六.1: no full-history ejection up front.  Row-level badness is
+    # handled as masks in the pipeline, not stock ejection.
     universe_used = list(stock_list)
 
     logger.info("Universe: %s", universe_desc)
@@ -756,11 +899,16 @@ def main():
     panel_stocks = sorted(panel["stock_code"].unique())
 
     # Load auxiliary data (unless --no-aux or --prebuilt)
+    required_set = {c.strip() for c in (args.require_aux_channels or "").split(",") if c.strip()}
     aux_data = None
+    channel_manifest: dict = {}
     if not args.no_aux and not args.prebuilt:
         logger.info("Loading auxiliary data...")
         t_aux = time.time()
-        aux_data = load_aux_data(stock_list, data_dir, args.start, args.end)
+        aux_data, channel_manifest = load_aux_data(
+            stock_list, data_dir, args.start, args.end,
+            required_channels=required_set,
+        )
         logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
 
     # Build features
@@ -780,6 +928,35 @@ def main():
     panel_data = fp.build_panel_features(
         panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
     )
+
+    if args.prebuilt:
+        # Live per-channel loading is skipped in prebuilt mode; probe the panel's
+        # has_* flags instead so the experiment still records what actually got
+        # in (review v7 §六.2).
+        channel_manifest = _prebuilt_channel_coverage(panel_data)
+
+    # Required-channel gate (review v7 §六.2): a required channel with ZERO
+    # coverage aborts the experiment instead of silently training on air.
+    missing_required = sorted(
+        ch for ch in required_set
+        if channel_manifest.get(ch, {}).get("loaded_stocks", 0) == 0
+        and channel_manifest.get(ch, {}).get("coverage", 0.0) == 0
+    )
+    if missing_required:
+        logger.error("Required aux channels have ZERO coverage: %s — aborting",
+                     ", ".join(missing_required))
+        sys.exit(1)
+    for ch in sorted(required_set):
+        if ch not in channel_manifest:
+            logger.warning("Required aux channel '%s' has no coverage probe in "
+                           "this mode (prebuilt panel without has_* flag) — "
+                           "coverage cannot be verified", ch)
+    if channel_manifest:
+        summary_bits = ", ".join(
+            f"{k}={v.get('status')}({v.get('coverage')})"
+            for k, v in sorted(channel_manifest.items()) if not k.startswith("_")
+        )
+        logger.info("Channel coverage manifest: %s", summary_bits)
 
     # Union trading calendar (datetime64[ns]) — fold boundaries in index space
     # map back to real dates for the summary (review v3 §十五).
@@ -815,6 +992,23 @@ def main():
     logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e rank_w=%.2f",
                 config.hidden_dim, config.xlstm_num_blocks, config.xlstm_num_heads,
                 config.batch_size, config.learning_rate, config.rank_loss_weight)
+
+    # v7 §十一 P1: freeze the data/code/feature versions up front so the run
+    # stays explainable even if every fold fails.  Written to version.json
+    # unconditionally; also embedded in summary.json when folds complete.
+    version_info = _experiment_version(
+        data_dir, universe_used, args.prebuilt,
+        static_dim,
+        panel_data["past_known"].shape[2],
+        panel_data["past_observed"].shape[2],
+        config, args.start, args.end, args.seed,
+    )
+    logger.info(
+        "Version freeze: commit=%s data=%s feat=%s uni=%s cal=%s eval=%s",
+        version_info["git_commit"][:10], version_info["data_manifest_hash"],
+        version_info["feature_schema_hash"], version_info["universe_hash"],
+        version_info["calendar_version"], version_info["evaluator_version"],
+    )
 
     # Purged walk-forward splits
     if args.minute:
@@ -855,6 +1049,8 @@ def main():
     oos_dates_all: list[str] = []
     oos_stocks_all: list[str] = []
     oos_preds_all: list[np.ndarray] = []
+    oos_pool_all: list[np.ndarray] = []
+    oos_ledgers: list[pd.DataFrame] = []
 
     rng = np.random.RandomState(args.seed)
     fold = 0
@@ -899,6 +1095,22 @@ def main():
         inner_train_data = _slice_panel(panel_data, inner_train_slice, price_pad=config.horizon)
         inner_val_data = _slice_panel(panel_data, inner_val_slice, price_pad=config.horizon)
         outer_test_data = _slice_panel(panel_data, outer_test_slice, price_pad=config.horizon)
+
+        # Per-fold PIT stock-level eligibility (review v7 §六.1): judge a stock
+        # ONLY on data before train_end, never the full 2000→2099 history.  The
+        # old global _filter_quality ejected a stock from EVERY fold because of
+        # one bad 2025 row; now each fold judges its own past.  Row-level
+        # badness remains masked (pipeline), not a reason to eject.
+        fold_eligible = _fold_eligible_stocks(panel_data, train_end)
+        fold_stocks = [panel_stocks[i] for i in np.where(fold_eligible)[0]]
+        if len(fold_stocks) < 20:
+            logger.warning("Fold %d: only %d stocks eligible PIT (need >= 20) — "
+                           "skipping fold", fold, len(fold_stocks))
+            val_start -= step
+            continue
+        inner_train_data = _mask_stocks(inner_train_data, fold_eligible)
+        inner_val_data = _mask_stocks(inner_val_data, fold_eligible)
+        outer_test_data = _mask_stocks(outer_test_data, fold_eligible)
 
         # y_return: cross-sectional z-score per date — preserves relative
         # ordering across stocks so ranking loss and IC evaluation work on a
@@ -963,11 +1175,15 @@ def main():
         outer_m = evaluate_portfolio(
             model, outer_test_data, config, device,
             horizon=config.horizon,
+            top_fraction=0.1,
             raw_returns=outer_test_data["realized_return"],
             # review v6 §十五.2: formal training must use the chronological
             # sleeve account — a prebuilt panel without price paths is a data
             # bug, not a reason to silently downgrade to the legacy estimator.
             require_price_path=True,
+            # review v7 §九.2: emit the per-position ledger so the OOS tape
+            # records every fill the account actually made, offline-replayable.
+            return_ledger=True,
         )
         best_epoch = history.get("best_epoch_idx", 0) + 1
 
@@ -977,22 +1193,80 @@ def main():
         oos_preds = _predict_outer(model, outer_test_data, config, device)
         if oos_preds is not None:
             n_w = oos_preds.shape[1]
+            p0 = config.seq_len
             entry_dates = [_fmt_date(global_dates, val_start + d) for d in range(n_w)]
-            # Entry-day eligibility on the same window-day grid so downstream
-            # sleeve-account construction can filter exactly what was tradable.
-            elig = outer_test_data["entry_eligible_mask"][
-                :, config.seq_len:config.seq_len + n_w]
+            # Window-day grid arrays (column d ↔ panel column seq_len+d), all
+            # aligned exactly as evaluate_portfolio slices them, so a tape
+            # consumer can reconstruct the sleeve account offline (review v7
+            # §九.2): the selection pool (decision & history, review v4 §三),
+            # the entry/open-validity fill gate, the clean open->open return
+            # target (saved before z-score, review v5 §五) and its mask.
+            dec = outer_test_data["decision_eligible_mask"][:, p0:p0 + n_w]
+            hist = outer_test_data["history_eligible_mask"][:, p0:p0 + n_w]
+            pool = dec & hist
+            elig = outer_test_data["entry_eligible_mask"][:, p0:p0 + n_w]
+            rt_mask = outer_test_data["return_target_mask"][:, p0:p0 + n_w]
+            rt = outer_test_data["y_return_raw"][:, p0:p0 + n_w]
+            # Price paths on the same grid, with `horizon` EXTRA columns so the
+            # sleeve entered on the last signal day W-1 can still liquidate at
+            # open[W-1+horizon] (review v5 §三) — identical to the grid
+            # evaluate_portfolio passes to the sleeve simulator.
+            price_grid = outer_test_data["close_price"][:, p0:p0 + n_w + config.horizon]
+            open_grid = outer_test_data["open_price"][:, p0:p0 + n_w + config.horizon]
+            price_dates = [_fmt_date(global_dates, val_start + d)
+                           for d in range(n_w + config.horizon)]
             np.savez(
                 os.path.join(oos_dir, f"fold_{fold:03d}.npz"),
                 preds=oos_preds,
                 dates=np.array(entry_dates),
-                stocks=np.array(panel_stocks),
+                stocks=np.array(fold_stocks),
+                decision_eligible=dec,
+                history_eligible=hist,
+                pool=pool,
                 entry_eligible=elig,
+                return_target_mask=rt_mask,
+                return_target=rt,
+                close_price=price_grid,
+                open_price=open_grid,
+                price_dates=np.array(price_dates),
+                horizon=config.horizon,
+                seq_len=config.seq_len,
+                top_fraction=0.1,
+                cost=config.txn_cost,
             )
+            # Per-position ledger (review v7 §九.2): the exact fills the long
+            # sleeve account made — entry/exit price, exit status, gross/net
+            # PnL and attributed costs — mapped to dates and stock codes so the
+            # tape is self-contained.  Sum(net_pnl) == final_nav - 1 holds per
+            # fold by construction (enforced inside _run_sleeve_sim).
+            ledger_rows = outer_m.get("long_ledger")
+            if ledger_rows:
+                ldf = pd.DataFrame(ledger_rows)
+                si = ldf["stock"].to_numpy(dtype=int)
+                di = ldf["entry_day"].to_numpy(dtype=int)
+                ldf["entry_date"] = [entry_dates[c] for c in di]
+                ldf["stock_code"] = [fold_stocks[i] for i in si]
+                ldf["prediction"] = oos_preds[si, di]
+                ldf["candidate_eligible"] = pool[si, di]
+                ldf["entry_eligible"] = elig[si, di]
+                ldf["fold"] = fold
+                ldf = ldf[["fold", "entry_day", "entry_date", "stock",
+                           "stock_code", "mode", "prediction",
+                           "candidate_eligible", "entry_eligible",
+                           "entry_price", "entry_value", "shares",
+                           "scheduled_exit_day", "actual_exit_day",
+                           "exit_status", "exit_price", "gross_pnl",
+                           "entry_cost", "exit_cost", "net_pnl"]]
+                ledger_path = os.path.join(oos_dir, f"fold_{fold:03d}_ledger.parquet")
+                ldf.to_parquet(ledger_path)
+                oos_ledgers.append(ldf)
+                logger.info("  Fold %d: ledger %d filled positions -> %s",
+                            fold, len(ldf), ledger_path)
             for d in range(n_w):
-                oos_dates_all.extend([entry_dates[d]] * len(panel_stocks))
-                oos_stocks_all.extend(panel_stocks)
+                oos_dates_all.extend([entry_dates[d]] * len(fold_stocks))
+                oos_stocks_all.extend(fold_stocks)
                 oos_preds_all.append(oos_preds[:, d])
+                oos_pool_all.append(pool[:, d])
 
         if outer_m["n_periods"] >= 2:
             best_ls = outer_m["ls_sharpe"]
@@ -1029,12 +1303,13 @@ def main():
             })
             logger.info(
                 "  Fold %d: best@epoch%d OUTER-TEST LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
-                "Long_Sharpe=%.2f Q5-Q1=%.1fbp EW_Sharpe=%.2f (%.1fs)",
+                "Long_Sharpe=%.2f Q5-Q1=%.1fbp ElgEW_Sharpe=%.2f UniEW_Sharpe=%.2f (%.1fs)",
                 fold, best_epoch, best_ls,
                 outer_m.get("ic_mean", 0), outer_m.get("ic_ir", 0),
                 outer_m.get("long_sharpe", 0),
                 outer_m.get("q5mq1_ret", 0) * 10000,
-                outer_m.get("ew_sharpe", 0),
+                outer_m.get("eligible_ew_sharpe", 0),
+                outer_m.get("universe_ew_sharpe", 0),
                 elapsed,
             )
         else:
@@ -1052,10 +1327,22 @@ def main():
             "entry_date": oos_dates_all,
             "stock_code": oos_stocks_all,
             "pred": np.concatenate(oos_preds_all),
+            # The exact select pool the sleeve account ranked over (decision &
+            # history, review v4 §三) — review v7 §九.2: a tape must expose the
+            # candidate set it was built from, not only the selected fills.
+            "candidate_eligible": np.concatenate(oos_pool_all),
         })
         oos_series_path = os.path.join(outdir, "oos_series.parquet")
         oos_series.to_parquet(oos_series_path)
         logger.info("OOS series: %d rows -> %s", len(oos_series), oos_series_path)
+
+    # Combined per-position ledger across all folds (review v7 §九.2) — the
+    # single file a consumer reads to reproduce every fill of the backtest.
+    if oos_ledgers:
+        oos_ledger_path = os.path.join(outdir, "oos_ledger.parquet")
+        pd.concat(oos_ledgers, ignore_index=True).to_parquet(oos_ledger_path)
+        logger.info("Combined OOS ledger: %d rows -> %s",
+                    sum(len(x) for x in oos_ledgers), oos_ledger_path)
 
     summary_data = None
     if all_sharpes:
@@ -1071,6 +1358,9 @@ def main():
         if all_ics:
             logger.info("IC mean: %.4f ± %.4f", np.mean(all_ics), np.std(all_ics))
         summary_data = {
+            # v7 §十一 P1: freeze the data/code/feature versions so the run
+            # stays explainable days later (same info also in version.json).
+            "version": version_info,
             "n_folds": len(all_sharpes),
             "ls_sharpe_mean": float(np.mean(all_sharpes)),
             "ls_sharpe_std": float(np.std(all_sharpes)),
@@ -1079,9 +1369,12 @@ def main():
             "universe": universe_desc,
             # Review v4 §十三: non-overlapping folds (step == val_len) — each
             # fold's test days are disjoint, so mean±std is the dispersion of
-            # genuinely independent OOS windows.
+            # disjoint OOS return windows.
             "folds_overlap": False,
-            "fold_note": None,
+            "fold_note": (
+                "disjoint OOS return windows (step == val_len); per-fold metrics "
+                "come from separate trainings, not repeated experiments on one model"
+            ),
             "lockbox": {
                 "months": args.lockbox_months,
                 "start": _fmt_date(global_dates, lockbox_start),
@@ -1091,6 +1384,8 @@ def main():
                         "freezes — no fold trains on or evaluates it.",
             },
             "oos_series": "oos_series.parquet",
+            # review v7 §九.2: the per-position fill ledger written above.
+            "oos_ledger": "oos_ledger.parquet" if oos_ledgers else None,
             "folds": [],
         }
         for i, f in enumerate(fold_histories):
@@ -1118,13 +1413,16 @@ def main():
                 "ic_ir": m.get("ic_ir"),
                 "long_sharpe": m.get("long_sharpe"),
                 "q5mq1_ret": m.get("q5mq1_ret"),
-                "ew_sharpe": m.get("ew_sharpe"),
+                "eligible_ew_sharpe": m.get("eligible_ew_sharpe"),
+                "universe_ew_sharpe": m.get("universe_ew_sharpe"),
             })
     else:
         logger.warning("No valid folds completed")
 
     _save_artifacts(
         outdir, args, universe_resolved, universe_used, universe_desc, summary_data,
+        channel_manifest=channel_manifest,
+        version=version_info,
     )
 
 

@@ -42,7 +42,7 @@
 | 子项 | 得分 | 说明 |
 |------|------|------|
 | 数据完整性 | 85 | 4 源 failover (Efinance→AKShare→Tushare→Baostock) |
-| 数据质量 | 80 | `_filter_quality()` 过滤负价/极端波动/全 NaN |
+| 数据质量 | 80 | 逐 fold PIT 资格判断 (`_fold_eligible_stocks` 只用 train_end 前数据) + 行级掩码修复非正价格 |
 | 数据治理 | 75 | Medallion 架构 (Bronze→Silver→Gold)，但无数据版本管理 |
 | 数据覆盖 | 80 | 19 个辅助数据维度 (情感/Guba/融资/北向/龙虎榜/基本面/ETF...) |
 

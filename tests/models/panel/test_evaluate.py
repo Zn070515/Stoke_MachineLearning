@@ -1,3 +1,5 @@
+import io
+
 import numpy as np
 import pytest
 import torch
@@ -15,6 +17,7 @@ from stoke_ml.models.panel.evaluate import (
     compute_ic_summary,
     evaluate_portfolio,
     _candidate_pool,
+    _run_sleeve_sim,
     _simulate_sleeve_account,
 )
 
@@ -358,7 +361,8 @@ class TestEvaluateRealizedPreference:
         # EW baseline is the cross-sectional mean of the EVALUATED actuals.
         # realized has positive mean (+0.02) → positive EW sharpe; raw has
         # negative mean → if wrongly preferred, EW sharpe would be negative.
-        assert m["ew_sharpe"] > 0, f"raw_returns leaked into eval: {m['ew_sharpe']}"
+        assert m["eligible_ew_sharpe"] > 0, (
+            f"raw_returns leaked into eval: {m['eligible_ew_sharpe']}")
 
 
 class TestEvaluateAllHorizonPhases:
@@ -710,7 +714,7 @@ class TestSleeveExitStatus:
             _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
         keys = {"clean", "delayed", "delisted", "unresolved", "unfilled"}
         for leg in ("long_exit_status", "short_exit_status",
-                    "benchmark_exit_status"):
+                    "eligible_ew_exit_status"):
             assert leg in m, f"missing per-leg exit status {leg}"
             es = m[leg]
             assert set(es["counts"].keys()) == keys
@@ -858,11 +862,23 @@ class TestLsAlgebra:
         assert m["long_sharpe"] > 0.3, f"long leg should profit: {m['long_sharpe']}"
         assert m["ls_sharpe"] > 0.3, (
             f"both legs profit → LS must be positive, got {m['ls_sharpe']}")
-        # The exposure metadata keeps the leverage assumption explicit.
-        assert m["exposure"]["gross_exposure"] == 1.0
-        assert m["exposure"]["net_exposure"] == 0.0
-        assert m["exposure"]["long_exposure"] == 0.5
-        assert m["exposure"]["short_exposure"] == 0.5
+        # The exposure metadata keeps the leverage assumption explicit
+        # (review v7 §四): `target` is the nominal 100% gross / 50-50 / net-0
+        # book construction, while `realized` reports the daily MEASURED
+        # exposure from the sleeve simulation (unfilled slots → below target,
+        # delayed exits → above), so the two are never conflated.
+        tgt = m["exposure"]["target"]
+        assert tgt["gross_exposure"] == 1.0
+        assert tgt["net_exposure"] == 0.0
+        assert tgt["long_exposure"] == 0.5
+        assert tgt["short_exposure"] == 0.5
+        r = m["exposure"]["realized"]
+        assert 0.0 < r["mean_gross_exposure"] <= 1.0, (
+            f"realized gross must be a measured fraction of NAV: "
+            f"{r['mean_gross_exposure']:.3f}")
+        daily = r["daily"]
+        assert len(daily["gross_exposure"]) == len(daily["net_exposure"]) > 0
+        assert len(daily["active_long_sleeves"]) == len(daily["active_short_sleeves"])
 
     def test_short_leg_rises_when_bottom_falls(self):
         """§十七.2: the short-only NAV must RISE when the bottom stock falls —
@@ -1047,3 +1063,108 @@ class TestSleeveAntiCheat:
         assert abs(np.mean(ics)) < 0.05, f"random preds mean IC={np.mean(ics):+.4f}"
         assert abs(np.mean(lss)) < 1.0, f"random preds long-short={np.mean(lss):+.2f}"
         assert abs(np.mean(q5s)) < 0.01, f"random preds q5-q1={np.mean(q5s) * 1e4:+.0f}bp"
+
+
+class TestSleeveLedger:
+    """review v7 §九.2: the per-position ledger — one record per FILLED
+    position with entry/exit price, scheduled/actual exit day, exit status,
+    gross/net PnL and attributed costs — must reconcile to the account identity
+    (sum(net_pnl) == final_nav - 1) and be fully recoverable from a saved tape
+    (preds + price paths + pool + metadata) replayed through _run_sleeve_sim."""
+
+    _SCHEMA = {
+        "entry_day", "stock", "mode", "entry_price", "entry_value", "shares",
+        "scheduled_exit_day", "actual_exit_day", "exit_status", "exit_price",
+        "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
+    }
+
+    def test_ledger_reconciles_to_final_nav(self):
+        preds = np.array([[0.9, 0.9, 0.9, 0.9],
+                          [0.1, 0.1, 0.1, 0.1]], dtype=np.float32)  # top-1 long = stock 0
+        close = np.array([[10.0, 11.0, 12.0, 13.0, 14.0],
+                          [20.0, 26.0, 27.0, 28.0, 29.0]], dtype=np.float32)
+        open_ = np.array([[10.0, 10.5, 11.5, 12.5, 13.5],
+                          [20.0, 25.5, 26.5, 27.5, 28.5]], dtype=np.float32)
+        pool = np.ones((2, 4), dtype=bool)
+        res = _run_sleeve_sim(
+            preds, close, open_, pool, horizon=1, top_fraction=0.5,
+            cost=0.0005, mode="long", return_ledger=True)
+        led = res["ledger"]
+        assert len(led) == 4, f"one clean position per signal day, got {len(led)}"
+        assert set(led[0]) == self._SCHEMA, set(led[0])
+        for r in led:
+            assert r["exit_status"] in {"clean", "delayed", "unresolved"}
+            # net = gross minus BOTH attributed costs (entry cost always, exit
+            # cost only when a real exit was executed — unresolved has none).
+            if r["exit_status"] == "unresolved":
+                assert r["exit_cost"] == 0.0
+            assert np.isclose(
+                r["net_pnl"],
+                r["gross_pnl"] - r["entry_cost"] - r["exit_cost"], atol=1e-12)
+            assert np.isclose(r["entry_value"], r["shares"] * r["entry_price"],
+                              rtol=1e-6)
+        total = sum(r["net_pnl"] for r in led)
+        final_nav = float(np.prod(1.0 + res["daily"]))
+        assert np.isclose(total, final_nav - 1.0, atol=1e-9), (
+            f"sum(net_pnl)={total:.8f} != final_nav - 1 = {final_nav - 1:.8f}")
+
+    def test_ledger_exposed_via_evaluate_portfolio(self):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+            up_stocks=(1,), down_stocks=(2,), seed=0)
+        cfg = PanelConfig(seq_len=60, horizon=5)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5,
+            return_ledger=True)
+        led = m.get("long_ledger")
+        assert led is not None and len(led) > 0, "return_ledger must emit fills"
+        assert set(led[0]) == self._SCHEMA, set(led[0])
+        assert {r["exit_status"] for r in led} <= {"clean", "delayed", "unresolved"}
+        # Filled positions have a real entry price and positive value.
+        assert all(np.isfinite(r["entry_price"]) and r["entry_value"] > 0
+                   for r in led)
+
+    def test_tape_roundtrip_replays_long_account(self):
+        """A tape holding preds + close/open price paths + pool + metadata (the
+        exact arrays train_panel.py saves per fold, review v7 §九.2) must replay
+        through _run_sleeve_sim to the SAME final NAV the sleeve account built,
+        so an offline consumer reconstructs the backtest without the model."""
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+            up_stocks=(1,), down_stocks=(2,), seed=0)
+        cfg = PanelConfig(seq_len=60, horizon=5)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5,
+            return_ledger=True)
+        orig_ledger = m["long_ledger"]
+        assert orig_ledger, "tape test needs a non-empty original account"
+
+        # _make_priced_panel stores static as (N, 6) per-stock markers, not a
+        # time axis — the window-day grid is defined by the price path.
+        n_timesteps = panel["close_price"].shape[1]
+        n_w = n_timesteps - cfg.seq_len
+        p0 = cfg.seq_len
+        # _StaticMarkerModel predicts static[:, :1] for every window, so the
+        # per-window pred matrix is the marker tiled across W.
+        preds_np = np.tile(panel["static_features"][:, :1], (1, n_w)).astype(np.float32)
+        pool_np = _candidate_pool(panel, n_w, cfg.seq_len).numpy()
+        close_grid = panel["close_price"][:, p0:p0 + n_w + cfg.horizon]
+        open_grid = panel["open_price"][:, p0:p0 + n_w + cfg.horizon]
+
+        buf = io.BytesIO()
+        np.savez(buf, preds=preds_np, close_price=close_grid, open_price=open_grid,
+                 pool=pool_np, horizon=cfg.horizon, top_fraction=0.1,
+                 cost=cfg.txn_cost)
+        buf.seek(0)
+        z = np.load(buf)
+        replay = _run_sleeve_sim(
+            z["preds"], z["close_price"], z["open_price"], z["pool"],
+            int(z["horizon"]), float(z["top_fraction"]), float(z["cost"]),
+            mode="long", return_ledger=True)
+
+        orig_final = 1.0 + sum(r["net_pnl"] for r in orig_ledger)
+        replay_final = float(np.prod(1.0 + replay["daily"]))
+        assert np.isclose(replay_final, orig_final, rtol=1e-6, atol=1e-9), (
+            f"tape replay final NAV {replay_final:.8f} != original {orig_final:.8f}")
+        replay_net = sum(r["net_pnl"] for r in replay["ledger"])
+        assert np.isclose(replay_net, replay_final - 1.0, atol=1e-9)

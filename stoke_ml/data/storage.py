@@ -1,19 +1,20 @@
-"""Data storage — daily K-line partitioned by year/month (v6 §七).
+"""Data storage — daily K-line, single canonical flat layout (review v7 §五).
 
 Canonical store
 ---------------
-Incremental writes go to ``daily/{year}/{month}/{code}.parquet``.  ``save_daily``
-is NON-destructive: it merges new rows with the existing month partition by
-``date``, dedups, sorts, then atomically ``os.replace``s a temp file.  A per-
-partition lock serializes concurrent downloader processes so a merge cannot
-lose the other process's rows.
+One layout only: ``daily/{code}.parquet`` — a complete per-stock file.  The
+legacy year/month partitions (``daily/{year}/{month}/{code}.parquet``) were the
+old write target, but keeping two layouts invited a split-brain: a downloader
+wrote partitions while training discovered flat files, and ``load_daily`` had
+to union the two with an mtime heuristic.  Now ``save_daily`` merges into the
+flat file and ``load_daily`` reads it directly; stale partition directories on
+disk are ignored (never read, never written).  A stock's full history is one
+small parquet, so per-stock atomic read-modify-write is cheap.
 
-The legacy flat file ``daily/{code}.parquet`` remains as a fast full-history
-base.  ``load_daily`` uses it directly when it is at least as fresh as every
-partition (mtime scan, no parquet reads); if a partition is newer — i.e. an
-increment landed after the flat file was last written — it unions the flat
-base with the partition rows and lets the partition (the fresher source) win
-per-date.  This guarantees a stale flat file can never shadow newer data.
+``save_daily`` is NON-destructive: it reads the existing flat file, merges the
+new rows by ``date``, dedups, sorts, then atomically ``os.replace``s a temp
+file.  A per-file lock serializes concurrent downloader processes so a merge
+cannot lose the other process's rows.
 """
 import os
 import time
@@ -53,28 +54,31 @@ def _release_lock(lock_path: str) -> None:
 
 
 class DataStorage:
-    """Save and load market data as partitioned Parquet files."""
+    """Save and load market data as single-layout flat Parquet files."""
 
     def __init__(self, data_dir: str):
         self._root = data_dir
         os.makedirs(data_dir, exist_ok=True)
 
+    def _daily_dir(self, market: str) -> str:
+        return os.path.join(self._root, market, "daily")
+
     def save_daily(self, df: pd.DataFrame, market: str = "a_shares"):
+        """Non-destructively merge ``df`` into ``daily/{code}.parquet``.
+
+        Existing rows (by ``date``) are kept on last-write-wins, new rows are
+        appended, the file is sorted by date and atomically replaced under a
+        per-file lock.  Only the flat canonical layout is touched.
+        """
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
-        df["year"] = df["date"].dt.year
-        df["month"] = df["date"].dt.month
+        drop_cols = [c for c in ("year", "month") if c in df.columns]
+        base = self._daily_dir(market)
+        os.makedirs(base, exist_ok=True)
 
-        for (year, month, code), group in df.groupby(["year", "month", "stock_code"]):
-            out_dir = os.path.join(
-                self._root, market, "daily", str(year), f"{month:02d}"
-            )
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"{code}.parquet")
-            save_df = group.drop(columns=["year", "month"])
-
-            # Read-merge-write under a partition lock so concurrent downloader
-            # processes cannot overwrite each other's increment (v6 §七).
+        for code, group in df.groupby("stock_code"):
+            save_df = group.drop(columns=drop_cols)
+            out_path = os.path.join(base, f"{code}.parquet")
             lock_path = out_path + ".lock"
             _acquire_lock(lock_path)
             try:
@@ -103,53 +107,24 @@ class DataStorage:
         self, stock_code: str, start_date: str, end_date: str,
         market: str = "a_shares"
     ) -> pd.DataFrame:
+        """Read ``daily/{code}.parquet`` (the single canonical store)."""
+        flat_path = os.path.join(self._daily_dir(market), f"{stock_code}.parquet")
+        if not os.path.isfile(flat_path):
+            return pd.DataFrame()
+        result = pd.read_parquet(flat_path)
+        result["date"] = pd.to_datetime(result["date"])
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
-
-        base = os.path.join(self._root, market, "daily")
-        if not os.path.exists(base):
-            return pd.DataFrame()
-
-        flat_path = os.path.join(base, f"{stock_code}.parquet")
-        flat_exists = os.path.isfile(flat_path)
-        flat_mtime = os.path.getmtime(flat_path) if flat_exists else -1.0
-
-        # stat-scan every partition (cheap, no parquet reads) to decide whether
-        # a fresh increment landed after the flat file was last written.
-        partition_paths = []
-        latest_part_mtime = -1.0
-        for entry in sorted(os.listdir(base)):
-            ydir = os.path.join(base, entry)
-            if not os.path.isdir(ydir) or not entry.isdigit():
-                continue
-            for mdir in os.listdir(ydir):
-                p = os.path.join(ydir, mdir, f"{stock_code}.parquet")
-                if os.path.isfile(p):
-                    partition_paths.append(p)
-                    latest_part_mtime = max(latest_part_mtime, os.path.getmtime(p))
-
-        # Fast path: flat is at least as fresh as every partition, so it is the
-        # canonical full history — no need to read any partition parquet.
-        need_union = (not flat_exists) or latest_part_mtime > flat_mtime
-
-        if not flat_exists and not partition_paths:
-            return pd.DataFrame()
-
-        chunks = []
-        if flat_exists:
-            chunks.append(pd.read_parquet(flat_path))
-        if need_union:
-            for p in partition_paths:
-                chunks.append(pd.read_parquet(p))
-
-        result = pd.concat(chunks, ignore_index=True)
-        result["date"] = pd.to_datetime(result["date"])
-        # Partitions appended last + keep="last" ⇒ the fresher partition value
-        # wins on dates present in both flat and partitions.
-        result = (
-            result.drop_duplicates(subset="date", keep="last")
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
         mask = (result["date"] >= start) & (result["date"] <= end)
         return result[mask].sort_values("date").reset_index(drop=True)
+
+    def list_stocks(self, market: str = "a_shares") -> list[str]:
+        """Discover stocks from the flat store (review v7 §五: discovery must use
+        the storage API, not raw ``os.listdir`` on a mix of files and dirs)."""
+        base = self._daily_dir(market)
+        if not os.path.isdir(base):
+            return []
+        return sorted(
+            f[: -len(".parquet")]
+            for f in os.listdir(base) if f.endswith(".parquet")
+        )
