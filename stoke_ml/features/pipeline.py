@@ -238,8 +238,10 @@ class FeaturePipeline:
         use_fundamental_refine: bool = True,
         use_temporal_stats: bool = True,
         drop_dead_features: bool = True,
+        min_history: int = 50,
     ):
         self.seq_len = seq_len
+        self.min_history = min_history
         self.horizon = horizon
         self.flat_mode = flat_mode
         self.use_technical = use_technical
@@ -1567,6 +1569,7 @@ class FeaturePipeline:
         aux_data: dict[str, dict[str, pd.DataFrame]] | None = None,
         horizon: int = 1,
         prebuilt_dir: str | None = None,
+        min_history: int | None = None,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -1598,6 +1601,8 @@ class FeaturePipeline:
         """
         codes = sorted(panel["stock_code"].unique())
         aux_data = aux_data or {}
+        if min_history is None:
+            min_history = self.min_history
 
         if prebuilt_dir:
             # A missing prebuilt parquet would otherwise surface as a bare
@@ -1725,10 +1730,24 @@ class FeaturePipeline:
         ret_tgt_arr = np.zeros((N_stocks, max_T), dtype=bool)
         vol_tgt_arr = np.zeros((N_stocks, max_T), dtype=bool)
         realized_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
+        # Daily price paths for sleeve-account evaluation (review v4 §四): the
+        # realized_return array is per-ENTRY-day open-to-exit, which cannot
+        # reconstruct a true daily mark-to-market series.  Expose the raw
+        # close/open paths (NaN outside a stock's trading days) so evaluate.py
+        # can build chronological sleeve daily returns + exit_status.
+        close_price_arr = np.full((N_stocks, max_T), np.nan, dtype=np.float32)
+        open_price_arr = np.full((N_stocks, max_T), np.nan, dtype=np.float32)
 
         # Row i of a stock's feature df → its column on the global calendar.
         # Computed once here and reused by the feature-array scatter below.
         stock_pos: list[np.ndarray] = [np.empty(0, dtype=np.int32) for _ in range(N_stocks)]
+
+        # Raw PIT-static inputs (review v4 §五): trailing 60d means of close and
+        # volume×close, plus first-listed global column — captured HERE because
+        # the per-date z-score normalization later mutates the feature dfs.
+        price60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
+        amt60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
+        first_col = np.full(N_stocks, -1, dtype=np.int32)
 
         # Direction noise threshold — scale by sqrt(horizon)
         # (0.003 per day, 1.0% / 5-day, 1.3% / 20-day)
@@ -1756,6 +1775,21 @@ class FeaturePipeline:
             open_valid = ~np.isnan(open_full)
             obs_arr[i] = close_valid
             entry_arr[i] = open_valid
+            close_price_arr[i] = close_full.astype(np.float32)
+            open_price_arr[i] = open_full.astype(np.float32)
+
+            # PIT static raw inputs — trailing 60d means over the trading days
+            # in each global-calendar window (NaNs from pre-listing/suspension
+            # are skipped).  Computed here on the RAW df before z-scoring.
+            price60_raw[i] = _trailing_mean(close_full, 60).astype(np.float32)
+            if "volume" in df_sorted.columns:
+                vol_full = np.full(max_T, np.nan, dtype=np.float64)
+                vol_full[pos] = df_sorted["volume"].to_numpy(dtype=np.float64)
+                amt_full = vol_full * close_full
+            else:
+                amt_full = close_full  # fallback: price as the size proxy
+            amt60_raw[i] = _trailing_mean(amt_full, 60).astype(np.float32)
+            first_col[i] = int(pos[0]) if len(pos) else -1
 
             # Clean forward return (training label): open[t] and open[t+h] both
             # real.  Positions without one stay NaN → direction -100 / return 0
@@ -1813,6 +1847,29 @@ class FeaturePipeline:
                     continue
                 y_vol_arr[i, t] = float(np.std(finite))
                 vol_tgt_arr[i, t] = True
+
+        # ── Decision / history eligibility (review v4 §二/§三) ──
+        # decision_arr[t] = close[t-1] is real, so a signal computed after
+        # close[t-1] (features through column t-1) can rank this stock and
+        # ENTER at open[t].  Aligned to the ENTRY column t so the candidate
+        # pool is decision & entry & history on one grid.
+        decision_arr = np.zeros((N_stocks, max_T), dtype=bool)
+        if max_T > 1:
+            decision_arr[:, 1:] = obs_arr[:, :-1]
+        # history_arr[t] = the seq_len input window ending at t-1 (columns
+        # [t-seq_len, t-1]) holds >= min_history real observations — excludes
+        # freshly-listed stocks whose window is mostly zero padding.
+        if min_history <= 0:
+            history_arr = np.ones((N_stocks, max_T), dtype=bool)
+        else:
+            obs_i = obs_arr.astype(np.int32)
+            cum = np.concatenate(
+                [np.zeros((N_stocks, 1), dtype=np.int32), np.cumsum(obs_i, axis=1)],
+                axis=1,
+            )
+            t_idx = np.arange(max_T)
+            lo = np.maximum(t_idx - self.seq_len, 0)
+            history_arr = (cum[:, t_idx] - cum[:, lo]) >= min_history
 
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
@@ -1886,7 +1943,11 @@ class FeaturePipeline:
 
         # ── Dynamic column discovery (replaces hardcoded _PAST_KNOWN/OBSERVED_COLS) ──
         first_df = all_feat_dfs[0]
-        static_cols_available = [c for c in _STATIC_FEATURE_COLS if c in first_df.columns]
+        # PIT static columns (review v4 §五): time-varying per-window context
+        # derived from data available at each decision day.  Replaces the leaky
+        # first-20-days permanent quantiles.  All five are derivable from OHLCV
+        # + date + stock code (+ sector_code when present) — see _PIT_STATIC_COLS.
+        static_cols_available = list(_PIT_STATIC_COLS)
         pk_cols_available = self._discover_pk_columns(first_df)
         if self.drop_dead_features:
             dead = self._dead_features()
@@ -1898,14 +1959,6 @@ class FeaturePipeline:
             dead = self._dead_features()
             if dead:
                 po_cols_available = [c for c in po_cols_available if c not in dead]
-
-        # Compute static features from first 20 days (zero look-ahead bias).
-        # Stock-invariant characteristics — size, liquidity, risk, price tier.
-        static_needed = [c for c in _STATIC_FEATURE_COLS if c not in first_df.columns]
-        if static_needed:
-            _compute_static_quantiles(all_feat_dfs, codes, static_needed)
-            static_cols_available = [c for c in _STATIC_FEATURE_COLS
-                                     if c in first_df.columns or c in all_feat_dfs[0].columns]
 
         # ── Per-date cross-sectional z-score normalization ──
         # Normalize each feature across stocks within each date, so that
@@ -1979,7 +2032,7 @@ class FeaturePipeline:
         # is the same date for every stock).  Days before listing or during a
         # suspension keep zero features; observation_mask / entry_eligible_mask
         # (returned below) tell training & evaluation which positions are real.
-        static_arr = np.zeros((N_stocks, static_dim), dtype=np.float32)
+        static_arr = np.zeros((N_stocks, max_T, static_dim), dtype=np.float32)
         pk_arr = np.zeros((N_stocks, max_T, pk_dim), dtype=np.float32)
         po_arr = np.zeros((N_stocks, max_T, po_dim), dtype=np.float32)
 
@@ -1992,13 +2045,57 @@ class FeaturePipeline:
             if len(pos) == 0:
                 continue
 
-            # Static: take first row values
+            # PIT static — per-row series scattered onto global-calendar columns.
+            # price_60d_q / amt_60d_q hold RAW trailing 60d means (captured in
+            # the mask loop before z-score); their cross-sectional per-date
+            # quantiles are computed over the whole (N, T) grid after the loop.
             if static_dim > 0:
-                static_arr[i] = df_sorted[static_cols_available].iloc[0].fillna(0.0).values.astype(np.float32)
+                s = np.zeros((len(pos), static_dim), dtype=np.float32)
+                sidx = {c: k for k, c in enumerate(static_cols_available)}
+                if "price_60d_q" in sidx:
+                    s[:, sidx["price_60d_q"]] = price60_raw[i][pos]
+                if "amt_60d_q" in sidx:
+                    s[:, sidx["amt_60d_q"]] = amt60_raw[i][pos]
+                if "listing_days" in sidx:
+                    glob_col = pos.astype(np.float32)
+                    if first_col[i] >= 0:
+                        glob_col = np.maximum(glob_col - first_col[i], 0.0)
+                    s[:, sidx["listing_days"]] = glob_col / 250.0
+                if "board_code" in sidx:
+                    s[:, sidx["board_code"]] = _board_code(codes[i])
+                if "industry_code" in sidx and "sector_code" in df_sorted.columns:
+                    s[:, sidx["industry_code"]] = (
+                        pd.to_numeric(df_sorted["sector_code"], errors="coerce")
+                        .fillna(0.0).to_numpy(dtype=np.float32)
+                    )
+                static_arr[i, pos] = s
 
             # Past known / observed — scattered onto global-calendar columns.
             pk_arr[i, pos] = df_sorted[pk_cols_available].fillna(0.0).values.astype(np.float32)
             po_arr[i, pos] = df_sorted[po_cols_available].fillna(0.0).values.astype(np.float32)
+
+        # Cross-sectional per-date quantile for the trailing-mean size/price
+        # features.  Rank within each column's cross-section of stocks that are
+        # genuinely listed there (obs True) with a nonzero trailing mean.
+        # PIT-safe: every value in column t uses only data through close t, and
+        # the within-column rank is itself known at t.
+        for qname in ("price_60d_q", "amt_60d_q"):
+            if qname not in static_cols_available:
+                continue
+            qk = static_cols_available.index(qname)
+            qcol = static_arr[:, :, qk]
+            qlisted = obs_arr & (qcol > 0)
+            for qt in range(max_T):
+                qidxs = np.nonzero(qlisted[:, qt])[0]
+                if qidxs.size < 2:
+                    if qidxs.size == 1:
+                        qcol[qidxs, qt] = 0.5  # singleton cross-section → neutral rank
+                    continue
+                qvals = qcol[qidxs, qt]
+                qorder = np.argsort(qvals, kind="mergesort")
+                qranks = np.empty(qidxs.size, dtype=np.float64)
+                qranks[qorder] = np.arange(qidxs.size)
+                qcol[qidxs, qt] = (qranks / max(qidxs.size - 1, 1)).astype(np.float32)
 
         # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
         # Alpha158 factors can produce Inf from near-zero divisors (e.g.
@@ -2042,98 +2139,62 @@ class FeaturePipeline:
             "return_target_mask": ret_tgt_arr,
             "vol_target_mask": vol_tgt_arr,
             "realized_return": realized_arr,
+            "decision_eligible_mask": decision_arr,
+            "history_eligible_mask": history_arr,
+            "close_price": close_price_arr,
+            "open_price": open_price_arr,
         }
 
 
 # ── Panel model feature column definitions ──────────────────────────────────
 
 
-def _compute_static_quantiles(
-    all_feat_dfs: list[pd.DataFrame],
-    codes: list[str],
-    needed: list[str],
-) -> None:
-    """Compute stock-invariant quantile features from first 20 days.
-
-    Mutates all_feat_dfs in-place.  Uses only the first 20 data points per stock
-    so there is zero forward-looking bias — characteristics valid at any timestamp.
-    """
-    n = len(all_feat_dfs)
-    first_n = 20
-
-    def _quantile_map(values: np.ndarray) -> dict[str, float]:
-        sorted_vals = np.sort(values)
-        q = np.searchsorted(sorted_vals, values).astype(np.float32) / len(values)
-        return {c: round(float(q[i]), 6) for i, c in enumerate(codes)}
-
-    # Extract per-stock statistics from the first 20-day window
-    if "market_cap_quantile" in needed:
-        raw = np.array([
-            all_feat_dfs[i]["close"].iloc[:min(first_n, len(all_feat_dfs[i]))].mean()
-            if len(all_feat_dfs[i]) > 0 and "close" in all_feat_dfs[i].columns else 0.0
-            for i in range(n)
-        ], dtype=np.float32)
-        cap_map = _quantile_map(raw)
-        for i, df in enumerate(all_feat_dfs):
-            df["market_cap_quantile"] = cap_map.get(codes[i], 0.5)
-
-    if "liquidity_quantile" in needed:
-        raw = np.zeros(n, dtype=np.float32)
-        for i, df in enumerate(all_feat_dfs):
-            if len(df) > 0 and "volume" in df.columns and "close" in df.columns:
-                n_days = min(first_n, len(df))
-                raw[i] = (df["volume"].iloc[:n_days] * df["close"].iloc[:n_days]).mean()
-        liq_map = _quantile_map(raw)
-        for i, df in enumerate(all_feat_dfs):
-            df["liquidity_quantile"] = liq_map.get(codes[i], 0.5)
-
-    if "volatility_quantile" in needed:
-        raw = np.zeros(n, dtype=np.float32)
-        for i, df in enumerate(all_feat_dfs):
-            if len(df) > 0 and "close" in df.columns:
-                n_days = min(first_n, len(df))
-                if n_days >= 3:
-                    c = df["close"].iloc[:n_days].values.astype(np.float64)
-                    log_ret = np.log(np.maximum(c[1:] / c[:-1], 1e-12))
-                    raw[i] = float(np.std(log_ret))
-        vol_map = _quantile_map(raw)
-        for i, df in enumerate(all_feat_dfs):
-            df["volatility_quantile"] = vol_map.get(codes[i], 0.5)
-
-    if "price_level_quantile" in needed:
-        raw = np.array([
-            all_feat_dfs[i]["close"].iloc[:min(first_n, len(all_feat_dfs[i]))].iloc[-1]
-            if len(all_feat_dfs[i]) > 0 and "close" in all_feat_dfs[i].columns else 0.0
-            for i in range(n)
-        ], dtype=np.float32)
-        price_map = _quantile_map(raw)
-        for i, df in enumerate(all_feat_dfs):
-            df["price_level_quantile"] = price_map.get(codes[i], 0.5)
-
-    # Per-stock raw return statistics — lets the model learn to re-scale
-    # z-scored predictions back to raw return space for cross-sectional ranking.
-    if "daily_ret_vol" in needed or "daily_ret_mean" in needed:
-        for i, df in enumerate(all_feat_dfs):
-            if len(df) >= 3 and "close" in df.columns:
-                n_days = min(first_n, len(df))   # first_n = 20, no look-ahead
-                c = df["close"].iloc[:n_days].values.astype(np.float64)
-                ret = np.diff(c) / (c[:-1] + 1e-8)
-                ret = ret[np.isfinite(ret)]
-                df["daily_ret_vol"] = float(np.std(ret)) if len(ret) > 1 else 0.0
-                df["daily_ret_mean"] = float(np.mean(ret)) if len(ret) > 0 else 0.0
-            else:
-                df["daily_ret_vol"] = 0.0
-                df["daily_ret_mean"] = 0.0
-
-
-_STATIC_FEATURE_COLS = [
-    "market_cap_quantile",       # size proxy (avg close first 20d)
-    "liquidity_quantile",        # dollar-volume proxy (avg volume×close first 20d)
-    "volatility_quantile",       # risk profile (log-return std first 20d)
-    "price_level_quantile",      # nominal price tier (avg close)
-    "daily_ret_vol",             # per-stock daily return volatility (raw scale)
-    "daily_ret_mean",            # per-stock mean daily return (raw scale)
+_PIT_STATIC_COLS = [
+    "price_60d_q",     # trailing 60d mean close → cross-sectional price tier
+    "amt_60d_q",       # trailing 60d mean volume×close → size / liquidity proxy
+    "listing_days",    # days since first bar (scaled by 250 → years)
+    "board_code",      # exchange board derived from stock code
+    "industry_code",   # sector/industry code (0 when unknown)
 ]
+
+
+def _trailing_mean(values: np.ndarray, window: int) -> np.ndarray:
+    """Point-in-time trailing mean over [t-window+1, t].
+
+    Early rows use the partial window (mean of the days available so far);
+    NaNs inside the window are skipped.  Rows with no valid value → 0.
+    Vectorized via cumulative sums — O(n) per call.
+    """
+    n = len(values)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    valid = np.isfinite(values)
+    vals = np.where(valid, values, 0.0)
+    scs = np.concatenate([[0.0], np.cumsum(vals)])
+    vcs = np.concatenate([[0.0], np.cumsum(valid.astype(np.float64))])
+    t_idx = np.arange(n)
+    lo = np.maximum(t_idx - window + 1, 0)
+    cnt = vcs[1:] - vcs[lo]
+    s = scs[1:] - scs[lo]
+    return np.where(cnt >= 1.0, s / np.maximum(cnt, 1.0), 0.0)
+
+
+def _board_code(code) -> float:
+    """Map a 6-digit A-share code to an exchange-board id."""
+    s = str(code).zfill(6)
+    if s.startswith("60"):
+        return 1.0   # SH main board
+    if s.startswith("68"):
+        return 2.0   # STAR market
+    if s.startswith("00"):
+        return 3.0   # SZ main board (incl. 002 SME)
+    if s.startswith("30"):
+        return 4.0   # ChiNext
+    if s[0] in ("8", "4"):
+        return 5.0   # Beijing Stock Exchange
+    return 0.0
+
+
 
 # Alpha158 rolling-window factor name generator.
 # Must stay in sync with _WINDOWS in stoke_ml/features/technical.py.

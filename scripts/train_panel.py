@@ -421,16 +421,22 @@ def _cross_sectional_normalize(
     return y_out
 
 
-def _slice_panel(panel_data: dict, tslice: slice) -> dict:
+def _slice_panel(panel_data: dict, tslice: slice, price_pad: int = 0) -> dict:
     """Slice every time-axis array of the panel by `tslice`.
 
-    Static features are shared (not sliced).  Arrays that downstream code
-    mutates in place (y_return z-score + clip, and their neighbours) are copied
-    so one fold's normalization never corrupts the shared panel for later
-    folds.
+    Static features are (N, T, D) PIT since review v4 §五 — sliced on the time
+    axis like every other panel array.  Arrays that downstream code mutates in
+    place (y_return z-score + clip, and their neighbours) are copied so one
+    fold's normalization never corrupts the shared panel for later folds.
+
+    `price_pad`: extend the close/open price columns by this many beyond
+    `tslice.stop` (capped at the panel end).  The sleeve-account evaluation
+    (review v4 §四) needs open[t+h] to liquidate a position entered at open[t],
+    so the last `price_pad` sleeves get a real exit instead of a forced carry.
     """
-    return {
-        "static_features": panel_data["static_features"],
+    stop = tslice.stop
+    out = {
+        "static_features": panel_data["static_features"][:, tslice, :],
         "past_known": panel_data["past_known"][:, tslice],
         "past_observed": panel_data["past_observed"][:, tslice],
         "y_direction": panel_data["y_direction"][:, tslice],
@@ -442,7 +448,17 @@ def _slice_panel(panel_data: dict, tslice: slice) -> dict:
         "vol_target_mask": panel_data["vol_target_mask"][:, tslice],
         "realized_return": panel_data["realized_return"][:, tslice].copy(),
         "date_indices": panel_data["date_indices"][:, tslice].copy(),
+        "decision_eligible_mask": panel_data["decision_eligible_mask"][:, tslice],
+        "history_eligible_mask": panel_data["history_eligible_mask"][:, tslice],
     }
+    # Price paths feed the sleeve-account evaluation; a stale prebuilt panel
+    # without them just falls back to the legacy path in evaluate_portfolio.
+    if "close_price" in panel_data and "open_price" in panel_data:
+        max_T = panel_data["close_price"].shape[1]
+        pstop = min(stop + price_pad, max_T) if price_pad > 0 else stop
+        out["close_price"] = panel_data["close_price"][:, tslice.start:pstop]
+        out["open_price"] = panel_data["open_price"][:, tslice.start:pstop]
+    return out
 
 
 def _fmt_date(global_dates, idx):
@@ -702,7 +718,9 @@ def main():
 
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
-    dims = f"S={panel_data['static_features'].shape[1]} " \
+    # Static features are (N, T, D) PIT (review v4 §五) — feature dim is axis 2.
+    static_dim = panel_data["static_features"].shape[2]
+    dims = f"S={static_dim} " \
            f"PK={panel_data['past_known'].shape[2]} " \
            f"PO={panel_data['past_observed'].shape[2]}"
     logger.info("Panel data: %d stocks × %d timesteps  dims: %s  horizon=%d",
@@ -710,7 +728,7 @@ def main():
 
     config = PanelConfig(
         seq_len=seq_len,
-        static_dim=panel_data["static_features"].shape[1],
+        static_dim=static_dim,
         past_known_dim=panel_data["past_known"].shape[2],
         past_observed_dim=panel_data["past_observed"].shape[2],
         hidden_dim=args.hidden_dim,
@@ -780,9 +798,9 @@ def main():
         inner_val_slice = slice(inner_val_context_start, train_end)
         outer_test_slice = slice(val_context_start, val_end)
 
-        inner_train_data = _slice_panel(panel_data, inner_train_slice)
-        inner_val_data = _slice_panel(panel_data, inner_val_slice)
-        outer_test_data = _slice_panel(panel_data, outer_test_slice)
+        inner_train_data = _slice_panel(panel_data, inner_train_slice, price_pad=config.horizon)
+        inner_val_data = _slice_panel(panel_data, inner_val_slice, price_pad=config.horizon)
+        outer_test_data = _slice_panel(panel_data, outer_test_slice, price_pad=config.horizon)
 
         # y_return: cross-sectional z-score per date — preserves relative
         # ordering across stocks so ranking loss and IC evaluation work on a

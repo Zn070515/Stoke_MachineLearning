@@ -74,5 +74,9 @@ class PanelConfig:
     # Ranking loss weight (0 = disabled, 0.1–0.5 recommended)
     rank_loss_weight: float = 0.1
 
+    # One-way transaction cost (fraction of notional) applied per fill in the
+    # sleeve-account evaluation (review v4 §八 / P1-C).  0.0005 = 5 bps/side.
+    txn_cost: float = 0.0005
+
     # Diagnostics (expensive — enable for debugging gradient collapse)
     log_gradient_flow: bool = False

@@ -166,7 +166,8 @@ def train_panel(
     ], lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
-    train_ds = PanelDataset(train_data, seq_len=config.seq_len)
+    train_ds = PanelDataset(train_data, seq_len=config.seq_len,
+                            min_history=config.min_history)
     train_sampler = DateGroupedSampler(train_ds.valid_mask)
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
@@ -175,7 +176,8 @@ def train_panel(
         drop_last=False, persistent_workers=config.num_workers > 0,
     )
 
-    val_ds = PanelDataset(val_data, seq_len=config.seq_len)
+    val_ds = PanelDataset(val_data, seq_len=config.seq_len,
+                          min_history=config.min_history)
     val_loader = DataLoader(
         val_ds, batch_size=config.batch_size,
         shuffle=False, collate_fn=panel_collate,

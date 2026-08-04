@@ -70,6 +70,10 @@ class PanelDataset(Dataset):
             _to_tensor(data["vol_target_mask"], torch.bool)
             if "vol_target_mask" in data else None
         )
+        self.decision_eligible = (
+            _to_tensor(data["decision_eligible_mask"], torch.bool)
+            if "decision_eligible_mask" in data else None
+        )
 
         self.n_stocks = self.past_known.shape[0]
         self.n_timesteps = self.past_known.shape[1]
@@ -86,10 +90,18 @@ class PanelDataset(Dataset):
             if self.vol_target is not None:
                 target_any = target_any | self.vol_target[:, self.seq_len:]
             hist_count = _window_history_counts(self.obs_mask, self.seq_len)
+            # decision_eligible[t] = close[t-1] real (signal computable after
+            # close[t-1]) — adds the review v4 §三 guard that we actually rank
+            # at a known point in time, not the first day after a suspension.
+            decision = (
+                self.decision_eligible[:, self.seq_len:]
+                if self.decision_eligible is not None else True
+            )
             self.valid_mask = (
                 self.entry_eligible[:, self.seq_len:]
                 & (hist_count >= self.min_history)
                 & target_any
+                & decision
             )
         else:
             # Backward-compat fallback: target-day label validity only.
@@ -140,8 +152,16 @@ class PanelDataset(Dataset):
         vol_mask = (self.vol_target[stock_idx, end]
                     if self.vol_target is not None else dir_mask)
 
+        # Static context: 2D (N, D) for backward-compat synthetic data, or
+        # 3D (N, T, D) PIT (review v4 §五).  For 3D take the DECISION column
+        # end-1 (the last feature day — known before entering at open[end]).
+        if self.static_features.dim() == 3:
+            static = self.static_features[stock_idx, end - 1]
+        else:
+            static = self.static_features[stock_idx]
+
         return (
-            self.static_features[stock_idx],
+            static,
             self.past_known[stock_idx, start:end],
             self.past_observed[stock_idx, start:end],
             self.y_direction[stock_idx, end],

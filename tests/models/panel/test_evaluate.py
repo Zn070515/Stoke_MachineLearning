@@ -13,6 +13,8 @@ from stoke_ml.models.panel.evaluate import (
     compute_bootstrap_sharpe_ci,
     compute_ic_summary,
     evaluate_portfolio,
+    _candidate_pool,
+    _simulate_sleeve_account,
 )
 
 
@@ -440,5 +442,324 @@ class TestEvaluateAntiCheat:
             m = self._eval(_RandomReturnModel(), seed=seed)
             lss.append(m["ls_sharpe"])
             q5s.append(m["q5mq1_ret"])
+        assert abs(np.mean(lss)) < 1.0, f"random preds long-short={np.mean(lss):+.2f}"
+        assert abs(np.mean(q5s)) < 0.01, f"random preds q5-q1={np.mean(q5s) * 1e4:+.0f}bp"
+
+
+def _make_priced_panel(
+    n_stocks=12,
+    n_timesteps=320,
+    seq_len=60,
+    horizon=5,
+    seed=0,
+    up_stocks=(),
+    down_stocks=(),
+    no_decision_stocks=(),
+    no_open_stocks=(),
+    with_decision=True,
+):
+    """Synthetic panel with REAL price paths for the sleeve-account evaluation
+    path (review v4 §四).  close/open are random walks with a per-stock daily
+    drift so forward returns are rankable.  static[:, 0] holds a per-stock
+    marker that _StaticMarkerModel uses as the return prediction:
+
+      up_stocks           drift +0.8%/day, marker +2.0
+      down_stocks         drift -0.8%/day, marker -2.0
+      no_decision_stocks  drift -0.8%/day, marker +3.0 — decision_eligible
+                          forced False in the eval window (a LEAKER a broken
+                          pool that ranked on future labels would pick)
+      no_open_stocks      drift 0, marker +4.0, open missing on the first 5
+                          eval days (selected but unfilled → cash, no backfill)
+
+    with_decision=False drops decision/history masks so _candidate_pool falls
+    back to entry-eligibility — the control where the leaker leaks in.
+    """
+    rng = np.random.RandomState(seed)
+    drift = np.zeros(n_stocks)
+    for i in up_stocks:
+        drift[i] = 0.008
+    for i in down_stocks:
+        drift[i] = -0.008
+    for i in no_decision_stocks:
+        drift[i] = -0.008
+    rets = rng.randn(n_stocks, n_timesteps) * 0.01 + drift[:, None]
+    close = 10.0 * np.exp(np.cumsum(rets, axis=1))
+    open_ = close * (1.0 + 0.001 * rng.randn(n_stocks, n_timesteps))
+    for i in no_open_stocks:
+        open_[i, seq_len:seq_len + 5] = np.nan  # unfillable entry days
+
+    # Clean forward open->open return (training label), as in the pipeline.
+    ret_fwd = np.full((n_stocks, n_timesteps), np.nan, dtype=np.float32)
+    ret_tgt = np.zeros((n_stocks, n_timesteps), dtype=bool)
+    if n_timesteps > horizon:
+        both = np.isfinite(open_[:, :-horizon]) & np.isfinite(open_[:, horizon:])
+        ret_fwd[:, :n_timesteps - horizon][both] = (
+            open_[:, horizon:][both] / open_[:, :-horizon][both] - 1.0)
+        ret_tgt[:, :n_timesteps - horizon] = both
+    y_ret = np.nan_to_num(ret_fwd, nan=0.0).astype(np.float32)
+    y_dir = np.full((n_stocks, n_timesteps), -100, dtype=np.int64)
+    y_dir[ret_tgt] = np.where(
+        ret_fwd[ret_tgt] > 0, 2, np.where(ret_fwd[ret_tgt] < 0, 0, 1))
+
+    obs = np.isfinite(close)
+    entry = np.isfinite(open_)
+    decision = np.zeros((n_stocks, n_timesteps), dtype=bool)
+    decision[:, 1:] = obs[:, :-1]
+    for i in no_decision_stocks:
+        decision[i, seq_len:] = False
+    history = np.ones((n_stocks, n_timesteps), dtype=bool)
+
+    static = np.zeros((n_stocks, 6), dtype=np.float32)
+    for i in up_stocks:
+        static[i, 0] = 2.0
+    for i in down_stocks:
+        static[i, 0] = -2.0
+    for i in no_decision_stocks:
+        static[i, 0] = 3.0
+    for i in no_open_stocks:
+        static[i, 0] = 4.0
+
+    data = {
+        "static_features": static,
+        "past_known": rng.randn(n_stocks, n_timesteps, 12).astype(np.float32),
+        "past_observed": rng.randn(n_stocks, n_timesteps, 10).astype(np.float32),
+        "y_direction": y_dir,
+        "y_return": y_ret,
+        "y_volatility": np.abs(y_ret).astype(np.float32),
+        "date_indices": np.tile(np.arange(n_timesteps), (n_stocks, 1)),
+        "observation_mask": obs,
+        "entry_eligible_mask": entry,
+        "return_target_mask": ret_tgt,
+        "vol_target_mask": ret_tgt,
+        "close_price": close.astype(np.float32),
+        "open_price": open_.astype(np.float32),
+    }
+    if with_decision:
+        data["decision_eligible_mask"] = decision
+        data["history_eligible_mask"] = history
+    return data
+
+
+class TestSleeveTrueDailySeries:
+    """review v4 §四 / P0-A2: the priced evaluation returns a TRUE daily return
+    series (n_periods == W-1), NOT the phase-concatenated W/h — the sleeve
+    account marks to close every calendar day."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def _eval(self, **kw):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), **kw)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        return evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+            horizon=self.HORIZON)
+
+    def test_sleeve_series_is_true_daily(self):
+        m = self._eval()
+        n_windows = self.N_TS - self.SEQ_LEN
+        assert m["n_periods"] == n_windows - 1, (
+            f"n_periods={m['n_periods']} != {n_windows-1} — sleeve series must "
+            f"be TRUE daily (W-1), not the phase-concatenated W/h")
+        assert m["n_periods"] > self.HORIZON * 40, (
+            f"series too short: {m['n_periods']}")
+
+
+class TestSleeveDecisionHistoryPool:
+    """review v4 §三 / P0-A3: the selection pool is DECISION & HISTORY eligible
+    (close[t-1] real + window covered).  A stock whose signal yesterday was
+    missing (decision-ineligible) must NOT be selectable even though its
+    prediction is the strongest — otherwise selection would leak."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def _pool_panel(self, with_decision):
+        return _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON,
+            up_stocks=(1,), down_stocks=(2,), no_decision_stocks=(3,),
+            with_decision=with_decision, seed=1)
+
+    def test_decision_pool_excludes_leaker(self):
+        panel = self._pool_panel(with_decision=True)
+        n_windows = self.N_TS - self.SEQ_LEN
+        pool = _candidate_pool(panel, n_windows, self.SEQ_LEN).numpy()
+        assert not pool[3].any(), (
+            "decision-ineligible leaker (marker +3, -0.8%/day drift) leaked "
+            "into the selection pool")
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+            horizon=self.HORIZON)
+        assert m["long_sharpe"] > 0.5, (
+            f"leaker leaked into top-K long: long_sharpe={m['long_sharpe']:.3f}")
+
+    def test_without_decision_pool_leaker_flips_sign(self):
+        """Control: drop decision/history masks → fallback pool includes the
+        leaker → its strongest prediction + negative outcome flips the long
+        book negative.  Proves the mask (not something else) suppresses it."""
+        panel = self._pool_panel(with_decision=False)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+            horizon=self.HORIZON)
+        assert m["long_sharpe"] < 0, (
+            f"fallback pool did not admit the leaker: "
+            f"long_sharpe={m['long_sharpe']:.3f}")
+
+
+class TestSleeveNoBackfill:
+    """review v4 §三: a selected-but-unfillable stock (no real open at entry)
+    keeps its weight CASH — the allocation is NOT redistributed to fillable
+    stocks (递补).  An unfilled sleeve contributes zero P&L even if another
+    stock moves big that day."""
+
+    def test_unfilled_sleeve_stays_cash(self):
+        preds = np.array([[0.9, 0.9, 0.9],
+                          [0.1, 0.1, 0.1]], dtype=np.float32)  # top-1 long = stock 0
+        close = np.array([[10.0, 11.0, 12.0],
+                          [20.0, 26.0, 27.0]], dtype=np.float32)  # stock 1 +30%
+        open_ = np.array([[np.nan, 10.5, 11.5],   # stock 0 unfillable on day 0
+                          [20.0, 25.5, 26.5]], dtype=np.float32)
+        pool = np.ones((2, 3), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=1, top_fraction=0.5,
+            cost=0.0, mode="long")
+        counts = res["exit_stats"]["counts"]
+        assert counts["unfilled"] == 1, f"unfilled={counts['unfilled']}"
+        # day-0 slot was NOT handed to stock 1 — its +30% move never shows up;
+        # the day-1 return is only stock 0's open->close (10.5 -> 11).
+        assert np.isclose(res["daily"][0], 11.0 / 10.5 - 1.0, atol=1e-4), (
+            f"backfilled stock 1 into the day-0 sleeve: "
+            f"daily[0]={res['daily'][0]:.4f}")
+
+
+class TestSleeveCosts:
+    """review v4 P0-C: transaction costs drag net below gross, and the sleeve
+    turns over real notional every day."""
+
+    def test_gross_above_net_and_turnover_positive(self):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+            up_stocks=(1,), down_stocks=(2,), seed=0)
+        cfg = PanelConfig(seq_len=60, horizon=5)  # txn_cost = 5 bps/side
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
+        assert m["long_turnover"] > 0.0, "sleeve account should turn over notional"
+        assert m["long_gross_sharpe"] > m["long_sharpe"], (
+            f"costs must drag net below gross: "
+            f"gross={m['long_gross_sharpe']:.3f} net={m['long_sharpe']:.3f}")
+        assert m["ls_gross_sharpe"] > m["ls_sharpe"], (
+            f"ls costs: gross={m['ls_gross_sharpe']:.3f} net={m['ls_sharpe']:.3f}")
+
+
+class TestSleeveExitStatus:
+    """review v4 §六 / P0-A4: exits are classified clean/carry/delist/unfilled
+    with P&L shares; a selected stock with a missing entry open is counted
+    unfilled, never silently traded."""
+
+    def test_exit_status_keys_and_unfilled(self):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+            up_stocks=(1,), down_stocks=(2,), no_open_stocks=(4,), seed=2)
+        cfg = PanelConfig(seq_len=60, horizon=5)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
+        es = m["exit_status"]
+        assert set(es["counts"].keys()) == {"clean", "carry", "delist", "unfilled"}
+        assert set(es["pnl_share"].keys()) == {"clean", "carry", "delist", "unfilled"}
+        assert es["counts"]["clean"] > 0, "fully-trading stocks should exit clean"
+        assert es["counts"]["unfilled"] > 0, (
+            "top-marker no-open stock is selected but unfilled → must be counted")
+        assert np.isclose(sum(es["pnl_share"].values()), 1.0, atol=1e-6)
+
+
+class TestSleeveCarryDelist:
+    """review v4 §六 / P0-A4 unit checks on _simulate_sleeve_account: a missing
+    exit open carries to the last close; a zero close at exit is a delist."""
+
+    def test_carry_on_missing_exit_open(self):
+        preds = np.array([[0.9, 0.9, 0.9, 0.9],
+                          [0.1, 0.1, 0.1, 0.1]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, 12.0, 13.0],
+                          [20.0, 21.0, 22.0, 23.0]], dtype=np.float32)
+        open_ = np.array([[10.5, 11.5, np.nan, 12.5],  # stock 0 exit open d=2 missing
+                          [20.5, 21.5, 22.5, 23.5]], dtype=np.float32)
+        pool = np.ones((2, 4), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=2, top_fraction=0.5,
+            cost=0.0, mode="long")
+        counts = res["exit_stats"]["counts"]
+        assert counts["carry"] >= 1, f"expected a carry exit, got {counts}"
+        assert counts["clean"] >= 1, f"expected a clean exit, got {counts}"
+
+    def test_delist_on_zero_close_at_exit(self):
+        preds = np.array([[0.9, 0.9, 0.9],
+                          [0.1, 0.1, 0.1]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, 0.0],   # stock 0 delists at d=2
+                          [20.0, 21.0, 22.0]], dtype=np.float32)
+        open_ = np.array([[10.5, 11.5, np.nan],
+                          [20.5, 21.5, 22.5]], dtype=np.float32)
+        pool = np.ones((2, 3), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=2, top_fraction=0.5,
+            cost=0.0, mode="long")
+        counts = res["exit_stats"]["counts"]
+        assert counts["delist"] >= 1, f"expected a delist exit, got {counts}"
+
+
+class TestCleanICSeparation:
+    """review v4 §七: IC is computed over the CLEAN y_return (open->open) ×
+    return_target_mask, separated from the exec P&L that uses fills/costs/
+    carry.  A rankable market must show strong positive clean IC even though
+    the exec path deducts costs."""
+
+    def test_ic_uses_clean_return(self):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+            up_stocks=(1,), down_stocks=(2,), seed=3)
+        cfg = PanelConfig(seq_len=60, horizon=5)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
+        assert m["ic_mean"] > 0.3, f"clean IC not positive: {m['ic_mean']:.3f}"
+        assert m["q5mq1_ret"] > 0.0, (
+            f"clean quintile spread wrong: {m['q5mq1_ret']:.4f}")
+
+
+class TestSleeveAntiCheat:
+    """review §五 anti-cheat on the PRICED path: constant / random predictions
+    must show no IC, no long-short, no quintile spread even though the market
+    contains real rankable drift — the evaluation must not manufacture alpha."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def _eval(self, model, seed):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=seed)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        return evaluate_portfolio(
+            model, panel, cfg, torch.device("cpu"), horizon=self.HORIZON)
+
+    def test_constant_preds_no_alpha(self):
+        ics, lss, q5s = [], [], []
+        for seed in range(3):
+            m = self._eval(_ConstantReturnModel(), seed)
+            ics.append(m["ic_mean"])
+            lss.append(m["ls_sharpe"])
+            q5s.append(m["q5mq1_ret"])
+        assert all(ic == 0.0 for ic in ics), "constant preds IC must be 0"
+        assert abs(np.mean(lss)) < 1.0, f"constant preds long-short={np.mean(lss):+.2f}"
+        assert abs(np.mean(q5s)) < 0.01, f"constant preds q5-q1={np.mean(q5s) * 1e4:+.0f}bp"
+
+    def test_random_preds_no_alpha(self):
+        ics, lss, q5s = [], [], []
+        for seed in range(3):
+            m = self._eval(_RandomReturnModel(), seed)
+            ics.append(m["ic_mean"])
+            lss.append(m["ls_sharpe"])
+            q5s.append(m["q5mq1_ret"])
+        assert abs(np.mean(ics)) < 0.05, f"random preds mean IC={np.mean(ics):+.4f}"
         assert abs(np.mean(lss)) < 1.0, f"random preds long-short={np.mean(lss):+.2f}"
         assert abs(np.mean(q5s)) < 0.01, f"random preds q5-q1={np.mean(q5s) * 1e4:+.0f}bp"
