@@ -58,7 +58,7 @@ class CrossSectionNormalizer(PreprocessingStep):
     # ------------------------------------------------------------------
 
     def fit(self, df, **kwargs):
-        return self
+        return super().fit(df, **kwargs)
 
     def transform(self, df, **kwargs):
         if not self.enabled or df.empty:

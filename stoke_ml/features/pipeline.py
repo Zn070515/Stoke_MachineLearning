@@ -567,6 +567,11 @@ class FeaturePipeline:
                 stages=cs_stages or ["sector", "size", "rank"],
             )
             feats_panel = csn.fit_transform(feats_panel)
+            logger.info(
+                "CrossSectionNormalizer fit range: %s → %s "
+                "(per-date stats, PIT-safe; v8 §三-1 audit)",
+                csn.fit_start, csn.fit_end,
+            )
 
         # 4. Create sequences per stock, track stock origin
         X_parts, y_parts, close_parts, idx_parts = [], [], [], []
@@ -2004,10 +2009,10 @@ class FeaturePipeline:
 
         # ── Dynamic column discovery (replaces hardcoded _PAST_KNOWN/OBSERVED_COLS) ──
         first_df = all_feat_dfs[0]
-        # PIT static columns (review v4 §五): time-varying per-window context
-        # derived from data available at each decision day.  Replaces the leaky
-        # first-20-days permanent quantiles.  All five are derivable from OHLCV
-        # + date + stock code (+ sector_code when present) — see _PIT_STATIC_COLS.
+        # PIT static columns (review v4 §五 / v8 §三-2): time-varying per-window
+        # context derived from data available at each decision day.  Replaces the
+        # leaky first-20-days permanent quantiles.  All are derivable from OHLCV
+        # + date + stock code — see _PIT_STATIC_COLS.
         static_cols_available = list(_PIT_STATIC_COLS)
         pk_cols_available = self._discover_pk_columns(first_df)
         if self.drop_dead_features:
@@ -2124,11 +2129,6 @@ class FeaturePipeline:
                     s[:, sidx["listing_days"]] = glob_col / 250.0
                 if "board_code" in sidx:
                     s[:, sidx["board_code"]] = _board_code(codes[i])
-                if "industry_code" in sidx and "sector_code" in df_sorted.columns:
-                    s[:, sidx["industry_code"]] = (
-                        pd.to_numeric(df_sorted["sector_code"], errors="coerce")
-                        .fillna(0.0).to_numpy(dtype=np.float32)
-                    )
                 static_arr[i, pos] = s
 
             # Past known / observed — scattered onto global-calendar columns.
@@ -2216,12 +2216,21 @@ class FeaturePipeline:
 # ── Panel model feature column definitions ──────────────────────────────────
 
 
+# PIT-static features (review v8 §三-2 audit):
+#   price_60d_q / amt_60d_q  trailing 60d means → per-date cross-sectional rank
+#   listing_days             (global col − first listed col) / 250
+#   board_code               exchange board derived from the stock code
+# All four are computed purely from data known at the decision day.
+# `industry_code` is deliberately EXCLUDED: the only available stock→industry
+# sources (sector_map.json / stock_sector_cache.csv) are current-snapshot maps
+# with no point-in-time membership history, so a static industry_code would
+# backfill today's classification onto historical rows — the present-backfill
+# the review prohibits.  Re-add only behind a genuine PIT membership source.
 _PIT_STATIC_COLS = [
     "price_60d_q",     # trailing 60d mean close → cross-sectional price tier
     "amt_60d_q",       # trailing 60d mean volume×close → size / liquidity proxy
     "listing_days",    # days since first bar (scaled by 250 → years)
     "board_code",      # exchange board derived from stock code
-    "industry_code",   # sector/industry code (0 when unknown)
 ]
 
 

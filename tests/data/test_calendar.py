@@ -6,9 +6,16 @@ match the SSE official trading calendar exactly for 2001-2026.
 """
 import datetime as dt
 
+import pandas as pd
 import pytest
 
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import (
+    TradingCalendar,
+    build_calendar_frame,
+    load_calendar,
+    save_calendar,
+    validate_calendar,
+)
 
 
 @pytest.fixture
@@ -132,3 +139,81 @@ class TestSeededCounts:
         days = cal.get_trading_days(f"{year}-01-01", f"{year}-12-31")
         assert len(days) == expected_days, (
             f"{year}: {len(days)} != {expected_days}")
+
+
+class TestExternalCalendar:
+    """review v8 §二-3: the calendar is externalized as a self-describing
+    exchange_calendar.parquet (date / is_open / exchange / source / version)
+    so consumers read a data artifact instead of parsing holiday rules.  The
+    artifact is authoritative when present and must match the verified
+    generator exactly."""
+
+    def test_build_calendar_frame_schema(self):
+        frame = build_calendar_frame("a_shares")
+        assert {"date", "is_open", "exchange", "source", "version"} <= set(frame.columns)
+        assert frame["date"].is_monotonic_increasing
+        assert not frame["date"].duplicated().any()
+        # Every date is a weekday; is_open never true on a weekend.
+        assert (frame["date"].dt.weekday < 5).all()
+        assert not frame.loc[frame["date"].dt.weekday >= 5, "is_open"].any()
+        # Version + exchange stamped on every row.
+        assert (frame["version"] == TradingCalendar.CALENDAR_VERSION).all()
+        assert (frame["exchange"] == "SSE/SZSE/BSE").all()
+        # Sanity: a known holiday is closed, a normal mid-week day is open.
+        assert not frame.loc[frame["date"] == pd.Timestamp("2018-12-31"), "is_open"].iloc[0]
+        assert frame.loc[frame["date"] == pd.Timestamp("2010-02-24"), "is_open"].iloc[0]
+
+    def test_save_load_roundtrip_is_authoritative(self, tmp_path):
+        path = save_calendar(tmp_path, "a_shares")
+        assert path.exists()
+        # A calendar loaded from the artifact answers identically to the
+        # code-only calendar across closures, resume days and ranges.
+        code = TradingCalendar("a_shares")
+        ext = TradingCalendar("a_shares", calendar_dir=tmp_path)
+        assert ext._external is not None
+        for d in [dt.date(2018, 12, 31), dt.date(2010, 2, 16),
+                  dt.date(2026, 6, 19), dt.date(2010, 2, 24),
+                  dt.date(2026, 8, 3), dt.date(2026, 2, 14)]:
+            assert ext.is_trading_day(d) == code.is_trading_day(d), d
+        assert (ext.get_trading_days("2010-02-01", "2010-02-28")
+                == code.get_trading_days("2010-02-01", "2010-02-28"))
+        assert (ext.get_trading_days("2001-09-28", "2001-10-10")
+                == code.get_trading_days("2001-09-28", "2001-10-10"))
+        # next_trading_day flows through the artifact.
+        assert (ext.next_trading_day(dt.date(2026, 2, 13))
+                == code.next_trading_day(dt.date(2026, 2, 13)))
+
+    def test_validate_calendar_clean_after_save(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert report["ok"], report
+        assert report["exists"] and report["mismatches"] == 0
+        assert report["trading_days"] > 0
+        # No artifact → validate reports not-ok with a reason, does not raise.
+        assert not validate_calendar(tmp_path / "empty", "a_shares")["ok"]
+
+    def test_validate_calendar_flags_drift(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        # Flip one real trading day to closed: the drift guard must catch it.
+        frame.loc[frame["date"] == pd.Timestamp("2010-02-24"), "is_open"] = False
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert not report["ok"] and report["mismatches"] == 1, report
+
+    def test_malformed_artifact_raises(self, tmp_path):
+        cal_dir = tmp_path / "exchange_calendar"
+        cal_dir.mkdir()
+        pd.DataFrame({"date": [], "is_open": []}).to_parquet(
+            cal_dir / "a_shares.parquet")
+        with pytest.raises(ValueError, match="missing columns"):
+            TradingCalendar("a_shares", calendar_dir=tmp_path)
+
+    def test_absent_artifact_falls_back_to_code(self, tmp_path):
+        ext = TradingCalendar("a_shares", calendar_dir=tmp_path)
+        assert ext._external is None
+        # Identical behaviour to the code-only calendar (no artifact present).
+        code = TradingCalendar("a_shares")
+        assert ext.is_trading_day(dt.date(2026, 6, 19)) == code.is_trading_day(dt.date(2026, 6, 19))
+        assert (ext.get_trading_days("2010-02-01", "2010-02-28")
+                == code.get_trading_days("2010-02-01", "2010-02-28"))

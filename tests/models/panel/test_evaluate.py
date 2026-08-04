@@ -222,13 +222,21 @@ class _ConstantReturnModel(nn.Module):
 class _RandomReturnModel(nn.Module):
     """Review §五 #3 proxy: predictions independent of the inputs, standing in
     for a model that learned nothing from globally-shuffled labels.  If the
-    evaluation pipeline is clean, this must show IC≈0 and no alpha."""
+    evaluation pipeline is clean, this must show IC≈0 and no alpha.
+
+    seed draws from a per-instance generator so results are reproducible — the
+    global torch RNG state varies with whatever tests ran before, which made
+    the |LS|<1.0 anti-cheat bound trip intermittently."""
+
+    def __init__(self, seed=None):
+        super().__init__()
+        self._gen = torch.Generator().manual_seed(seed) if seed is not None else None
 
     def forward(self, static, pk, po):
         b = pk.shape[0]
         return (
             torch.zeros(b, 3, dtype=torch.float32),
-            torch.randn(b, 1, dtype=torch.float32) * 0.01,
+            torch.randn(b, 1, dtype=torch.float32, generator=self._gen) * 0.01,
             torch.full((b, 1), 0.02, dtype=torch.float32),
         )
 
@@ -444,7 +452,7 @@ class TestEvaluateAntiCheat:
 
     def test_random_predictions_yield_near_zero_ic(self):
         """#3: label-shuffle proxy — noise predictions must show |IC|≈0."""
-        ics = [self._eval(_RandomReturnModel(), s)["ic_mean"] for s in range(10)]
+        ics = [self._eval(_RandomReturnModel(seed=s), s)["ic_mean"] for s in range(10)]
         assert abs(np.mean(ics)) < 0.03, f"random preds mean IC={np.mean(ics):+.4f}"
 
     def test_random_predictions_produce_no_systematic_alpha(self):
@@ -452,7 +460,7 @@ class TestEvaluateAntiCheat:
         see the power note on test_constant_predictions_produce_no_systematic_spread)."""
         lss, q5s = [], []
         for seed in range(10):
-            m = self._eval(_RandomReturnModel(), seed=seed)
+            m = self._eval(_RandomReturnModel(seed=seed), seed=seed)
             lss.append(m["ls_sharpe"])
             q5s.append(m["q5mq1_ret"])
         assert abs(np.mean(lss)) < 1.0, f"random preds long-short={np.mean(lss):+.2f}"
@@ -932,6 +940,161 @@ class TestLastSleeveExit:
         assert gross[-1] > net[-1], "final sleeve exit cost was not booked"
 
 
+class TestSleeveAccountIdentity:
+    """review v8 P0-1: the strongest consistency check for any backtest — the
+    returned daily-return series must compound to EXACTLY the account's final
+    NAV, and the exit ledger must reconcile to it.  The most dangerous failure
+    mode in a quant backtest is not an error but a strategy whose equity curve
+    looks normal while the reported stats derive from a DIFFERENT path; this
+    pins the identity across every mode and cost level."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def _inputs(self):
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=0)
+        n_w = self.N_TS - self.SEQ_LEN
+        p0 = self.SEQ_LEN
+        preds = np.tile(panel["static_features"][:, :1], (1, n_w)).astype(np.float32)
+        pool = _candidate_pool(panel, n_w, self.SEQ_LEN).numpy()
+        close = panel["close_price"][:, p0:p0 + n_w + self.HORIZON]
+        open_ = panel["open_price"][:, p0:p0 + n_w + self.HORIZON]
+        return preds, close, open_, pool
+
+    @pytest.mark.parametrize("mode", ["long", "short", "ew"])
+    @pytest.mark.parametrize("cost", [0.0, 0.0005, 0.002])
+    def test_daily_compounds_to_final_nav(self, mode, cost):
+        preds, close, open_, pool = self._inputs()
+        res = _run_sleeve_sim(preds, close, open_, pool, self.HORIZON,
+                              top_fraction=0.1, cost=cost, mode=mode)
+        daily = np.asarray(res["daily"], dtype=np.float64)
+        assert np.all(np.isfinite(daily)), f"{mode}: daily has non-finite entries"
+        compound = float(np.prod(1.0 + daily))
+        assert compound > 0.0
+        assert np.isclose(compound, res["final_nav"], rtol=1e-9, atol=1e-9), (
+            f"{mode}@{cost}: prod(1+daily)={compound:.12f} != "
+            f"final_nav={res['final_nav']:.12f}")
+
+    def test_net_and_gross_series_both_reconcile(self):
+        """The net and the cost=0 gross runs are INDEPENDENT accounts (v7 §三)
+        — each must satisfy the identity internally, and the net book carries a
+        cost drag so it never compounds above the gross one."""
+        preds, close, open_, pool = self._inputs()
+        acc = _simulate_sleeve_account(preds, close, open_, pool, self.HORIZON,
+                                       0.1, 0.001, "long")
+        net_final = float(np.prod(1.0 + np.asarray(acc["daily"], dtype=np.float64)))
+        gross_final = float(np.prod(1.0 + np.asarray(acc["gross_daily"], dtype=np.float64)))
+        assert np.isfinite(net_final) and np.isfinite(gross_final)
+        assert net_final > 0.0 and gross_final > 0.0
+        assert net_final <= gross_final + 1e-9, (
+            f"net final {net_final:.8f} above gross {gross_final:.8f} — "
+            f"costs must not inflate the account")
+
+    def test_ledger_reconciles_to_final_nav_across_modes(self):
+        preds, close, open_, pool = self._inputs()
+        for mode in ("long", "short", "ew"):
+            res = _run_sleeve_sim(preds, close, open_, pool, self.HORIZON,
+                                  0.1, 0.001, mode, return_ledger=True)
+            total = sum(r["net_pnl"] for r in res["ledger"])
+            assert np.isclose(total, res["final_nav"] - 1.0, atol=1e-8), (
+                f"{mode}: sum(net_pnl)={total:.10f} != "
+                f"final_nav-1={res['final_nav'] - 1.0:.10f}")
+
+
+class TestLastHorizonSuspendedExit:
+    """review v8 P0-3: a signal fired on the last signal day whose ENTIRE exit
+    window is suspended must NOT silently vanish at test end.  The position
+    holds (pending) and either exits at the resumed open with cost booked
+    (DELAYED) or books UNRESOLVED at the final carried mark — never
+    "signal → entry → test ends" with the position unaccounted for.
+
+    Exact reviewer scenario: stock A day0 open 100, day1 close 110,
+    days 2-5 suspended, day6 open 120.
+    """
+
+    def _run(self, close_path, open_path, horizon=5, cost=0.001,
+             return_ledger=False):
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)  # top-1 = stock 0
+        close = np.array(close_path, dtype=np.float32)
+        open_ = np.array(open_path, dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        return _run_sleeve_sim(preds, close, open_, pool, horizon=horizon,
+                               top_fraction=0.5, cost=cost, mode="long",
+                               return_ledger=return_ledger)
+
+    def test_resume_in_padded_window_is_delayed_exit_with_cost(self):
+        # W=1 signal day (d0 = the last signal day), horizon=5, price path
+        # padded to Wp=7 so the day-6 resume sits inside the walked window.
+        close = [[105.0, 110.0, 110.0, 110.0, 110.0, 110.0, 120.0],
+                 [20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0]]
+        open_ = [[100.0, np.nan, np.nan, np.nan, np.nan, np.nan, 120.0],
+                 [20.5, 21.5, 22.5, 23.5, 24.5, 25.5, 26.5]]
+        res = self._run(close, open_, return_ledger=True)
+        counts = res["exit_stats"]["counts"]
+        assert counts["delayed"] == 1, f"expected a delayed exit, got {counts}"
+        assert counts["clean"] == 0 and counts["unresolved"] == 0
+        # The pending exit resolved at the resumed open — capital not dumped at
+        # the stale close on the scheduled exit day.
+        assert res["exit_stats"]["pnl"]["delayed"] > 0.0, (
+            "delayed exit bought 100 / sold 120 → P&L must be positive")
+        # The final-day exit cost is booked in the NET run only.
+        net = np.asarray(res["daily"])
+        gross = np.asarray(res["gross_daily"]) if "gross_daily" in res else None
+        # (gross_daily is only present via _simulate_sleeve_account)
+        assert res["ledger"][0]["exit_status"] == "delayed"
+        assert res["ledger"][0]["exit_price"] == 120.0
+        assert res["ledger"][0]["exit_cost"] > 0.0, (
+            "delayed exit must book a sell cost")
+
+    def test_simulate_account_books_exit_cost_on_delayed_day(self):
+        """The gross/net separation (independent cost=0 account) shows the
+        resumed exit day's cost drag: gross return on the final day exceeds the
+        net one."""
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)
+        close = np.array([[105.0, 110.0, 110.0, 110.0, 110.0, 110.0, 120.0],
+                          [20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0]],
+                         dtype=np.float32)
+        open_ = np.array([[100.0, np.nan, np.nan, np.nan, np.nan, np.nan, 120.0],
+                          [20.5, 21.5, 22.5, 23.5, 24.5, 25.5, 26.5]],
+                         dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        res = _simulate_sleeve_account(preds, close, open_, pool, horizon=5,
+                                       top_fraction=0.5, cost=0.001, mode="long")
+        net = np.asarray(res["daily"])
+        gross = np.asarray(res["gross_daily"])
+        assert gross[-1] > net[-1], (
+            "final-day delayed exit cost was not booked into the net account")
+
+    def test_no_resume_books_unresolved_at_final_mark(self):
+        # Same entry but the price path ends INSIDE the suspension (Wp=6 = W+h,
+        # exit day d5 has no open and no resume) → UNRESOLVED at the carried
+        # close, entering the ledger with entry cost charged and the held mark
+        # still reflected in NAV.
+        close = [[105.0, 110.0, 110.0, 110.0, 110.0, 110.0],
+                 [20.0, 21.0, 22.0, 23.0, 24.0, 25.0]]
+        open_ = [[100.0, np.nan, np.nan, np.nan, np.nan, np.nan],
+                 [20.5, 21.5, 22.5, 23.5, 24.5, 25.5]]
+        res = self._run(close, open_, return_ledger=True)
+        counts = res["exit_stats"]["counts"]
+        assert counts["unresolved"] == 1, f"expected unresolved, got {counts}"
+        assert counts["delayed"] == 0 and counts["clean"] == 0
+        # NAV was affected by the held position: it gained the carried mark
+        # 105→110 on 1/5 weight minus the entry cost → final NAV > 1.
+        assert res["final_nav"] > 1.0, f"NAV untouched? final_nav={res['final_nav']:.6f}"
+        # The audit trail records the locked capital: entry cost charged, no
+        # fictitious sell cost, exit at the final carried close.
+        led = res["ledger"]
+        assert len(led) == 1, f"expected the single filled sleeve, got {len(led)}"
+        r = led[0]
+        assert r["exit_status"] == "unresolved"
+        assert r["entry_price"] == 100.0
+        assert r["exit_price"] == 110.0, "unresolved books the final carried mark"
+        assert r["entry_cost"] > 0.0 and r["exit_cost"] == 0.0
+        # Ledger reconciles to the account identity even with capital locked.
+        assert np.isclose(r["net_pnl"], res["final_nav"] - 1.0, atol=1e-9)
+
+
 class TestRawReturnUnits:
     """review v5 §五 / §十七.6: Q5−Q1 "bp" and clean IC must be in RAW return
     units even when the training label y_return is z-scored + clipped per fold.
@@ -1056,7 +1219,7 @@ class TestSleeveAntiCheat:
     def test_random_preds_no_alpha(self):
         ics, lss, q5s = [], [], []
         for seed in range(10):
-            m = self._eval(_RandomReturnModel(), seed)
+            m = self._eval(_RandomReturnModel(seed=seed), seed)
             ics.append(m["ic_mean"])
             lss.append(m["ls_sharpe"])
             q5s.append(m["q5mq1_ret"])
@@ -1073,9 +1236,10 @@ class TestSleeveLedger:
     (preds + price paths + pool + metadata) replayed through _run_sleeve_sim."""
 
     _SCHEMA = {
-        "entry_day", "stock", "mode", "entry_price", "entry_value", "shares",
+        "entry_day", "stock", "mode", "entry_price", "entry_value",
+        "executed_weight", "shares",
         "scheduled_exit_day", "actual_exit_day", "exit_status", "exit_price",
-        "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
+        "realized_return", "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
     }
 
     def test_ledger_reconciles_to_final_nav(self):

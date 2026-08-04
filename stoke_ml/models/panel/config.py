@@ -19,10 +19,10 @@ class PanelConfig:
     """
 
     # Input dimensions (overridden at runtime from actual data).  Defaults track
-    # the current prebuilt panel (review v5 §十六): S=5 PIT static, PK=255,
-    # PO=1418 — the docs guard (check_docs_consistency.py) enforces README /
-    # CONTEXT against these, so update all three together.
-    static_dim: int = 5
+    # the current prebuilt panel (review v5 §十六 / v8 §三-2): S=4 PIT static,
+    # PK=255, PO=1418 — the docs guard (check_docs_consistency.py) enforces
+    # README / CONTEXT against these, so update all three together.
+    static_dim: int = 4
     past_known_dim: int = 255
     past_observed_dim: int = 1418
 

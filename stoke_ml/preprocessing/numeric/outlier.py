@@ -36,7 +36,7 @@ class OutlierDetector(PreprocessingStep):
 
     def fit(self, df, **kwargs):
         """Stateless — bounds are computed point-in-time inside transform()."""
-        return self
+        return super().fit(df, **kwargs)
 
     def transform(self, df, **kwargs):
         if df.empty:

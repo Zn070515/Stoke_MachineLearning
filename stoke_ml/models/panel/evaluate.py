@@ -461,11 +461,13 @@ def _run_sleeve_sim(
                             "mode": mode,
                             "entry_price": float(open_np[j, c]),
                             "entry_value": ej,
+                            "executed_weight": float(ej),
                             "shares": float(sl["shares"][j]),
                             "scheduled_exit_day": int(sl["scheduled_exit_day"]),
                             "actual_exit_day": d,
                             "exit_status": "clean" if is_clean[j] else "delayed",
                             "exit_price": float(ex_price[j]),
+                            "realized_return": float((xj - ej) / ej) if ej > 0 else 0.0,
                             "gross_pnl": float(side * (xj - ej)),
                             "entry_cost": cost * ej,
                             "exit_cost": cost * abs(xj),
@@ -578,11 +580,13 @@ def _run_sleeve_sim(
                         "mode": mode,
                         "entry_price": float(open_np[j, c]),
                         "entry_value": ej,
+                        "executed_weight": float(ej),
                         "shares": float(sl["shares"][j]),
                         "scheduled_exit_day": int(sl["scheduled_exit_day"]),
                         "actual_exit_day": int(Wp - 1),
                         "exit_status": "unresolved",
                         "exit_price": float(last_close[j]),
+                        "realized_return": float((xj - ej) / ej) if ej > 0 else 0.0,
                         "gross_pnl": float(side * (xj - ej)),
                         "entry_cost": cost * ej,
                         "exit_cost": 0.0,
@@ -625,6 +629,10 @@ def _run_sleeve_sim(
 
     return {
         "daily": net_daily,
+        # The account's final mark, exposed so a consumer can verify the
+        # identity prod(1+daily) == final_nav WITHOUT recomputing nav_close
+        # (review v8 P0-1) — the strongest cross-check a backtest can carry.
+        "final_nav": float(nav_close) if np.isfinite(nav_close) else None,
         "exit_stats": {
             "counts": exit_counts,
             "pnl": {k: float(v) for k, v in exit_pnl.items()},

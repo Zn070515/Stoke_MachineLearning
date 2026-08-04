@@ -175,7 +175,7 @@
 | 术语 | 含义 |
 |------|------|
 | Panel | (N_stocks, T_timesteps, D_features) 三维数组，区别于单stock (T, D) |
-| Static features | 时不变特征 (5维)：上市天数、所属交易所等 |
+| Static features | PIT 静态特征 (4维)：price_60d_q / amt_60d_q（60日滚动均值的截面分位）/ listing_days / board_code。全部可由决策日已知数据推导（v8 §三-2）。~~industry_code~~ 已排除：唯一可用的 stock→industry 映射是当前快照（sector_map.json / stock_sector_cache.csv），无 PIT 成分历史，作静态特征会把今日分类回填到历史行 |
 | Past Known (PK) | 已知历史特征 (255维)：价格、技术指标、情感、资金流等，含close用于target计算 |
 | Past Observed (PO) | 观测历史特征 (1418维)：换手率、振幅、涨跌幅等，不含close。维度由当前预构建特征面板动态决定 |
 | Cross-sectional normalization | 跨股票截面归一化：按日期 groupby → z-score，解决不同股票量纲差异 |
@@ -269,6 +269,8 @@
 - ~~随机打乱时序数据~~ → 必须用 WalkForwardSplitter，按时间顺序拆分
 - ~~用收盘价预测收盘价~~ → 预测的是次日涨跌**方向**（0/1），不是价格
 - ~~在全部数据上 fit StandardScaler~~ → 只在训练窗口上 fit，验证窗口仅 transform
+- ~~在全量历史上算 normalization 再拿去训练早期窗口~~ → 已审计（v8 §三-1）：所有 scaler/normalizer 均为 PIT 安全——CrossSectionNormalizer 按日期截面、RobustScaler/OutlierDetector 按滚动/回溯窗口、MissingImputer 因果插值，fit 均无状态；每个 `PreprocessingStep` 记录 `fit_start`/`fit_end`（fit 输入日期范围），`tests/preprocessing/test_pit_fit_range.py` 用「追加未来行不改过去输出」的截断不变性测试兜底
+- ~~static 特征用"现在回填历史"的值~~ → 已审计（v8 §三-2）：static 4 维全部由决策日已知数据推导（price_60d_q/amt_60d_q=60日滚动均值→截面分位、listing_days、board_code），财务/估值列（pe/pb/roe…）经 disclose_date 前向填充 + `_batch_fill_shift` 滞后 1 日 + 滚动 252 日分位（`FundamentalRefiner`），均为 PIT；`industry_code` 因无 PIT 成分历史源（`sector_map.json`/`stock_sector_cache.csv` 只是当前快照）已从 `_PIT_STATIC_COLS` 移除，`tests/features/test_static_feature_pit.py` 用截断不变性 + 滞后性测试兜底
 - ~~"情绪分析"~~ → 统一用"情感分析"（sentiment）
 - ~~裸 `python`~~ → 必须 `PYTHONPATH=. ./.venv/Scripts/python`（系统 Anaconda 缺依赖）
 - ~~用 `use_limit_up=True`~~ → limit-up 生态 19 列已定义但未接线（`use_limit_up=False`），勿在训练中开启

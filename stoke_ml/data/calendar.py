@@ -8,6 +8,8 @@ exchange holiday notices.  The calendar is therefore just: weekdays MINUS
 official holiday closures.  Review v6 §五.
 """
 import datetime as dt
+import pathlib
+
 import pandas as pd
 
 
@@ -257,11 +259,25 @@ class TradingCalendar:
 
     HOLIDAYS = {"a_shares": A_SHARES_HOLIDAYS, "us": US_HOLIDAYS_2024}
 
-    def __init__(self, market: str = "a_shares"):
+    def __init__(
+        self,
+        market: str = "a_shares",
+        calendar_dir: str | pathlib.Path | None = None,
+    ):
         if market not in self.HOLIDAYS:
             raise ValueError(f"Unknown market: {market}. Choose: a_shares, us")
         self.market = market
         self._holidays = self.HOLIDAYS[market]
+        # review v8 §二-3: the A-share calendar is the EXCHANGE-published
+        # calendar, not "workdays minus holidays".  When an externally-published
+        # calendar artifact (exchange_calendar/{market}.parquet) is supplied it
+        # becomes the authoritative source of truth; the hardcoded holiday set
+        # is the fallback (and the generator for the artifact).  Every consumer
+        # goes through this one calendar, so a data-driven correction never
+        # requires touching code.
+        self._external = None
+        if calendar_dir is not None:
+            self._external = load_calendar(calendar_dir, market)
 
     def get_trading_days(
         self, start: str | dt.date, end: str | dt.date
@@ -270,13 +286,26 @@ class TradingCalendar:
             start = dt.date.fromisoformat(start)
         if isinstance(end, str):
             end = dt.date.fromisoformat(end)
-        # Weekdays only (pd.bdate_range already drops weekends); A-shares never
-        # trade on weekends, even on 调休 makeup workdays.  Then drop official
-        # holiday closures.
+        if self._external is not None:
+            f = self._external
+            lo, hi = f["date"].min().date(), f["date"].max().date()
+            if start >= lo and end <= hi:
+                m = ((f["date"].dt.date >= start) & (f["date"].dt.date <= end)
+                     & f["is_open"])
+                return f.loc[m, "date"].dt.date.tolist()
+        # Fallback (also covers ranges outside the external window): weekdays
+        # only (pd.bdate_range drops weekends — A-shares never trade on
+        # weekends, even on 调休 makeup workdays) minus holiday closures.
         dates = pd.bdate_range(start=start, end=end).date
         return [d for d in dates if d not in self._holidays]
 
     def is_trading_day(self, date: dt.date) -> bool:
+        if self._external is not None:
+            f = self._external
+            if f["date"].min().date() <= date <= f["date"].max().date():
+                hit = f.loc[f["date"].dt.date == date, "is_open"]
+                if not hit.empty:
+                    return bool(hit.iloc[0])
         if date.weekday() >= 5:
             return False
         if date in self._holidays:
@@ -288,3 +317,110 @@ class TradingCalendar:
         while not self.is_trading_day(candidate):
             candidate += dt.timedelta(days=1)
         return candidate
+
+
+# ── External calendar artifact (review v8 §二-3) ─────────────────────────────
+# The calendar is published as a self-describing parquet so consumers never
+# parse holiday rules themselves.  `build_calendar_frame` materializes it from
+# the verified holiday set; `save_calendar`/`load_calendar` persist and read
+# it; `validate_calendar` cross-checks an on-disk artifact against the
+# generator so a drifted calendar surfaces loudly (mirrors the repo's
+# docs-vs-code drift guard).
+
+# Window covered by the materialized artifact.  Wide enough to stay
+# authoritative for every range real data can ask (2000-2026) plus the forward
+# estimates; queries outside it transparently fall back to the code formula.
+CALENDAR_WINDOW = (dt.date(2000, 1, 1), dt.date(2030, 12, 31))
+
+_CALENDAR_SCHEMA = {"date", "is_open", "exchange", "source", "version"}
+_EXCHANGE_NAMES = {"a_shares": "SSE/SZSE/BSE", "us": "NYSE/NASDAQ"}
+_CALENDAR_SOURCES = {
+    "a_shares": "sse/szse/bse_notices+verified_stored_bars",
+    "us": "nyse_nasdaq_published_schedule",
+}
+
+
+def _calendar_path(data_dir: str | pathlib.Path, market: str = "a_shares") -> pathlib.Path:
+    return pathlib.Path(data_dir) / "exchange_calendar" / f"{market}.parquet"
+
+
+def build_calendar_frame(market: str = "a_shares") -> pd.DataFrame:
+    """Materialize the full trading calendar as a self-describing frame.
+
+    One row per weekday in CALENDAR_WINDOW with the exact schema an external
+    exchange-calendar feed would carry: date / is_open / exchange / source /
+    version.  The code holiday set (verified against official exchange notices
+    and stored bars) is the generator; the persisted parquet is the artifact
+    all modules read.
+    """
+    if market not in TradingCalendar.HOLIDAYS:
+        raise ValueError(f"Unknown market: {market}. Choose: a_shares, us")
+    lo, hi = CALENDAR_WINDOW
+    days = pd.bdate_range(start=lo, end=hi).date
+    closed = TradingCalendar.HOLIDAYS[market]
+    return pd.DataFrame({
+        "date": pd.Series(days, dtype="datetime64[ns]"),
+        "is_open": [d not in closed for d in days],
+        "exchange": _EXCHANGE_NAMES[market],
+        "source": _CALENDAR_SOURCES[market],
+        "version": TradingCalendar.CALENDAR_VERSION,
+    })
+
+
+def save_calendar(data_dir: str | pathlib.Path, market: str = "a_shares") -> pathlib.Path:
+    """Persist the calendar artifact; returns the written path."""
+    path = _calendar_path(data_dir, market)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    build_calendar_frame(market).to_parquet(path, index=False)
+    return path
+
+
+def load_calendar(
+    data_dir: str | pathlib.Path, market: str = "a_shares"
+) -> pd.DataFrame | None:
+    """Read the external calendar artifact, or None if it is absent.
+
+    A present-but-malformed artifact raises — silently trusting a corrupted
+    calendar is worse than failing loudly, since every downstream module would
+    inherit the wrong trading days.
+    """
+    path = _calendar_path(data_dir, market)
+    if not path.exists():
+        return None
+    frame = pd.read_parquet(path)
+    missing = _CALENDAR_SCHEMA - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"calendar artifact {path} missing columns {sorted(missing)}")
+    if frame["date"].duplicated().any():
+        raise ValueError(f"calendar artifact {path} has duplicate dates")
+    return frame
+
+
+def validate_calendar(
+    data_dir: str | pathlib.Path, market: str = "a_shares"
+) -> dict:
+    """Cross-check a persisted calendar artifact against the code-derived frame.
+
+    Returns a report dict (never raises on mismatch).  A persisted calendar
+    that disagrees with the verified generator is a real inconsistency that
+    must surface.
+    """
+    path = _calendar_path(data_dir, market)
+    if not path.exists():
+        return {"path": str(path), "exists": False, "trading_days": 0,
+                "mismatches": 0, "ok": False, "reason": "artifact not present"}
+    on_disk = load_calendar(data_dir, market)
+    derived = build_calendar_frame(market)
+    merged = on_disk.merge(derived[["date", "is_open"]], on="date",
+                           suffixes=("_disk", "_derived"))
+    mismatch = merged[merged["is_open_disk"] != merged["is_open_derived"]]
+    return {
+        "path": str(path),
+        "exists": True,
+        "trading_days": int(on_disk["is_open"].sum()),
+        "mismatches": int(len(mismatch)),
+        "ok": bool(len(mismatch) == 0),
+        "reason": ("" if len(mismatch) == 0
+                   else f"{len(mismatch)} date(s) disagree with the generator"),
+    }

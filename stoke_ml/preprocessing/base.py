@@ -12,10 +12,23 @@ import inspect
 
 
 class PreprocessingStep(ABC):
-    """One preprocessing operation with fit/transform/fit_transform."""
+    """One preprocessing operation with fit/transform/fit_transform.
+
+    Every step records ``fit_start`` / ``fit_end`` — the date range of the
+    data it was last fit on (None until first fit) — so a reviewer can audit
+    that no step was fit over full history instead of per-fold (v8 §三-1).
+    PIT-safe steps (per-date / rolling normalizers) leave fit() stateless and
+    compute statistics point-in-time inside transform(); the recorded range
+    documents the caller's fit discipline.
+    """
+
+    # PIT fit-range provenance, set by _record_fit_range() during fit().
+    fit_start = None
+    fit_end = None
 
     def fit(self, df, **kwargs):
         """Learn parameters from *df*. Default is no-op, return self."""
+        self._record_fit_range(df)
         return self
 
     @abstractmethod
@@ -27,6 +40,13 @@ class PreprocessingStep(ABC):
         """Fit then transform in one call."""
         self.fit(df, **kwargs)
         return self.transform(df, **kwargs)
+
+    def _record_fit_range(self, df):
+        """Store min/max date of *df* as fit_start/fit_end for auditing."""
+        lo, hi = _frame_date_range(df)
+        if lo is not None:
+            self.fit_start = lo
+            self.fit_end = hi
 
     def __repr__(self) -> str:
         init_params = _init_param_repr(self)
@@ -46,9 +66,12 @@ class PreprocessingChain(PreprocessingStep):
     def __init__(self, steps=None, name="chain"):
         self.steps = list(steps or [])
         self.name = name
+        self.fit_start = None
+        self.fit_end = None
 
     def fit(self, df, **kwargs):
         current = df.copy()
+        self._record_fit_range(current)
         for step in self.steps:
             step.fit(current, **kwargs)
             current = step.transform(current, **kwargs)
@@ -86,6 +109,28 @@ class PreprocessingChain(PreprocessingStep):
     def __repr__(self) -> str:
         step_names = " → ".join(type(s).__name__ for s in self.steps)
         return f"PreprocessingChain('{self.name}': {step_names or 'empty'})"
+
+
+def _frame_date_range(df):
+    """Return (min_date, max_date) of *df* via its 'date' column or DatetimeIndex.
+
+    Returns (None, None) when no date axis is available, so fit provenance is
+    simply not recorded for row-id-indexed frames.
+    """
+    import pandas as pd
+
+    if df is None:
+        return None, None
+    if "date" in getattr(df, "columns", ()):
+        dates = df["date"]
+    elif isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+        dates = df.index
+    else:
+        return None, None
+    try:
+        return dates.min(), dates.max()
+    except (TypeError, ValueError):
+        return None, None
 
 
 def _init_param_repr(obj) -> str:

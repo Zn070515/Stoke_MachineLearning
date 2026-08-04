@@ -183,7 +183,7 @@ FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_u
 
 **预构建特征**: 5530 只股票 × 3744 列/股（516 基础 + 3228 时序展开），共 109GB，存于 `data/features/{code}.parquet`。XGBoost flat 模式再按窗口展平，维度极易爆炸——建议按 IC 预筛 top-K 特征。
 
-**Panel 格式**: 255 PastKnown + 1418 PastObserved + 5 Static = 1678 features × 60 seq_len. 跨股票截面归一化 (per-date z-score). 维度由当前预构建特征面板决定，训练时从数据自动推导。
+**Panel 格式**: 255 PastKnown + 1418 PastObserved + 4 Static = 1677 features × 60 seq_len. 跨股票截面归一化 (per-date z-score). 维度由当前预构建特征面板决定，训练时从数据自动推导。
 
 ### 预构建特征 (data/features/)
 
@@ -324,7 +324,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 
 ## 测试
 
-~39 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
+~46 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q

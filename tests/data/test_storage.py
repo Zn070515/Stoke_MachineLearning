@@ -1,10 +1,14 @@
-"""DataStorage flat-canonical tests (review v7 §五).
+"""DataStorage flat-canonical tests (review v7 §五 + v8 §二-1).
 
 The canonical store is a single flat ``daily/{code}.parquet`` per stock.
 ``save_daily`` is NON-destructive: read existing flat, merge by date, dedup,
 sort, atomically replace under a per-file lock.  ``load_daily`` reads only the
 flat file; legacy year/month partition directories on disk are ignored (never
 read, never written).  ``list_stocks`` discovers codes from flat files only.
+
+Each parquet carries a sidecar ``daily/{code}.manifest.json`` (review v8 §二-1)
+pinning stock / start / end / rows / source / adjust / schema hash so "file
+exists" never silently implies "data complete".
 """
 import os
 
@@ -146,6 +150,77 @@ class TestListStocks:
         with open(os.path.join(base, "README.txt"), "w", encoding="utf-8") as f:
             f.write("x")
         assert store.list_stocks() == ["000001"]
+
+
+class TestManifest:
+    """review v8 §二-1: save_daily writes a per-stock contract manifest and the
+    storage can validate that the on-disk parquet still matches it.  The whole
+    point: "file exists" must never silently imply "data complete"."""
+
+    def test_save_writes_full_manifest(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df = _frame(["2024-01-05", "2024-01-06"])
+        df.attrs["source"] = "efinance"
+        df.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(df)
+        m = store.manifest("000001")
+        assert m is not None
+        assert m["stock"] == "000001"
+        assert m["start"] == "2024-01-05"
+        assert m["end"] == "2024-01-06"
+        assert m["rows"] == 2
+        assert m["source"] == "efinance"
+        assert m["adjust"] == "qfq"
+        assert len(m["schema_hash"]) == 16
+        assert "updated" in m
+
+    def test_incremental_merge_updates_manifest(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-07", "2024-01-08"]))
+        m = store.manifest("000001")
+        assert m["rows"] == 4
+        assert m["start"] == "2024-01-05" and m["end"] == "2024-01-08"
+
+    def test_validate_ok_after_save(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        report = store.validate_manifest("000001")
+        assert report["ok"], report
+        assert report["exists"] and report["mismatches"] == []
+
+    def test_validate_flags_missing_manifest(self, tmp_path):
+        # A bare parquet with no manifest is NOT "complete" — validate must say so.
+        _write_flat(tmp_path, "000001", ["2024-01-05"], closes=[10.0])
+        report = DataStorage(str(tmp_path)).validate_manifest("000001")
+        assert not report["ok"]
+        assert report["reason"] == "manifest missing — file exists ≠ data complete"
+
+    def test_validate_flags_schema_drift(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05"]))
+        # Drop a column directly on disk → schema_hash no longer matches.
+        path = os.path.join(str(tmp_path), "a_shares", "daily", "000001.parquet")
+        df = pd.read_parquet(path).drop(columns=["amount"])
+        df.to_parquet(path, index=False)
+        report = store.validate_manifest("000001")
+        assert not report["ok"]
+        assert any("schema_hash" in m for m in report["mismatches"]), report
+
+    def test_validate_flags_row_drift(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        # Overwrite the parquet with fewer rows behind the manifest's back.
+        path = os.path.join(str(tmp_path), "a_shares", "daily", "000001.parquet")
+        _frame(["2024-01-05"], code="000001").to_parquet(path, index=False)
+        report = store.validate_manifest("000001")
+        assert not report["ok"]
+        assert any("rows" in m for m in report["mismatches"]), report
+
+    def test_manifest_none_for_missing_stock(self, tmp_path):
+        assert DataStorage(str(tmp_path)).manifest("600519") is None
+        report = DataStorage(str(tmp_path)).validate_manifest("600519")
+        assert not report["ok"] and report["reason"] == "parquet missing"
 
 
 class TestPartitionLock:

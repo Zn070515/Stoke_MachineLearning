@@ -29,7 +29,7 @@ class MissingImputer(PreprocessingStep):
         self.medium_gap_method = medium_gap_method
 
     def fit(self, df, **kwargs):
-        return self
+        return super().fit(df, **kwargs)
 
     def transform(self, df, **kwargs):
         if df.empty:

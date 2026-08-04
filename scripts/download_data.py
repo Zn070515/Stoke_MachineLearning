@@ -7,8 +7,10 @@ import time
 from datetime import datetime
 
 import akshare as ak
+import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.download_manifest import default_path, write_manifest
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.sources.a_shares.failover import AShareDownloader
 
@@ -82,6 +84,9 @@ def main():
                         help="Download ALL A-shares (~5500 stocks)")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip stocks already in data/a_shares/daily/")
+    parser.add_argument("--require-complete", action="store_true",
+                        help="Exit non-zero if any requested stock is missing "
+                             "after the run (review v8 §二-2 anti-fake-complete)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -113,6 +118,7 @@ def main():
 
     logger.info("Downloading %d stocks from %s to %s", len(codes), start_date, end_date)
     success, fail = 0, 0
+    failed_codes: list[str] = []
 
     for i, code in enumerate(codes):
         if i > 0:
@@ -124,6 +130,7 @@ def main():
         if df.empty:
             logger.warning("  %s: EMPTY (all sources failed)", code)
             fail += 1
+            failed_codes.append(code)
             continue
 
         storage.save_daily(df)
@@ -133,9 +140,36 @@ def main():
                      dates.max().strftime("%Y-%m-%d"))
         success += 1
 
-    logger.info("Done: %d success, %d fail, %d skip", success, fail, n_skipped)
+    # Persist the download manifest so a PARTIAL run cannot pass for complete
+    # (review v8 §二-2): requested vs success vs failed vs missing is written to
+    # disk and the summary below reports `all_complete` explicitly.
+    _, on_disk = filter_existing(codes, cfg.project.data_dir)
+    manifest = write_manifest(
+        default_path(cfg.project.data_dir),
+        market="a_shares",
+        start_date=start_date,
+        end_date=end_date,
+        requested=codes,
+        failed=failed_codes,
+        on_disk=on_disk,
+        success_count=success,
+        skipped_existing_count=n_skipped,
+    )
+    logger.info("Download manifest: %s", default_path(cfg.project.data_dir))
+    logger.info("Requested=%d success=%d failed=%d missing=%d all_complete=%s",
+                manifest["requested_count"], manifest["success_count"],
+                manifest["failed_count"], manifest["missing_count"],
+                manifest["all_complete"])
+    if manifest["missing"]:
+        logger.warning("MISSING %d stock(s) requested but not on disk: %s",
+                       len(manifest["missing"]),
+                       ", ".join(manifest["missing"][:20])
+                       + (" ..." if len(manifest["missing"]) > 20 else ""))
+    if args.require_complete and not manifest["all_complete"]:
+        logger.error("--require-complete set but %d stock(s) missing",
+                     manifest["missing_count"])
+        sys.exit(2)
 
 
 if __name__ == "__main__":
-    import pandas as pd
     main()

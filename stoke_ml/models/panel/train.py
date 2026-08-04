@@ -14,6 +14,8 @@ from stoke_ml.models.panel.model import PanelModel
 from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, PairwiseRankingLoss
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateGroupedSampler
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from scipy.stats import spearmanr
+
 from stoke_ml.models.panel.evaluate import evaluate_portfolio
 
 logger = logging.getLogger(__name__)
@@ -45,12 +47,16 @@ def _compute_val_loss(
     device: torch.device,
     use_amp: bool,
     vol_enabled: bool = True,
-) -> tuple[float, float, float, float]:
-    """Validation loss accumulated per VALID SAMPLE, not per batch.
+) -> tuple[float, float, float, float, float]:
+    """Validation metrics accumulated per VALID SAMPLE, not per batch.
 
     Review v4 §九: sparse batches (few clean targets) must not weigh the same
-    as dense ones — the checkpoint-selection metric v_ret is a sample-weighted
-    mean over all valid return targets across the whole validation loader.
+    as dense ones — each task loss is a sample-weighted mean over all valid
+    targets across the whole validation loader.  The final element is the
+    per-date cross-sectional Spearman RankIC of predicted vs actual returns
+    (review v8 §四-1): the PRIMARY checkpoint-selection metric.  RankIC is
+    accumulated over all valid return samples and grouped by date afterwards,
+    so like the sample-weighted losses it is independent of batch boundaries.
     """
     model.eval()
     n_batches = 0
@@ -60,9 +66,11 @@ def _compute_val_loss(
     uncer_num = uncer_den = 0.0
     nan_batches = 0
     skipped_batches = 0
+    # Per-date (pred, actual) return pairs over valid ret samples, for RankIC.
+    rank_by_date: dict[int, tuple[list[float], list[float]]] = {}
     with torch.no_grad():
         for batch in val_loader:
-            static, pk, po, y_dir, y_ret, y_vol, _date_idx, dir_mask, ret_mask, vol_mask = batch
+            static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -109,6 +117,16 @@ def _compute_val_loss(
                     ))
                     counts.append(int(ret_valid.sum().item()))
                     active.append(True)
+                    # RankIC accumulation (review v8 §四-1): keep the
+                    # (pred, actual, date) triple of every valid return sample.
+                    pr = pred_ret.squeeze(-1)[ret_valid].detach().cpu()
+                    yr = y_ret[ret_valid].detach().cpu()
+                    dd = date_idx[ret_valid.cpu()]
+                    for k in range(pr.shape[0]):
+                        d = int(dd[k])
+                        rank_by_date.setdefault(d, ([], []))
+                        rank_by_date[d][0].append(float(pr[k]))
+                        rank_by_date[d][1].append(float(yr[k]))
                 else:
                     losses_elem.append(torch.zeros((), device=device))
                     counts.append(0)
@@ -161,11 +179,26 @@ def _compute_val_loss(
         )
     model.train()
     if uncer_den == 0:
-        return float("inf"), float("inf"), float("inf"), float("inf")
+        return float("inf"), float("inf"), float("inf"), float("inf"), float("nan")
     v_ce = ce_sum / ce_cnt if ce_cnt > 0 else float("inf")
     v_ret = ret_sum / ret_cnt if ret_cnt > 0 else float("inf")
     v_vol = vol_sum / vol_cnt if vol_cnt > 0 else float("inf")
-    return uncer_num / uncer_den, v_ce, v_ret, v_vol
+    # Per-date Spearman rank IC, then mean across dates (mirrors evaluate.py's
+    # clean-IC definition: rank correlation per day, skipped when the day has
+    # <2 valid samples or a constant pred/actual).
+    ics = []
+    for prs, yrs in rank_by_date.values():
+        if len(prs) < 2:
+            continue
+        p = np.asarray(prs)
+        a = np.asarray(yrs)
+        if np.unique(p).size < 2 or np.unique(a).size < 2:
+            continue
+        rho, _ = spearmanr(p, a)
+        if np.isfinite(rho):
+            ics.append(rho)
+    v_rankic = float(np.mean(ics)) if ics else float("nan")
+    return uncer_num / uncer_den, v_ce, v_ret, v_vol, v_rankic
 
 
 def _log_gradient_norms(model: nn.Module, epoch: int) -> None:
@@ -277,10 +310,11 @@ def train_panel(
         if not any(head_n in n for head_n in head_param_names)
     ]
 
-    # Checkpoint selection uses the FIXED return loss, not the learned-weighted
-    # total — the uncertainty log_vars are trainable parameters the model can
-    # inflate to shrink the total without improving return prediction.
-    best_val_ret = float("inf")
+    # Checkpoint selection (review v8 §四-1) runs on validation RANKIC, never
+    # the total loss: the uncertainty log_vars and rank-loss weight are
+    # tunable, so a loss-weighted selection drifts as those weights change.
+    # The per-task losses are logged as auxiliary traces only.
+    best_val_rankic = float("-inf")
     best_state = None
     best_epoch_idx = 0
     patience_counter = 0
@@ -422,19 +456,26 @@ def train_panel(
         avg_loss = epoch_loss / n_batches
         history["train_loss"].append(avg_loss)
 
-        val_loss, v_ce, v_ret, v_vol = _compute_val_loss(
+        val_loss, v_ce, v_ret, v_vol, v_rankic = _compute_val_loss(
             model, val_loader, ret_loss, loss_fn, device, use_amp,
             vol_enabled=vol_enabled,
         )
         history["val_loss"].append(val_loss)
         history.setdefault("val_ret", []).append(v_ret)
+        history.setdefault("val_rankic", []).append(v_rankic)
 
         # Step scheduler AFTER optimizer updates (PyTorch >=1.1 requirement).
         # Called here at epoch end since this is an epoch-level scheduler.
         scheduler.step()
 
-        if v_ret < best_val_ret:
-            best_val_ret = v_ret
+        # Primary selection metric = validation RankIC (maximize).  A NaN
+        # RankIC (degenerate val set: <2 valid samples per day) is not a
+        # regression — keep the last best without advancing the patience
+        # counter so early stopping never fires on missing signal.
+        if not np.isfinite(v_rankic):
+            pass
+        elif v_rankic > best_val_rankic:
+            best_val_rankic = v_rankic
             best_epoch_idx = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
@@ -460,11 +501,11 @@ def train_panel(
             history["val_metrics"].append(m)
             history["val_eval_epochs"].append(epoch + 1)
             logger.info(
-                "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f "
-                "pairs=%d IC=%.4f(IR=%.2f) LS_Sharpe=%.2f[%.1f,%.1f] "
-                "Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
+                "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) "
+                "RankIC=%.4f rank=%.6f pairs=%d IC=%.4f(IR=%.2f) "
+                "LS_Sharpe=%.2f[%.1f,%.1f] Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
                 epoch + 1, config.max_epochs, avg_loss, val_loss,
-                v_ce, v_ret, v_vol,
+                v_ce, v_ret, v_vol, v_rankic,
                 epoch_rank_loss / n_batches,
                 epoch_rank_pairs,
                 ic_mean, m["ic_ir"],
@@ -472,22 +513,24 @@ def train_panel(
                 m["long_sharpe"], m["q5mq1_ret"] * 10000,
                 optimizer.param_groups[0]["lr"])
         else:
-            logger.info("Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) rank=%.6f pairs=%d lr=%.2e",
-                        epoch + 1, config.max_epochs, avg_loss, val_loss,
-                        v_ce, v_ret, v_vol,
-                        epoch_rank_loss / n_batches,
-                        epoch_rank_pairs,
-                        optimizer.param_groups[0]["lr"])
+            logger.info(
+                "Epoch %d/%d: loss=%.4f val=%.4f(CE=%.3f R=%.3f V=%.5f) "
+                "RankIC=%.4f rank=%.6f pairs=%d lr=%.2e",
+                epoch + 1, config.max_epochs, avg_loss, val_loss,
+                v_ce, v_ret, v_vol, v_rankic,
+                epoch_rank_loss / n_batches,
+                epoch_rank_pairs,
+                optimizer.param_groups[0]["lr"])
 
         if patience_counter >= config.early_stop_patience:
-            logger.info("Early stopping at epoch %d (best val_ret=%.6f)",
-                        epoch + 1, best_val_ret)
+            logger.info("Early stopping at epoch %d (best val_rankic=%.4f)",
+                        epoch + 1, best_val_rankic)
             break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     history["best_epoch_idx"] = best_epoch_idx
-    # Exact portfolio evaluation on the deployed best-val-loss checkpoint.
+    # Exact portfolio evaluation on the deployed best-val-RankIC checkpoint.
     # The in-loop val_metrics snapshots are taken at each eval epoch from
     # whatever model was current then, which may differ from best_state —
     # reporting those is the "nearest epoch proxy" the review flags.  Compute

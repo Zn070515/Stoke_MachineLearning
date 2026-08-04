@@ -72,6 +72,7 @@ class TopicModeler(PreprocessingStep):
             source: Name used in cache filename (e.g. ``"news"``, ``"guba"``).
             force_retrain: If True, ignore cached model.
         """
+        self._record_fit_range(df)
         if df.empty or not self._enabled:
             return self
 

@@ -30,7 +30,7 @@ class RobustScaler(PreprocessingStep):
         self.min_periods = min_periods
 
     def fit(self, df, **kwargs):
-        return self
+        return super().fit(df, **kwargs)
 
     def transform(self, df, **kwargs):
         if df.empty:

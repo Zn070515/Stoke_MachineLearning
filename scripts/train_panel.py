@@ -642,12 +642,31 @@ def _experiment_version(
                 src.update(str(source_files[name].get("hash")).encode())
                 src.update(b";")
 
+    # Model hash (review v8 §五-2): content-addressed over the architecture
+    # source + the PanelConfig hyper-parameters, so an OOS tape row records
+    # exactly which model produced it — config change or arch edit flips it.
+    model_h = hashlib.sha1()
+    model_h.update(repr(config).encode("utf-8"))
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for rel in ("stoke_ml/models/panel/model.py",
+                "stoke_ml/models/panel/vsn.py",
+                "stoke_ml/models/panel/xlstm.py",
+                "stoke_ml/models/panel/heads.py",
+                "stoke_ml/models/panel/config.py",
+                "stoke_ml/models/panel/loss.py"):
+        fp = cache_manifest.file_fingerprint(os.path.join(_root, rel)) or "absent"
+        model_h.update(rel.encode("utf-8"))
+        model_h.update(b"=")
+        model_h.update(fp.encode("utf-8"))
+        model_h.update(b";")
+
     return {
         "git_commit": cache_manifest.git_head(),
         "data_manifest_hash": src.hexdigest()[:16],
         "calendar_version": TradingCalendar.CALENDAR_VERSION,
         "feature_schema_hash": feat.hexdigest()[:16],
         "universe_hash": _sha1("\n".join(sorted(universe_used))),
+        "model_hash": model_h.hexdigest()[:16],
         "evaluator_version": EVALUATOR_VERSION,
         "cost_model": f"sleeve per-side txn_cost={config.txn_cost}, top_fraction=0.1",
         "random_seed": seed,
@@ -1233,6 +1252,10 @@ def main():
                 seq_len=config.seq_len,
                 top_fraction=0.1,
                 cost=config.txn_cost,
+                # review v8 §五-2: a tape row must identify the data + model
+                # that produced it, so every return number is traceable.
+                data_version=version_info["data_manifest_hash"],
+                model_hash=version_info["model_hash"],
             )
             # Per-position ledger (review v7 §九.2): the exact fills the long
             # sleeve account made — entry/exit price, exit status, gross/net
@@ -1250,13 +1273,18 @@ def main():
                 ldf["candidate_eligible"] = pool[si, di]
                 ldf["entry_eligible"] = elig[si, di]
                 ldf["fold"] = fold
+                # review v8 §五-2: data/model provenance columns on every tape
+                # row — realized return + executed weight make the P&L fully
+                # recomputable from prices alone.
+                ldf["data_version"] = version_info["data_manifest_hash"]
+                ldf["model_hash"] = version_info["model_hash"]
                 ldf = ldf[["fold", "entry_day", "entry_date", "stock",
                            "stock_code", "mode", "prediction",
                            "candidate_eligible", "entry_eligible",
-                           "entry_price", "entry_value", "shares",
-                           "scheduled_exit_day", "actual_exit_day",
-                           "exit_status", "exit_price", "gross_pnl",
-                           "entry_cost", "exit_cost", "net_pnl"]]
+                           "entry_price", "entry_value", "executed_weight",
+                           "shares", "scheduled_exit_day", "actual_exit_day",
+                           "exit_status", "exit_price", "realized_return",
+                           "gross_pnl", "entry_cost", "exit_cost", "net_pnl"]]
                 ledger_path = os.path.join(oos_dir, f"fold_{fold:03d}_ledger.parquet")
                 ldf.to_parquet(ledger_path)
                 oos_ledgers.append(ldf)
@@ -1331,6 +1359,10 @@ def main():
             # history, review v4 §三) — review v7 §九.2: a tape must expose the
             # candidate set it was built from, not only the selected fills.
             "candidate_eligible": np.concatenate(oos_pool_all),
+            # Provenance (review v8 §五-2): data + model versions so every tape
+            # row is traceable to the exact experiment it was produced by.
+            "data_version": version_info["data_manifest_hash"],
+            "model_hash": version_info["model_hash"],
         })
         oos_series_path = os.path.join(outdir, "oos_series.parquet")
         oos_series.to_parquet(oos_series_path)

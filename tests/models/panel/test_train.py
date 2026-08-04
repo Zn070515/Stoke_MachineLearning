@@ -173,15 +173,22 @@ class TestValLossBatchSizeInvariant:
         data, config, model, ret_loss, loss_fn = self._model_and_losses()
         device = torch.device("cpu")
         rets = []
+        rankics = []
         for bs in (32, 64, 128):
             ds = PanelDataset(data, seq_len=config.seq_len,
                               min_history=config.min_history)
             loader = DataLoader(ds, batch_size=bs, shuffle=False,
                                 collate_fn=panel_collate, num_workers=0)
-            _, _, v_ret, _ = _compute_val_loss(
+            _, _, v_ret, _, v_rankic = _compute_val_loss(
                 model, loader, ret_loss, loss_fn, device,
                 use_amp=False, vol_enabled=True,
             )
             assert np.isfinite(v_ret)
+            assert np.isfinite(v_rankic), "RankIC must be computable on a normal panel"
             rets.append(v_ret)
+            rankics.append(v_rankic)
         assert max(rets) - min(rets) < 1e-5, rets
+        # RankIC is accumulated over all valid samples and grouped by date at
+        # the end, so like v_ret it must be independent of batch boundaries —
+        # the primary checkpoint-selection metric must not shift with batching.
+        assert max(rankics) - min(rankics) < 1e-12, rankics
