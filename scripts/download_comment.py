@@ -19,7 +19,11 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.comment_storage import CommentStorage
-from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
+from stoke_ml.data.download_resume import (
+    evidence_says_complete,
+    mark_stock_result,
+    skip_completed_stocks,
+)
 from stoke_ml.data.sources.a_shares.comment_source import CommentSource
 
 logging.basicConfig(
@@ -103,6 +107,9 @@ def main():
 
     logger.info("Downloading 30-day comment history for %d stocks...", len(codes))
     success = 0
+    partial = 0
+    empty = 0
+    fail = 0
     for i, code in enumerate(codes):
         if i > 0:
             time.sleep(args.sleep)
@@ -115,19 +122,34 @@ def main():
                     comment_dir, code, df, dataset="comment_sentiment",
                     source="efinance",
                 )
+                empty += 1
                 continue
             storage.save_daily(df)
+            # Single non-paginated per-stock call returns the complete record
+            # set the provider holds -> dense range guarantee.
             mark_stock_result(
                 comment_dir, code, df, dataset="comment_sentiment",
-                source="efinance",
+                source="efinance", provider_range_guaranteed=True,
             )
-            success += 1
+            if evidence_says_complete(df, provider_range_guaranteed=True):
+                success += 1
+            else:
+                partial += 1
             if success % 100 == 0:
                 logger.info("[%d/%d] %s: %d days", i + 1, len(codes), code, len(df))
         except Exception as e:
             logger.debug("[%d/%d] %s: ERROR %s", i + 1, len(codes), code, e)
+            fail += 1
 
-    logger.info("Done: %d/%d stocks with comment history", success, len(codes))
+    logger.info("Done: %d complete, %d partial, %d empty, %d fail / %d stocks",
+                success, partial, empty, fail, len(codes))
+
+    # Exit code reflects the outcome — 0 all good, 1 fetch failures,
+    # 2 any partial/degraded (empty) result.
+    if fail:
+        sys.exit(1)
+    if partial or empty:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -41,25 +41,41 @@ class NewsPipeline:
         end_date: str | None = None,
         max_pages: int = 3,
         fetch_bodies: bool = True,
+        meta: dict | None = None,
     ) -> pd.DataFrame:
         """Fetch news from all active sources, deduplicate by (title, date).
 
         Returns DataFrame with columns: date, title, url, source.
         Sources that support body fetching (Sina) will include full article text.
+
+        ``meta`` (optional dict) receives aggregated ``pages_requested`` /
+        ``pages_fetched`` / ``pagination_exhausted`` (download completion
+        evidence).  Aggregated pagination is considered exhausted only when
+        every active source exhausted its own pages AND none raised — a failed
+        or truncated source means the history may be incomplete.
         """
         all_frames = []
+        pages_fetched = 0
+        pages_requested = 0
+        exhausted_all = True
 
         for source_name, source in self._sources.items():
+            src_meta: dict = {}
             try:
                 kwargs = dict(
                     stock_code=stock_code,
                     start_date=start_date,
                     end_date=end_date,
                     max_pages=max_pages,
+                    meta=src_meta,
                 )
                 if source_name in _BODY_SOURCES:
                     kwargs["fetch_bodies"] = fetch_bodies
                 df = source.fetch_news(**kwargs)
+                pages_fetched += src_meta.get("pages_fetched", 0)
+                pages_requested += src_meta.get("pages_requested", 0)
+                if not src_meta.get("pagination_exhausted", False):
+                    exhausted_all = False
                 if not df.empty:
                     df["source"] = source_name
                     all_frames.append(df)
@@ -68,6 +84,12 @@ class NewsPipeline:
                     )
             except Exception as e:
                 logger.debug("  %s: source %s failed: %s", stock_code, source_name, e)
+                exhausted_all = False
+
+        if meta is not None:
+            meta["pages_fetched"] = pages_fetched
+            meta["pages_requested"] = pages_requested
+            meta["pagination_exhausted"] = exhausted_all
 
         if not all_frames:
             return pd.DataFrame(columns=["date", "title", "body", "url", "source"])

@@ -71,17 +71,25 @@ class THSNewsSource:
         start_date: str | None = None,
         end_date: str | None = None,
         max_pages: int = 5,
+        meta: dict | None = None,
     ) -> pd.DataFrame:
         """Fetch stock news from EastMoney search with deep pagination.
 
         Each page returns up to 100 articles. The API typically allows
         ~5 pages before returning empty, yielding up to ~500 articles
         spanning ~6-12 months of history.
+
+        ``meta`` (optional dict) receives ``pages_requested`` / ``pages_fetched`` /
+        ``pagination_exhausted`` (download completion evidence).
         """
         all_rows = []
+        pages_fetched = 0
+        pagination_exhausted = False
         for page in range(1, max_pages + 1):
+            pages_fetched += 1
             items = self._fetch_em_page(stock_code, page, page_size=100)
             if not items:
+                pagination_exhausted = True
                 break
             for it in items:
                 title = (it.get("title") or "").replace("<em>", "").replace("</em>", "")
@@ -96,6 +104,11 @@ class THSNewsSource:
                         "body": content if len(content) > 20 else "",
                         "url": url,
                     })
+
+        if meta is not None:
+            meta["pages_requested"] = max_pages
+            meta["pages_fetched"] = pages_fetched
+            meta["pagination_exhausted"] = pagination_exhausted
 
         if not all_rows:
             return pd.DataFrame(columns=["date", "title", "body", "url"])

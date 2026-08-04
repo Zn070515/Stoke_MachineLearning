@@ -234,9 +234,13 @@ def main():
             if label == "northbound":
                 northbound_dir = os.path.join(data_dir, "a_shares", "northbound")
                 for code, group in df.groupby("stock_code"):
+                    # Northbound is a dense per-day range query — the provider
+                    # returns every record in the requested window, so a
+                    # non-empty group is complete.
                     mark_stock_result(
                         northbound_dir, code, group, dataset="northbound",
                         requested_start=args.start, requested_end=args.end,
+                        provider_range_guaranteed=True,
                     )
             logger.info(
                 "  %s: %d rows saved (%.1fs)",

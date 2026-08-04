@@ -65,7 +65,7 @@ class TestPanelDataset:
         assert vol_mask.shape == (4,)
 
     def test_valid_mask_requires_history_and_entry(self):
-        """Review §四: a window is trainable only when its input window holds
+        """A window is trainable only when its input window holds
         >= min_history real observations (new listings with mostly zero-padded
         history are excluded) AND the target day is entry-eligible."""
         data = make_synthetic_data(n_stocks=2, n_days=100, seq_len=60)
@@ -87,7 +87,7 @@ class TestPanelDataset:
         assert not bool(vm[1, :].any())
 
     def test_getitem_returns_per_task_masks(self):
-        """Review §八: each loss applies its own mask instead of one shared
+        """Each loss applies its own mask instead of one shared
         y_direction mask — return-target valid but vol-target invalid must be
         reflected separately."""
         data = make_synthetic_data(n_stocks=2, n_days=100, seq_len=60)
@@ -104,7 +104,7 @@ class TestPanelDataset:
 
 
     def test_date_idx_is_target_date_not_last_feature_date(self):
-        """Review §五 off-by-one: a window [start, end) is ranked by the TARGET
+        """Off-by-one: a window [start, end) is ranked by the TARGET
         date `end` (the step after the window), not the last feature date
         `end - 1`.  Ranking pairs must compare stocks' outcomes on the SAME
         future day, and with global calendar alignment date_indices is simply

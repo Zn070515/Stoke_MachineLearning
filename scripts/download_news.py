@@ -19,7 +19,11 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
+from stoke_ml.data.download_resume import (
+    evidence_says_complete,
+    mark_stock_result,
+    skip_completed_stocks,
+)
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.sources.a_shares.news_pipeline import NewsPipeline
 from stoke_ml.data.storage import DataStorage
@@ -145,7 +149,28 @@ def main():
     )
 
     total_articles = 0
-    success, fail, empty = 0, 0, 0
+    success, fail, empty, partial = 0, 0, 0, 0
+
+    def _mark(code: str, df: pd.DataFrame, meta: dict) -> None:
+        """Write the per-stock manifest with pagination evidence."""
+        mark_stock_result(
+            raw_dir, code, df, dataset="news_raw",
+            requested_start=args.start, requested_end=args.end,
+            source=source_label,
+            pages_requested=meta.get("pages_requested"),
+            pages_fetched=meta.get("pages_fetched"),
+            pagination_exhausted=meta.get("pagination_exhausted"),
+        )
+
+    def _classify(df: pd.DataFrame, meta: dict) -> str:
+        """complete / partial / degraded — mirrors mark_stock_result's decision."""
+        if df is None or df.empty:
+            return "degraded"
+        if evidence_says_complete(
+            df, pagination_exhausted=meta.get("pagination_exhausted"),
+        ):
+            return "complete"
+        return "partial"
 
     if args.concurrent:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -157,17 +182,19 @@ def main():
             daily_quota=cfg.crawler.rate_limit.daily_quota_per_domain,
         )
 
-        def _fetch_one(code: str):
+        def _fetch_one(code: str) -> tuple[pd.DataFrame, dict]:
+            meta: dict = {}
             df = news_pipeline.fetch_all_news(
                 code,
                 start_date=args.start,
                 end_date=args.end,
                 max_pages=args.max_pages,
                 fetch_bodies=not args.no_bodies,
+                meta=meta,
             )
             if not args.skip_sentiment and not df.empty:
                 df = compute_raw_sentiment(df, analyzer)
-            return df
+            return df, meta
 
         def _worker(code: str):
             rate_limiter.wait()
@@ -183,7 +210,7 @@ def main():
                 done += 1
                 logger.info("[%d/%d] %s ...", done, len(codes), code)
                 try:
-                    _code, df = future.result()
+                    _code, (df, meta) = future.result()
                 except Exception as e:
                     logger.error("  %s: fetch failed: %s", code, e)
                     fail += 1
@@ -194,23 +221,16 @@ def main():
                     fail += 1
                     continue
 
-                if df.empty:
+                outcome = _classify(df, meta)
+                if outcome == "degraded":
                     logger.info("  %s: no news found", code)
-                    mark_stock_result(
-                        raw_dir, code, df, dataset="news_raw",
-                        requested_start=args.start, requested_end=args.end,
-                        source=source_label,
-                    )
+                    _mark(code, df, meta)
                     empty += 1
                     continue
 
                 # Save raw (Bronze)
                 news_storage.save_raw_news(code, df)
-                mark_stock_result(
-                    raw_dir, code, df, dataset="news_raw",
-                    requested_start=args.start, requested_end=args.end,
-                    source=source_label,
-                )
+                _mark(code, df, meta)
                 logger.info("  %s: %d articles saved (raw)", code, len(df))
                 total_articles += len(df)
 
@@ -229,7 +249,10 @@ def main():
                             logger.info("  %s: %d sentiment days (%d with news)",
                                         code, len(gold), news_days)
 
-                success += 1
+                if outcome == "complete":
+                    success += 1
+                else:
+                    partial += 1
     else:
         for i, code in enumerate(codes):
             if i > 0:
@@ -237,6 +260,7 @@ def main():
 
             logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
 
+            meta: dict = {}
             try:
                 df = news_pipeline.fetch_all_news(
                     code,
@@ -244,19 +268,17 @@ def main():
                     end_date=args.end,
                     max_pages=args.max_pages,
                     fetch_bodies=not args.no_bodies,
+                    meta=meta,
                 )
             except Exception as e:
                 logger.error("  %s: fetch failed: %s", code, e)
                 fail += 1
                 continue
 
-            if df.empty:
+            outcome = _classify(df, meta)
+            if outcome == "degraded":
                 logger.info("  %s: no news found", code)
-                mark_stock_result(
-                    raw_dir, code, df, dataset="news_raw",
-                    requested_start=args.start, requested_end=args.end,
-                    source=source_label,
-                )
+                _mark(code, df, meta)
                 empty += 1
                 continue
 
@@ -266,11 +288,7 @@ def main():
 
             # Save raw (Bronze)
             news_storage.save_raw_news(code, df)
-            mark_stock_result(
-                raw_dir, code, df, dataset="news_raw",
-                requested_start=args.start, requested_end=args.end,
-                source=source_label,
-            )
+            _mark(code, df, meta)
             logger.info("  %s: %d articles saved (raw)", code, len(df))
             total_articles += len(df)
 
@@ -289,10 +307,22 @@ def main():
                         logger.info("  %s: %d sentiment days (%d with news)",
                                     code, len(gold), news_days)
 
-            success += 1
+            if outcome == "complete":
+                success += 1
+            else:
+                partial += 1
 
-    logger.info("Done: %d success, %d fail, %d empty, %d total articles",
-                success, fail, empty, total_articles)
+    logger.info(
+        "Done: %d complete, %d partial, %d empty, %d fail, %d total articles",
+        success, partial, empty, fail, total_articles,
+    )
+
+    # Exit code reflects the outcome — 0 when every result is complete
+    # or skipped, 1 on fetch failures, 2 when any result is partial/degraded.
+    if fail:
+        sys.exit(1)
+    if partial or empty:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

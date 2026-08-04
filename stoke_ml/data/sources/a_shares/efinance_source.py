@@ -3,7 +3,6 @@ import logging
 import time
 
 import pandas as pd
-from curl_cffi import requests
 
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
@@ -52,6 +51,15 @@ class EfinanceSource(AShareSourceBase):
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
+        try:
+            from curl_cffi import requests  # optional dep
+        except ImportError:
+            logger.warning(
+                "curl_cffi not installed — EfinanceSource unavailable for %s",
+                stock_code,
+            )
+            return pd.DataFrame()
+
         params = {
             "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
             "fields2": ",".join(EM_FIELD_MAP.keys()),
@@ -142,7 +150,7 @@ class EfinanceSource(AShareSourceBase):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         # EastMoney kline volume is 手 (lots of 100 shares) — normalize to 股
-        # so all providers share one unit (v6 §六). amount is already 元.
+        # so all providers share one unit. amount is already 元.
         df["volume"] = df["volume"] * 100.0
         df["stock_code"] = stock_code
         df["date"] = pd.to_datetime(df["date"]).dt.date

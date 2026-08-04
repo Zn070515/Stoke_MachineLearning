@@ -9,8 +9,8 @@ from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 
 logger = logging.getLogger(__name__)
 
-# Version stamp for the panel evaluator (v7 §十一 P1: experiments freeze the
-# evaluator that produced their numbers).  Bump on any behavioral change to
+# Version stamp for the panel evaluator — experiments freeze the evaluator
+# that produced their numbers.  Bump on any behavioral change to
 # the sleeve-account / IC / quintile logic.
 EVALUATOR_VERSION = "2026-08-04"
 
@@ -43,7 +43,7 @@ def compute_sortino(
     mean = daily_returns.mean().item()
     downside = daily_returns[daily_returns < target]
     if len(downside) < 2:
-        # Review v5 §十五.3: with < 2 downside samples the Sortino is undefined.
+        # With < 2 downside samples the Sortino is undefined.
         # NaN (not inf) so JSON summaries / means / charts don't treat a lucky
         # no-downside stretch as an unbounded score.
         return float("nan") if mean > target else 0.0
@@ -75,7 +75,7 @@ def compute_calmar(
     mdd = compute_max_drawdown(equity)
     if mdd < 1e-8:
         return 0.0
-    # Review v5 §十五: use the actual CAGR of the NAV curve (geometric), not
+    # Use the actual CAGR of the NAV curve (geometric), not
     # the arithmetic mean*252 — under volatility the two diverge materially.
     final_nav = float(equity[-1].item())
     if final_nav <= 0:
@@ -85,7 +85,7 @@ def compute_calmar(
 
 
 def compute_daily_return_profit_factor(daily_returns: torch.Tensor) -> float:
-    """Gross profit / gross loss over *daily* return samples (review v5 §十五.2).
+    """Gross profit / gross loss over *daily* return samples.
 
     This is NOT a trade-level profit factor — it aggregates per-day returns of
     a strategy equity curve, not closed-trade P&L.  A trade-level PF would need
@@ -118,7 +118,7 @@ def compute_bootstrap_sharpe_ci(
     Uses a MOVING-BLOCK bootstrap (Künsch 1989): daily returns carry
     autocorrelation and volatility clustering, so resampling single points
     (iid) destroys that structure and the CI comes out too narrow — worse for
-    overlapping-horizon returns (review v3 §十三).  Block length defaults to
+    overlapping-horizon returns.  Block length defaults to
     the classical ceil(n^(1/3)); the horizon floor keeps the block at least
     as long as the return overlap.
     """
@@ -146,14 +146,17 @@ def _compute_daily_ic(
     preds_np: np.ndarray,
     actuals_np: np.ndarray,
     mask_np: np.ndarray | None = None,
+    min_stocks: int = 10,
 ) -> list[float]:
     """Per-day Spearman rank IC.
 
     mask_np: (n_stocks, n_windows) bool — candidate pool (entry-eligible) on
     each day. Without it, zero-feature padded rows (short listing history) get
-    garbage predictions that drag down the rank correlation.  Days whose
-    predictions are constant (std < eps) have a degenerate Spearman and are
-    skipped.
+    garbage predictions that drag down the rank correlation.  A day is skipped
+    unless it holds >= `min_stocks` eligible stocks — the unified threshold
+    so checkpoint selection and the formal report agree.
+    Days whose predictions are constant (std < eps) have a degenerate Spearman
+    and are skipped.
     """
     daily_ics = []
     n_windows = preds_np.shape[1]
@@ -163,7 +166,7 @@ def _compute_daily_ic(
         mask = np.isfinite(p) & np.isfinite(a)
         if mask_np is not None:
             mask = mask & mask_np[:, t]
-        if mask.sum() >= 10:
+        if mask.sum() >= min_stocks:
             pv = p[mask]
             if pv.std() < 1e-8:
                 continue  # constant predictions → rank correlation undefined
@@ -171,6 +174,53 @@ def _compute_daily_ic(
             if np.isfinite(ic):
                 daily_ics.append(ic)
     return daily_ics
+
+
+def _raw_clean_rank_ic(
+    val_data: dict,
+    preds_np: np.ndarray,
+    n_windows: int,
+    seq_len: int,
+    min_stocks: int = 10,
+    diag: dict | None = None,
+) -> tuple[list[float] | None, torch.Tensor | None]:
+    """Per-day Spearman IC of predictions vs the RAW open->open return.
+
+    The single shared clean-IC definition used BOTH by the formal report
+    (evaluate_portfolio) and by checkpoint selection (train._compute_val_loss).  Ranking against the
+    z-scored + clipped [-5,5] model
+    target manufactures ties and can select a different checkpoint than the
+    report; both must rank the raw clean return (y_return_raw, saved before
+    the fold z-score; falls back to y_return for data without
+    a raw copy).
+
+    The candidate pool is decision & history & return-target,
+    so weak cross-sections are filtered identically to the report.  Returns
+    (None, None) when val_data has no y_return_raw / y_return — the caller
+    falls back to the legacy realized-return reconstruction.
+
+    `diag` (optional mutable dict) receives the per-window pool statistics the
+    failure path needs: valid_days / avg_stocks_per_day /
+    mask_retention.
+    """
+    pool = _candidate_pool(val_data, n_windows, seq_len).numpy()
+    if "return_target_mask" in val_data:
+        rt = np.asarray(val_data["return_target_mask"], dtype=bool)
+        pool = pool & rt[:, seq_len:seq_len + n_windows]
+    if diag is not None:
+        per_day = pool.sum(axis=0)
+        diag["valid_days"] = int((per_day >= min_stocks).sum())
+        diag["avg_stocks_per_day"] = float(
+            per_day[per_day > 0].mean()) if per_day.any() else 0.0
+        diag["mask_retention"] = float(pool.mean())
+    clean_key = "y_return_raw" if "y_return_raw" in val_data else "y_return"
+    if clean_key not in val_data:
+        return None, None
+    clean_actuals = torch.as_tensor(val_data[clean_key], dtype=torch.float32)[
+        :, seq_len:seq_len + n_windows]
+    daily_ics = _compute_daily_ic(
+        preds_np, clean_actuals.numpy(), pool, min_stocks=min_stocks)
+    return daily_ics, clean_actuals
 
 
 def _newey_west_t(series: np.ndarray, lag: int) -> float:
@@ -196,7 +246,7 @@ def _newey_west_t(series: np.ndarray, lag: int) -> float:
 def compute_ic_summary(daily_ics: list[float], horizon: int = 1) -> dict:
     """IC mean, std, IR, positivity rate, and a Newey-West t-stat.
 
-    Review v3 §十三: the plain mean/std ratio ignores serial correlation —
+    The plain mean/std ratio ignores serial correlation —
     with overlapping-horizon labels the per-day IC series is autocorrelated,
     so a naive IR overstates signal.  `ic_newey_west_t` uses the NW-1994
     automatic lag truncation (Bartlett kernel), floored to horizon-1 so the
@@ -279,11 +329,11 @@ def _build_portfolio_returns(
 def _candidate_pool(data: dict, n_windows: int, seq_len: int) -> torch.Tensor:
     """Selection pool for window day t (column t ↔ panel column seq_len+t).
 
-    review v4 §三 / P0-A3: rank over the DECISION pool — close[t-1] is real
+    Rank over the DECISION pool — close[t-1] is real
     (signal after close[t-1]) AND the seq_len-window ending at t-1 holds >=
     min_history real observations.  Both masks are aligned to the ENTRY column
     t.  Falls back to entry-eligibility, then to future-label validity, for
-    synthetic/legacy data without the v4 masks.
+    synthetic/legacy data without the decision/history masks.
     """
     has_dh = "decision_eligible_mask" in data and "history_eligible_mask" in data
     if has_dh:
@@ -327,7 +377,7 @@ def _run_sleeve_sim(
     mode: str = "long",
     return_ledger: bool = False,
 ) -> dict:
-    """Chronological sleeve-account backtest, ONE run at a fixed cost (review v7 §三).
+    """Chronological sleeve-account backtest, ONE run at a fixed cost.
 
     Core simulator shared by `_simulate_sleeve_account`, which runs it twice —
     once at the real cost (net NAV series) and once at cost=0 (the TRUE
@@ -336,7 +386,7 @@ def _run_sleeve_sim(
     does NOT compute a gross series (the old `gross_daily = net + cost_paid`
     approximation was not a real counterfactual — a zero-cost account would
     reallocate different sleeve sizes, so its daily returns differ day-by-day,
-    not just by an additive cost term, review v7 §三).
+    not just by an additive cost term).
 
     Every signal day d (< W) enters a new sleeve that buys the top-K (long),
     shorts the bottom-K (short), or buys every pool member (ew), at open[d],
@@ -346,30 +396,30 @@ def _run_sleeve_sim(
     series annualized with sqrt(252) — fixing the phase-concatenation bug.
 
     The simulation runs to the END of the price path (Wp columns), NOT just to
-    the last signal day — review v5 §三: the sleeve entered on the last signal
+    the last signal day: the sleeve entered on the last signal
     day W-1 must still be liquidated at open[W-1+horizon], with its exit cost
     booked and the book reaching zero active sleeves.  Entry only happens on
     days d < W (no signal beyond W).
 
-    Exits are TRUE delayed exits (review v5 §四): a position whose scheduled
+    Exits are TRUE delayed exits: a position whose scheduled
     exit open is missing (suspension) is NOT sold at its stale close — it keeps
     holding, marks to its last known close, and retries the exit on every later
     day until a real open appears (DELAYED) or the price path ends with the
     position still open (UNRESOLVED_AT_END, booked at the last carried close,
-    capital left locked — no fake exit, no fictitious sell cost, review v6
-    §十四.1).  A carried close <= 0 is treated as DATA-MISSING, NOT an
-    executable delist (review v6 §十四.4): after ffill a zero price cannot
+    capital left locked — no fake exit, no fictitious sell cost).  A carried
+    close <= 0 is treated as DATA-MISSING, NOT an executable delist: after
+    ffill a zero price cannot
     distinguish a real delisting from a dead data row, so the position is never
     force-sold at 0.  exit_status covers every successfully entered position.
 
     Fills respect entry eligibility: a selected stock with no real open[d]
-    stays unfilled (its weight remains cash) and is NEVER backfilled (review
-    v4 §三).  Long/EW entries are additionally capped so total spend (notional
-    + entry cost) never exceeds available cash (review v6 §四) — the old cap
+    stays unfilled (its weight remains cash) and is NEVER backfilled.  Long/EW
+    entries are additionally capped so total spend (notional
+    + entry cost) never exceeds available cash — the old cap
     booked the cost AFTER sizing, so a full-buy at 10bp went cash-negative.
 
     The account starts at nav 1.0 on the close BEFORE the first price day, so
-    the returned daily series INCLUDES day 0 (review v6 §三).  An internal
+    the returned daily series INCLUDES day 0.  An internal
     assertion enforces the account identity np.prod(1+daily) == final_nav.
 
     preds_np: (N, W) predictions for entry at window column d.  close_np /
@@ -393,7 +443,7 @@ def _run_sleeve_sim(
     buy_notional = np.zeros(Wp)
     sell_notional = np.zeros(Wp)
     nav_before_day = np.zeros(Wp)
-    # Daily exposure ledger (review v7 §四): held notional / held value / cash /
+    # Daily exposure ledger: held notional / held value / cash /
     # active sleeves / delayed capital, each normalized by start-of-day NAV so
     # the ratios are scale-free and comparable across sub-accounts.
     gross_exposure = np.zeros(Wp)
@@ -405,7 +455,7 @@ def _run_sleeve_sim(
                    "unresolved": 0, "unfilled": 0}
     exit_pnl = {k: 0.0 for k in exit_counts}
     exit_days = {k: 0.0 for k in exit_counts}
-    # Per-position ledger (review v7 §九.2): one record per FILLED position,
+    # Per-position ledger: one record per FILLED position,
     # with entry/exit price, scheduled/actual exit day, exit status, gross PnL
     # and attributed costs.  Sum(net_pnl) == final_nav - 1 by construction —
     # each position's gross PnL matches exit_pnl aggregation and entry/exit
@@ -430,7 +480,7 @@ def _run_sleeve_sim(
                 # are held (marked to last close) until a real open appears.
                 sl["pending"] |= held & (~ex_open_ok) & (carried[:, d] > 0)
             # A held position whose carried close is <= 0 is DATA-MISSING, not
-            # an executable delist (review v6 §十四.4): price<=0 after ffill
+            # an executable delist: price<=0 after ffill
             # cannot tell a real delisting from a dead data row, so it is never
             # force-sold at 0.  It stays held at its (zero) carried mark and
             # resolves as UNRESOLVED_AT_END at the path end.
@@ -499,21 +549,21 @@ def _run_sleeve_sim(
                 n_fill = int(fillable.sum())
                 if n_fill > 0:
                     # Fixed per-stock weight w/|chosen| — the unfilled fraction
-                    # stays cash (NO backfill / 递补, review v4 §三).  Long/EW
+                    # stays cash (NO backfill / 递补).  Long/EW
                     # cap the whole sleeve at available cash so leverage cannot
-                    # drift past what the account holds (review v5 §六.2); the
+                    # drift past what the account holds; the
                     # short leg is a theoretical factor book and needs no cap.
                     per_stock = w / chosen.size
                     if side > 0:
                         # Cap total spend (notional + entry cost) at available
-                        # cash (review v6 §四): per_stock*n_fill*(1+cost) <= cash
+                        # cash: per_stock*n_fill*(1+cost) <= cash
                         # so the entry cost can never push cash negative.
                         per_stock = min(per_stock, cash / ((1.0 + cost) * n_fill))
                     shares[fillable] = per_stock / open_np[fillable, d]
                     entry_val[fillable] = per_stock
                     spent = per_stock * n_fill
                     # The entry cost is deducted from cash along with the
-                    # notional (review v6 §三) — previously only the notional
+                    # notional — previously only the notional
                     # left cash, so net returns excluded the entry cost.
                     cash -= side * spent + cost * spent
                     cost_paid[d] += cost * spent
@@ -536,13 +586,13 @@ def _run_sleeve_sim(
                 if d > sl["scheduled_exit_day"]:
                     delayed_value += abs(mv)
         nav_close = cash + pos_value
-        # review v6 §三: the account starts at nav 1.0 on the close BEFORE the
+        # The account starts at nav 1.0 on the close BEFORE the
         # first price day, so day-0's open->close P&L IS part of the return
         # series — dropping it broke the identity prod(1+daily) == final_nav.
         if nav_prev > 0:
             net_daily[d] = nav_close / nav_prev - 1.0
-            # Exposure ratios scale the held notional by the day's capital base
-            # (review v7 §四): the nominal 1/h-per-sleeve book is only an
+            # Exposure ratios scale the held notional by the day's capital base:
+            # the nominal 1/h-per-sleeve book is only an
             # approximation — unfilled slots stay cash (gross < target) while
             # delayed/unresolved sleeves push gross above it.
             gross_exposure[d] = gross_value / nav_prev
@@ -553,13 +603,13 @@ def _run_sleeve_sim(
         nav_prev = nav_close
 
     # ── End of price path: any holding that never found a real exit is
-    # UNRESOLVED_AT_END, booked at its last carried close (review v5 §四): the
+    # UNRESOLVED_AT_END, booked at its last carried close: the
     # capital stays locked in the position — no fake exit, no fictitious sell
-    # cost (review v6 §十四.1). ──
+    # cost. ──
     for c, sl in sleeves.items():
         held = sl["mask"]
         if held.any():
-            # Book the unresolved hold at the FINAL carried mark (review v7 §二):
+            # Book the unresolved hold at the FINAL carried mark:
             # carried[:, Wp-1] is what final_nav's mark-to-market used on the
             # last day, so the P&L ledger reconciles with the NAV series.  The
             # old min(c+horizon, Wp-1) booked at the scheduled exit day, which
@@ -596,7 +646,7 @@ def _run_sleeve_sim(
     total_pnl = sum(exit_pnl.values())
     abs_total = sum(abs(v) for v in exit_pnl.values())
 
-    # P&L reconciliation (review v7 §二): every sleeve's realized P&L net of
+    # P&L reconciliation: every sleeve's realized P&L net of
     # ALL entry/exit costs must equal the account's total NAV change.  Booked
     # at a mark different from the final one (or costs missing from cost_paid)
     # would silently break this identity, so assert it explicitly.
@@ -607,19 +657,19 @@ def _run_sleeve_sim(
             raise AssertionError(
                 f"sleeve P&L reconciliation violated: sum(pnl) - sum(cost) = "
                 f"{reconciled:.8f} != final_nav - 1 = {target:.8f}")
-    # Turnover is the traded notional scaled by the NAV the day opened on
-    # (review v5 §六.3) — a ratio, invariant to the initial capital.
+    # Turnover is the traded notional scaled by the NAV the day opened on —
+    # a ratio, invariant to the initial capital.
     turnover_daily = (buy_notional + sell_notional) / np.maximum(nav_before_day, 1e-8)
 
-    # review v6 §十四.3: the signed PnL share explodes when the book's total
+    # The signed PnL share explodes when the book's total
     # PnL is near zero, so alongside the signed share (kept for compat) report
     # the signed PnL, an ABSOLUTE-PnL share, capital-occupancy days, and the
     # mean delay of delayed exits.
     avg_delayed_days = (exit_days["delayed"] / exit_counts["delayed"]
                         if exit_counts["delayed"] else 0.0)
 
-    # Enforce the account identity without relying on manual inspection
-    # (review v6 §三): np.prod(1+daily) must equal final_nav / initial_nav.
+    # Enforce the account identity without relying on manual inspection:
+    # np.prod(1+daily) must equal final_nav / initial_nav.
     if np.isfinite(nav_close) and nav_close > 0 and np.all(nav_before_day > 0):
         cum = float(np.prod(1.0 + net_daily))
         if not np.isclose(cum, nav_close, rtol=1e-5, atol=1e-8):
@@ -630,8 +680,8 @@ def _run_sleeve_sim(
     return {
         "daily": net_daily,
         # The account's final mark, exposed so a consumer can verify the
-        # identity prod(1+daily) == final_nav WITHOUT recomputing nav_close
-        # (review v8 P0-1) — the strongest cross-check a backtest can carry.
+        # identity prod(1+daily) == final_nav WITHOUT recomputing nav_close —
+        # the strongest cross-check a backtest can carry.
         "final_nav": float(nav_close) if np.isfinite(nav_close) else None,
         "exit_stats": {
             "counts": exit_counts,
@@ -646,13 +696,13 @@ def _run_sleeve_sim(
         "turnover": {
             "daily_avg": float(turnover_daily.mean()) if Wp > 0 else 0.0,
         },
-        # Daily exposure ledger (review v7 §四): ratios normalized by NAV.
+        # Daily exposure ledger: ratios normalized by NAV.
         "gross_exposure": gross_exposure,
         "net_exposure": net_exposure,
         "cash_ratio": cash_ratio,
         "active_sleeves": active_sleeves,
         "delayed_capital": delayed_capital,
-        # Per-position ledger (review v7 §九.2); empty unless return_ledger.
+        # Per-position ledger; empty unless return_ledger.
         "ledger": ledger,
     }
 
@@ -668,7 +718,7 @@ def _simulate_sleeve_account(
     mode: str = "long",
     return_ledger: bool = False,
 ) -> dict:
-    """Sleeve-account backtest with a TRUE cost-free gross counterfactual (v7 §三).
+    """Sleeve-account backtest with a TRUE cost-free gross counterfactual.
 
     Runs `_run_sleeve_sim` twice — once at the real `cost` (net NAV series,
     realized exit ledger, turnover) and once at cost=0 (the independent
@@ -680,8 +730,8 @@ def _simulate_sleeve_account(
     so each returned series is internally consistent.  Return keys are
     backward-compatible with the pre-refactor shape.
 
-    `return_ledger` surfaces the NET run's per-position ledger (review v7
-    §九.2) so a caller can persist every filled position's entry/exit prices,
+    `return_ledger` surfaces the NET run's per-position ledger so a caller can
+    persist every filled position's entry/exit prices,
     status and attributed costs — the audit trail that lets the OOS account be
     reconstructed offline from a tape.
     """
@@ -695,7 +745,7 @@ def _simulate_sleeve_account(
         "gross_daily": gross["daily"],
         "exit_stats": net["exit_stats"],
         "turnover": net["turnover"],
-        # Exposure ledger is measured on the REAL-cost run (review v7 §四) —
+        # Exposure ledger is measured on the REAL-cost run —
         # it describes the account as actually traded, not the counterfactual.
         "gross_exposure": net["gross_exposure"],
         "net_exposure": net["net_exposure"],
@@ -709,7 +759,7 @@ def _simulate_sleeve_account(
 
 
 def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
-    """Combined LS-book daily exposure ledger + summary (review v7 §四).
+    """Combined LS-book daily exposure ledger + summary.
 
     The LS book holds the long and short sub-accounts at 0.5 weight each.  Each
     sub-account reports NAV-relative ratios from its own simulation; weighting
@@ -751,7 +801,7 @@ def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
     n = ls_net[np.isfinite(ls_net)]
     dly = ls_delayed[np.isfinite(ls_delayed)]
     # Target gross is 1.0; count days deviating >5% either way and the mean
-    # over-leverage (gross above 1.0) — the delay-driven excess the review flags.
+    # over-leverage (gross above 1.0) — the excess delayed exits can create.
     off_target = int(np.sum(np.abs(g - 1.0) > 0.05)) if g.size else 0
     excess = float(np.mean(np.maximum(g - 1.0, 0.0))) if g.size else 0.0
 
@@ -784,8 +834,36 @@ def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
         },
         "note": ("target = nominal book (ls_sharpe is 100% gross, 50% long / "
                  "50% short, net 0; ls2x_* is 200% gross); realized = daily "
-                 "measured exposure from the sleeve simulation (review v7 §四)."),
+                 "measured exposure from the sleeve simulation."),
     }
+
+
+def _combine_book_daily(
+    a_daily: np.ndarray,
+    b_daily: np.ndarray,
+    w_a: float,
+    w_b: float,
+    subtract: float = 0.0,
+) -> np.ndarray:
+    """Daily returns of a NO-rebalance blend of two sub-account NAVs.
+
+    Each sub-account starts at ``w_a`` / ``w_b`` of unit capital and is never
+    rebalanced, so the combined daily return is the NAV ratio of the weighted
+    NAV blend — the same NAV ``_ls_exposure_ledger`` reports, keeping the
+    metric and the ledger on one policy (方案 A).  ``subtract`` folds in
+    borrowed capital for leverage >100% gross: the 2x book holds a full unit
+    long AND a full unit short, so its NAV = long_nav + short_nav - 1.0 (the
+    short leg's margin loan).  The first element is ``nav[0] - 1`` because the
+    book starts at unit capital.
+    """
+    a = np.cumprod(1.0 + np.asarray(a_daily, dtype=np.float64))
+    b = np.cumprod(1.0 + np.asarray(b_daily, dtype=np.float64))
+    nav = w_a * a + w_b * b - subtract
+    out = np.empty_like(nav)
+    out[0] = nav[0] - 1.0
+    prev = np.where(nav[:-1] > 0, nav[:-1], 1.0)
+    out[1:] = nav[1:] / prev - 1.0
+    return out
 
 
 def _sleeve_account_metrics(
@@ -805,13 +883,13 @@ def _sleeve_account_metrics(
                                       return_ledger=return_ledger)
     short_a = _simulate_sleeve_account(preds_np, close_np, open_np, select_pool,
                                        horizon, top_fraction, cost, "short")
-    # Eligible candidate-pool equal-weight (review v7 §九.3): every pool member
+    # Eligible candidate-pool equal-weight: every pool member
     # gets an equal slice — NOT a full-market/index benchmark.  A SEPARATE
-    # PIT-universe equal-weight account (all fold stocks, no eligibility gate)
-    # is run below as the naive "buy everything" market proxy.
+    # selected-universe equal-weight proxy (all fold stocks, no eligibility
+    # gate) is run below as the naive "buy everything" reference.
     ew_a = _simulate_sleeve_account(preds_np, close_np, open_np, select_pool,
                                     horizon, top_fraction, cost, "ew")
-    uni_a = _simulate_sleeve_account(
+    sel_uni_a = _simulate_sleeve_account(
         preds_np, close_np, open_np, np.ones_like(select_pool),
         horizon, top_fraction, cost, "ew")
 
@@ -820,16 +898,23 @@ def _sleeve_account_metrics(
     long_g = np.asarray(long_a["gross_daily"], dtype=np.float64)
     short_g = np.asarray(short_a["gross_daily"], dtype=np.float64)
 
-    # Review v5 §二: `short_d` is already the short account's REAL daily return
-    # (side=-1 applied inside), so the long-short book is long_d + short_d —
-    # NOT long_d - short_d, which cancels the legs when both sides profit.
-    # Primary metric = 100% gross (50% long + 50% short, net 0); 200% gross
-    # (100% long + 100% short) is reported alongside as ls2x.  Both are
-    # explicit so two different-leverage books are never compared as one.
-    ls_d = 0.5 * (long_d + short_d)
-    ls2x_d = long_d + short_d
-    ls_g = 0.5 * (long_g + short_g)
-    ls2x_g = long_g + short_g
+    # `short_d` is already the short account's REAL daily return
+    # (side=-1 applied inside), so the long-short book ADDS the legs — NOT
+    # long_d - short_d, which cancels them when both sides profit.
+    # The LS book does NOT rebalance daily.  The two legs each
+    # start at their target weight of unit capital and are left alone, so the
+    # combined daily return is the NAV ratio of the weighted NAV blend (方案 A)
+    # — NOT the arithmetic mean of the legs' daily returns, which silently
+    # assumes a daily 50/50 reallocation and drifts from the ledger NAV.  All
+    # Sharpe/MDD/CAGR now derive from the same combined NAV the exposure
+    # ledger uses (_ls_exposure_ledger).  Primary metric = 100% gross (50% long
+    # + 50% short, net 0); 200% gross (100% long + 100% short) is reported
+    # alongside as ls2x (NAV = long_nav + short_nav - 1).  Both are explicit so
+    # two different-leverage books are never compared as one.
+    ls_d = _combine_book_daily(long_d, short_d, 0.5, 0.5)
+    ls2x_d = _combine_book_daily(long_d, short_d, 1.0, 1.0, subtract=1.0)
+    ls_g = _combine_book_daily(long_g, short_g, 0.5, 0.5)
+    ls2x_g = _combine_book_daily(long_g, short_g, 1.0, 1.0, subtract=1.0)
 
     def _met(daily, gross):
         t = torch.tensor(daily, dtype=torch.float32)
@@ -849,10 +934,10 @@ def _sleeve_account_metrics(
     ls2x_m = _met(ls2x_d, ls2x_g)
     eligible_ew_sharpe = compute_sharpe(
         torch.tensor(ew_a["daily"], dtype=torch.float32), horizon=1)
-    universe_ew_sharpe = compute_sharpe(
-        torch.tensor(uni_a["daily"], dtype=torch.float32), horizon=1)
+    selected_universe_ew_sharpe = compute_sharpe(
+        torch.tensor(sel_uni_a["daily"], dtype=torch.float32), horizon=1)
 
-    # Review v5 §七: no forced block_len=horizon — when horizon=1 that would
+    # No forced block_len=horizon — when horizon=1 that would
     # degenerate to iid resampling.  The default block (ceil(n^(1/3))) keeps
     # autocorrelation and volatility clustering in the CI.
     long_lo, long_hi = compute_bootstrap_sharpe_ci(
@@ -882,24 +967,24 @@ def _sleeve_account_metrics(
         "ls2x_maxdd": ls2x_m["maxdd"],
         # The short leg is a theoretical bottom-quantile factor book (A-share
         # stocks cannot be shorted directly) — the exposure metadata keeps the
-        # leverage assumption explicit (review v5 §六.1).  review v7 §四: the
+        # leverage assumption explicit.  The
         # nominal target is only a book construction — the REALIZED daily
         # exposure is measured from the sleeve simulation (unfilled slots stay
         # cash → gross below target; delayed/unresolved sleeves → gross above
         # target), so the metadata reports the measured distribution + full
         # daily ledger instead of a constant.
         "exposure": _ls_exposure_ledger(long_a, short_a),
-        # review v7 §九.3: equal-weight of the ELIGIBLE candidate pool — NOT a
-        # full-market/index benchmark.  `universe_ew_sharpe` is the separate
-        # PIT-universe equal-weight (all fold stocks) market proxy.
+        # Equal-weight of the ELIGIBLE candidate pool — NOT a
+        # full-market/index benchmark.  `selected_universe_ew_sharpe` is the separate
+        # selected-universe equal-weight (all fold stocks) proxy.
         "eligible_ew_sharpe": eligible_ew_sharpe,
-        "universe_ew_sharpe": universe_ew_sharpe,
+        "selected_universe_ew_sharpe": selected_universe_ew_sharpe,
         "long_turnover": long_a["turnover"]["daily_avg"],
         "ls_turnover": (long_a["turnover"]["daily_avg"]
                         + short_a["turnover"]["daily_avg"]) / 2.0,
         "ew_turnover": ew_a["turnover"]["daily_avg"],
         "exit_status": long_a["exit_stats"],
-        # Per-leg exit status (review v6 §十四.2): the long leg alone cannot
+        # Per-leg exit status: the long leg alone cannot
         # reveal whether the short book's abnormal returns come from more
         # unfillable or trailing positions — each leg must be auditable on its
         # own.  `exit_status` stays as the long-leg alias for backward compat.
@@ -959,20 +1044,20 @@ def evaluate_portfolio(
     """Multi-angle portfolio evaluation.
 
     Candidate pool = DECISION & HISTORY eligible stocks (close[t-1] real, input
-    window covered — review v4 §三).  Fills then gate on real open[t]; a
+    window covered).  Fills then gate on real open[t]; a
     selected stock with no real open stays unfilled (cash), never backfilled.
 
     Exec P&L (when close_price/open_price are present) is a chronological
-    sleeve account (review v4 §四): every calendar day enters a new top-K
+    sleeve account: every calendar day enters a new top-K
     sleeve held `horizon` days, each with weight 1/h of NAV, marked to close
     daily → a TRUE daily return series annualized by sqrt(252).  exit_status
-    classifies each position clean/carry/delist/unfilled (P0-A4) and costs are
-    applied per side (P0-C).  Clean IC is computed separately over y_return ×
-    return_target_mask (review v4 §七).
+    classifies each position clean/carry/delist/unfilled and costs are applied
+    per side.  Clean IC is computed separately over y_return ×
+    return_target_mask.
 
     Without price paths (synthetic tests) it falls back to the legacy
     phase-concatenated top-K over realized returns.  Formal training MUST pass
-    require_price_path=True (review v6 §十五.2): the two estimators measure
+    require_price_path=True: the two estimators measure
     different things, and two experiments that silently used different ones
     would not be comparable — missing price paths should then fail loudly
     instead of quietly downgrading to the legacy estimator.
@@ -987,7 +1072,7 @@ def evaluate_portfolio(
       — Exits: exit_status {counts, pnl_share}
       — Quintile: q1_ret … q5_ret, q5mq1_ret, q_monotonic
       — Eligible candidate-pool equal-weight: eligible_ew_sharpe
-      — PIT-universe equal-weight: universe_ew_sharpe
+      — selected-universe equal-weight proxy: selected_universe_ew_sharpe
       — Metadata: n_periods, n_stocks, n_days
     """
     model.eval()
@@ -1018,32 +1103,36 @@ def evaluate_portfolio(
     preds = preds.reshape(n_stocks, n_windows)
     preds_np = preds.numpy()
 
-    # Selection pool: decision & history (review v4 §三), with entry/future-label
+    # Selection pool: decision & history, with entry/future-label
     # fallbacks for synthetic/legacy data.
     pool = _candidate_pool(val_data, n_windows, config.seq_len)
     pool_np = pool.numpy()
 
-    # ── Clean IC (review v4 §七): rank correlation of preds vs the CLEAN
+    # ── Clean IC: rank correlation of preds vs the CLEAN
     # open->open return, over decision & history & return_target.  This is the
     # pure-signal diagnostic.  The exec P&L below (sleeve account) uses fills +
     # costs + delayed exits instead — the two are deliberately separated so a
     # suspension bias in realized returns can't masquerade as signal.
     #
-    # The actuals must be the RAW open->open return (review v5 §五): train_panel
+    # The actuals must be the RAW open->open return: train_panel
     # z-scores + clips y_return per fold for the model, and Spearman on the
     # clipped tails produces spurious ties while quintile "bp" would be in
     # cross-sectional-std units.  y_return_raw (saved before the z-score) is
-    # preferred; fall back to y_return for data that has no raw copy.
+    # preferred; fall back to y_return for data that has no raw copy.  This is
+    # the SAME helper train._compute_val_loss uses for checkpoint selection,
+    # so the selection metric and the report metric are
+    # one quantity and share the min_stocks_per_day threshold.
+    daily_ics, clean_actuals = _raw_clean_rank_ic(
+        val_data, preds_np, n_windows, config.seq_len,
+        min_stocks=config.min_stocks_per_day,
+    )
     ic_pool = pool
     if "return_target_mask" in val_data:
         rt = torch.as_tensor(val_data["return_target_mask"])
         ic_pool = ic_pool & rt[:, config.seq_len:config.seq_len + n_windows]
-    clean_key = "y_return_raw" if "y_return_raw" in val_data else "y_return"
-    if clean_key in val_data:
-        clean_actuals = torch.as_tensor(val_data[clean_key], dtype=torch.float32)[
-            :, config.seq_len:config.seq_len + n_windows]
-        daily_ics = _compute_daily_ic(preds_np, clean_actuals.numpy(), ic_pool.numpy())
-    else:
+    if daily_ics is None:
+        # Legacy fallback: no y_return_raw / y_return in val_data — reconstruct
+        # the raw open->open actuals from realized_return / raw_returns.
         clean_actuals = None
         if "realized_return" in val_data:
             act = _build_raw_actuals(torch.as_tensor(val_data["realized_return"]),
@@ -1056,7 +1145,10 @@ def evaluate_portfolio(
                 "raw_returns - returning empty result."
             )
             return _empty_result()
-        daily_ics = _compute_daily_ic(preds_np, act.numpy(), ic_pool.numpy())
+        daily_ics = _compute_daily_ic(
+            preds_np, act.numpy(), ic_pool.numpy(),
+            min_stocks=config.min_stocks_per_day,
+        )
     ic_summary = compute_ic_summary(daily_ics, horizon=horizon)
 
     # ── Exec P&L ──
@@ -1064,9 +1156,9 @@ def evaluate_portfolio(
     if has_prices:
         # Price columns are global-calendar indexed like every mask; a window
         # prediction is for ENTRY at panel column seq_len+d, so slice prices to
-        # the same window-day grid the pool / preds use (review v4 §四).  Take
+        # the same window-day grid the pool / preds use.  Take
         # horizon EXTRA columns so the sleeve entered on the last signal day
-        # W-1 can still liquidate at open[W-1+horizon] (review v5 §三) — the
+        # W-1 can still liquidate at open[W-1+horizon] — the
         # pad comes from _slice_panel(price_pad=horizon).  NumPy clips the stop
         # to the array width, so data without the pad simply runs unresolved.
         p0 = config.seq_len
@@ -1115,7 +1207,7 @@ def evaluate_portfolio(
             "ls2x_maxdd": pm["ls2x_maxdd"],
             "exposure": pm["exposure"],
             "eligible_ew_sharpe": pm["eligible_ew_sharpe"],
-            "universe_ew_sharpe": pm["universe_ew_sharpe"],
+            "selected_universe_ew_sharpe": pm["selected_universe_ew_sharpe"],
             "long_turnover": pm["long_turnover"],
             "ls_turnover": pm["ls_turnover"],
             "ew_turnover": pm["ew_turnover"],
@@ -1134,7 +1226,7 @@ def evaluate_portfolio(
             "evaluate_portfolio(require_price_path=True) called without "
             "close_price/open_price price paths — formal training must use the "
             "chronological sleeve account, not the legacy phase-concatenation "
-            "fallback (review v6 §十五.2)")
+            "fallback")
     if "realized_return" in val_data:
         actuals = _build_raw_actuals(
             torch.as_tensor(val_data["realized_return"]),
@@ -1172,7 +1264,7 @@ def evaluate_portfolio(
         preds, actuals, n_windows, horizon, n_stocks, mask=pool,
     )
     ew_rets = []
-    uni_ew_rets = []
+    sel_uni_ew_rets = []
     for offset in range(horizon):
         for t in range(offset, n_windows, horizon):
             col = actuals[:, t]
@@ -1180,19 +1272,20 @@ def evaluate_portfolio(
             r = col[keep].mean().item()
             if np.isfinite(r):
                 ew_rets.append(r)
-            # PIT-universe equal-weight (review v7 §九.3): every stock with a
-            # realized return — no eligibility gate — as the naive market
-            # proxy.  Zero-filled padding (_build_raw_actuals) is excluded.
+            # Selected-universe equal-weight proxy: every
+            # stock with a realized return — no eligibility gate — as the naive
+            # "buy everything" reference.  Zero-filled padding
+            # (_build_raw_actuals) is excluded.
             keep_uni = torch.isfinite(col) & (col != 0)
             ru = col[keep_uni].mean().item()
             if np.isfinite(ru):
-                uni_ew_rets.append(ru)
+                sel_uni_ew_rets.append(ru)
     eligible_ew_sharpe = compute_sharpe(
         torch.tensor(ew_rets, dtype=torch.float32), horizon=horizon,
     ) if len(ew_rets) >= 2 else 0.0
-    universe_ew_sharpe = compute_sharpe(
-        torch.tensor(uni_ew_rets, dtype=torch.float32), horizon=horizon,
-    ) if len(uni_ew_rets) >= 2 else 0.0
+    selected_universe_ew_sharpe = compute_sharpe(
+        torch.tensor(sel_uni_ew_rets, dtype=torch.float32), horizon=horizon,
+    ) if len(sel_uni_ew_rets) >= 2 else 0.0
 
     return {
         "n_periods": n_periods,
@@ -1218,7 +1311,7 @@ def evaluate_portfolio(
         "ls_maxdd": compute_max_drawdown(ls_equity),
         **quintile_metrics,
         "eligible_ew_sharpe": eligible_ew_sharpe,
-        "universe_ew_sharpe": universe_ew_sharpe,
+        "selected_universe_ew_sharpe": selected_universe_ew_sharpe,
     }
 
 
@@ -1349,7 +1442,7 @@ def _empty_result() -> dict:
         "q1_ret": 0.0, "q2_ret": 0.0, "q3_ret": 0.0, "q4_ret": 0.0, "q5_ret": 0.0,
         "q5mq1_ret": 0.0, "q_monotonic": 0.0,
         "eligible_ew_sharpe": 0.0,
-        "universe_ew_sharpe": 0.0,
+        "selected_universe_ew_sharpe": 0.0,
         "long_ledger": None,
     }
 

@@ -17,7 +17,11 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
+from stoke_ml.data.download_resume import (
+    evidence_says_complete,
+    mark_stock_result,
+    skip_completed_stocks,
+)
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.sources.a_shares.guba_source import GubaSource
 from stoke_ml.features.news_nlp import (
@@ -116,7 +120,7 @@ def main():
     )
 
     total_posts = 0
-    success, fail, empty, skipped = 0, 0, 0, 0
+    success, fail, empty, partial, skipped = 0, 0, 0, 0, 0
 
     # Resume: skip stocks whose raw data already covers start_date
     raw_dir = os.path.join(data_dir, "a_shares", "guba_raw")
@@ -129,14 +133,31 @@ def main():
     else:
         skipped = 0
 
-    # Shared save function used by both paths
-    def _save_stock(code: str, df: pd.DataFrame) -> int:
-        """Save one stock through the full medallion pipeline. Returns post count."""
-        guba_storage.save_raw(code, df)
+    def _mark(code: str, df: pd.DataFrame, meta: dict) -> None:
+        """Write the per-stock manifest with pagination evidence."""
         mark_stock_result(
             raw_dir, code, df, dataset="guba_raw",
             requested_start=args.start, requested_end=args.end,
+            pages_requested=meta.get("pages_requested"),
+            pages_fetched=meta.get("pages_fetched"),
+            pagination_exhausted=meta.get("pagination_exhausted"),
         )
+
+    def _classify(df: pd.DataFrame, meta: dict) -> str:
+        """complete / partial / degraded — mirrors mark_stock_result's decision."""
+        if df is None or df.empty:
+            return "degraded"
+        if evidence_says_complete(
+            df, pagination_exhausted=meta.get("pagination_exhausted"),
+        ):
+            return "complete"
+        return "partial"
+
+    # Shared save function used by both paths
+    def _save_stock(code: str, df: pd.DataFrame, meta: dict) -> int:
+        """Save one stock through the full medallion pipeline. Returns post count."""
+        guba_storage.save_raw(code, df)
+        _mark(code, df, meta)
         post_count = len(df)
         silver = guba_storage.bronze_to_silver(code)
         if not silver.empty:
@@ -164,7 +185,8 @@ def main():
         lock = threading.Lock()
         completed = 0
 
-        def _fetch_one(code: str) -> tuple[str, pd.DataFrame | None, str | None]:
+        def _fetch_one(code: str) -> tuple[str, pd.DataFrame | None, str | None, dict]:
+            meta: dict = {}
             try:
                 df = guba_source.fetch_posts(
                     code,
@@ -172,17 +194,18 @@ def main():
                     end_date=args.end,
                     max_pages=args.max_pages,
                     fetch_bodies=not args.no_bodies,
+                    meta=meta,
                 )
                 if not args.skip_sentiment and not df.empty:
                     df = compute_raw_sentiment(df, analyzer)
-                return code, df, None
+                return code, df, None, meta
             except Exception as e:
-                return code, None, str(e)
+                return code, None, str(e), meta
 
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {executor.submit(_fetch_one, code): code for code in codes}
             for future in as_completed(futures):
-                code, df, err = future.result()
+                code, df, err, meta = future.result()
                 with lock:
                     completed += 1
                     logger.info("[%d/%d] %s ...", completed, len(codes) + skipped, code)
@@ -192,18 +215,19 @@ def main():
                     fail += 1
                     continue
 
-                if df is None or df.empty:
+                outcome = _classify(df, meta)
+                if outcome == "degraded":
                     logger.info("  %s: no posts found", code)
                     if df is not None:
-                        mark_stock_result(
-                            raw_dir, code, df, dataset="guba_raw",
-                            requested_start=args.start, requested_end=args.end,
-                        )
+                        _mark(code, df, meta)
                     empty += 1
                     continue
 
-                total_posts += _save_stock(code, df)
-                success += 1
+                total_posts += _save_stock(code, df, meta)
+                if outcome == "complete":
+                    success += 1
+                else:
+                    partial += 1
     else:
         for i, code in enumerate(codes):
             if i > 0:
@@ -211,6 +235,7 @@ def main():
 
             logger.info("[%d/%d] %s ...", i + 1, len(codes), code)
 
+            meta: dict = {}
             try:
                 df = guba_source.fetch_posts(
                     code,
@@ -218,18 +243,17 @@ def main():
                     end_date=args.end,
                     max_pages=args.max_pages,
                     fetch_bodies=not args.no_bodies,
+                    meta=meta,
                 )
             except Exception as e:
                 logger.error("  %s: fetch failed: %s", code, e)
                 fail += 1
                 continue
 
-            if df.empty:
+            outcome = _classify(df, meta)
+            if outcome == "degraded":
                 logger.info("  %s: no posts found", code)
-                mark_stock_result(
-                    raw_dir, code, df, dataset="guba_raw",
-                    requested_start=args.start, requested_end=args.end,
-                )
+                _mark(code, df, meta)
                 empty += 1
                 continue
 
@@ -237,33 +261,24 @@ def main():
             if not args.skip_sentiment:
                 df = compute_raw_sentiment(df, analyzer)
 
-            # Save raw (Bronze)
-            guba_storage.save_raw(code, df)
-            mark_stock_result(
-                raw_dir, code, df, dataset="guba_raw",
-                requested_start=args.start, requested_end=args.end,
-            )
+            total_posts += _save_stock(code, df, meta)
             logger.info("  %s: %d posts saved (raw)", code, len(df))
-            total_posts += len(df)
+            if outcome == "complete":
+                success += 1
+            else:
+                partial += 1
 
-            # PIT-align -> Silver
-            silver = guba_storage.bronze_to_silver(code)
-            if not silver.empty:
-                guba_storage.save_silver(code, silver)
+    logger.info(
+        "Done: %d complete, %d partial, %d empty, %d fail, %d skipped, %d total posts",
+        success, partial, empty, fail, skipped, total_posts,
+    )
 
-            # Daily aggregation -> Gold
-            if not args.skip_sentiment:
-                gold = guba_storage.silver_to_gold(code, analyzer)
-                if not gold.empty:
-                    guba_storage.save_daily_sentiment(gold)
-                    post_days = gold["has_guba_post"].sum()
-                    logger.info("  %s: %d sentiment days (%d with posts)",
-                                code, len(gold), post_days)
-
-            success += 1
-
-    logger.info("Done: %d success, %d fail, %d empty, %d skipped, %d total posts",
-                success, fail, empty, skipped, total_posts)
+    # Exit code reflects the outcome — 0 when every result is complete
+    # or skipped, 1 on fetch failures, 2 when any result is partial/degraded.
+    if fail:
+        sys.exit(1)
+    if partial or empty:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Download-run manifest (review v8 §二-2).
+"""Download-run manifest.
 
 Records what a download run REQUESTED vs what actually landed on disk, so a
 partially-successful run ("4990 of 5000 succeeded, 10 failed, program said

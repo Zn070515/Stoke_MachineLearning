@@ -1,32 +1,45 @@
-"""Gap-classified missing value imputation.
+"""Gap-classified missing value imputation (causal methods only).
 
-Short gaps (1-2 days): linear interpolation.
-Medium gaps (3-10 days): Kalman smoother (statsmodels) with linear fallback.
-Long gaps (>10 days): NaN preserved + has_gap_{col} flag generated.
+Forecasting for time series may only use causal imputation — the value at
+time ``t`` must never depend on observations after ``t``.  Every fill here
+is causal:
+
+* Short gaps (<= short_gap_max): forward-fill from the last observed value.
+* Medium gaps (<= medium_gap_max): Kalman filter forecast (local-level model
+  fit on pre-gap observations, then forecast into the gap) with a
+  forward-fill fallback.
+* Long gaps (> medium_gap_max): NaN preserved + ``has_gap_{col}`` flag.
+
+Banned: linear interpolation, backfill, bidirectional smoothing,
+Kalman smoother — they all pull future observations into imputed rows.
 """
 
+import logging
+
 import numpy as np
+
 from stoke_ml.preprocessing.base import PreprocessingStep
+from stoke_ml.utils.error_summary import classify_error
+
+logger = logging.getLogger(__name__)
 
 
 class MissingImputer(PreprocessingStep):
-    """Impute missing values by gap length with interpolation strategy.
+    """Impute missing values by gap length using causal methods only.
 
     Never uses ZI (zero-imputation) -- that's the core improvement
-    over the legacy approach.
+    over the legacy approach.  Also never uses linear interpolation or
+    any bidirectional fill -- those leak future observations into
+    historical features.
     """
 
     def __init__(
         self,
         short_gap_max: int = 2,
-        short_gap_method: str = "linear",
         medium_gap_max: int = 10,
-        medium_gap_method: str = "kalman",
     ):
         self.short_gap_max = short_gap_max
-        self.short_gap_method = short_gap_method
         self.medium_gap_max = medium_gap_max
-        self.medium_gap_method = medium_gap_method
 
     def fit(self, df, **kwargs):
         return super().fit(df, **kwargs)
@@ -64,23 +77,20 @@ class MissingImputer(PreprocessingStep):
             has_long_gap = False
             for start, length in gap_starts:
                 end = start + length
+                # Only the last observed value before the gap may be used —
+                # the post-gap value is in the future at imputation time.
+                last_obs = values[start - 1] if start > 0 else np.nan
                 if length <= self.short_gap_max:
-                    if start > 0 and end < n and not np.isnan(values[start - 1]) and not np.isnan(values[end]):
-                        left = values[start - 1]
-                        right = values[end]
-                        step = (right - left) / (length + 1)
-                        for k in range(length):
-                            values[start + k] = left + step * (k + 1)
+                    # Forward-fill: causal, uses no future information.
+                    if start > 0 and not np.isnan(last_obs):
+                        values[start:end] = last_obs
                 elif length <= self.medium_gap_max:
                     filled = self._kalman_fill(values, start, end)
                     if filled is not None:
                         values[start:end] = filled
-                    elif start > 0 and end < n and not np.isnan(values[start - 1]) and not np.isnan(values[end]):
-                        left = values[start - 1]
-                        right = values[end]
-                        step = (right - left) / (length + 1)
-                        for k in range(length):
-                            values[start + k] = left + step * (k + 1)
+                    elif start > 0 and not np.isnan(last_obs):
+                        # Causal fallback (never the old linear blend).
+                        values[start:end] = last_obs
                 else:
                     has_long_gap = True
 
@@ -123,5 +133,9 @@ class MissingImputer(PreprocessingStep):
             # Causal forecast only — do NOT blend toward the post-gap
             # anchor: that would leak future information into imputed rows.
             return forecast
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Kalman gap fill failed (category=%s), falling back to "
+                "causal ffill", classify_error(exc).value,
+            )
             return None

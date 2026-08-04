@@ -1,11 +1,12 @@
 """Integration tests for train_panel on a masked synthetic panel.
 
-P1-A (review v4 §八/§九/§十) regression: the training loop must survive
+P1-A regression: the training loop must survive
 all-ignore direction batches (y_direction=-100 with ret/vol still active),
 the validation loss must accumulate per valid sample, and the per-task
 uncertainty masks must not produce NaN.
 """
 import numpy as np
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -89,6 +90,7 @@ def _make_masked_panel(n_stocks=12, n_timesteps=120, seq_len=60, horizon=5, seed
 
 
 class TestTrainPanelMasked:
+    @pytest.mark.slow
     def test_trains_2_epochs_on_masked_panel(self):
         """Full train loop on a masked panel — no NaN, history populated."""
         data = _make_masked_panel()
@@ -98,6 +100,7 @@ class TestTrainPanelMasked:
             grn_layers=1, seq_len=60, dropout=0.0,
             compile_model=False, batch_size=16, num_workers=0,
             max_epochs=2, horizon=5, rank_loss_weight=0.1,
+            min_stocks_per_day=5,
         )
         device = torch.device("cpu")
         model, history = train_panel(
@@ -122,6 +125,7 @@ class TestTrainPanelMasked:
         assert not torch.isnan(v).any()
         assert (v >= 0).all()
 
+    @pytest.mark.slow
     def test_vol_only_batch_trains(self):
         """A batch whose direction labels are all -100 still trains via ret/vol.
 
@@ -139,6 +143,7 @@ class TestTrainPanelMasked:
             grn_layers=1, seq_len=60, dropout=0.0,
             compile_model=False, batch_size=16, num_workers=0,
             max_epochs=2, horizon=5, rank_loss_weight=0.1,
+            min_stocks_per_day=5,
         )
         device = torch.device("cpu")
         model, history = train_panel(
@@ -150,7 +155,7 @@ class TestTrainPanelMasked:
 
 
 class TestValLossBatchSizeInvariant:
-    """Review v5 §十七 P1#9: the validation return loss is a SAMPLE-WEIGHTED
+    """The validation return loss is a SAMPLE-WEIGHTED
     mean (train.py `_compute_val_loss`), so re-batching the same validation
     data with batch sizes 32 / 64 / 128 must give the same v_ret.  This guards
     the checkpoint-selection metric against batch-boundary artifacts."""
@@ -163,6 +168,7 @@ class TestValLossBatchSizeInvariant:
             grn_layers=1, seq_len=60, dropout=0.0,
             compile_model=False, batch_size=128, num_workers=0,
             max_epochs=1, horizon=5, rank_loss_weight=0.1,
+            min_stocks_per_day=5,
         )
         model = PanelModel(config)
         ret_loss = AdjMSELoss()
@@ -180,7 +186,7 @@ class TestValLossBatchSizeInvariant:
             loader = DataLoader(ds, batch_size=bs, shuffle=False,
                                 collate_fn=panel_collate, num_workers=0)
             _, _, v_ret, _, v_rankic = _compute_val_loss(
-                model, loader, ret_loss, loss_fn, device,
+                model, loader, data, config, ret_loss, loss_fn, device,
                 use_amp=False, vol_enabled=True,
             )
             assert np.isfinite(v_ret)

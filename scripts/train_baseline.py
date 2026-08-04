@@ -128,6 +128,7 @@ def main():
             code,
             start_date=cfg.markets.a_shares.start_date,
             end_date=datetime.now().strftime("%Y-%m-%d"),
+            require_valid_manifest=True,
         )
         if df.empty:
             logger.warning("No data for %s, skipping", code)

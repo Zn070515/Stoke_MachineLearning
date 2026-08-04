@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 _LOCK_TIMEOUT = 600.0
 _LOCK_STALE = 900.0
 
-# v6 §十一: destructive window replacement must reject if the new output would
-# drop too many previously-present dates, or silently remove columns that
-# downstream readers depend on.  Allow up to 20% date loss by default.
+# Destructive window replacement must reject if the new output would drop too
+# many previously-present dates, or silently remove columns that downstream
+# readers depend on.  Allow up to 20% date loss by default.
 DEFAULT_DEGRADE_THRESHOLD = 0.2
 _SCHEMA_RESERVED = frozenset({"date", "stock_code"})
 
@@ -112,8 +112,8 @@ class MarketWideStorage:
         upstream raw load came back short) is measured against the full range
         and rejected instead of slipping through a narrow default window.
 
-        v6 §十一 degradation guard: a destructive replace is REJECTED (the old
-        file is left untouched) when it would delete more than
+        A destructive replace is REJECTED (the old file is left untouched)
+        when it would delete more than
         ``degrade_threshold`` of the dates previously present inside the
         window, or when it drops columns the old file carried — either signals
         an upstream failure that produced a partial output.  Pass ``force=True``

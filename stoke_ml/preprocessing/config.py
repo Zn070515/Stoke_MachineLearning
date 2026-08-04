@@ -54,15 +54,24 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
 
     Accepts plain dict or OmegaConf DictConfig.
     """
-    if cfg is not None and not isinstance(cfg, dict):
+    if cfg is None:
+        cfg = {}
+    elif not isinstance(cfg, dict):
         try:
             from omegaconf import OmegaConf
             cfg = OmegaConf.to_container(cfg, resolve=True)
-        except Exception:
-            cfg = {}
+        except Exception as exc:
+            raise ValueError(
+                f"preprocessing config could not be parsed: {exc}"
+            ) from exc
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                "preprocessing config must resolve to a mapping, got "
+                f"{type(cfg).__name__}"
+            )
 
     pp = PreprocessingPipeline()
-    pp_cfg = cfg if isinstance(cfg, dict) else {}
+    pp_cfg = cfg
     if not pp_cfg:
         return pp
 

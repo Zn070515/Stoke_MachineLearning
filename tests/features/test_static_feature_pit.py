@@ -1,4 +1,4 @@
-"""Review v8 §三-2: static-feature Point-In-Time audit.
+"""Static-feature Point-In-Time audit.
 
 Static features must use values known at the decision day, not values
 present-backfilled from today.  Three guarantees are tested here:
@@ -16,7 +16,9 @@ present-backfilled from today.  Three guarantees are tested here:
 
 import numpy as np
 import pandas as pd
+import pytest
 
+from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.features.pipeline import FeaturePipeline, _PIT_STATIC_COLS
 
 SEQ_LEN = 20
@@ -24,9 +26,14 @@ HORIZON = 5
 
 
 def _make_synthetic_panel(n_stocks=8, n_days=200, seed=7):
+    """Real A-share trading days (not pd.bdate_range — that includes holidays
+    like 2022-01-03 元旦, which the §十二-1 calendar-clean pass would drop and
+    desync the full/trunc column indices)."""
     rng = np.random.RandomState(seed)
     codes = [f"{600000 + i:06d}" for i in range(n_stocks)]
-    dates = pd.bdate_range("2022-01-03", periods=n_days)
+    all_td = TradingCalendar("a_shares").get_trading_days("2022-01-03", "2023-12-31")
+    assert len(all_td) >= n_days, f"need {n_days} trading days, have {len(all_td)}"
+    dates = pd.DatetimeIndex(all_td[:n_days])
     rows = []
     for i, code in enumerate(codes):
         drift = 0.0005 * (i % 3 - 1)
@@ -75,6 +82,7 @@ class TestStaticTruncationInvariance:
     a build that stops at the end of 2015.
     """
 
+    @pytest.mark.slow
     def test_truncated_panel_equals_full_panel_on_overlap(self):
         panel = _make_synthetic_panel()
         cut = 150  # columns [0, cut) overlap between the two builds
@@ -93,6 +101,7 @@ class TestStaticTruncationInvariance:
         b = trunc["static_features"][:, :cut, :]
         np.testing.assert_allclose(a, b, rtol=0.0, atol=0.0)
 
+    @pytest.mark.slow
     def test_listing_days_is_chronological(self):
         """listing_days must increase with the calendar column, never decrease."""
         panel = _make_synthetic_panel()

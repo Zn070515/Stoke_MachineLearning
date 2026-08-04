@@ -17,7 +17,11 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.announcement_storage import AnnouncementStorage
-from stoke_ml.data.download_resume import mark_stock_result, skip_completed_stocks
+from stoke_ml.data.download_resume import (
+    evidence_says_complete,
+    mark_stock_result,
+    skip_completed_stocks,
+)
 from stoke_ml.data.sources.a_shares.announcement_source import AnnouncementSource
 from stoke_ml.features.news_nlp import compute_raw_sentiment, NewsSentimentAnalyzer
 
@@ -94,14 +98,27 @@ def main():
     analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer(force_lexicon=True)
 
     success = 0
+    partial = 0
+    empty = 0
+    fail = 0
+
+    def _mark(code: str, df: pd.DataFrame, meta: dict) -> None:
+        """Write the per-stock manifest with pagination evidence."""
+        mark_stock_result(
+            raw_dir, code, df, dataset="announcements",
+            requested_start=args.start, requested_end=end_date,
+            expected_rows=meta.get("expected_rows"),
+            pages_fetched=meta.get("pages_fetched"),
+            pagination_exhausted=meta.get("pagination_exhausted"),
+        )
+
     for i, code in enumerate(codes):
+        meta: dict = {}
         try:
-            df = source.fetch_announcements(code, args.start, end_date)
+            df = source.fetch_announcements(code, args.start, end_date, meta=meta)
             if df.empty:
-                mark_stock_result(
-                    raw_dir, code, df, dataset="announcements",
-                    requested_start=args.start, requested_end=end_date,
-                )
+                _mark(code, df, meta)
+                empty += 1
                 if (i + 1) % 250 == 0:
                     logger.info("[%d/%d] %s: 0 announcements", i + 1, len(codes), code)
                 continue
@@ -112,12 +129,16 @@ def main():
                 df = compute_raw_sentiment(df, analyzer)
 
             storage.save_raw(code, df)
-            mark_stock_result(
-                raw_dir, code, df, dataset="announcements",
-                requested_start=args.start, requested_end=end_date,
-            )
+            _mark(code, df, meta)
             storage.build_daily_sentiment(code)
-            success += 1
+            if evidence_says_complete(
+                df,
+                expected_rows=meta.get("expected_rows"),
+                pagination_exhausted=meta.get("pagination_exhausted"),
+            ):
+                success += 1
+            else:
+                partial += 1
 
             if success % 250 == 0:
                 logger.info("[%d/%d] %s: %d announcements saved",
@@ -125,8 +146,17 @@ def main():
 
         except Exception as e:
             logger.error("[%d/%d] %s: ERROR %s", i + 1, len(codes), code, e)
+            fail += 1
 
-    logger.info("Done%s: %d/%d stocks with announcements", shard_label, success, len(codes))
+    logger.info("Done%s: %d complete, %d partial, %d empty, %d fail / %d stocks",
+                shard_label, success, partial, empty, fail, len(codes))
+
+    # Exit code reflects the outcome — 0 all good, 1 fetch failures,
+    # 2 any partial/degraded (truncated or empty) result.
+    if fail:
+        sys.exit(1)
+    if partial or empty:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

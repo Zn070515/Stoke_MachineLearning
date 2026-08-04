@@ -1,4 +1,4 @@
-"""Production-chain smoke test (review v7 §一.4).
+"""Production-chain smoke test.
 
 Runs the REAL production pipeline end-to-end on tiny synthetic OHLCV:
 
@@ -6,15 +6,17 @@ Runs the REAL production pipeline end-to-end on tiny synthetic OHLCV:
         → evaluate_portfolio(require_price_path=True) → sleeve-account identity
 
 Only production functions are called — no hand-written training loop, no 2D
-static shortcut.  This is the guard that the review's "NEW train_panel.py /
-evaluate.py call NEW Panel interface" claim holds on a real forward pass, and
+static shortcut.  This is the guard that the "NEW train_panel.py /
+evaluate.py call NEW Panel interface" contract holds on a real forward pass, and
 that the price-path sleeve account runs (its internal account-identity
 assertion fires) rather than silently falling back to the legacy estimator.
 """
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
+from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.evaluate import _simulate_sleeve_account, evaluate_portfolio
@@ -30,7 +32,11 @@ def _make_synthetic_panel(n_stocks=N_STOCKS, n_days=N_DAYS, seed=42):
     """Geometric random-walk OHLCV panel → well-defined indicators / vol targets."""
     rng = np.random.RandomState(seed)
     codes = [f"{600000 + i:06d}" for i in range(n_stocks)]
-    dates = pd.bdate_range("2022-01-03", periods=n_days)
+    # Official A-share trading days: the pipeline rejects dates not
+    # on the exchange calendar, so a bdate_range grid would silently shrink T.
+    dates = pd.DatetimeIndex(
+        TradingCalendar("a_shares").get_trading_days("2022-01-03", "2022-12-31")
+    )[:n_days]
     rows = []
     for i, code in enumerate(codes):
         drift = 0.0005 * (i % 5 - 2)
@@ -52,7 +58,7 @@ def _make_synthetic_panel(n_stocks=N_STOCKS, n_days=N_DAYS, seed=42):
 
 
 def _slice_time(panel_data: dict, start: int, stop: int, price_pad: int = 0) -> dict:
-    """Time-axis slice mirroring train_panel._slice_panel (review v4 §五).
+    """Time-axis slice mirroring train_panel._slice_panel.
 
     Price columns are padded `horizon` columns beyond `stop` so the sleeve
     entered on the last signal day can still liquidate at open[stop+horizon].
@@ -86,10 +92,12 @@ def _pipeline():
         seq_len=SEQ_LEN,
         minute_mode=False,
         use_board=False, use_sector=False, use_concept=False,
+        min_history=SEQ_LEN,
     )
 
 
 class TestBuildPanelFeatures:
+    @pytest.mark.slow
     def test_keys_and_shapes(self):
         panel = _make_synthetic_panel()
         data = _pipeline().build_panel_features(panel, horizon=HORIZON)
@@ -100,7 +108,7 @@ class TestBuildPanelFeatures:
         assert T == N_DAYS
         for key in ("static_features", "past_known", "past_observed"):
             assert data[key].dtype == np.float32
-        # 4 PIT-static cols (review v8 §三-2): price_60d_q / amt_60d_q /
+        # 4 PIT-static cols: price_60d_q / amt_60d_q /
         # listing_days / board_code.  industry_code excluded — no PIT
         # industry-membership source exists, only a present-snapshot map.
         assert data["static_features"].shape == (N, T, 4)
@@ -117,6 +125,7 @@ class TestBuildPanelFeatures:
 
 
 class TestProductionTrainThenEvaluate:
+    @pytest.mark.slow
     def test_full_chain(self):
         panel = _make_synthetic_panel()
         panel_data = _pipeline().build_panel_features(panel, horizon=HORIZON)
@@ -134,6 +143,7 @@ class TestProductionTrainThenEvaluate:
             grn_layers=1, seq_len=SEQ_LEN, min_history=SEQ_LEN,
             batch_size=16, max_epochs=1, compile_model=False,
             num_workers=0, horizon=HORIZON, seed=0, rank_loss_weight=0.0,
+            min_stocks_per_day=5,
         )
         device = torch.device("cpu")
 

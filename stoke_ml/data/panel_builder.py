@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.data.stock_sector_mapper import StockSectorMapper
+from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class PanelBuilder:
         self._mapper = StockSectorMapper()
         self._sector_cache: dict[str, str] = {}
         self._fund_cache: dict[str, pd.DataFrame] = {}
+        self._error_summary = ErrorSummary()
 
     # ------------------------------------------------------------------
     # Public API
@@ -47,6 +49,7 @@ class PanelBuilder:
 
         Stocks with fewer than *min_rows_per_stock* rows are dropped.
         """
+        self._error_summary = ErrorSummary()
         frames: list[pd.DataFrame] = []
         skipped = 0
 
@@ -76,7 +79,14 @@ class PanelBuilder:
         logger.info("Panel built: %d stocks × %d rows, %d dates",
                      panel["stock_code"].nunique(), len(panel),
                      panel["date"].nunique())
+        if self._error_summary:
+            log_summary(self._error_summary, logger, "PanelBuilder.build")
         return panel
+
+    @property
+    def error_summary(self) -> ErrorSummary:
+        """Aggregate of channel-load failures from the most recent build()."""
+        return self._error_summary
 
     # ------------------------------------------------------------------
     # Internal
@@ -124,7 +134,8 @@ class PanelBuilder:
         for c in uncached:
             try:
                 self._sector_cache[c] = self._mapper.get_sector(c) or "未知"
-            except Exception:
+            except Exception as exc:
+                self._error_summary.record_exc(exc, "sector_map")
                 self._sector_cache[c] = "未知"
         return self._sector_cache
 
@@ -148,7 +159,8 @@ class PanelBuilder:
                     continue
                 try:
                     fd = pd.read_parquet(fpath)
-                except Exception:
+                except Exception as exc:
+                    self._error_summary.record_exc(exc, "fundamental_size")
                     continue
                 if "total_revenue" not in fd.columns or "disclose_date" not in fd.columns:
                     continue

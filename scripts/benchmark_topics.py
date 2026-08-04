@@ -62,6 +62,11 @@ def main():
     parser.add_argument("--stocks", type=int, default=10)
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--corpus-cutoff", type=str, default=None,
+        help="Fit topic modeler only on posts with date <= this (YYYY-MM-DD), "
+             "so the topic representation space never sees later documents.",
+    )
     args = parser.parse_args()
 
     t0 = time.time()
@@ -131,7 +136,7 @@ def main():
         logger.info("Fitting topic modeler on %d posts...", len(all_silver))
         # Run quality filter first on combined data
         clean = pp.run("text_pre", all_silver)
-        tm.fit(clean, source=args.source)
+        tm.fit(clean, source=args.source, corpus_cutoff=args.corpus_cutoff)
         fit_time = time.time() - t_fit
         logger.info("Topic modeler fit: %.1fs", fit_time)
         if tm._model is not None:

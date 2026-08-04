@@ -5,11 +5,14 @@ import pytest
 from stoke_ml.data.sources.a_shares.guba_source import GubaSource
 
 
+@pytest.mark.network
 class TestGubaSource:
     """Integration tests for GubaSource.
 
-    These tests make live HTTP requests to guba.eastmoney.com.
-    They may be skipped with --no-integration if a marker is configured.
+    These tests make live HTTP requests to guba.eastmoney.com, so they are
+    flaky (WAF rate-limiting) and carry the ``network`` marker.  The default
+    smoke run deselects ``network`` and ``slow`` tests (pyproject.toml
+    addopts); run them explicitly with ``pytest -m "network or slow"``.
     """
 
     @pytest.fixture

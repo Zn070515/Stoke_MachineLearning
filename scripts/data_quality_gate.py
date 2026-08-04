@@ -6,6 +6,10 @@ check fails, so it can gate CI / a post-download hook. Run it after any
 download or feature rebuild.
 
 Checks:
+  datasets         : required-dataset pre-gate — dir exists, file /
+                     stock / row minimums, date-span coverage, freshness.
+                     DEFAULT: 0 file or 0 row = FAIL; only --allow-empty lets
+                     an empty/missing dataset pass.
   daily_internal   : daily flat pct_change == close.pct_change()*100 (fill-0 pollution)
   aux_pct_aligned  : board/industry processed pct_change == daily pct_change (stale-0)
   aux_close_aligned: processed OHLC == canonical daily close (调整基准漂移)
@@ -15,7 +19,10 @@ Checks:
                      low<=open/close<=high, volume/amount>=0
 
 Any read error or missing column FAILS its check — a problem recorded in the
-report must also flip the gate (v6 §九).
+report must also flip the gate.
+
+Sampling is exchange-stratified with a fixed seed so a --quick run is
+not biased toward low-code stocks.
 
 Output: reports/data_quality_gate.json (machine-readable) + console summary.
 
@@ -23,6 +30,9 @@ Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/data_quality_gate.py
   PYTHONPATH=. ./.venv/Scripts/python scripts/data_quality_gate.py --quick --sample 200
   PYTHONPATH=. ./.venv/Scripts/python scripts/data_quality_gate.py --check daily_internal,feature_pct
+  PYTHONPATH=. ./.venv/Scripts/python scripts/data_quality_gate.py --data-dir <train-root> \
+      --require daily,features --max-stale-days 10
+  PYTHONPATH=. ./.venv/Scripts/python scripts/data_quality_gate.py --allow-empty  # dev bootstrap
 """
 import argparse
 import glob
@@ -93,14 +103,150 @@ def _load_daily(code: str, cols: list[str]) -> pd.DataFrame | None:
     return cached[list(cols)].copy()
 
 
+# ── required-dataset pre-gate ───────────────────────────────────────────────
+# A gate that PASSes on an empty directory is worse than no gate: a wrong
+# path, an aborted download, or a config pointing elsewhere all get a green
+# check.  Every required dataset must satisfy: dir exists, file count >= min,
+# valid stock count >= min, total rows >= min, date-span coverage, freshness.
+# Default 0 file / 0 row = FAIL; only --allow-empty permits empty data.
+SAMPLE_SEED = 20240804
+REQUIRED_DATASETS = ["daily"]  # CLI: --require daily,features,features_panel
+MIN_FILES = 1
+MIN_STOCKS = 1
+MIN_ROWS = 1
+MIN_SPAN_DAYS = 180
+MAX_STALE_DAYS = 30
+ALLOW_EMPTY = False
+
+
+def _dataset_dir(name: str) -> Path:
+    """Resolve a required-dataset directory from the current data root."""
+    if name == "daily":
+        return DAILY_DIR
+    if name == "features":
+        return FEAT_DIR
+    if name == "features_panel":
+        return A_SHARES.parent / "features_panel"
+    return DAILY_DIR  # unknown names are flagged by check_datasets
+
+
+def _exchange_of(code: str) -> str:
+    """A-share exchange bucket from the stock-code first digit."""
+    first = code[0] if code else ""
+    if first in ("0", "3"):
+        return "SZ"
+    if first == "6":
+        return "SH"
+    if first in ("4", "8"):
+        return "BJ"
+    return "other"
+
+
+def _sample_files(files: list[str], n: int, seed: int = SAMPLE_SEED) -> list[str]:
+    """Fixed-seed exchange-stratified sample.
+
+    Plain ``files[:n]`` on the sorted code list is biased toward low-code
+    stocks (00xxxx dominate the head).  Stratify by exchange so a --quick run
+    covers SH/SZ/BSE proportionally, deterministically per seed.
+    """
+    if n <= 0 or len(files) <= n:
+        return list(files)
+    rng = np.random.default_rng(seed)
+    buckets: dict[str, list[str]] = {}
+    for f in files:
+        buckets.setdefault(_exchange_of(Path(f).stem), []).append(f)
+    out = []
+    for bucket in sorted(buckets):
+        items = buckets[bucket]
+        want = max(1, round(len(items) / len(files) * n))
+        items = list(items)
+        rng.shuffle(items)
+        out.extend(items[:want])
+    return out[:n]
+
+
+def _scan_dataset(name: str, d: Path, sample: int) -> tuple[list, int, int]:
+    """Return (issues, n_files, n_rows) for one required dataset.
+
+    ``n_files`` is the true on-disk parquet count; the expensive row/date
+    reads only cover a stratified sample when ``sample > 0`` (--quick).
+    """
+    issues: list = []
+    if not d.exists():
+        issues.append((f"{name}", "missing_dir"))
+        return issues, 0, 0
+    files = sorted(glob.glob(str(d / "*.parquet")))
+    if len(files) < MIN_FILES:
+        issues.append((f"{name}", f"files={len(files)} < min={MIN_FILES}"))
+    scan = _sample_files(files, sample)
+    valid_stocks = total_rows = 0
+    dates: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for fp in scan:
+        try:
+            df = pd.read_parquet(fp, columns=["date"])
+        except Exception:
+            continue
+        if "date" not in df:
+            continue
+        dts = pd.to_datetime(df["date"], errors="coerce").dropna()
+        total_rows += len(dts)
+        if len(dts):
+            valid_stocks += 1
+            dates.append((dts.min(), dts.max()))
+    if valid_stocks < MIN_STOCKS:
+        issues.append((f"{name}", f"valid_stocks={valid_stocks} < min={MIN_STOCKS}"))
+    if total_rows < MIN_ROWS:
+        issues.append((f"{name}", f"rows={total_rows} < min={MIN_ROWS}"))
+    if dates:
+        lo = min(a for a, _ in dates)
+        hi = max(b for _, b in dates)
+        span = (hi - lo).days
+        if span < MIN_SPAN_DAYS:
+            issues.append((f"{name}", f"span={span}d < min={MIN_SPAN_DAYS}d"))
+        stale = (pd.Timestamp.now().normalize() - pd.Timestamp(hi)).days
+        if stale > MAX_STALE_DAYS:
+            issues.append((f"{name}", f"stale={stale}d > max={MAX_STALE_DAYS}d"))
+    elif scan:
+        issues.append((f"{name}", "empty_rows"))
+    return issues, len(files), total_rows
+
+
+def check_datasets(sample: int) -> CheckResult:
+    """Required-dataset pre-gate: empty/missing data must FAIL."""
+    res = CheckResult("datasets", True, "")
+    if ALLOW_EMPTY:
+        res.summary = "skipped (--allow-empty)"
+        return res
+    n_files = n_rows = 0
+    issues: list = []
+    for name in REQUIRED_DATASETS:
+        if name not in ("daily", "features", "features_panel"):
+            issues.append((name, "unknown_dataset"))
+            continue
+        iss, nf, nr = _scan_dataset(name, _dataset_dir(name), sample)
+        n_files += nf
+        n_rows += nr
+        issues.extend(iss)
+    res.files_scanned = n_files
+    res.rows_scanned = n_rows
+    res.issues = issues
+    if issues:
+        res.passed = False
+    first = issues[0] if issues else ("", "")
+    res.summary = (
+        f"{'FAIL' if issues else 'OK'} files={n_files} rows={n_rows} "
+        f"datasets={','.join(REQUIRED_DATASETS)}"
+        + (f" first={first[0]}:{first[1]}" if issues else "")
+    )
+    return res
+
+
 # ── checks ──────────────────────────────────────────────────────────────
 
 def check_daily_internal(sample: int) -> CheckResult:
     """pct_change must equal close.pct_change()*100 (fill-0 pollution)."""
     res = CheckResult("daily_internal", True, "")
-    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
-    if sample:
-        files = files[:sample]
+    files = _sample_files(sorted(glob.glob(str(DAILY_DIR / "*.parquet"))), sample)
     res.files_scanned = len(files)
     max_diff = 0.0
     poll_total = 0
@@ -136,9 +282,7 @@ def check_aux_pct_aligned(sample: int) -> CheckResult:
     files = []
     for d in AUX_PCT_DIRS:
         files += glob.glob(str(A_SHARES / d / "*.parquet"))
-    files.sort()
-    if sample:
-        files = files[:sample]
+    files = _sample_files(sorted(files), sample)
     res.files_scanned = len(files)
     max_diff = 0.0
     for fp in files:
@@ -179,9 +323,7 @@ def check_aux_close_aligned(sample: int) -> CheckResult:
     files = []
     for d in AUX_CLOSE_DIRS:
         files += glob.glob(str(A_SHARES / d / "*.parquet"))
-    files.sort()
-    if sample:
-        files = files[:sample]
+    files = _sample_files(sorted(files), sample)
     res.files_scanned = len(files)
     max_diff = 0.0
     OHLC = ["open", "high", "low", "close"]
@@ -230,9 +372,7 @@ def check_aux_close_aligned(sample: int) -> CheckResult:
 def check_feature_pct(sample: int) -> CheckResult:
     """Feature pct_change must equal daily (feature-layer pollution canary)."""
     res = CheckResult("feature_pct", True, "")
-    feats = sorted(glob.glob(str(FEAT_DIR / "*.parquet")))
-    if sample:
-        feats = feats[:sample]
+    feats = _sample_files(sorted(glob.glob(str(FEAT_DIR / "*.parquet"))), sample)
     res.files_scanned = len(feats)
     max_diff = 0.0
     CUTOFF = pd.Timestamp("2026-06-18")
@@ -277,15 +417,13 @@ def check_feature_pct(sample: int) -> CheckResult:
 def check_sparsity(sample: int) -> CheckResult:
     """Per-feature non-zero coverage across a sampled panel (event-sparse canary).
 
-    v6 §九: ``(x != 0).mean()`` counts NaN as non-zero (NaN != 0 is True), which
+    ``(x != 0).mean()`` counts NaN as non-zero (NaN != 0 is True), which
     inflates coverage for missing-heavy features. Report finite-excluded ratios:
       finite_cov        = np.isfinite(x).mean()
       effective_nonzero = (np.isfinite(x) & (x != 0)).mean()
     """
     res = CheckResult("sparsity", True, "")
-    feats = sorted(glob.glob(str(FEAT_DIR / "*.parquet")))
-    if sample:
-        feats = feats[:sample]
+    feats = _sample_files(sorted(glob.glob(str(FEAT_DIR / "*.parquet"))), sample)
     res.files_scanned = len(feats)
     finite: dict[str, list] = {}
     nz: dict[str, list] = {}
@@ -327,16 +465,14 @@ def check_sparsity(sample: int) -> CheckResult:
 
 
 def check_ohlc_sanity(sample: int) -> CheckResult:
-    """Raw daily files must be internally consistent (v6 §九).
+    """Raw daily files must be internally consistent.
 
     Dates unique / sorted / no-weekend (A-shares never trade weekends, even on
     调休 makeup days), stock_code == filename, prices > 0, low <= open/close <=
     high, volume/amount >= 0. Any violation fails the gate.
     """
     res = CheckResult("ohlc_sanity", True, "")
-    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
-    if sample:
-        files = files[:sample]
+    files = _sample_files(sorted(glob.glob(str(DAILY_DIR / "*.parquet"))), sample)
     res.files_scanned = len(files)
     TOL = 1e-9
     dup_total = 0
@@ -419,16 +555,14 @@ def check_ohlc_sanity(sample: int) -> CheckResult:
 
 
 def check_contract_schema(sample: int) -> CheckResult:
-    """Every daily file must satisfy the frozen DAILY_EQUITY contract (v6 §十六).
+    """Every daily file must satisfy the frozen DAILY_EQUITY contract.
 
     Schema, primary-key uniqueness, date rules and unit sign constraints all
     come from ``stoke_ml.data.contract`` instead of ad-hoc local checks, so the
     gate and the storage/downloader layers share one source of truth.
     """
     res = CheckResult("contract_schema", True, "")
-    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
-    if sample:
-        files = files[:sample]
+    files = _sample_files(sorted(glob.glob(str(DAILY_DIR / "*.parquet"))), sample)
     res.files_scanned = len(files)
     contract = get_contract("daily_equity")
     for fp in files:
@@ -448,6 +582,7 @@ def check_contract_schema(sample: int) -> CheckResult:
 
 
 CHECKS = {
+    "datasets": check_datasets,
     "daily_internal": check_daily_internal,
     "aux_pct_aligned": check_aux_pct_aligned,
     "aux_close_aligned": check_aux_close_aligned,
@@ -459,6 +594,8 @@ CHECKS = {
 
 
 def main():
+    global MIN_FILES, MIN_STOCKS, MIN_ROWS, MIN_SPAN_DAYS, MAX_STALE_DAYS
+    global ALLOW_EMPTY, A_SHARES, DAILY_DIR, FEAT_DIR
     ap = argparse.ArgumentParser(description="Data quality gate")
     ap.add_argument("--check", default=None,
                     help="comma-separated checks (default: all)")
@@ -468,7 +605,39 @@ def main():
                     help="shorthand for --sample 300 (CI / post-build gate)")
     ap.add_argument("--output", default="reports",
                     help="report dir (default reports/)")
+    ap.add_argument("--data-dir", default=None,
+                    help="data root (default: <repo>/data) — gate the same root "
+                         "training reads so gate-PASS and train-read can't diverge")
+    ap.add_argument("--require", default="daily",
+                    help="comma-separated required datasets: "
+                         "daily,features,features_panel (default: daily)")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="permit empty/missing required datasets (dev bootstrap)")
+    ap.add_argument("--min-files", type=int, default=MIN_FILES,
+                    help="minimum parquet files per required dataset")
+    ap.add_argument("--min-stocks", type=int, default=MIN_STOCKS,
+                    help="minimum readable stocks per required dataset")
+    ap.add_argument("--min-rows", type=int, default=MIN_ROWS,
+                    help="minimum total rows per required dataset")
+    ap.add_argument("--min-span-days", type=int, default=MIN_SPAN_DAYS,
+                    help="minimum earliest→latest span per required dataset")
+    ap.add_argument("--max-stale-days", type=int, default=MAX_STALE_DAYS,
+                    help="max calendar days since latest date before FAIL")
     args = ap.parse_args()
+
+    MIN_FILES = args.min_files
+    MIN_STOCKS = args.min_stocks
+    MIN_ROWS = args.min_rows
+    MIN_SPAN_DAYS = args.min_span_days
+    MAX_STALE_DAYS = args.max_stale_days
+    ALLOW_EMPTY = args.allow_empty
+    REQUIRED_DATASETS[:] = [x.strip() for x in args.require.split(",") if x.strip()]
+    if args.data_dir:
+        root = Path(args.data_dir).resolve()
+        _DAILY_CACHE.clear()
+        A_SHARES = root / "a_shares"
+        DAILY_DIR = A_SHARES / "daily"
+        FEAT_DIR = root / "features"
 
     names = (args.check.split(",") if args.check else list(CHECKS))
     unknown = [n for n in names if n not in CHECKS]

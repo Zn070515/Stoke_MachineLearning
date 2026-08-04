@@ -1,4 +1,4 @@
-"""Feature-cache sidecar manifests (v6 §十二).
+"""Feature-cache sidecar manifests.
 
 Each prebuilt feature parquet carries a JSON manifest recording the code
 version, config signature, feature schema, and per-channel source file
@@ -8,9 +8,14 @@ reusing it during training.
 """
 import hashlib
 import json
+import logging
 import os
 import subprocess
 from datetime import datetime, timezone
+
+from stoke_ml.utils.error_summary import classify_error
+
+logger = logging.getLogger(__name__)
 
 # Per-stock channel directories under data/a_shares/{subdir}/{code}.parquet.
 SOURCE_SUBDIRS = {
@@ -64,7 +69,8 @@ def git_head() -> str:
             capture_output=True, text=True, check=True,
         )
         return out.stdout.strip() or "unknown"
-    except Exception:
+    except Exception as exc:
+        logger.warning("git rev-parse failed (category=%s)", classify_error(exc).value)
         return "unknown"
 
 
@@ -89,7 +95,10 @@ def schema_hash(path: str) -> str:
         schema = pq.read_schema(path)
         cols = [(f.name, str(f.type)) for f in schema]
         return _sha1(json.dumps(cols, sort_keys=True))
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "schema_hash failed for %s (category=%s)", path, classify_error(exc).value,
+        )
         return "unknown"
 
 
@@ -170,7 +179,11 @@ def manifest_matches(
     try:
         with open(manifest_path, encoding="utf-8") as f:
             m = json.load(f)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "manifest %s unreadable (category=%s), treating as stale",
+            manifest_path, classify_error(exc).value,
+        )
         return False
     if not all([
         m.get("stock_code") == code,

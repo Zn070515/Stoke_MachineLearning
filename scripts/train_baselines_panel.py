@@ -1,4 +1,4 @@
-"""Panel baselines benchmark (review v8 四-2).
+"""Panel baselines benchmark.
 
 The VSN+xLSTM panel model is complex; without simple reference points there is
 no way to tell whether the complexity earns its keep.  This script trains
@@ -10,7 +10,7 @@ scores each with the SAME ``evaluate_portfolio`` sleeve-account evaluator.
   runs are aligned by construction, not by copy.
 - Feature contract is point-in-time: a sample entering at day ``e`` uses the
   feature cross-section at ``e-1`` (the decision column the xLSTM also sees).
-- The naive "past return mean" baseline is the floor the review names: if the
+- The naive "past return mean" baseline is the floor to beat: if the
   complex model cannot beat it, the complexity adds no value.
 
 Usage:
@@ -44,6 +44,7 @@ from stoke_ml.models.baseline.panel_baselines import (
     ScaledPredictor,
     build_flat_samples,
     build_momentum_grid,
+    fit_mlp_with_early_stopping,
 )
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.evaluate import EVALUATOR_VERSION, evaluate_portfolio
@@ -86,12 +87,24 @@ class _LGBMWrapper:
         self._params["seed"] = seed
         self._bst = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray):
+    def fit(self, X: np.ndarray, y: np.ndarray,
+            X_val: np.ndarray | None = None, y_val: np.ndarray | None = None):
         import lightgbm as lgb
 
-        self._bst = lgb.train(
-            self._params, lgb.Dataset(X, label=y), num_boost_round=150
-        )
+        if X_val is not None and len(y_val) >= 20:
+            # Early-stop on the same chronological inner_val
+            # region the deep model uses for checkpoint selection, instead of a
+            # fixed 150 rounds.
+            self._bst = lgb.train(
+                self._params, lgb.Dataset(X, label=y),
+                num_boost_round=1000,
+                valid_sets=[lgb.Dataset(X_val, label=y_val)],
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
+        else:
+            self._bst = lgb.train(
+                self._params, lgb.Dataset(X, label=y), num_boost_round=150
+            )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._bst is None:
@@ -121,7 +134,7 @@ def make_model(name: str, seed: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Panel baselines benchmark (v8 四-2)")
+    parser = argparse.ArgumentParser(description="Panel baselines benchmark")
     parser.add_argument("--prebuilt", type=str, default="data/features_panel",
                         help="Panel-mode prebuilt features dir (same as train_panel.py)")
     parser.add_argument("--stocks", type=int, default=200,
@@ -139,7 +152,11 @@ def main():
                         help="Comma-separated baselines to run")
     parser.add_argument("--max-train-rows", type=int, default=100000,
                         help="Cap on baseline training rows per fold (benchmark "
-                             "memory guard; biases toward earlier train columns only)")
+                             "memory guard; sampled date-stratified)")
+    parser.add_argument("--with-seq-features", action="store_true",
+                        help="Append the shared sequence summary (trailing mean/std/"
+                             "slope + lags of the seq_len window) to baseline inputs "
+                             "so baselines see the same history as the xLSTM")
     parser.add_argument("--seq-len", type=int, default=None,
                         help="Override seq_len (default: 60)")
     parser.add_argument("--horizon", type=int, default=5)
@@ -174,7 +191,8 @@ def main():
     ds = DataStorage(data_dir)
     frames = []
     for code in stock_list:
-        df = ds.load_daily(code, args.start, args.end)
+        df = ds.load_daily(code, args.start, args.end,
+                           require_valid_manifest=True)
         if df is not None and not df.empty:
             df["stock_code"] = code
             frames.append(df)
@@ -250,8 +268,11 @@ def main():
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     summary_rows: list[dict] = []
     fold_records: list[dict] = []
+    rng = np.random.RandomState(args.seed)
 
-    last_val_start = n_timesteps - val_len - lockbox_len
+    # Reserve `horizon` steps before the lockbox as a
+    # settlement buffer so the last fold's exits stop before the lockbox opens.
+    last_val_start = n_timesteps - config.horizon - val_len - lockbox_len
     val_start = last_val_start
     fold = 0
     while val_start >= 0:
@@ -272,8 +293,27 @@ def main():
             val_start -= step
             continue
 
+        # Mirror train_panel.py's inner_val carve-out.  The
+        # deep model fits [0, inner_train_end) and selects its checkpoint on the
+        # last ~15% of the trainable span; a baseline that trained on the whole
+        # [0, train_end) would win by "seeing more labels", not by modeling the
+        # data better.  inner_val here is used ONLY for early stopping /
+        # checkpoint selection — never appended to the fit.
+        n_train_targets = train_end - config.seq_len
+        inner_val_len = max(1, int(round(0.15 * n_train_targets)))
+        inner_val_context_start = train_end - inner_val_len - config.seq_len
+        if inner_val_context_start < config.seq_len + 1:
+            break
+        inner_train_end = inner_val_context_start
+
         inner_train_data = _mask_stocks(
-            _slice_panel(panel_data, slice(0, train_end), price_pad=config.horizon),
+            _slice_panel(panel_data, slice(0, inner_train_end),
+                         price_pad=config.horizon),
+            fold_eligible,
+        )
+        inner_val_data = _mask_stocks(
+            _slice_panel(panel_data, slice(inner_val_context_start, train_end),
+                         price_pad=config.horizon),
             fold_eligible,
         )
         outer_test_data = _mask_stocks(
@@ -284,17 +324,32 @@ def main():
 
         # Same target normalization as train_panel.py: cross-sectional z-score
         # per date (clean open-to-open returns), then clip to [-5, 5].
-        inner_train_data["y_return"] = _cross_sectional_normalize(
-            inner_train_data["y_return"], inner_train_data["return_target_mask"])
-        outer_test_data["y_return"] = _cross_sectional_normalize(
-            outer_test_data["y_return"], outer_test_data["return_target_mask"])
-        for dd in (inner_train_data, outer_test_data):
+        for dd in (inner_train_data, inner_val_data, outer_test_data):
+            dd["y_return"] = _cross_sectional_normalize(
+                dd["y_return"], dd["return_target_mask"])
             np.clip(dd["y_return"], -5.0, 5.0, out=dd["y_return"])
 
+        inner_train_T = inner_train_data["past_known"].shape[1]
+        inner_val_T = inner_val_data["past_known"].shape[1]
         n_windows = outer_test_data["past_known"].shape[1] - config.seq_len
-        logger.info("Fold %d/%d: inner_train [0:%d] outer_test [%d:%d] "
-                    "(%d eligible stocks, %d entry days)",
-                    fold, args.max_folds or "∞", train_end,
+
+        # Early-stopping set for the deep-style baselines: the inner_val region,
+        # with entry columns capped so every label is realized inside
+        # [inner_val_context_start, train_end) — never into the outer test.
+        inner_val_samples = None
+        if any(m in ("lgbm", "mlp") for m in models):
+            inner_val_samples = build_flat_samples(
+                inner_val_data, config.seq_len, inner_val_T - config.horizon,
+                seq_features=args.with_seq_features, seq_len=config.seq_len,
+                sample_rng=rng)
+            if len(inner_val_samples[1]) < 20:
+                inner_val_samples = None
+
+        logger.info("Fold %d/%d: inner_train [0:%d] inner_val [%d:%d] "
+                    "outer_test [%d:%d] (%d eligible stocks, %d entry days)",
+                    fold, args.max_folds or "∞",
+                    0, inner_train_end,
+                    inner_val_context_start, train_end,
                     val_context_start, val_end, len(fold_stocks), n_windows)
 
         for model_name in models:
@@ -304,27 +359,48 @@ def main():
                     outer_test_data, config.seq_len, config.seq_len + n_windows,
                     config.seq_len)
                 adapter = PrecomputedScoreAdapter(grid)
+                n_train = 0
             else:
                 # PIT label gate: y_return[:, e] is realized at open[e+horizon],
                 # so a training sample is usable only when its label is fully
-                # known by the fold cutoff train_end (e + horizon <= train_end-1,
-                # i.e. entry_end = train_end - horizon).  train_panel.py's inner
-                # train ends at inner_train_end = train_end - inner_val_len -
-                # seq_len, which guarantees the same property — without this
+                # known inside the fit span — entry_end = inner_train_T - horizon
+                # for the carved train slice.  Without this
                 # gate the baseline would train on labels unfolding into the
-                # purge gap right before the test window.
+                # inner_val region or the purge gap before the test window.
                 Xtr, ytr = build_flat_samples(
-                    inner_train_data, config.seq_len, train_end - config.horizon,
-                    max_rows=args.max_train_rows)
-                if len(ytr) < 100:
+                    inner_train_data, config.seq_len,
+                    inner_train_T - config.horizon,
+                    max_rows=args.max_train_rows,
+                    seq_features=args.with_seq_features,
+                    seq_len=config.seq_len,
+                    sample_rng=rng)
+                n_train = len(ytr)
+                if n_train < 100:
                     logger.warning("  fold %d %s: only %d training rows — skipping",
-                                   fold, model_name, len(ytr))
+                                   fold, model_name, n_train)
                     continue
                 scaler = StandardScaler()
                 Xtr_s = scaler.fit_transform(Xtr)
-                model = make_model(model_name, args.seed)
-                model.fit(Xtr_s, ytr)
-                adapter = FittedScoreAdapter(ScaledPredictor(model, scaler))
+                Xval_s = None
+                yval = None
+                if model_name in ("lgbm", "mlp") and inner_val_samples is not None:
+                    Xval_s = scaler.transform(inner_val_samples[0])
+                    yval = inner_val_samples[1]
+                if model_name == "mlp" and Xval_s is not None:
+                    # Chronological early stopping on the same
+                    # inner_val region the deep model uses for checkpoint
+                    # selection, instead of a fixed 25 epochs.
+                    model = fit_mlp_with_early_stopping(
+                        Xtr_s, ytr, Xval_s, yval, seed=args.seed)
+                elif model_name == "lgbm" and Xval_s is not None:
+                    model = _LGBMWrapper(args.seed)
+                    model.fit(Xtr_s, ytr, X_val=Xval_s, y_val=yval)
+                else:
+                    model = make_model(model_name, args.seed)
+                    model.fit(Xtr_s, ytr)
+                adapter = FittedScoreAdapter(
+                    ScaledPredictor(model, scaler),
+                    with_seq=args.with_seq_features)
             adapter.reset()
             outer_m = evaluate_portfolio(
                 adapter, outer_test_data, config, device,
@@ -338,7 +414,9 @@ def main():
             rec = {
                 "model": model_name,
                 "fold": fold,
-                "train_rows": len(ytr) if model_name != "momentum" else 0,
+                "train_rows": n_train,
+                "inner_val_start": _fmt_date(global_dates, inner_val_context_start),
+                "inner_val_end": _fmt_date(global_dates, train_end - 1),
                 "ls_sharpe": outer_m.get("ls_sharpe", 0.0),
                 "ls_gross_sharpe": outer_m.get("ls_gross_sharpe", 0.0),
                 "ic_mean": outer_m.get("ic_mean", 0.0),
@@ -346,7 +424,7 @@ def main():
                 "long_sharpe": outer_m.get("long_sharpe", 0.0),
                 "q5mq1_ret": outer_m.get("q5mq1_ret", 0.0),
                 "eligible_ew_sharpe": outer_m.get("eligible_ew_sharpe", 0.0),
-                "universe_ew_sharpe": outer_m.get("universe_ew_sharpe", 0.0),
+                "selected_universe_ew_sharpe": outer_m.get("selected_universe_ew_sharpe", 0.0),
                 "entry_start": _fmt_date(global_dates, val_start),
                 "entry_end": _fmt_date(global_dates, val_start + val_len - 1),
                 "seconds": round(elapsed, 1),
@@ -354,10 +432,10 @@ def main():
             fold_records.append(rec)
             logger.info(
                 "  %-8s fold %d | LS_Sharpe=%.2f IC=%.4f Long=%.2f Q5-Q1=%.1fbp "
-                "ElgEW=%.2f UniEW=%.2f (%.1fs)",
+                "ElgEW=%.2f SelUniEW=%.2f (%.1fs)",
                 model_name, fold, rec["ls_sharpe"], rec["ic_mean"],
                 rec["long_sharpe"], rec["q5mq1_ret"] * 10000,
-                rec["eligible_ew_sharpe"], rec["universe_ew_sharpe"], elapsed,
+                rec["eligible_ew_sharpe"], rec["selected_universe_ew_sharpe"], elapsed,
             )
         val_start -= step
 
@@ -375,8 +453,16 @@ def main():
         "n_folds": int(rows["fold"].nunique()),
         "eval_note": (
             "Same prebuilt features + same non-overlapping folds + same "
-            "evaluate_portfolio sleeve account as train_panel.py; baselines "
-            "train on the full [0, train_end) span (no inner_val carve-out)."
+            "evaluate_portfolio sleeve account as train_panel.py.  Baselines "
+            "now mirror the deep model's inner_val carve-out: "
+            "fit on [0, inner_train_end) only and early-stop / select on the "
+            "same chronological inner_val region, with entry_end capped so no "
+            "training label unfolds past the fit span.  Training rows are "
+            "sampled date-stratified under --max-train-rows; "
+            "LGBM/MLP tune on inner_val with chronological early stopping; "
+            "--with-seq-features appends the shared "
+            "sequence summary (trailing mean/std/slope + lags) so baselines see "
+            "the same history as the xLSTM."
         ),
         "models_result": {},
     }
@@ -397,7 +483,7 @@ def main():
             "long_sharpe": _agg("long_sharpe"),
             "q5mq1_ret": _agg("q5mq1_ret"),
             "eligible_ew_sharpe": _agg("eligible_ew_sharpe"),
-            "universe_ew_sharpe": _agg("universe_ew_sharpe"),
+            "selected_universe_ew_sharpe": _agg("selected_universe_ew_sharpe"),
         }
 
     with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
@@ -409,7 +495,7 @@ def main():
 
     logger.info("=== Baseline Summary (%d folds, disjoint OOS windows) ===",
                 summary["n_folds"])
-    header = f"{'model':<10} {'LS_sharpe':>10} {'IC':>8} {'long_sharpe':>12} {'q5mq1(bp)':>10} {'elgEW':>8} {'uniEW':>8}"
+    header = f"{'model':<10} {'LS_sharpe':>10} {'IC':>8} {'long_sharpe':>12} {'q5mq1(bp)':>10} {'elgEW':>8} {'selUniEW':>8}"
     logger.info(header)
     for model_name in models:
         r = summary["models_result"].get(model_name)
@@ -422,7 +508,7 @@ def main():
                     r["long_sharpe"]["mean"] or 0.0,
                     (r["q5mq1_ret"]["mean"] or 0.0) * 10000,
                     r["eligible_ew_sharpe"]["mean"] or 0.0,
-                    r["universe_ew_sharpe"]["mean"] or 0.0)
+                    r["selected_universe_ew_sharpe"]["mean"] or 0.0)
     logger.info("Artifacts saved to %s", outdir)
 
 

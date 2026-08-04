@@ -1,4 +1,4 @@
-"""TradingCalendar correctness tests (review v6 §五).
+"""TradingCalendar correctness tests.
 
 A-shares NEVER trade on weekends — not even on 调休 makeup workdays.  The
 calendar is weekdays MINUS official SSE/SZSE holiday closures, verified to
@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from stoke_ml.data.calendar import (
+    VERIFIED_UNTIL,
     TradingCalendar,
     build_calendar_frame,
     load_calendar,
@@ -48,8 +49,8 @@ class Test2026Holidays:
 
     @pytest.mark.parametrize("d", [
         dt.date(2026, 1, 1),    # 元旦
-        dt.date(2026, 1, 2),    # 元旦 (was missing before v6)
-        dt.date(2026, 2, 16),   # 春节 (was missing before v6)
+        dt.date(2026, 1, 2),    # 元旦
+        dt.date(2026, 2, 16),   # 春节
         dt.date(2026, 2, 17), dt.date(2026, 2, 18), dt.date(2026, 2, 19),
         dt.date(2026, 2, 20), dt.date(2026, 2, 23),
         dt.date(2026, 4, 6),    # 清明
@@ -142,7 +143,7 @@ class TestSeededCounts:
 
 
 class TestExternalCalendar:
-    """review v8 §二-3: the calendar is externalized as a self-describing
+    """The calendar is externalized as a self-describing
     exchange_calendar.parquet (date / is_open / exchange / source / version)
     so consumers read a data artifact instead of parsing holiday rules.  The
     artifact is authoritative when present and must match the verified
@@ -150,7 +151,9 @@ class TestExternalCalendar:
 
     def test_build_calendar_frame_schema(self):
         frame = build_calendar_frame("a_shares")
-        assert {"date", "is_open", "exchange", "source", "version"} <= set(frame.columns)
+        assert {"date", "is_open", "exchange", "source", "version",
+                "verified_until", "generated_at",
+                "status_after_verified_until"} <= set(frame.columns)
         assert frame["date"].is_monotonic_increasing
         assert not frame["date"].duplicated().any()
         # Every date is a weekday; is_open never true on a weekend.
@@ -162,6 +165,13 @@ class TestExternalCalendar:
         # Sanity: a known holiday is closed, a normal mid-week day is open.
         assert not frame.loc[frame["date"] == pd.Timestamp("2018-12-31"), "is_open"].iloc[0]
         assert frame.loc[frame["date"] == pd.Timestamp("2010-02-24"), "is_open"].iloc[0]
+        # The artifact records the verified window as metadata.
+        assert (frame["verified_until"] == pd.Timestamp("2026-12-31")).all()
+        assert (frame["status_after_verified_until"] == "UNKNOWN").all()
+        assert frame["generated_at"].notna().all()
+        # A row past verified_until (a 2027 weekday) is only a forward estimate.
+        assert pd.Timestamp(frame.loc[frame["date"] == pd.Timestamp("2027-01-04"),
+                                      "date"].iloc[0]).date() > VERIFIED_UNTIL["a_shares"]
 
     def test_save_load_roundtrip_is_authoritative(self, tmp_path):
         path = save_calendar(tmp_path, "a_shares")
@@ -204,10 +214,18 @@ class TestExternalCalendar:
     def test_malformed_artifact_raises(self, tmp_path):
         cal_dir = tmp_path / "exchange_calendar"
         cal_dir.mkdir()
-        pd.DataFrame({"date": [], "is_open": []}).to_parquet(
+        # Non-empty but missing required columns → load must raise loudly.
+        pd.DataFrame({"date": [pd.Timestamp("2026-01-01")]}).to_parquet(
             cal_dir / "a_shares.parquet")
         with pytest.raises(ValueError, match="missing columns"):
             TradingCalendar("a_shares", calendar_dir=tmp_path)
+
+    def test_empty_artifact_raises(self, tmp_path):
+        cal_dir = tmp_path / "exchange_calendar"
+        cal_dir.mkdir()
+        pd.DataFrame().to_parquet(cal_dir / "a_shares.parquet")
+        with pytest.raises(ValueError, match="empty"):
+            load_calendar(tmp_path, "a_shares")
 
     def test_absent_artifact_falls_back_to_code(self, tmp_path):
         ext = TradingCalendar("a_shares", calendar_dir=tmp_path)
@@ -217,3 +235,113 @@ class TestExternalCalendar:
         assert ext.is_trading_day(dt.date(2026, 6, 19)) == code.is_trading_day(dt.date(2026, 6, 19))
         assert (ext.get_trading_days("2010-02-01", "2010-02-28")
                 == code.get_trading_days("2010-02-01", "2010-02-28"))
+
+    # ── verified_until + strict mode ────────────────────────────────
+
+    def test_artifact_carries_verified_metadata(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        assert pd.Timestamp(frame["verified_until"].iloc[0]).date() == VERIFIED_UNTIL["a_shares"]
+        assert frame["status_after_verified_until"].iloc[0] == "UNKNOWN"
+        assert pd.notna(frame["generated_at"].iloc[0])
+        # A strict calendar inherits verified_until from the artifact.
+        ext = TradingCalendar("a_shares", calendar_dir=tmp_path, strict=True)
+        assert ext.verified_until == VERIFIED_UNTIL["a_shares"]
+
+    def test_strict_raises_beyond_verified_until(self, cal):
+        strict = TradingCalendar("a_shares", strict=True)
+        assert strict.verified_until == VERIFIED_UNTIL["a_shares"]
+        # 2027 is a forward estimate — a formal flow must fail, not guess.
+        with pytest.raises(ValueError, match="verified_until"):
+            strict.is_trading_day(dt.date(2027, 1, 4))
+        with pytest.raises(ValueError, match="verified_until"):
+            strict.get_trading_days("2027-01-01", "2027-01-31")
+        # Even a query that only ENDS past verified_until fails.
+        with pytest.raises(ValueError, match="verified_until"):
+            strict.get_trading_days("2026-12-30", "2027-01-02")
+
+    def test_strict_within_verified_ok(self, cal):
+        strict = TradingCalendar("a_shares", strict=True)
+        assert strict.is_trading_day(dt.date(2026, 7, 15))
+        assert strict.is_trading_day(dt.date(2026, 6, 19)) is False  # 端午 2026
+        assert strict.get_trading_days("2026-02-09", "2026-02-27")[0] == dt.date(2026, 2, 9)
+        assert strict.next_trading_day(dt.date(2026, 2, 13)) == dt.date(2026, 2, 24)
+
+    def test_non_strict_still_answers_forward_estimates(self, cal):
+        # Non-strict (downloader/scheduling) keeps answering 2027 estimates.
+        assert cal.is_trading_day(dt.date(2027, 1, 4))
+        assert dt.date(2027, 1, 4) in cal.get_trading_days("2027-01-01", "2027-01-31")
+
+    def test_artifact_gap_raises_at_load(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        # Drop a weekday INSIDE the artifact's window: a torn/partial artifact.
+        frame = frame[frame["date"] != pd.Timestamp("2010-02-24")]
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        with pytest.raises(ValueError, match="incomplete"):
+            load_calendar(tmp_path, "a_shares")
+        with pytest.raises(ValueError, match="incomplete"):
+            TradingCalendar("a_shares", calendar_dir=tmp_path)
+
+    # ── full outer join validation (no vanishing dates) ───────────
+
+    def test_validate_calendar_detects_missing_date(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        # Truncate the window to 2000-2020: the artifact is complete INSIDE its
+        # own window (load succeeds) but missing every 2020+ weekday that the
+        # generator covers — only a full outer join surfaces that.
+        frame = frame[frame["date"] <= pd.Timestamp("2020-12-31")]
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert not report["ok"]
+        assert report["problems"]["missing_dates"] > 0, report
+
+    def test_validate_calendar_reports_interior_gap(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        # Dropping ONE interior weekday makes load_calendar raise "incomplete";
+        # validate_calendar must report that loudly, not silently pass.
+        frame = frame[frame["date"] != pd.Timestamp("2010-02-24")]
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert not report["ok"]
+        assert "incomplete" in report["reason"], report
+
+    def test_validate_calendar_detects_extra_date(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        # A spurious Saturday row that the generator would never produce.
+        extra = pd.DataFrame([{
+            "date": pd.Timestamp("2026-08-01"), "is_open": True,
+            "exchange": "SSE/SZSE/BSE", "source": "tampered",
+            "version": TradingCalendar.CALENDAR_VERSION,
+            "verified_until": pd.Timestamp("2026-12-31"),
+            "generated_at": pd.Timestamp.now(tz="UTC"),
+            "status_after_verified_until": "UNKNOWN",
+        }])
+        pd.concat([frame, extra], ignore_index=True).to_parquet(
+            tmp_path / "exchange_calendar" / "a_shares.parquet")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert not report["ok"]
+        assert report["problems"]["extra_dates"] == 1, report
+
+    def test_validate_calendar_detects_version_and_source_mismatch(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        frame["version"] = "stale-version"
+        frame["source"] = "tampered"
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert not report["ok"]
+        assert report["problems"]["version_mismatch"] > 0, report
+        assert report["problems"]["source_mismatch"] > 0, report
+
+    def test_validate_calendar_detects_verified_until_mismatch(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares")
+        frame["verified_until"] = pd.Timestamp("2025-12-31")
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        report = validate_calendar(tmp_path, "a_shares")
+        assert not report["ok"]
+        assert report["problems"]["verified_until_mismatch"] is True, report

@@ -1,21 +1,28 @@
-"""DataContract tests (v6 §十六).
+"""DataContract tests.
 
 The frozen contract is the single source of truth for schema / primary key /
 units / date rules.  Validators return a flat list of violation strings (empty
 == valid), and ``get_contract`` resolves the registry by dataset name.
 """
+import numpy as np
 import pandas as pd
 import pytest
 
 from stoke_ml.data.contract import (
+    ADJUSTMENT_FACTOR,
     CONTRACTS,
     DAILY_EQUITY,
+    RAW_UNQUOTED_DAILY,
+    RESEARCH_QFQ_DAILY,
     DataContract,
     get_contract,
     validate_contract,
     validate_dates,
+    validate_finite,
+    validate_ohlc,
     validate_primary_key,
     validate_schema,
+    validate_source_metadata,
     validate_units,
 )
 
@@ -110,9 +117,15 @@ class TestRegistry:
         assert c.units["volume"] == "shares"
         assert c.units["amount"] == "CNY"
         assert c.units["close"] == "price"
-        assert c.price_basis == "unadjusted"
+        # On-disk daily K-line is the forward-adjusted (qfq) research
+        # series (unified qfq basis), so the contract says qfq — not unadjusted.
+        assert c.price_basis == "qfq"
+        assert c.adjustment_mode == "qfq"
         assert c.timezone == "Asia/Shanghai"
         assert c.source_priority == ("efinance", "akshare", "tushare", "baostock")
+        # OHLC must be ~fully finite; 0-valid-row files are corrupt.
+        assert c.required_finite_ratio["close"] == 0.99
+        assert c.minimum_valid_rows == 1
 
     def test_contract_frozen(self):
         with pytest.raises(Exception):
@@ -132,3 +145,134 @@ class TestRegistry:
         assert validate_contract(df, c) == []
         df = pd.DataFrame({"id": [1], "ts": ["a"], "v": [-1.0]})
         assert validate_contract(df, c) == ["v<0:1"]
+
+
+class TestFinite:
+    """All-NaN key prices must fail, not silently pass."""
+
+    def test_all_nan_close_fails(self):
+        df = _daily(close=[np.nan, np.nan, np.nan])
+        out = validate_finite(df, DAILY_EQUITY)
+        assert any("close_finite_ratio" in v for v in out)
+
+    def test_partial_nan_above_threshold_fails(self):
+        df = _daily(close=[10.0, np.nan, 12.0])  # 2/3 finite = 0.667 < 0.99
+        assert any("close_finite_ratio" in v for v in validate_finite(df, DAILY_EQUITY))
+
+    def test_clean_passes(self):
+        assert validate_finite(_daily(), DAILY_EQUITY) == []
+
+    def test_empty_frame_fails(self):
+        df = _daily().iloc[0:0]
+        assert validate_finite(df, DAILY_EQUITY) != []
+
+    def test_too_few_rows_fails(self):
+        df = _daily().iloc[0:0]
+        out = validate_finite(df, DAILY_EQUITY)
+        assert any("too_few_rows" in v for v in out)
+
+    def test_all_nan_close_fails_contract(self):
+        df = _daily(close=[np.nan, np.nan, np.nan])
+        assert any("close_finite_ratio" in v for v in validate_contract(df, DAILY_EQUITY))
+
+
+class TestOhlc:
+    """Low <= open/close <= high on every bar."""
+
+    def test_close_above_high_fails(self):
+        df = _daily(close=[10.2, 11.2, 999.0])
+        out = validate_ohlc(df, DAILY_EQUITY)
+        assert any("close>high" in v for v in out)
+
+    def test_open_below_low_fails(self):
+        df = _daily(open=[10.0, 1.0, 12.0])
+        out = validate_ohlc(df, DAILY_EQUITY)
+        assert any("open<low" in v for v in out)
+
+    def test_clean_passes(self):
+        assert validate_ohlc(_daily(), DAILY_EQUITY) == []
+
+    def test_nan_bar_skipped(self):
+        # A bar with NaN high/low must not false-trigger the relation check.
+        df = _daily(high=[10.5, np.nan, 12.5])
+        assert validate_ohlc(df, DAILY_EQUITY) == []
+
+    def test_contract_wires_ohlc(self):
+        df = _daily(close=[10.2, 11.2, 999.0])
+        assert any("close>high" in v for v in validate_contract(df, DAILY_EQUITY))
+
+
+class TestSourceMetadata:
+    """Source column non-empty, adjustment_mode legal."""
+
+    def test_empty_source_fails(self):
+        df = _daily(source=["efinance", "", None])
+        out = validate_source_metadata(df, DAILY_EQUITY)
+        assert any("source_empty" in v for v in out)
+
+    def test_valid_source_passes(self):
+        assert validate_source_metadata(_daily(source=["efinance"] * 3), DAILY_EQUITY) == []
+
+    def test_invalid_adjustment_mode_fails(self):
+        df = _daily(adjustment_mode=["qfq"] * 3)
+        df.loc[1, "adjustment_mode"] = "bogus"
+        out = validate_source_metadata(df, DAILY_EQUITY)
+        assert any("adjustment_mode_invalid" in v for v in out)
+
+    def test_valid_adjustment_mode_passes(self):
+        assert validate_source_metadata(
+            _daily(adjustment_mode=["qfq"] * 3), DAILY_EQUITY
+        ) == []
+
+    def test_absent_columns_are_noop(self):
+        assert validate_source_metadata(_daily(), DAILY_EQUITY) == []
+
+
+class TestCalendarMembership:
+    """Optional official-calendar membership check."""
+
+    def test_non_trading_day_fails(self):
+        # 2024-01-01 is New Year's Day (exchange holiday).
+        df = _daily(date=["2024-01-02", "2024-01-03", "2024-01-01"])
+        trading = {
+            pd.Timestamp("2024-01-02").date(),
+            pd.Timestamp("2024-01-03").date(),
+        }
+        out = validate_dates(df, DAILY_EQUITY, trading_days=trading)
+        assert any("non_trading_day:1" in v for v in out)
+
+    def test_all_trading_days_pass(self):
+        df = _daily(date=["2024-01-02", "2024-01-03", "2024-01-04"])
+        trading = {d.date() for d in pd.to_datetime(df["date"])}
+        assert validate_dates(df, DAILY_EQUITY, trading_days=trading) == []
+
+    def test_string_trading_days(self):
+        df = _daily(date=["2024-01-02", "2024-01-03", "2024-01-04"])
+        trading = {"2024-01-02", "2024-01-03", "2024-01-04"}
+        assert validate_dates(df, DAILY_EQUITY, trading_days=trading) == []
+
+
+class TestSplitContracts:
+    """Distinct price systems must not share one contract."""
+
+    def test_daily_equity_aliases_qfq(self):
+        assert DAILY_EQUITY is RESEARCH_QFQ_DAILY
+        assert get_contract("daily_equity") is RESEARCH_QFQ_DAILY
+
+    def test_three_price_systems_exist(self):
+        assert RAW_UNQUOTED_DAILY.price_basis == "unadjusted"
+        assert RAW_UNQUOTED_DAILY.adjustment_mode == "raw"
+        assert RESEARCH_QFQ_DAILY.price_basis == "qfq"
+        assert RESEARCH_QFQ_DAILY.adjustment_mode == "qfq"
+        assert ADJUSTMENT_FACTOR.dataset_name == "adjustment_factor"
+
+    def test_registry_has_all(self):
+        for name in (
+            "daily_equity", "raw_unadjusted_daily", "research_qfq_daily",
+            "adjustment_factor",
+        ):
+            assert name in CONTRACTS
+
+    def test_raw_contract_rejects_qfq_semantics_documented(self):
+        # raw contract has no pct_change (computed only after qfq normalization)
+        assert "pct_change" not in RAW_UNQUOTED_DAILY.required_columns

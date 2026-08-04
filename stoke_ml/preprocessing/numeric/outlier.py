@@ -3,7 +3,7 @@
 Uses Median Absolute Deviation (robust to skewed financial data).
 Limit-up/down moves (+-9.5% daily change) are real signals, not outliers.
 
-v6 §十: bounds are computed per row from a *trailing* window (expanding until
+Bounds are computed per row from a *trailing* window (expanding until
 ``window_days`` is reached), so each clip uses only data known up to that day.
 The previous implementation estimated per-column median/MAD on the full sample
 and clipped the entire history with those future-informed bounds — a look-ahead

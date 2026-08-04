@@ -1,0 +1,77 @@
+[project]
+name = "stoke-ml"
+version = "0.1.0"
+description = "A-share (5530 stocks, 2000-2026) deep learning stock prediction: anti-block crawler → data pipeline → feature engineering → model training → backtesting"
+requires-python = ">=3.10"
+dependencies = [
+    # Core — always needed (config, storage, dataframe)
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "polars>=0.20",
+    "pyarrow>=14.0",
+    "fastparquet>=2023.10",
+    "omegaconf>=2.3",
+    "hydra-core>=1.3",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# 在线数据适配器 — 离线复现/测试可省略，仅真实下载需要
+data-adapters = [
+    "akshare>=1.12",
+    "efinance>=0.4",
+    "tushare>=1.4",
+    "baostock>=0.8",
+    "yfinance>=0.2",
+]
+# 在线爬虫反屏蔽栈 — 与 data-adapters 同属在线路径（见 §十六-1 惰性导入）
+online = [
+    "curl-cffi>=0.6",
+    "browserforge>=1.0",
+    "playwright>=1.40",
+]
+# ML/DL — 模型训练
+ml = [
+    "torch==2.11.0",
+    "pytorch-lightning>=2.0",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "scikit-learn>=1.3",
+]
+# NLP 文本链 (FinBERT / BERTopic)
+nlp = [
+    "transformers>=4.35",
+    "jieba>=0.42",
+    "bertopic>=0.16",
+    "umap-learn>=0.5",
+    "hdbscan>=0.8",
+    "sentence-transformers>=2.2",
+]
+# 技术指标库
+ta = [
+    "ta-lib>=0.4",
+    "pandas-ta>=0.3",
+]
+# 分析 / 可视化 / 文档解析
+analysis = [
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "PyMuPDF>=1.23",
+]
+# 开发
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.1",
+    "wandb>=0.16",
+]
+
+[tool.pytest.ini_options]
+# 快慢测试分层: the default `pytest` run is the fast
+# smoke (target ~30-60s). Long/heavy tests carry `slow`; tests that hit live
+# external APIs (flaky/rate-limited) carry `network`. Run only those with
+# `-m "slow or network"`; run everything with `-m ""`.
+markers = [
+    "slow: long-running tests excluded from the default smoke run",
+    "network: tests that hit live external APIs (flaky/rate-limited)",
+]
+addopts = "-m 'not slow and not network'"

@@ -1,3 +1,4 @@
+import pytest
 import torch
 import numpy as np
 from stoke_ml.models.panel import PanelConfig
@@ -27,6 +28,7 @@ def make_synthetic_panel(n_stocks=20, n_timesteps=300, seq_len=60):
 
 
 class TestIntegration:
+    @pytest.mark.slow
     def test_full_training_loop(self):
         """Train 2 epochs on synthetic data — verify no crashes."""
         data = make_synthetic_panel(n_stocks=20, n_timesteps=300, seq_len=60)

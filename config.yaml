@@ -142,9 +142,8 @@ preprocessing:
       threshold: 5.0
       clip: true
     missing:
-      short_gap_method: "linear"
+      # Causal methods only — no linear interpolation / backfill.
       short_gap_max: 2
-      medium_gap_method: "kalman"
       medium_gap_max: 10
     cross_section:
       enabled: true

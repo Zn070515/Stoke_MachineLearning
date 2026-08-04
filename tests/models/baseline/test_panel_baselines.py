@@ -1,4 +1,4 @@
-"""Panel baselines tests (review v8 四-2).
+"""Panel baselines tests.
 
 The baseline benchmark must satisfy the same PIT / alignment contracts as the
 xLSTM panel model:
@@ -22,9 +22,11 @@ from sklearn.linear_model import Ridge
 from stoke_ml.models.baseline.panel_baselines import (
     FittedScoreAdapter,
     PrecomputedScoreAdapter,
+    _stratified_quotas,
     build_flat_samples,
     build_momentum_grid,
     entry_column_features,
+    sequence_summary_dim,
 )
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.evaluate import evaluate_portfolio
@@ -123,10 +125,40 @@ class TestBuildFlatSamples:
         data = _make_deterministic_panel()
         X, y = build_flat_samples(
             data, entry_start=5, entry_end=9, max_rows=5)
-        # Columns are collected whole; once total >= max_rows the loop stops.
-        # 3 rows/col → first col=3, second col=6 ≥ 5 → 6 rows, never more than
-        # max_rows + one column of n_stocks.
-        assert 5 <= len(X) <= 5 + 3, f"max_rows cap violated: {len(X)}"
+        # The cap is allocated date-stratified (largest
+        # remainder over counts [3,3,3,3], budget 5 → quotas [2,1,1,1]) so ALL
+        # entry columns stay represented — the old greedy collection stopped
+        # after 2 columns (6 rows) and only ever saw the earliest dates.
+        assert len(X) == 5, f"expected exactly max_rows rows, got {len(X)}"
+        assert len(set(y.tolist())) == 4, (
+            f"expected all 4 entry columns represented, got {sorted(set(y.tolist()))}")
+
+    def test_stratified_quotas_proportional_largest_remainder(self):
+        q = _stratified_quotas(np.array([3, 3, 3, 3]), 5)
+        np.testing.assert_array_equal(q, [2, 1, 1, 1])
+        q2 = _stratified_quotas(np.array([10, 90]), 20)
+        np.testing.assert_array_equal(q2, [2, 18])
+        # Zero-count columns must never receive budget.
+        q3 = _stratified_quotas(np.array([0, 5]), 3)
+        assert q3[0] == 0 and q3[1] == 3
+
+    def test_seq_features_train_eval_consistency(self):
+        """The seq summary a baseline sees at FIT time must equal what the
+        eval-time FittedScoreAdapter builds for the same decision day — so
+        train/eval vectors match by construction."""
+        data = _make_deterministic_panel()
+        seq_len = 5
+        e = 7  # entry column; decision day = e-1 = 6
+        X, y = build_flat_samples(
+            data, entry_start=e, entry_end=e + 1,
+            seq_features=True, seq_len=seq_len)
+        assert X.shape == (3, 3 + sequence_summary_dim(1, 1))
+        fcol = e - 1
+        static_2d = torch.from_numpy(data["static_features"][:, fcol])
+        pk_win = torch.from_numpy(data["past_known"][:, e - seq_len:e])
+        po_win = torch.from_numpy(data["past_observed"][:, e - seq_len:e])
+        Xe = entry_column_features(static_2d, pk_win, po_win, with_seq=True)
+        np.testing.assert_allclose(X, Xe.numpy(), atol=1e-6)
 
     def test_empty_when_no_eligible_columns(self):
         data = _make_deterministic_panel()
@@ -307,7 +339,8 @@ class TestBaselineThroughEvaluator:
         grid = np.tile(panel["static_features"][:, -1, :], (1, n_windows))
         adapter = PrecomputedScoreAdapter(grid)
         adapter.reset()
-        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
+                          min_stocks_per_day=5)  # 12-stock panel
         m = evaluate_portfolio(adapter, panel, cfg, torch.device("cpu"),
                                horizon=self.HORIZON)
         assert m["ic_mean"] > 0.3, (
@@ -322,7 +355,8 @@ class TestBaselineThroughEvaluator:
         model.fit(Xtr, ytr)
         adapter = FittedScoreAdapter(model)
         adapter.reset()
-        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
+                          min_stocks_per_day=5)  # 12-stock panel
         m = evaluate_portfolio(adapter, panel, cfg, torch.device("cpu"),
                                horizon=self.HORIZON)
         assert m["ic_mean"] > 0.1, (

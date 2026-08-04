@@ -1,6 +1,6 @@
-"""Golden pipeline system test (review v8 §六).
+"""Golden pipeline system test.
 
-Fixed 20 stocks × 500 trading days, with every scenario the review lists baked
+Fixed 20 stocks × 500 trading days, with every scenario below baked
 into the synthetic download mock:
 
   * 停牌 (suspension)     — contiguous trading-day blocks dropped for 3 stocks
@@ -19,14 +19,16 @@ called, no hand-written training loop, no mocked feature/dataset/train layers:
     → build_panel_features(prebuilt_dir) → PanelDataset → train_panel(1 epoch)
     → evaluate_portfolio(require_price_path=True)
 
-This is the review's "highest value" test: the system test that proves the whole
+This is the "highest value" test: the system test that proves the whole
 chain holds together when the data is dirty.
 """
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from scripts import data_quality_gate as dqg
+from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 from stoke_ml.data.sources.a_shares.failover import AShareDownloader
 from stoke_ml.data.storage import DataStorage
@@ -45,7 +47,14 @@ START_DATE = "2024-01-02"
 
 
 def _grid_dates() -> pd.DatetimeIndex:
-    return pd.bdate_range(START_DATE, periods=N_DAYS)
+    # Official A-share trading days: the pipeline rejects dates not
+    # on the exchange calendar, so a bdate_range grid would silently shrink T.
+    # get_trading_days returns plain date()s → pd.DatetimeIndex infers a lower
+    # resolution than the ns real downloads carry; force ns so the parquet
+    # round-trip keeps the date dtype stable (schema_hash compares resolutions).
+    return pd.DatetimeIndex(
+        TradingCalendar("a_shares").get_trading_days(START_DATE, "2026-12-31")
+    )[:N_DAYS].as_unit("ns")
 
 
 def _make_synthetic_daily():
@@ -346,6 +355,7 @@ class TestCorporateActionAdjustment:
 
 
 class TestGoldenPipeline:
+    @pytest.mark.slow
     def test_full_chain_with_all_scenarios(self, tmp_path):
         daily, aux, meta = _make_synthetic_daily()
         codes = meta["codes"]
@@ -453,6 +463,7 @@ class TestGoldenPipeline:
             grn_layers=1, seq_len=SEQ_LEN, min_history=SEQ_LEN,
             batch_size=16, max_epochs=1, compile_model=False,
             num_workers=0, horizon=HORIZON, seed=0, rank_loss_weight=0.0,
+            min_stocks_per_day=10,
         )
         device = torch.device("cpu")
         model, history = train_panel(

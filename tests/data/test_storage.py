@@ -1,4 +1,4 @@
-"""DataStorage flat-canonical tests (review v7 §五 + v8 §二-1).
+"""DataStorage flat-canonical tests.
 
 The canonical store is a single flat ``daily/{code}.parquet`` per stock.
 ``save_daily`` is NON-destructive: read existing flat, merge by date, dedup,
@@ -6,17 +6,27 @@ sort, atomically replace under a per-file lock.  ``load_daily`` reads only the
 flat file; legacy year/month partition directories on disk are ignored (never
 read, never written).  ``list_stocks`` discovers codes from flat files only.
 
-Each parquet carries a sidecar ``daily/{code}.manifest.json`` (review v8 §二-1)
+Each parquet carries a sidecar ``daily/{code}.manifest.json``
 pinning stock / start / end / rows / source / adjust / schema hash so "file
-exists" never silently implies "data complete".
+exists" never silently implies "data complete".  The manifest is a strong
+contract: the schema hash covers dtype/units/price-basis/content drift, the
+manifest records per-date source segments, formal reads can force validation
+via ``require_valid_manifest``, and the file lock is a JSON heartbeat record
+that a live writer's lock is never stolen.
 """
+import json
 import os
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from stoke_ml.data.storage import DataStorage, _acquire_lock, _release_lock
+from stoke_ml.data.storage import (
+    DataStorage,
+    _acquire_lock,
+    _lock_is_stale,
+    _release_lock,
+)
 
 
 def _frame(dates, closes=None, code="000001"):
@@ -153,7 +163,7 @@ class TestListStocks:
 
 
 class TestManifest:
-    """review v8 §二-1: save_daily writes a per-stock contract manifest and the
+    """save_daily writes a per-stock contract manifest and the
     storage can validate that the on-disk parquet still matches it.  The whole
     point: "file exists" must never silently imply "data complete"."""
 
@@ -248,3 +258,211 @@ class TestPartitionLock:
         _acquire_lock(lock)
         assert os.path.exists(lock)
         _release_lock(lock)
+
+
+class TestManifestV9:
+    """The schema hash is a strong contract and the manifest
+    records per-date source segments + declared provenance, so a dtype, unit,
+    price-basis or value drift is caught instead of silently trusted."""
+
+    def _parquet_path(self, tmp_path, code="000001"):
+        return os.path.join(str(tmp_path), "a_shares", "daily", f"{code}.parquet")
+
+    def test_manifest_records_provenance_fields(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        m = store.manifest("000001")
+        for key in ("units", "price_basis", "calendar_version", "dataset_version",
+                    "source_segments", "run_id"):
+            assert key in m, f"manifest missing {key}"
+        assert m["source_segments"][0]["source"] == "unknown"
+        assert m["source_segments"][0]["rows"] == 2
+
+    def test_source_segments_split_by_source(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df1 = _frame(["2024-01-05", "2024-01-06"])
+        df1.attrs["source"] = "efinance"
+        df1.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(df1)
+        df2 = _frame(["2024-01-07", "2024-01-08"])
+        df2.attrs["source"] = "baostock"
+        df2.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(df2)
+        segs = store.manifest("000001")["source_segments"]
+        assert segs == [
+            {"source": "efinance", "adjust": "qfq",
+             "start": "2024-01-05", "end": "2024-01-06", "rows": 2},
+            {"source": "baostock", "adjust": "qfq",
+             "start": "2024-01-07", "end": "2024-01-08", "rows": 2},
+        ]
+
+    def test_batch_segments_row_level_source(self, tmp_path):
+        """source_segments stamped by the fetch layer (one batch
+        mixing a Baostock backfill + primary) survive into the manifest,
+        instead of flattening every new date to the batch's flat source."""
+        store = DataStorage(str(tmp_path))
+        df = _frame(["2000-01-03", "2000-01-04", "2024-01-05", "2024-01-06"])
+        df.attrs["source"] = "efinance"
+        df.attrs["adjustment_mode"] = "qfq"
+        df.attrs["source_segments"] = [
+            {"source": "baostock", "adjust": "qfq",
+             "start": "2000-01-03", "end": "2000-01-04", "rows": 2},
+            {"source": "efinance", "adjust": "qfq",
+             "start": "2024-01-05", "end": "2024-01-06", "rows": 2},
+        ]
+        store.save_daily(df)
+        segs = store.manifest("000001")["source_segments"]
+        assert segs == [
+            {"source": "baostock", "adjust": "qfq",
+             "start": "2000-01-03", "end": "2000-01-04", "rows": 2},
+            {"source": "efinance", "adjust": "qfq",
+             "start": "2024-01-05", "end": "2024-01-06", "rows": 2},
+        ]
+
+    def test_source_segments_overlap_flips_to_latest(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df1 = _frame(["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])
+        df1.attrs["source"] = "efinance"
+        store.save_daily(df1)
+        df2 = _frame(["2024-01-06", "2024-01-07"], closes=[99.0, 12.0])
+        df2.attrs["source"] = "baostock"
+        store.save_daily(df2)
+        segs = store.manifest("000001")["source_segments"]
+        assert segs[0] == {"source": "efinance", "adjust": "unknown",
+                           "start": "2024-01-05", "end": "2024-01-05", "rows": 1}
+        assert segs[1] == {"source": "baostock", "adjust": "unknown",
+                           "start": "2024-01-06", "end": "2024-01-07", "rows": 2}
+
+    def test_schema_hash_detects_dtype_drift(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        path = self._parquet_path(tmp_path)
+        df = pd.read_parquet(path)
+        df["volume"] = df["volume"].astype("float32")
+        df.to_parquet(path, index=False)
+        report = store.validate_manifest("000001")
+        assert not report["ok"]
+        assert any("schema_hash" in m for m in report["mismatches"]), report
+
+    def test_schema_hash_detects_value_drift(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"], closes=[10.0, 11.0]))
+        path = self._parquet_path(tmp_path)
+        df = pd.read_parquet(path)
+        df.loc[df["date"] == pd.Timestamp("2024-01-06"), "close"] = 88.0
+        df.to_parquet(path, index=False)
+        report = store.validate_manifest("000001")
+        assert not report["ok"]
+        assert any("schema_hash" in m for m in report["mismatches"]), report
+
+    def test_schema_hash_detects_units_change(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        path = self._parquet_path(tmp_path)
+        df = pd.read_parquet(path)
+        df.attrs["units"] = "amount=wan;close=cny;high=cny;low=cny;open=cny;volume=shares"
+        df.to_parquet(path, index=False)
+        report = store.validate_manifest("000001")
+        assert not report["ok"]
+        assert any("units" in m for m in report["mismatches"]), report
+
+    def test_schema_hash_detects_price_basis_change(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        path = self._parquet_path(tmp_path)
+        df = pd.read_parquet(path)
+        df.attrs["adjustment_mode"] = "raw"
+        df.to_parquet(path, index=False)
+        report = store.validate_manifest("000001")
+        assert not report["ok"]
+        assert any("price_basis" in m for m in report["mismatches"]), report
+
+    def test_rebuild_manifest_writes_valid_manifest(self, tmp_path):
+        # Legacy parquet with NO manifest → rebuild → validate ok.
+        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"],
+                    closes=[10.0, 11.0])
+        store = DataStorage(str(tmp_path))
+        assert store.manifest("000001") is None
+        store.rebuild_manifest("000001")
+        m = store.manifest("000001")
+        assert m is not None and m["source"] == "unknown"
+        assert m["rows"] == 2
+        assert store.validate_manifest("000001")["ok"]
+
+
+class TestRequireValidManifest:
+    """Formal reads force manifest validation, so a missing,
+    stale or mismatched manifest raises instead of being silently read."""
+
+    def test_ok_after_save(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        out = store.load_daily("000001", "2024-01-01", "2024-01-31",
+                               require_valid_manifest=True)
+        assert len(out) == 2
+
+    def test_raises_when_manifest_missing(self, tmp_path):
+        _write_flat(tmp_path, "000001", ["2024-01-05"], closes=[10.0])
+        store = DataStorage(str(tmp_path))
+        with pytest.raises(ValueError, match="manifest missing"):
+            store.load_daily("000001", "2024-01-01", "2024-01-31",
+                             require_valid_manifest=True)
+
+    def test_raises_on_value_drift(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-06"], closes=[10.0, 11.0]))
+        path = os.path.join(str(tmp_path), "a_shares", "daily", "000001.parquet")
+        df = pd.read_parquet(path)
+        df.loc[df["date"] == pd.Timestamp("2024-01-06"), "close"] = 88.0
+        df.to_parquet(path, index=False)
+        with pytest.raises(ValueError):
+            store.load_daily("000001", "2024-01-01", "2024-01-31",
+                             require_valid_manifest=True)
+
+    def test_missing_parquet_returns_empty(self, tmp_path):
+        out = DataStorage(str(tmp_path)).load_daily(
+            "000001", "2024-01-01", "2024-01-31", require_valid_manifest=True)
+        assert out.empty
+
+
+class TestLockV9:
+    """The lock records pid/hostname/run_id and a live
+    writer's lock is never reclaimed, even when old."""
+
+    def _write_json_lock(self, path, pid, hostname):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": pid, "hostname": hostname,
+                       "run_id": "x", "created_at": "2026-01-01"}, f)
+
+    def test_lock_records_json_metadata(self, tmp_path):
+        lock = os.path.join(str(tmp_path), "x.lock")
+        handle = _acquire_lock(lock)
+        try:
+            with open(lock, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            assert info["pid"] == os.getpid()
+            assert info["hostname"] == __import__("socket").gethostname()
+            assert "run_id" in info and len(info["run_id"]) == 32
+        finally:
+            _release_lock(handle)
+
+    def test_alive_pid_lock_not_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("stoke_ml.data.storage._LOCK_STALE", 0.0)
+        lock = os.path.join(str(tmp_path), "x.lock")
+        self._write_json_lock(lock, os.getpid(), "some-host")
+        os.utime(lock, (1.0, 1.0))  # old mtime, but writer alive → not stale
+        assert _lock_is_stale(lock) is False
+
+    def test_other_host_lock_never_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("stoke_ml.data.storage._LOCK_STALE", 0.0)
+        lock = os.path.join(str(tmp_path), "x.lock")
+        self._write_json_lock(lock, 999999, "some-other-host")
+        os.utime(lock, (1.0, 1.0))
+        assert _lock_is_stale(lock) is False
+
+    def test_dead_pid_old_lock_is_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("stoke_ml.data.storage._LOCK_STALE", 0.0)
+        lock = os.path.join(str(tmp_path), "x.lock")
+        self._write_json_lock(lock, 999999, __import__("socket").gethostname())
+        os.utime(lock, (1.0, 1.0))
+        assert _lock_is_stale(lock) is True

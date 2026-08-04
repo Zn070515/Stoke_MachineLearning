@@ -38,6 +38,7 @@ class SinaNewsSource:
         end_date: str | None = None,
         max_pages: int = 3,
         fetch_bodies: bool = False,
+        meta: dict | None = None,
     ) -> pd.DataFrame:
         """Fetch news headlines for a stock. Returns DataFrame with date/title/url.
 
@@ -47,11 +48,17 @@ class SinaNewsSource:
             end_date: YYYY-MM-DD filter (inclusive).
             max_pages: Pages to fetch (~25 items/page).
             fetch_bodies: If True, fetch full article body for each article.
+            meta: Optional dict.  On return, populated with ``pages_requested``,
+                ``pages_fetched`` and ``pagination_exhausted`` (download
+                completion evidence).
         """
         prefix = self._to_sina_prefix(stock_code)
         all_items = []
+        pages_fetched = 0
+        pagination_exhausted = False
 
         for page in range(1, max_pages + 1):
+            pages_fetched += 1
             url = SINA_NEWS_URL.format(prefix=prefix, code=stock_code, page=page)
 
             try:
@@ -86,10 +93,16 @@ class SinaNewsSource:
                                         "url": href,
                                     })
                 if not found:
+                    pagination_exhausted = True
                     break  # no more pages
             except Exception as e:
                 logger.warning("Sina news page %d failed for %s: %s", page, stock_code, e)
                 break
+
+        if meta is not None:
+            meta["pages_requested"] = max_pages
+            meta["pages_fetched"] = pages_fetched
+            meta["pagination_exhausted"] = pagination_exhausted
 
         if not all_items:
             return pd.DataFrame(columns=["date", "title", "body", "url"])

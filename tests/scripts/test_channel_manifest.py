@@ -1,4 +1,4 @@
-"""Unit tests for the channel-coverage manifest (v7 §六.2).
+"""Unit tests for the channel-coverage manifest.
 
 train_panel.py must be able to tell "this aux channel is absent from disk"
 (MISSING) from "the channel broke while loading" (FAILED), so a storage schema

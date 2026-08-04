@@ -14,9 +14,8 @@ from stoke_ml.models.panel.model import PanelModel
 from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, PairwiseRankingLoss
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateGroupedSampler
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
-from scipy.stats import spearmanr
 
-from stoke_ml.models.panel.evaluate import evaluate_portfolio
+from stoke_ml.models.panel.evaluate import evaluate_portfolio, _raw_clean_rank_ic
 
 logger = logging.getLogger(__name__)
 
@@ -42,21 +41,28 @@ def _set_seed(seed: int | None) -> None:
 def _compute_val_loss(
     model: nn.Module,
     val_loader: DataLoader,
+    val_data: dict,
+    config: PanelConfig,
     ret_loss: AdjMSELoss,
     loss_fn: UncertaintyLoss,
     device: torch.device,
     use_amp: bool,
     vol_enabled: bool = True,
+    diag: dict | None = None,
 ) -> tuple[float, float, float, float, float]:
     """Validation metrics accumulated per VALID SAMPLE, not per batch.
 
-    Review v4 §九: sparse batches (few clean targets) must not weigh the same
+    Sparse batches (few clean targets) must not weigh the same
     as dense ones — each task loss is a sample-weighted mean over all valid
     targets across the whole validation loader.  The final element is the
-    per-date cross-sectional Spearman RankIC of predicted vs actual returns
-    (review v8 §四-1): the PRIMARY checkpoint-selection metric.  RankIC is
-    accumulated over all valid return samples and grouped by date afterwards,
-    so like the sample-weighted losses it is independent of batch boundaries.
+    per-date cross-sectional Spearman RankIC of predicted vs RAW clean returns:
+    the PRIMARY checkpoint-selection metric.
+    It shares the evaluate.py raw-clean-IC definition and its
+    min_stocks_per_day threshold with the formal report, so the metric that
+    selects a checkpoint is exactly the metric the report prints.  The full
+    prediction grid is reconstructed in flat (n_stocks, n_windows) order (the
+    val_loader runs shuffle=False with no sampler), so like the sample-weighted
+    losses the RankIC is independent of batch boundaries.
     """
     model.eval()
     n_batches = 0
@@ -66,11 +72,10 @@ def _compute_val_loss(
     uncer_num = uncer_den = 0.0
     nan_batches = 0
     skipped_batches = 0
-    # Per-date (pred, actual) return pairs over valid ret samples, for RankIC.
-    rank_by_date: dict[int, tuple[list[float], list[float]]] = {}
+    all_preds: list[torch.Tensor] = []
     with torch.no_grad():
         for batch in val_loader:
-            static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask = batch
+            static, pk, po, y_dir, y_ret, y_vol, _, dir_mask, ret_mask, vol_mask = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -83,6 +88,11 @@ def _compute_val_loss(
             n_batches += 1
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
+                # Save the FULL (unmasked) prediction grid so the RankIC can be
+                # reconstructed in flat order at the end — NaN batches still
+                # contribute their slot; _compute_daily_ic filters them via the
+                # isfinite mask.
+                all_preds.append(pred_ret.detach().cpu().squeeze(-1))
                 if (torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any()
                         or torch.isnan(pred_vol).any()):
                     nan_batches += 1
@@ -91,7 +101,7 @@ def _compute_val_loss(
                 ret_valid = ret_mask > 0
                 vol_valid = vol_mask > 0
 
-                # Per-task elementwise losses (review v4 §八/§九): each loss is
+                # Per-task elementwise losses: each loss is
                 # computed ONLY over its valid samples, and a batch whose
                 # direction labels are all -100 must not produce NaN CE.
                 losses_elem: list[torch.Tensor] = []
@@ -117,16 +127,6 @@ def _compute_val_loss(
                     ))
                     counts.append(int(ret_valid.sum().item()))
                     active.append(True)
-                    # RankIC accumulation (review v8 §四-1): keep the
-                    # (pred, actual, date) triple of every valid return sample.
-                    pr = pred_ret.squeeze(-1)[ret_valid].detach().cpu()
-                    yr = y_ret[ret_valid].detach().cpu()
-                    dd = date_idx[ret_valid.cpu()]
-                    for k in range(pr.shape[0]):
-                        d = int(dd[k])
-                        rank_by_date.setdefault(d, ([], []))
-                        rank_by_date[d][0].append(float(pr[k]))
-                        rank_by_date[d][1].append(float(yr[k]))
                 else:
                     losses_elem.append(torch.zeros((), device=device))
                     counts.append(0)
@@ -178,26 +178,26 @@ def _compute_val_loss(
             nan_batches, skipped_batches, n_batches,
         )
     model.train()
-    if uncer_den == 0:
+    if uncer_den == 0 or not all_preds:
         return float("inf"), float("inf"), float("inf"), float("inf"), float("nan")
+    # Reconstruct the FULL prediction grid in flat order (n_stocks, n_windows):
+    # the val_loader runs shuffle=False with no sampler, so flat index
+    # i = stock*n_windows + window regardless of batch boundaries.  The RankIC
+    # is then the SAME quantity as the formal report — evaluate._raw_clean_rank_ic
+    # ranks RAW clean returns (y_return_raw) and enforces config.min_stocks_per_day
+    # per date.  `diag` receives the pool
+    # statistics the train_panel failure path reports on.
+    n_stocks = val_data["static_features"].shape[0]
+    n_windows = val_loader.dataset.n_windows
+    preds = torch.cat(all_preds).reshape(n_stocks, n_windows)
+    daily_ics, _ = _raw_clean_rank_ic(
+        val_data, preds.numpy(), n_windows, config.seq_len,
+        min_stocks=config.min_stocks_per_day, diag=diag,
+    )
+    v_rankic = float(np.mean(daily_ics)) if daily_ics else float("nan")
     v_ce = ce_sum / ce_cnt if ce_cnt > 0 else float("inf")
     v_ret = ret_sum / ret_cnt if ret_cnt > 0 else float("inf")
     v_vol = vol_sum / vol_cnt if vol_cnt > 0 else float("inf")
-    # Per-date Spearman rank IC, then mean across dates (mirrors evaluate.py's
-    # clean-IC definition: rank correlation per day, skipped when the day has
-    # <2 valid samples or a constant pred/actual).
-    ics = []
-    for prs, yrs in rank_by_date.values():
-        if len(prs) < 2:
-            continue
-        p = np.asarray(prs)
-        a = np.asarray(yrs)
-        if np.unique(p).size < 2 or np.unique(a).size < 2:
-            continue
-        rho, _ = spearmanr(p, a)
-        if np.isfinite(rho):
-            ics.append(rho)
-    v_rankic = float(np.mean(ics)) if ics else float("nan")
     return uncer_num / uncer_den, v_ce, v_ret, v_vol, v_rankic
 
 
@@ -310,7 +310,7 @@ def train_panel(
         if not any(head_n in n for head_n in head_param_names)
     ]
 
-    # Checkpoint selection (review v8 §四-1) runs on validation RANKIC, never
+    # Checkpoint selection runs on validation RANKIC, never
     # the total loss: the uncertainty log_vars and rank-loss weight are
     # tunable, so a loss-weighted selection drifts as those weights change.
     # The per-task losses are logged as auxiliary traces only.
@@ -324,6 +324,13 @@ def train_panel(
         "val_eval_epochs": [],  # 1-based epoch of each val_metrics entry
     }
     use_amp = config.use_amp and device.type == "cuda"
+    # The validation pool (candidate & return-target masks)
+    # can be degenerate — too few eligible stocks per day, or near-total mask
+    # retention loss.  Track whether ANY epoch produced a finite RankIC so a
+    # silently empty signal fails loudly with the pool diagnostics instead of
+    # picking a checkpoint on NaN.
+    val_diag: dict = {}
+    finite_rankic_count = 0
 
     for epoch in range(config.max_epochs):
         model.train()
@@ -349,7 +356,7 @@ def train_panel(
 
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                # Per-task masks (review v4 §八): each loss runs ONLY over its
+                # Per-task masks: each loss runs ONLY over its
                 # valid samples.  A batch whose direction labels are all -100
                 # must not produce NaN CrossEntropy, and an inactive task must
                 # not update its uncertainty log-var.
@@ -457,9 +464,11 @@ def train_panel(
         history["train_loss"].append(avg_loss)
 
         val_loss, v_ce, v_ret, v_vol, v_rankic = _compute_val_loss(
-            model, val_loader, ret_loss, loss_fn, device, use_amp,
-            vol_enabled=vol_enabled,
+            model, val_loader, val_data, config, ret_loss, loss_fn, device,
+            use_amp, vol_enabled=vol_enabled, diag=val_diag,
         )
+        if np.isfinite(v_rankic):
+            finite_rankic_count += 1
         history["val_loss"].append(val_loss)
         history.setdefault("val_ret", []).append(v_ret)
         history.setdefault("val_rankic", []).append(v_rankic)
@@ -489,7 +498,7 @@ def train_panel(
             m = evaluate_portfolio(
                 model, val_data, config, device,
                 horizon=config.horizon, raw_returns=raw_val_returns,
-                # review v6 §十五.2: formal training requires price paths — no
+                # Formal training requires price paths — no
                 # silent fallback to the legacy phase-concatenation estimator.
                 require_price_path=True,
             )
@@ -530,10 +539,28 @@ def train_panel(
     if best_state is not None:
         model.load_state_dict(best_state)
     history["best_epoch_idx"] = best_epoch_idx
+    # No epoch produced a finite validation RankIC — the
+    # candidate pool is degenerate (too few eligible stocks per day).  Fail
+    # loudly with the pool diagnostics instead of silently shipping a
+    # checkpoint selected on NaN.
+    history["val_diag"] = val_diag
+    if finite_rankic_count == 0:
+        raise ValueError(
+            "inner validation produced NO finite RankIC across all "
+            f"{config.max_epochs} epochs — refusing to select a checkpoint. "
+            "Pool diagnostics: valid_days="
+            f"{val_diag.get('valid_days', 'n/a')}, "
+            "avg_stocks_per_day="
+            f"{val_diag.get('avg_stocks_per_day', 'n/a')}, "
+            "mask_retention="
+            f"{val_diag.get('mask_retention', 'n/a')}. "
+            "Check the fold's candidate/return-target masks and "
+            "config.min_stocks_per_day."
+        )
     # Exact portfolio evaluation on the deployed best-val-RankIC checkpoint.
     # The in-loop val_metrics snapshots are taken at each eval epoch from
     # whatever model was current then, which may differ from best_state —
-    # reporting those is the "nearest epoch proxy" the review flags.  Compute
+    # reporting those is only a "nearest epoch proxy" for the true metrics.  Compute
     # the true IC/Sharpe of the checkpoint that is actually returned/saved.
     try:
         history["best_metrics"] = evaluate_portfolio(

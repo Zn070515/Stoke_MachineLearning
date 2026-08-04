@@ -1,4 +1,4 @@
-"""Data storage — daily K-line, single canonical flat layout (review v7 §五).
+"""Data storage — daily K-line, single canonical flat layout.
 
 Canonical store
 ---------------
@@ -15,48 +15,225 @@ small parquet, so per-stock atomic read-modify-write is cheap.
 new rows by ``date``, dedups, sorts, then atomically ``os.replace``s a temp
 file.  A per-file lock serializes concurrent downloader processes so a merge
 cannot lose the other process's rows.
+
+Manifest contract
+------------------------------------------------------
+Each flat parquet carries a sidecar ``daily/{code}.manifest.json`` pinning
+stock / start / end / rows / source / adjust / schema hash / provenance /
+write time.  The schema hash now covers columns, dtypes, declared units, price
+basis, calendar epoch, dataset-convention version AND a content checksum, so a
+dtype, unit (元→千元), lot (手→股), adjustment (raw→qfq) or value
+drift is caught by ``validate_manifest`` instead of silently trusted.
+Provenance comes from ``df.attrs``, which pandas round-trips through the
+parquet footer, with stable ``unknown`` defaults for files written before the
+attrs feature, so the hash is recomputable from the file on disk.
+
+Formal reads (training / feature build / preprocessing) pass
+``require_valid_manifest=True``: a file that exists without a valid
+manifest raises instead of being read, so the manifest is a hard constraint,
+not a report.  ``load_daily`` keeps a lenient default for exploratory scripts.
+
+The parquet replace and the manifest write are two ``os.replace`` calls, not
+one atomic transaction.  A crash in between leaves a stale sidecar,
+but the manifest's rows/start/end/schema-hash cross-check detects that pair on
+the next validated read, and the lock + heartbeat keep a live
+writer's lock from being stolen.
 """
 import datetime as dt
 import hashlib
 import json
 import os
+import socket
+import threading
 import time
+import uuid
 
 import pandas as pd
 
+from stoke_ml.data.calendar import VERIFIED_UNTIL
+
 _LOCK_TIMEOUT = 30.0  # seconds to wait for a concurrent writer
-_LOCK_STALE = 600.0   # a lock older than this is a crashed writer's leftover
+_LOCK_STALE = 600.0   # a dead lock older than this is a crashed writer's leftover
+_LOCK_HEARTBEAT = 5.0  # a live writer refreshes its lock mtime this often
+
+# Canonical K-line value conventions.  A future convention change (元→千元,
+# 手→股, raw→qfq) must bump ``_DATA_CONVENTION_VERSION`` so old data is
+# flagged by the schema-hash contract instead of silently re-consumed.
+_DEFAULT_UNITS = {
+    "open": "cny", "high": "cny", "low": "cny", "close": "cny",
+    "volume": "shares", "amount": "cny",
+}
+_DATA_CONVENTION_VERSION = "kline-v1"
+_CALENDAR_VERSION = f"a_shares:{VERIFIED_UNTIL['a_shares'].isoformat()}"
+
+
+def _units_tag() -> str:
+    return ";".join(f"{k}={v}" for k, v in sorted(_DEFAULT_UNITS.items()))
+
+
+def _content_checksum(df: pd.DataFrame, columns: list[str]) -> str:
+    """Deterministic hash of the actual values, stable across parquet round-trip.
+
+    Numeric/datetime columns hash raw bytes where cheap; object/string columns
+    hash the joined UTF-8 text (``.values.tobytes()`` on object dtype would
+    hash Python pointers, which differ between processes).
+    """
+    h = hashlib.sha256()
+    for c in columns:
+        s = df[c]
+        if s.dtype == object:
+            h.update(b"\x00".join(str(v).encode("utf-8") for v in s.tolist()))
+        elif s.dtype.kind in "biufc":
+            h.update(s.to_numpy().tobytes())
+        else:
+            h.update(str(s.dtype).encode("utf-8") + b"\x00" +
+                     b"\x00".join(str(v).encode("utf-8") for v in s.tolist()))
+    return h.hexdigest()
+
+
+def _provenance_from_attrs(df: pd.DataFrame) -> dict:
+    """Normalized provenance contract, from ``df.attrs`` with stable defaults.
+
+    Files written before provenance was stamped (legacy parquets) restore no
+    attrs, so defaults keep the hash recomputable and the manifest honest
+    (``unknown`` source/adjust is the only truthful value for those rows).
+    """
+    return {
+        "source": df.attrs.get("source") or "unknown",
+        "adjust": df.attrs.get("adjustment_mode") or "unknown",
+        "units": df.attrs.get("units") or _units_tag(),
+        "price_basis": df.attrs.get("adjustment_mode") or "unknown",
+        "calendar_version": df.attrs.get("calendar_version") or _CALENDAR_VERSION,
+        "dataset_version": df.attrs.get("data_convention_version") or _DATA_CONVENTION_VERSION,
+    }
 
 
 def _schema_hash(df: pd.DataFrame) -> str:
-    """Stable hash of the column set — the feature-consuming schema contract.
+    """Stable hash of the data contract.
 
-    Column renames/additions/removals change the hash so a stale parquet (built
-    with a different feature schema) is caught by `validate_manifest` instead
-    of being silently trusted (review v8 §二-1).  Column-only on purpose: the
-    dtype can drift across a parquet round-trip without the content being
-    wrong, while the provenance (source / adjust / date range / rows) lives in
-    the manifest's other fields.
+    Columns + dtypes + declared units + price basis + calendar epoch + dataset
+    convention version + content checksum.  A parquet that drifts in any of
+    these — renamed/dropped column, dtype change, 元→千元, 手→股, raw→qfq, or
+    values edited in place — no longer hashes to the manifest's recorded value
+    and ``validate_manifest`` flags it.
     """
-    sig = "|".join(sorted(map(str, df.columns)))
+    columns = sorted(map(str, df.columns))
+    dtypes = [f"{c}:{df[c].dtype}" for c in columns]
+    prov = _provenance_from_attrs(df)
+    sig = "|".join([
+        "cols=" + ",".join(columns),
+        "dtypes=" + ",".join(dtypes),
+        "units=" + prov["units"],
+        "price_basis=" + prov["price_basis"],
+        "calendar_version=" + prov["calendar_version"],
+        "dataset_version=" + prov["dataset_version"],
+        "content=" + _content_checksum(df, columns),
+    ])
     return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:16]
 
 
-def _write_manifest(base: str, code: str, df: pd.DataFrame,
-                    source: str, adjust: str) -> None:
-    """Atomically write the per-stock contract manifest (review v8 §二-1).
+def _build_source_segments(
+    old_manifest: dict | None, combined: pd.DataFrame,
+    new_dates, source: str, adjust: str,
+    batch_segments: list[dict] | None = None,
+) -> list[dict]:
+    """Per-date source provenance audit.
 
-    The manifest pins stock / start / end / rows / source / adjust / schema
-    hash / write time so "file exists" never silently implies "data complete".
+    A merged file can be early Baostock + late Efinance + some Tushare; the
+    flat ``source``/``adjust`` fields only name the latest batch.  This derives
+    an attribution for every date — the new batch owns every date it touches
+    (last-write-wins, matching the merge) and old segments keep the rest — then
+    collapses adjacent dates into disjoint ``{source, adjust, start, end,
+    rows}`` segments so the manifest describes which provider fed which part
+    of the history.  Legacy manifests degrade to a single un-typed segment,
+    which is all that can be known about pre-upgrade rows.
+
+    ``batch_segments`` carries row-level source attribution from the fetch
+    layer: a single ``fetch_daily`` batch may itself mix a Baostock
+    backfill with the primary source, and without these ranges every new date
+    would be attributed to the flat ``source``.  When a new date falls inside a
+    batch segment's ``[start, end]``, that segment's ``(source, adjust)`` wins
+    over the flat default.
     """
+    dates = sorted(set(pd.to_datetime(combined["date"]).dt.normalize()))
+    new_set = set(pd.to_datetime(new_dates).dt.normalize())
+    if not dates:
+        return []
+    if old_manifest:
+        old_segs = old_manifest.get("source_segments")
+        if old_segs:
+            base = [dict(s) for s in old_segs]
+        else:
+            base = [{
+                "source": old_manifest.get("source", "unknown"),
+                "adjust": old_manifest.get("adjust", "unknown"),
+                "start": old_manifest.get("start"),
+                "end": old_manifest.get("end"),
+                "rows": int(old_manifest.get("rows") or 0),
+            }]
+    else:
+        base = []
+    owned: dict[pd.Timestamp, tuple[str, str]] = {}
+    for seg in base:
+        lo = (pd.Timestamp(seg["start"]).normalize()
+              if seg.get("start") else pd.Timestamp.min)
+        hi = (pd.Timestamp(seg["end"]).normalize()
+              if seg.get("end") else pd.Timestamp.max)
+        key = (seg.get("source", "unknown"), seg.get("adjust", "unknown"))
+        for d in dates:
+            if d in new_set or d in owned:
+                continue
+            if lo <= d <= hi:
+                owned[d] = key
+    batch_ranges = []
+    for seg in batch_segments or []:
+        lo = (pd.Timestamp(seg["start"]).normalize()
+              if seg.get("start") else pd.Timestamp.min)
+        hi = (pd.Timestamp(seg["end"]).normalize()
+              if seg.get("end") else pd.Timestamp.max)
+        batch_ranges.append(
+            (lo, hi, (seg.get("source", "unknown"), seg.get("adjust", "unknown")))
+        )
+    for d in dates:
+        if d in new_set and d not in owned:
+            for lo, hi, key in batch_ranges:
+                if lo <= d <= hi:
+                    owned[d] = key
+                    break
+    for d in dates:
+        owned.setdefault(d, (source, adjust))
+    segments: list[dict] = []
+    for d in dates:
+        key = owned[d]
+        if (segments and segments[-1]["source"] == key[0]
+                and segments[-1]["adjust"] == key[1]):
+            segments[-1]["end"] = d.date().isoformat()
+            segments[-1]["rows"] += 1
+        else:
+            segments.append({"source": key[0], "adjust": key[1],
+                             "start": d.date().isoformat(),
+                             "end": d.date().isoformat(), "rows": 1})
+    return segments
+
+
+def _write_manifest(base: str, code: str, df: pd.DataFrame,
+                    segments: list[dict], run_id: str) -> None:
+    """Atomically write the per-stock contract manifest."""
+    prov = _provenance_from_attrs(df)
     manifest = {
         "stock": code,
         "start": (df["date"].min().strftime("%Y-%m-%d") if len(df) else None),
         "end": (df["date"].max().strftime("%Y-%m-%d") if len(df) else None),
         "rows": int(len(df)),
-        "source": source,
-        "adjust": adjust,
+        "source": prov["source"],
+        "adjust": prov["adjust"],
+        "units": prov["units"],
+        "price_basis": prov["price_basis"],
+        "calendar_version": prov["calendar_version"],
+        "dataset_version": prov["dataset_version"],
         "schema_hash": _schema_hash(df),
+        "source_segments": segments,
+        "run_id": run_id,
         "updated": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     path = os.path.join(base, f"{code}.manifest.json")
@@ -66,30 +243,96 @@ def _write_manifest(base: str, code: str, df: pd.DataFrame,
     os.replace(tmp, path)
 
 
-def _acquire_lock(lock_path: str) -> None:
+class _LockHandle:
+    """Cross-process lock that refreshes its own heartbeat."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self._thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(_LOCK_HEARTBEAT)
+            try:
+                os.utime(self.path, None)
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours to signal
+    except OSError:
+        return False
+
+
+def _lock_is_stale(lock_path: str) -> bool:
+    """Whether a lockfile can be reclaimed.
+
+    Never stale on another host; never stale while its writer PID is alive;
+    stale only when the PID is dead/unknown AND the lock has not been touched
+    for ``_LOCK_STALE`` (a live writer refreshes mtime via heartbeat).  A
+    legacy pid-only lock falls back to the time-only heuristic.
+    """
+    info = None
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if not isinstance(info, dict):
+        info = None  # legacy pid-only lock → time-only heuristic below
+    if info and info.get("hostname") != socket.gethostname():
+        return False
+    pid = info.get("pid") if info else None
+    if pid is not None and _pid_alive(int(pid)):
+        return False
+    return time.time() - os.path.getmtime(lock_path) > _LOCK_STALE
+
+
+def _acquire_lock(lock_path: str) -> _LockHandle:
     """Cross-process exclusive lock via O_CREAT|O_EXCL lockfile."""
     deadline = time.time() + _LOCK_TIMEOUT
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.write(fd, json.dumps({
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "run_id": uuid.uuid4().hex,
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }).encode("utf-8"))
             os.close(fd)
-            return
+            return _LockHandle(lock_path)
         except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock_path) > _LOCK_STALE:
+            if _lock_is_stale(lock_path):
+                try:
                     os.remove(lock_path)
-                    continue
-            except OSError:
-                pass
+                except OSError:
+                    pass
+                continue
             if time.time() >= deadline:
                 raise TimeoutError(f"could not acquire lock {lock_path}")
             time.sleep(0.05)
 
 
-def _release_lock(lock_path: str) -> None:
+def _release_lock(lock) -> None:
+    path = lock.path if isinstance(lock, _LockHandle) else lock
+    if isinstance(lock, _LockHandle):
+        lock.stop()
     try:
-        os.remove(lock_path)
+        os.remove(path)
     except OSError:
         pass
 
@@ -104,7 +347,8 @@ class DataStorage:
     def _daily_dir(self, market: str) -> str:
         return os.path.join(self._root, market, "daily")
 
-    def save_daily(self, df: pd.DataFrame, market: str = "a_shares"):
+    def save_daily(self, df: pd.DataFrame, market: str = "a_shares",
+                   run_id: str | None = None):
         """Non-destructively merge ``df`` into ``daily/{code}.parquet``.
 
         Existing rows (by ``date``) are kept on last-write-wins, new rows are
@@ -116,18 +360,25 @@ class DataStorage:
         drop_cols = [c for c in ("year", "month") if c in df.columns]
         base = self._daily_dir(market)
         os.makedirs(base, exist_ok=True)
-        # Provenance stamped by the downloader onto the frame (failover.py sets
-        # df.attrs["source"] / ["adjustment_mode"]); falls back to "unknown" so
-        # the manifest is always written and always self-describing.
         source = df.attrs.get("source", "unknown")
         adjust = df.attrs.get("adjustment_mode", "unknown")
+        # Row-level source ranges stamped by the fetch layer (failover.py
+        # §十-4) survive here as the batch attribution; read before the
+        # groupby slicing so group.attrs cannot drop them.
+        batch_segments = df.attrs.get("source_segments")
+        run_id = run_id or uuid.uuid4().hex
 
         for code, group in df.groupby("stock_code"):
             save_df = group.drop(columns=drop_cols)
             out_path = os.path.join(base, f"{code}.parquet")
             lock_path = out_path + ".lock"
-            _acquire_lock(lock_path)
+            handle = _acquire_lock(lock_path)
             try:
+                old_manifest = None
+                manifest_path = os.path.join(base, f"{code}.manifest.json")
+                if os.path.isfile(manifest_path):
+                    with open(manifest_path, "r", encoding="utf-8") as f:
+                        old_manifest = json.load(f)
                 existing = None
                 if os.path.isfile(out_path):
                     existing = pd.read_parquet(out_path)
@@ -143,23 +394,46 @@ class DataStorage:
                     )
                 else:
                     combined = save_df
+                # Stamp provenance into the frame so both the parquet footer
+                # (round-tripped by pandas) and the manifest record it.
+                combined.attrs["source"] = source
+                combined.attrs["adjustment_mode"] = adjust
+                combined.attrs["units"] = _units_tag()
+                combined.attrs["calendar_version"] = _CALENDAR_VERSION
+                combined.attrs["data_convention_version"] = _DATA_CONVENTION_VERSION
                 tmp_path = f"{out_path}.tmp.{os.getpid()}"
                 combined.to_parquet(tmp_path, index=False, compression="lz4")
                 os.replace(tmp_path, out_path)
+                segments = _build_source_segments(
+                    old_manifest, combined, save_df["date"], source, adjust,
+                    batch_segments=batch_segments,
+                )
                 # Contract manifest written atomically alongside the parquet,
                 # still under the lock so readers see a consistent pair.
-                _write_manifest(base, code, combined, source, adjust)
+                _write_manifest(base, code, combined, segments, run_id)
             finally:
-                _release_lock(lock_path)
+                _release_lock(handle)
 
     def load_daily(
         self, stock_code: str, start_date: str, end_date: str,
-        market: str = "a_shares"
+        market: str = "a_shares", require_valid_manifest: bool = False
     ) -> pd.DataFrame:
-        """Read ``daily/{code}.parquet`` (the single canonical store)."""
+        """Read ``daily/{code}.parquet`` (the single canonical store).
+
+        ``require_valid_manifest=True`` (formal reads) raises if the
+        file exists but its contract manifest is missing, stale or mismatched,
+        instead of silently reading a possibly-corrupt parquet.
+        """
         flat_path = os.path.join(self._daily_dir(market), f"{stock_code}.parquet")
         if not os.path.isfile(flat_path):
             return pd.DataFrame()
+        if require_valid_manifest:
+            report = self.validate_manifest(stock_code, market)
+            if not report["ok"]:
+                raise ValueError(
+                    f"refusing to read {stock_code} with require_valid_manifest=True: "
+                    f"{report.get('reason') or report.get('mismatches')}"
+                )
         result = pd.read_parquet(flat_path)
         result["date"] = pd.to_datetime(result["date"])
         start = pd.Timestamp(start_date)
@@ -168,8 +442,8 @@ class DataStorage:
         return result[mask].sort_values("date").reset_index(drop=True)
 
     def list_stocks(self, market: str = "a_shares") -> list[str]:
-        """Discover stocks from the flat store (review v7 §五: discovery must use
-        the storage API, not raw ``os.listdir`` on a mix of files and dirs)."""
+        """Discover stocks from the flat store (discovery must use the storage
+        API, not raw ``os.listdir`` on a mix of files and dirs)."""
         base = self._daily_dir(market)
         if not os.path.isdir(base):
             return []
@@ -185,8 +459,9 @@ class DataStorage:
         """Read the per-stock contract manifest, or None if it is absent.
 
         The manifest is the record that "file exists" ≠ "data complete": it
-        pins stock / start / end / rows / source / adjust / schema hash / write
-        time (review v8 §二-1), so a stale or re-configured parquet is
+        pins stock / start / end / rows / source / adjust / units / price basis
+        / calendar epoch / dataset version / schema hash / source segments /
+        write time, so a stale or re-configured parquet is
         detectable instead of silently trusted.
         """
         path = self._manifest_path(market, stock_code)
@@ -195,15 +470,38 @@ class DataStorage:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def rebuild_manifest(self, stock_code: str, market: str = "a_shares") -> None:
+        """Write a contract manifest for an existing parquet (one-time migration).
+
+        Legacy parquets predate the manifest / provenance features, so their
+        source is unknowable; the manifest honestly records ``unknown``
+        source/adjust with the canonical units/version.  Non-destructive: the
+        parquet is only read, never rewritten.
+        """
+        flat_path = os.path.join(self._daily_dir(market), f"{stock_code}.parquet")
+        if not os.path.isfile(flat_path):
+            raise FileNotFoundError(flat_path)
+        df = pd.read_parquet(flat_path)
+        df["date"] = pd.to_datetime(df["date"])
+        segments = [{
+            "source": "unknown", "adjust": "unknown",
+            "start": (df["date"].min().strftime("%Y-%m-%d") if len(df) else None),
+            "end": (df["date"].max().strftime("%Y-%m-%d") if len(df) else None),
+            "rows": int(len(df)),
+        }] if len(df) else []
+        _write_manifest(self._daily_dir(market), stock_code, df, segments,
+                        run_id=uuid.uuid4().hex)
+
     def validate_manifest(
         self, stock_code: str, market: str = "a_shares"
     ) -> dict:
         """Cross-check the on-disk parquet against its contract manifest.
 
         Returns a report that is ``ok`` only when the manifest exists AND the
-        parquet's actual row count / date range / schema hash match what the
-        manifest claims.  A schema change, a partial write or a re-adjustment
-        surfaces here instead of silently producing wrong training features.
+        parquet's actual row count / date range / schema hash / declared
+        provenance match what the manifest claims.  A schema change, a partial
+        write, a unit/basis/convention drift or a re-adjustment surfaces here
+        instead of silently producing wrong training features.
         """
         flat_path = os.path.join(self._daily_dir(market), f"{stock_code}.parquet")
         if not os.path.isfile(flat_path):
@@ -228,6 +526,13 @@ class DataStorage:
             for key, value in actual.items()
             if manifest.get(key) != value
         ]
+        prov = _provenance_from_attrs(df)
+        for key in ("source", "adjust", "units", "price_basis",
+                    "calendar_version", "dataset_version"):
+            if manifest.get(key) != prov[key]:
+                mismatches.append(
+                    f"{key}: manifest={manifest.get(key)!r} actual={prov[key]!r}"
+                )
         return {
             "exists": True,
             "ok": not mismatches,

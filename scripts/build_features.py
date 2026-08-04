@@ -36,6 +36,7 @@ from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.data.announcement_storage import AnnouncementStorage
 from stoke_ml.features import cache_manifest
 from stoke_ml.features.pipeline import FeaturePipeline
+from stoke_ml.utils.error_summary import ErrorSummary, classify_error, log_summary
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -65,8 +66,11 @@ def _load_stock_parquet(directory: str, code: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return pd.read_parquet(path)
-    except Exception:
-        logger.warning("Corrupted parquet, skipping: %s", path)
+    except Exception as exc:
+        logger.warning(
+            "Corrupted parquet, skipping (category=%s): %s",
+            classify_error(exc).value, path,
+        )
         return pd.DataFrame()
 
 
@@ -78,11 +82,12 @@ def _load_opt(args: dict, storage_key: str, method: str, code: str):
     try:
         out = getattr(obj, method)(code, args["start"], args["end"])
         return out if not out.empty else None
-    except Exception:
+    except Exception as exc:
         if storage_key not in _reported_load_fail:
             logger.warning(
-                "channel %s failed to load for %s (suppressing further warnings)",
-                storage_key, code,
+                "channel %s failed to load for %s (category=%s, suppressing "
+                "further warnings)",
+                storage_key, code, classify_error(exc).value,
             )
             _reported_load_fail.add(storage_key)
         return None
@@ -95,7 +100,11 @@ def _load_etf(args: dict, code: str):
             return None
         out = args["etf_storage"].load_sector_flow(sector, args["start"], args["end"])
         return out if not out.empty else None
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "etf flow load failed for %s (category=%s)",
+            code, classify_error(exc).value,
+        )
         return None
 
 
@@ -107,8 +116,8 @@ def _is_valid_feature(path: str) -> bool:
         return False
 
 
-def build_one(args: dict) -> tuple[str, str]:
-    """Build features for one stock. args carries ALL inputs; returns (code, status)."""
+def build_one(args: dict) -> tuple[str, str, str]:
+    """Build features for one stock. args carries ALL inputs; returns (code, status, category)."""
     code = args["code"]
     try:
         pipeline = FeaturePipeline(
@@ -132,7 +141,7 @@ def build_one(args: dict) -> tuple[str, str]:
             args["output_dir"], ".manifests", f"{code}.json"
         )
         # Cache hit: file non-empty AND sidecar manifest still matches the
-        # current code/config/schema/source data (v6 §十二).  Existence alone
+        # current code/config/schema/source data.  Existence alone
         # would silently reuse a feature built by an older config or data.
         if not args["force"] and _is_valid_feature(output_path) and (
             cache_manifest.manifest_matches(
@@ -140,10 +149,12 @@ def build_one(args: dict) -> tuple[str, str]:
                 args["_git_commit"], args["_config_hash"],
             )
         ):
-            return code, "exists"
-        df = args["storage"].load_daily(code, start_date=args["start"], end_date=args["end"])
+            return code, "exists", ""
+        df = args["storage"].load_daily(
+            code, start_date=args["start"], end_date=args["end"],
+            require_valid_manifest=True)
         if df.empty:
-            return code, "empty"
+            return code, "empty", ""
         # limit_up_df intentionally absent (family deferred, top scope note)
         a_shares = os.path.join(args["data_dir"], "a_shares")
         pledge_df = _load_stock_parquet(os.path.join(a_shares, "pledge_processed"), code)
@@ -182,10 +193,11 @@ def build_one(args: dict) -> tuple[str, str]:
             ),
             manifest_path,
         )
-        return code, "built"
-    except Exception:
-        logger.exception("[%s] failed", code)
-        return code, "failed"
+        return code, "built", ""
+    except Exception as exc:
+        cat = classify_error(exc).value
+        logger.exception("[%s] failed (category=%s)", code, cat)
+        return code, "failed", cat
 
 
 def main():
@@ -338,7 +350,7 @@ def main():
         "panel_mode": args.panel_mode,
     }
 
-    # Code + config signatures for the sidecar manifest (v6 §十二).  Precomputed
+    # Code + config signatures for the sidecar manifest.  Precomputed
     # once so parallel workers don't each shell out to git / re-hash config.
     worker_args["_git_commit"] = cache_manifest.git_head()
     worker_args["_config_hash"] = cache_manifest.config_hash(worker_args)
@@ -356,8 +368,14 @@ def main():
         with ProcessPoolExecutor(max_workers=workers) as ex:
             results = list(ex.map(build_one, tasks))
 
-    counts = Counter(s for _, s in results)
+    counts = Counter(s for _, s, _ in results)
     logger.info("Done: %s (out of %d stocks)", dict(counts), len(codes))
+    summary = ErrorSummary()
+    for _code, status, cat in results:
+        if status == "failed":
+            summary.record(cat or "UNKNOWN", "build_features")
+    if summary:
+        log_summary(summary, logger, "build_features")
 
     if args.quality_gate:
         import subprocess

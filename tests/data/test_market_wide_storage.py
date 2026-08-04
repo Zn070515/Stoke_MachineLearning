@@ -1,4 +1,4 @@
-"""MarketWideStorage.replace_range degradation-guard tests (v6 §十一).
+"""MarketWideStorage.replace_range degradation-guard tests.
 
 A destructive window replacement must never delete previously-present dates
 (or columns) and silently write a partial output back.  The guard rejects such

@@ -138,7 +138,7 @@ def main():
                   f"expect {n_stocks} in {doc_key}")
 
     # ── Fold schedule → train_panel.py + docs ──
-    # Review v4 §十三 / v5: non-overlapping OOS folds (step = val_len), inner_val
+    # Non-overlapping OOS folds (step = val_len), inner_val
     # carve selects best epoch, outer_test evaluated once, lockbox reserved.
     tp = read_src(os.path.join("scripts", "train_panel.py"))
     val_ok = "inner_val" in tp and "step = val_len" in tp
@@ -149,6 +149,66 @@ def main():
               and re.search(r"63\s*天", docs[doc_key]) is None)
         check(f"{doc_key} fold schedule", ok,
               "expect inner_val/outer_test described, no stale 63天 step in " + doc_key)
+
+    # ── Architectural facts ─────────────────────────────────────────────
+    # Each check derives ground truth from code; the docs must state the same
+    # fact so an agent editing either side can't silently drift.
+
+    def docs_all(pattern, name):
+        ok = True
+        for doc_key in DOCS:
+            hit = re.search(pattern, docs[doc_key], re.IGNORECASE) is not None
+            check(f"{doc_key} {name}", hit, f"expect '{pattern}' in {doc_key}")
+            ok = ok and hit
+        return ok
+
+    storage_src = read_src(os.path.join("stoke_ml", "data", "storage.py"))
+    contract_src = read_src(os.path.join("stoke_ml", "data", "contract.py"))
+    calendar_src = read_src(os.path.join("stoke_ml", "data", "calendar.py"))
+    evaluate_src = read_src(os.path.join("stoke_ml", "models", "panel", "evaluate.py"))
+    baselines_src = read_src(os.path.join("stoke_ml", "models", "baseline", "panel_baselines.py"))
+
+    # storage layout: single canonical flat daily/{code}.parquet (+ sidecar manifest)
+    if "daily/{code}.parquet" in storage_src:
+        docs_all(r"daily/\{code\}\.parquet", "flat storage layout")
+    else:
+        check("storage flat layout", False, "code lost daily/{code}.parquet canonical layout")
+
+    # price basis: forward-adjusted qfq research series (unified qfq basis)
+    if 'price_basis="qfq"' in contract_src:
+        docs_all(r"qfq|前复权", "qfq price basis")
+    else:
+        check("price basis qfq", False, "code lost price_basis=qfq contract")
+
+    # calendar: externalized exchange_calendar artifact with verified_until
+    if "verified_until" in calendar_src and "bse_notices" in calendar_src:
+        docs_all(r"verified_until", "verified_until calendar")
+    else:
+        check("calendar verified_until", False, "code lost externalized verified_until calendar")
+
+    # headline evaluator version (EVALUATOR_VERSION in evaluate.py)
+    m_ev = re.search(r'EVALUATOR_VERSION\s*=\s*"([^"]+)"', evaluate_src)
+    if m_ev:
+        ev = m_ev.group(1)
+        pattern = r"evaluator(?:[_ ]version)?\s*[=:：]?\s*" + re.escape(ev)
+        ok = any(re.search(pattern, docs[k], re.IGNORECASE) for k in DOCS)
+        check("evaluator version", ok, f"expect evaluator version {ev} in a doc")
+    else:
+        check("evaluator version", False, "EVALUATOR_VERSION missing in evaluate.py")
+
+    # required manifest: formal reads enforce manifest verification
+    if "require_valid_manifest" in storage_src:
+        docs_all(r"manifest", "manifest-required reads")
+    else:
+        check("required manifest", False, "code lost require_valid_manifest")
+
+    # baseline list: Ridge / LightGBM / MLP panel baselines
+    if all(w in baselines_src for w in ("Ridge", "LightGBM", "MLP")):
+        for doc_key in DOCS:
+            ok = all(re.search(w, docs[doc_key], re.IGNORECASE) for w in ("Ridge", "LightGBM", "MLP"))
+            check(f"{doc_key} baseline list", ok, f"expect Ridge/LightGBM/MLP in {doc_key}")
+    else:
+        check("baseline list", False, "code lost Ridge/LightGBM/MLP baselines")
 
     # ── Report ──
     width = max(len(n) for n, _, _ in results)

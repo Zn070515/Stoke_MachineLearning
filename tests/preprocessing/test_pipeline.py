@@ -111,6 +111,19 @@ class TestPreprocessingPipeline:
         assert "text" in pp.list_chains()
         assert "numeric" in pp.list_chains()
 
+
+class TestFromConfigErrors:
+    """A malformed preprocessing config must BLOCK, not silently
+    degrade to an empty pipeline.  None is the legitimate 'no section' case."""
+
+    def test_none_builds_empty_pipeline(self):
+        pp = PreprocessingPipeline.from_config(None)
+        assert pp.list_chains() == []
+
+    def test_malformed_non_dict_config_raises(self):
+        with pytest.raises(ValueError):
+            PreprocessingPipeline.from_config("not a config")
+
     def test_list_chains_empty(self):
         pp = PreprocessingPipeline()
         assert pp.list_chains() == []
@@ -127,7 +140,7 @@ class TestPreprocessingPipeline:
 
 
 class TestStrictMode:
-    """v6 §十: strict mode blocks error-level quality issues instead of
+    """Strict mode blocks error-level quality issues instead of
     degrading silently.  The raised exception keeps the staging output and
     full quality report for the caller to persist / audit."""
 

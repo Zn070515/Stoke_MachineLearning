@@ -16,7 +16,7 @@ class PreprocessingStep(ABC):
 
     Every step records ``fit_start`` / ``fit_end`` — the date range of the
     data it was last fit on (None until first fit) — so a reviewer can audit
-    that no step was fit over full history instead of per-fold (v8 §三-1).
+    that no step was fit over full history instead of per-fold.
     PIT-safe steps (per-date / rolling normalizers) leave fit() stateless and
     compute statistics point-in-time inside transform(); the recorded range
     documents the caller's fit discipline.
@@ -84,8 +84,15 @@ class PreprocessingChain(PreprocessingStep):
         return current
 
     def fit_transform(self, df, **kwargs):
-        """Fit then transform in a single pass — each step runs once."""
+        """Fit then transform in a single pass — each step runs once.
+
+        Mirrors fit() so the chain records its own fit_start/fit_end — the
+        formal PreprocessingPipeline.run() path uses fit_transform(), and
+        without this the chain-level provenance would stay None while every
+        step records a range.
+        """
         current = df.copy()
+        self._record_fit_range(current)
         for step in self.steps:
             step.fit(current, **kwargs)
             current = step.transform(current, **kwargs)

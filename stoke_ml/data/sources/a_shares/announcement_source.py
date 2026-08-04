@@ -63,10 +63,18 @@ class AnnouncementSource:
         stock_code: str,
         start_date: str = "2015-01-01",
         end_date: str | None = None,
+        meta: dict | None = None,
     ) -> pd.DataFrame:
         """Fetch all announcements for a stock across the full date range.
 
         Returns DataFrame with columns: date, title, notice_type, url.
+
+        ``meta`` (optional dict) receives ``pages_fetched``, ``expected_rows``
+        (the API-reported total across all year windows) and
+        ``pagination_exhausted`` (download completion evidence).  A year
+        is exhausted only when its declared page count is fully fetched without
+        an early empty page; a year whose ``total`` exceeds the 10-page cap is
+        truncated and marks the whole fetch NOT exhausted.
         """
         if end_date is None:
             end_date = time.strftime("%Y-%m-%d")
@@ -74,6 +82,9 @@ class AnnouncementSource:
         all_items = []
         start_year = int(start_date[:4])
         end_year = int(end_date[:4])
+        pages_fetched = 0
+        total_expected = 0
+        pagination_exhausted = True
 
         for year in range(start_year, end_year + 1):
             y_begin = f"{year}-01-01"
@@ -82,16 +93,28 @@ class AnnouncementSource:
             time.sleep(0.05)
 
             items, total = self._fetch_page(stock_code, y_begin, y_end, page=1)
+            pages_fetched += 1
+            total_expected += total
             all_items.extend(items)
 
             if total > 100:
-                total_pages = min((total + 99) // 100, 10)
+                needed_pages = (total + 99) // 100
+                if needed_pages > 10:
+                    pagination_exhausted = False
+                total_pages = min(needed_pages, 10)
                 for page in range(2, total_pages + 1):
                     time.sleep(0.05)
                     more_items, _ = self._fetch_page(stock_code, y_begin, y_end, page=page)
+                    pages_fetched += 1
                     if not more_items:
+                        pagination_exhausted = False
                         break
                     all_items.extend(more_items)
+
+        if meta is not None:
+            meta["pages_fetched"] = pages_fetched
+            meta["expected_rows"] = total_expected
+            meta["pagination_exhausted"] = pagination_exhausted
 
         if not all_items:
             return pd.DataFrame(columns=["date", "title", "notice_type", "url"])

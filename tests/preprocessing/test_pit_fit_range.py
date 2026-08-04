@@ -1,4 +1,4 @@
-"""v8 §三-1: scaler/normalizer fit-range PIT audit.
+"""Scaler/normalizer fit-range PIT audit.
 
 Every PreprocessingStep records ``fit_start`` / ``fit_end`` — the date range
 of the data it was last fit on — so a reviewer can audit that no step was fit
@@ -51,6 +51,15 @@ class TestFitRangeRecording:
         chain = PreprocessingChain([_Identity()])
         dates = pd.date_range("2022-01-03", periods=5, freq="B")
         chain.fit(pd.DataFrame({"date": dates, "x": range(5)}))
+        assert chain.fit_start == dates[0]
+        assert chain.fit_end == dates[-1]
+
+    def test_chain_fit_transform_records_overall_fit_range(self):
+        """PreprocessingPipeline.run() uses fit_transform(), so the
+        chain itself must record provenance on that path, not just fit()."""
+        chain = PreprocessingChain([_Identity()])
+        dates = pd.date_range("2022-01-03", periods=5, freq="B")
+        chain.fit_transform(pd.DataFrame({"date": dates, "x": range(5)}))
         assert chain.fit_start == dates[0]
         assert chain.fit_end == dates[-1]
 

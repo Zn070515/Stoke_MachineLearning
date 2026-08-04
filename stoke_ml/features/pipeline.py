@@ -24,6 +24,19 @@ from stoke_ml.features.market_env import MarketEnvRefiner
 
 logger = logging.getLogger(__name__)
 
+# The official A-share trading calendar used to validate every
+# stock's date axis before it joins the panel's UNION date axis.  Lazy-loaded
+# (module-level singleton) so the panel path pays for it only when used.
+_panel_calendar = None
+
+
+def _get_panel_calendar():
+    global _panel_calendar
+    if _panel_calendar is None:
+        from stoke_ml.data.calendar import TradingCalendar
+        _panel_calendar = TradingCalendar("a_shares")
+    return _panel_calendar
+
 # Fix 3 (sparse feature policy): drop structurally-dead columns — constant on
 # >=90% of stocks per reports/feature_sparsity_report.csv — from training.  The
 # SPARSE_KEEP_PREFIXES families are exempt: they are genuinely-rare events that
@@ -141,10 +154,15 @@ CONCEPT_COLS = [
     "is_concept_leader", "board_overlap_score",
 ]
 
+# NOTE: ind_matched_return / stock_vs_industry were REMOVED:
+# they map a stock onto its industry via the current-snapshot sector_map.json,
+# backfilling today's classification onto historical rows (present-backfill
+# bias).  The industry-level columns below are PIT-safe — they are daily
+# cross-sectional stats over all industry indexes, with no per-stock membership.
 INDUSTRY_COLS = [
     "ind_pct_up", "ind_return_mean", "ind_return_std",
     "ind_return_max", "ind_return_min", "ind_return_skew",
-    "ind_dispersion_20d", "ind_matched_return", "stock_vs_industry",
+    "ind_dispersion_20d",
 ]
 
 MACRO_COLS = [
@@ -328,7 +346,12 @@ class FeaturePipeline:
             try:
                 from omegaconf import OmegaConf
                 cfg = OmegaConf.to_container(cfg, resolve=True)
-            except Exception:
+            except Exception as exc:
+                from stoke_ml.utils.error_summary import classify_error
+                logger.warning(
+                    "OmegaConf conversion failed (category=%s), using raw cfg",
+                    classify_error(exc).value,
+                )
                 cfg = {}
         if isinstance(cfg, dict):
             return PreprocessingPipeline.from_config(cfg.get("preprocessing", cfg))
@@ -569,7 +592,7 @@ class FeaturePipeline:
             feats_panel = csn.fit_transform(feats_panel)
             logger.info(
                 "CrossSectionNormalizer fit range: %s → %s "
-                "(per-date stats, PIT-safe; v8 §三-1 audit)",
+                "(per-date stats, PIT-safe)",
                 csn.fit_start, csn.fit_end,
             )
 
@@ -812,7 +835,9 @@ class FeaturePipeline:
         if not available and not extra:
             return df
         df = df.merge(s[["date"] + available + extra], on="date", how="left")
-        _batch_fill_shift(df, available + extra)
+        # NewsStorage maps post-close → next trading day; date is already the
+        # effective_trade_date, so no extra shift.
+        _batch_fill_shift(df, available + extra, lag=False)
         return df
 
     def _merge_announcements(self, df: pd.DataFrame,
@@ -964,10 +989,10 @@ class FeaturePipeline:
         """Merge the per-stock daily earnings-active frame (see EarningsStorage).
 
         The storage already forward-fills the net-profit band across trading
-        days (a forecast stays active until superseded) and applies the
-        post-close → next-trading-day PIT mapping; this method only merges on
-        date and applies the standard lag+ZI fill, so the signal first appears
-        one extra trading day out — no same-day leakage.
+        days (a forecast stays active until superseded) and maps every
+        announce_date to its next-trading-day ``effective_trade_date``; this
+        method only merges on date and ZI-fills — no extra shift, so the signal
+        first appears exactly on its effective date.
         """
         if not self.use_earnings:
             return df
@@ -981,7 +1006,8 @@ class FeaturePipeline:
         if not available:
             return df
         df = df.merge(ed[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # date is the storage-mapped effective_trade_date → no extra shift.
+        _batch_fill_shift(df, available, lag=False)
         return df
 
     def _merge_valuation(self, df: pd.DataFrame,
@@ -1036,7 +1062,9 @@ class FeaturePipeline:
         if not available and not extra:
             return df
         df = df.merge(g[["date"] + available + extra], on="date", how="left")
-        _batch_fill_shift(df, available + extra)
+        # GubaStorage maps post-close → next trading day; date is already the
+        # effective_trade_date, so no extra shift.
+        _batch_fill_shift(df, available + extra, lag=False)
         return df
 
     def _merge_comment(self, df: pd.DataFrame,
@@ -1239,13 +1267,20 @@ class FeaturePipeline:
 
     def _merge_industry(self, df: pd.DataFrame,
                         industry_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        """Merge industry-level and stock-vs-industry relative features."""
+        """Merge industry-level cross-sectional stats (NOT per-stock membership).
+
+        The industry-level columns (ind_pct_up / ind_return_* / ind_dispersion_20d)
+        are daily cross-sectional statistics over all industry indexes and are
+        PIT-safe.  The per-stock industry-relative columns (ind_matched_return /
+        stock_vs_industry) were removed: they mapped each
+        stock onto its industry through the current-snapshot sector_map.json,
+        backfilling today's classification onto historical rows.
+        """
         if not self.use_industry:
             return df
         if industry_df is None:
             industry_df = self._industry_cache
             if industry_df is None:
-                import json
                 import os
                 from stoke_ml.config import load_config
                 cfg = load_config()
@@ -1273,14 +1308,6 @@ class FeaturePipeline:
                 if ind_float_cols:
                     industry_df[ind_float_cols] = industry_df[ind_float_cols].astype(np.float32)
                 self._industry_cache = industry_df
-                # Cache sector map and raw industry returns for per-stock features
-                self._industry_returns = raw
-                sm_path = os.path.join(ind_dir, "sector_map.json")
-                if os.path.exists(sm_path):
-                    with open(sm_path, "r", encoding="utf-8") as f:
-                        self._sector_map = json.load(f)
-                else:
-                    self._sector_map = {}
         if industry_df.empty:
             return df
         ind = industry_df.copy()
@@ -1288,30 +1315,6 @@ class FeaturePipeline:
         available = [c for c in INDUSTRY_COLS if c in ind.columns]
         if not available:
             return df
-
-        # -- Per-stock industry-relative features (if sector_map loaded) --
-        sm = getattr(self, "_sector_map", {})
-        ir = getattr(self, "_industry_returns", None)
-        if sm and ir is not None and "stock_code" in df.columns:
-            stock_code = str(df["stock_code"].iloc[0]) if len(df) > 0 else ""
-            ind_name = sm.get(stock_code, "")
-            if ind_name and ind_name in ir.columns:
-                ind_ret = ir[ind_name].copy()
-                ind_ret_df = pd.DataFrame({
-                    "date": pd.to_datetime(ir.index),
-                    "ind_matched_return": ind_ret.values,
-                })
-                ind_ret_df["date"] = pd.to_datetime(ind_ret_df["date"])
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.merge(ind_ret_df, on="date", how="left")
-                df = df.copy()  # defragment after merge
-                # Stock vs industry excess return (computable before lag)
-                if "pct_change" in df.columns:
-                    df["stock_vs_industry"] = (
-                        df["pct_change"] - df["ind_matched_return"].fillna(0.0)
-                    ).astype(np.float32)
-                # PIT lag + fill for industry-matched columns
-                _batch_fill_shift(df, ["ind_matched_return", "stock_vs_industry"])
 
         df = df.merge(ind[["date"] + available], on="date", how="left")
         # Batch fill → shift → fill (vectorized block assignment, no fragmentation)
@@ -1569,6 +1572,51 @@ class FeaturePipeline:
         skip = {"date", "stock_code", "sector", "size_proxy", "sector_code"}
         return [c for c in df.columns if c not in pk_set and c not in skip]
 
+    def _clean_calendar_dates(self, df: pd.DataFrame, stock_code: str):
+        """Keep a stock's date axis calendar-clean before the panel
+        UNION date axis is built from it.
+
+        One wrong weekend/closed-day bar, or a duplicated/out-of-order date,
+        would add a phantom column to the global panel calendar and corrupt
+        cross-sectional alignment for every stock.  Repair in place: drop
+        unparsable dates, de-dup (keep the last row, matching storage
+        overwrite semantics), drop dates that are not official trading days,
+        then re-sort so the surviving dates are unique and strictly increasing.
+        Returns the cleaned frame, or None when nothing valid remains.
+        """
+        if df is None or len(df) == 0:
+            return None
+        d = pd.to_datetime(df["date"])
+        unparsable = d.isna()
+        if unparsable.any():
+            logger.warning(
+                "Panel %s: dropping %d row(s) with unparsable date",
+                stock_code, int(unparsable.sum()),
+            )
+            df = df[~unparsable]
+            d = d[~unparsable]
+            if len(df) == 0:
+                return None
+        dup = d.duplicated(keep="last")
+        trading = set(_get_panel_calendar().get_trading_days(
+            d.min().date(), d.max().date()))
+        off_cal = ~np.array([x.date() in trading for x in d])
+        bad = dup | off_cal
+        n_bad = int(bad.sum())
+        if n_bad:
+            examples = [
+                pd.Timestamp(x).date().isoformat() for x in d[bad].head(8)
+            ]
+            logger.warning(
+                "Panel %s: dropping %d date-invalid row(s) "
+                "(duplicate or not an official trading day; e.g. %s)",
+                stock_code, n_bad, examples,
+            )
+            df = df[~bad]
+            if len(df) == 0:
+                return None
+        return df.sort_values("date").reset_index(drop=True)
+
     def build_panel_features(
         self,
         panel: pd.DataFrame,
@@ -1632,7 +1680,7 @@ class FeaturePipeline:
                 )
                 codes = [c for c in codes if c not in set(missing)]
 
-            # v6 §十二 lineage guard: surface prebuilt features that lack a
+            # Lineage guard: surface prebuilt features that lack a
             # sidecar manifest, or whose manifest no longer matches the file
             # (schema drift) or the current code (built by another git commit).
             # Warning-only — legacy un-manifested dirs still train — so stale
@@ -1650,7 +1698,12 @@ class FeaturePipeline:
                     try:
                         with open(mp, encoding="utf-8") as f:
                             m = json.load(f)
-                    except Exception:
+                    except Exception as exc:
+                        from stoke_ml.utils.error_summary import classify_error
+                        logger.warning(
+                            "manifest %s unreadable (category=%s), marking stale",
+                            mp, classify_error(exc).value,
+                        )
                         stale_manifest.append(code)
                         continue
                     if (
@@ -1682,7 +1735,7 @@ class FeaturePipeline:
                 logger.warning(
                     "prebuilt_dir %s has no sidecar manifests — feature lineage "
                     "cannot be verified; run build_features.py to regenerate "
-                    "with manifests (v6 §十二)",
+                    "with manifests",
                     prebuilt_dir,
                 )
 
@@ -1702,6 +1755,11 @@ class FeaturePipeline:
                 lag_cols = [c for c in feats.columns if re.search(r"_lag\d+$", c)]
                 if lag_cols:
                     feats = feats.drop(columns=lag_cols)
+                # A stale/hand-built parquet may carry a
+                # weekend/duplicate bar that would pollute the UNION date axis.
+                feats = self._clean_calendar_dates(feats, code)
+                if feats is None:
+                    continue
                 # Calendar features are idempotent (overwrite in place); safe
                 # to re-apply even though save_features(panel_mode=True) already
                 # added them — guards against hand-built parquets.
@@ -1717,6 +1775,12 @@ class FeaturePipeline:
             else:
                 mask = panel["stock_code"] == code
                 df_stock = panel[mask].sort_values("date").reset_index(drop=True)
+                # Drop phantom/duplicate/out-of-calendar rows before
+                # feature engineering so a bad bar neither pollutes the UNION
+                # date axis nor corrupts the rolling indicators around it.
+                df_stock = self._clean_calendar_dates(df_stock, code)
+                if df_stock is None:
+                    continue
                 stock_aux = aux_data.get(code, {})
                 feats = self._engineer_features(
                     df_stock,
@@ -1775,7 +1839,7 @@ class FeaturePipeline:
         stock_T = np.zeros(N_stocks, dtype=np.int32)
 
         # ── Per-task target masks ──
-        # Review v3 §二/§八: one `y_direction != -100` cannot carry four distinct
+        # One `y_direction != -100` cannot carry four distinct
         # jobs — "tradable today", "clean label exists", "loss applies here",
         # "portfolio P&L computable".  Split them:
         #   obs_arr        — real close at t (base observation / history count)
@@ -1791,7 +1855,7 @@ class FeaturePipeline:
         ret_tgt_arr = np.zeros((N_stocks, max_T), dtype=bool)
         vol_tgt_arr = np.zeros((N_stocks, max_T), dtype=bool)
         realized_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
-        # Daily price paths for sleeve-account evaluation (review v4 §四): the
+        # Daily price paths for sleeve-account evaluation: the
         # realized_return array is per-ENTRY-day open-to-exit, which cannot
         # reconstruct a true daily mark-to-market series.  Expose the raw
         # close/open paths (NaN outside a stock's trading days) so evaluate.py
@@ -1803,9 +1867,10 @@ class FeaturePipeline:
         # Computed once here and reused by the feature-array scatter below.
         stock_pos: list[np.ndarray] = [np.empty(0, dtype=np.int32) for _ in range(N_stocks)]
 
-        # Raw PIT-static inputs (review v4 §五): trailing 60d means of close and
-        # volume×close, plus first-listed global column — captured HERE because
-        # the per-date z-score normalization later mutates the feature dfs.
+        # Raw PIT-static inputs: trailing 60d means of close and
+        # turnover (canonical `amount`), plus first-listed global
+        # column — captured HERE because the per-date z-score normalization
+        # later mutates the feature dfs.
         price60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
         amt60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
         first_col = np.full(N_stocks, -1, dtype=np.int32)
@@ -1823,7 +1888,7 @@ class FeaturePipeline:
             stock_pos[i] = pos
             T_i = len(pos)
             stock_T[i] = T_i
-            # Trading-time convention (review v3 §六): features up to close[t]
+            # Trading-time convention: features up to close[t]
             # (window's last column end-1) → signal after close[t] → ENTER at
             # open[end]=open[t+1] → hold h days → EXIT at open[end+h].  Labels
             # are therefore open-to-open; entry eligibility needs a real open.
@@ -1832,9 +1897,9 @@ class FeaturePipeline:
             open_col = "open" if "open" in df_sorted.columns else target_col
             open_full = np.full(max_T, np.nan, dtype=np.float64)
             open_full[pos] = df_sorted[open_col].to_numpy(dtype=np.float64)
-            # review v7 §六.1: row-level quality = REPAIR/MASK, not stock
+            # Row-level quality = REPAIR/MASK, not stock
             # ejection.  A non-positive price is DATA-MISSING (a dead data row,
-            # indistinguishable from a delisting, review v6 §十四.4) — mask it
+            # indistinguishable from a delisting) — mask it
             # like a suspension so it never becomes a training observation or an
             # entry, instead of ejecting the whole stock because of one bad row.
             close_valid = ~np.isnan(close_full) & (close_full > 0)
@@ -1848,7 +1913,14 @@ class FeaturePipeline:
             # in each global-calendar window (NaNs from pre-listing/suspension
             # are skipped).  Computed here on the RAW df before z-scoring.
             price60_raw[i] = _trailing_mean(close_full, 60).astype(np.float32)
-            if "volume" in df_sorted.columns:
+            # Prefer the data layer's canonical CNY turnover
+            # (`amount`, real 成交额).  volume×qfq-close misstates historical
+            # nominal turnover because qfq prices are rescaled while volume is
+            # not; the stored amount is the actual traded value.
+            if "amount" in df_sorted.columns:
+                amt_full = np.full(max_T, np.nan, dtype=np.float64)
+                amt_full[pos] = df_sorted["amount"].to_numpy(dtype=np.float64)
+            elif "volume" in df_sorted.columns:
                 vol_full = np.full(max_T, np.nan, dtype=np.float64)
                 vol_full[pos] = df_sorted["volume"].to_numpy(dtype=np.float64)
                 amt_full = vol_full * close_full
@@ -1893,28 +1965,33 @@ class FeaturePipeline:
                         realized[t] = float(close_full[k] / open_full[t] - 1.0)
             realized_arr[i] = realized
 
-            # FORWARD-looking realized volatility: std of the NEXT `horizon`
-            # close-to-close daily returns (return[t+1 : t+horizon+1]).  The
-            # target is strictly positive, matching VolatilityHead's softplus —
-            # train_panel must NOT z-score it.  Suspension days leave a NaN
-            # daily return (skipped); a window with <2 valid returns sets
-            # vol_tgt_arr False so the vol loss never sees it.  (Known accepted
-            # deviation per review v3 §七.1: the clean forward return includes
-            # the resumption gap while vol skips it.)
-            ret_daily = np.full(max_T, np.nan, dtype=np.float32)
-            adj = close_valid[:-1] & close_valid[1:]
-            ret_daily[:-1][adj] = (
-                (close_full[1:] - close_full[:-1]) / (close_full[:-1] + 1e-8)
-            )[adj]
+            # FORWARD-looking realized volatility: std of the daily returns
+            # realized over the NEXT `horizon` days (return[t+1 : t+horizon+1]),
+            # spanning the same forward window as y_return.  The target is
+            # strictly positive, matching VolatilityHead's softplus — train_panel
+            # must NOT z-score it.  Suspended days get a 0 return and the
+            # resumption day records the accumulated close gap, so a "5-day vol"
+            # label uses all 5 days instead of silently collapsing to however
+            # many days actually traded.  A window with <2
+            # valid closes sets vol_tgt_arr False so the vol loss never sees a
+            # degenerate single-price window.
+            ret_daily = np.zeros(max_T, dtype=np.float32)
+            last_valid = np.maximum.accumulate(
+                np.where(close_valid, np.arange(max_T), -1))
+            prev_close = np.full(max_T, -1)
+            prev_close[1:] = last_valid[:-1]
+            ok = close_valid & (prev_close >= 0)
+            ret_daily[ok] = (
+                close_full[ok] / close_full[prev_close[ok]] - 1.0
+            )
             for t in range(max_T - horizon):
                 win = ret_daily[t + 1:t + 1 + horizon]
-                finite = win[np.isfinite(win)]
-                if len(finite) < 2:
+                if close_valid[t + 1:t + 1 + horizon].sum() < 2:
                     continue
-                y_vol_arr[i, t] = float(np.std(finite))
+                y_vol_arr[i, t] = float(np.std(win))
                 vol_tgt_arr[i, t] = True
 
-        # ── Decision / history eligibility (review v4 §二/§三) ──
+        # ── Decision / history eligibility ──
         # decision_arr[t] = close[t-1] is real, so a signal computed after
         # close[t-1] (features through column t-1) can rank this stock and
         # ENTER at open[t].  Aligned to the ENTRY column t so the candidate
@@ -2009,7 +2086,7 @@ class FeaturePipeline:
 
         # ── Dynamic column discovery (replaces hardcoded _PAST_KNOWN/OBSERVED_COLS) ──
         first_df = all_feat_dfs[0]
-        # PIT static columns (review v4 §五 / v8 §三-2): time-varying per-window
+        # PIT static columns: time-varying per-window
         # context derived from data available at each decision day.  Replaces the
         # leaky first-20-days permanent quantiles.  All are derivable from OHLCV
         # + date + stock code — see _PIT_STATIC_COLS.
@@ -2038,6 +2115,15 @@ class FeaturePipeline:
             for df in all_feat_dfs
             if len(df) > 0
         ], ignore_index=True)
+        # Strip non-finite BEFORE any cross-sectional statistic.
+        # A single inf (e.g. a near-zero divisor in a factor) pollutes the
+        # groupby mean/std, corrupting the whole date's z-score before the
+        # final nan_to_num silently zeroes it out.
+        finite_cols = [c for c in norm_cols if c in all_feat.columns]
+        for c in finite_cols:
+            vals = all_feat[c]
+            if not np.isfinite(vals.to_numpy()).all():
+                all_feat[c] = vals.replace([np.inf, -np.inf], np.nan)
 
         date_stats: dict[str, pd.DataFrame] = {}
         for col in norm_cols:
@@ -2153,10 +2239,18 @@ class FeaturePipeline:
                         qcol[qidxs, qt] = 0.5  # singleton cross-section → neutral rank
                     continue
                 qvals = qcol[qidxs, qt]
+                # Average-rank ties — pandas rank(method="average",
+                # pct=True).  argsort ordinal ranks would give equal values
+                # different quantiles purely from stock array order.
                 qorder = np.argsort(qvals, kind="mergesort")
-                qranks = np.empty(qidxs.size, dtype=np.float64)
-                qranks[qorder] = np.arange(qidxs.size)
-                qcol[qidxs, qt] = (qranks / max(qidxs.size - 1, 1)).astype(np.float32)
+                q0 = qvals[qorder]
+                qsz = qidxs.size
+                grp_start = np.concatenate([[0], np.nonzero(np.diff(q0))[0] + 1])
+                grp_end = np.concatenate([grp_start[1:], [qsz]])
+                grp_rank1 = (grp_start + grp_end + 1) / 2.0  # 1-based avg rank/group
+                qranks = np.empty(qsz, dtype=np.float64)
+                qranks[qorder] = np.repeat(grp_rank1, grp_end - grp_start)
+                qcol[qidxs, qt] = (qranks / qsz).astype(np.float32)
 
         # ── Sanitize: replace NaN/Inf with zeros and clip extreme values ──
         # Alpha158 factors can produce Inf from near-zero divisors (e.g.
@@ -2184,8 +2278,7 @@ class FeaturePipeline:
         date_idx_arr = np.tile(np.arange(max_T, dtype=np.int32), (N_stocks, 1))
 
         # Union trading calendar (datetime64[ns]) — lets callers convert a
-        # panel column index back to the real trading date (review v3 §十五:
-        # summary.json should record which market period each fold tested).
+        # panel column index back to the real trading date.
         return {
             "static_features": static_arr,
             "past_known": pk_arr,
@@ -2205,8 +2298,8 @@ class FeaturePipeline:
             "close_price": close_price_arr,
             "open_price": open_price_arr,
             # Column order of the feature grids (axis 2) — lets consumers probe
-            # per-channel presence via the has_* flags (v7 §六.2 coverage
-            # manifest).  Both are the post-union, post-dead-drop order actually
+            # per-channel presence via the has_* flags.  Both are the post-union,
+            # post-dead-drop order actually
             # used to build pk_arr / po_arr.
             "past_known_cols": list(pk_cols_available),
             "past_observed_cols": list(po_cols_available),
@@ -2216,7 +2309,7 @@ class FeaturePipeline:
 # ── Panel model feature column definitions ──────────────────────────────────
 
 
-# PIT-static features (review v8 §三-2 audit):
+# PIT-static features:
 #   price_60d_q / amt_60d_q  trailing 60d means → per-date cross-sectional rank
 #   listing_days             (global col − first listed col) / 250
 #   board_code               exchange board derived from the stock code
@@ -2224,11 +2317,14 @@ class FeaturePipeline:
 # `industry_code` is deliberately EXCLUDED: the only available stock→industry
 # sources (sector_map.json / stock_sector_cache.csv) are current-snapshot maps
 # with no point-in-time membership history, so a static industry_code would
-# backfill today's classification onto historical rows — the present-backfill
-# the review prohibits.  Re-add only behind a genuine PIT membership source.
+# backfill today's classification onto historical rows — a present-backfill
+# that must never happen.  Re-add only behind a genuine PIT membership source.
+# The per-stock industry-relative features (ind_matched_return /
+# stock_vs_industry) are likewise removed from _merge_industry for the same
+# reason.
 _PIT_STATIC_COLS = [
     "price_60d_q",     # trailing 60d mean close → cross-sectional price tier
-    "amt_60d_q",       # trailing 60d mean volume×close → size / liquidity proxy
+    "amt_60d_q",       # trailing 60d mean turnover (canonical amount) → size/liquidity
     "listing_days",    # days since first bar (scaled by 250 → years)
     "board_code",      # exchange board derived from stock code
 ]
@@ -2336,12 +2432,18 @@ def _has_col_in_any_stock(all_feat_dfs: list[pd.DataFrame], col_name: str) -> st
     return None
 
 
-def _batch_fill_shift(df: pd.DataFrame, cols: list[str]) -> None:
+def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
+                      lag: bool = True) -> None:
     """Vectorized fill → shift → fill for merged aux columns.
 
     Groups columns by dtype and does each operation in a single block
     assignment — zero DataFrame fragmentation (no PerformanceWarning).
     Mutates *df* in-place.
+
+    ``lag=False`` skips the PIT shift for sources whose storage layer already
+    mapped events to their ``effective_trade_date`` (earnings/guba/news:
+    post-close → next trading day).  Their date column IS the PIT-effective
+    day, so an extra shift would double-lag the signal.
     """
     available = [c for c in cols if c in df.columns]
     if not available:
@@ -2368,7 +2470,8 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str]) -> None:
         df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
 
     # PIT lag: feature[t-1] paired with price[t]
-    df[available] = df[available].shift(1)
+    if lag:
+        df[available] = df[available].shift(1)
 
     # Post-lag fill (first row becomes NaN after shift)
     if float_cols:

@@ -136,7 +136,7 @@ def _resolve_universe(
     raise ValueError(f"unknown --universe: {universe}")
 
 
-# Channel coverage manifest (review v7 §六.2): every aux channel is loaded
+# Channel coverage manifest: every aux channel is loaded
 # per-stock with per-stock error counting, so an experiment that silently lost a
 # whole channel (storage schema update, missing dir) is caught instead of
 # finishing quietly.  `status` distinguishes three empty states:
@@ -187,7 +187,7 @@ def _load_channel_aux(
     load_one,          # Callable[[object, str], pd.DataFrame | None]
     required: bool = False,
 ) -> None:
-    """Per-stock aux load with per-stock error counting (review v7 §六.2)."""
+    """Per-stock aux load with per-stock error counting."""
     entry = _new_channel_entry(True, required)
     manifest[name] = entry
     n = len(stock_list)
@@ -224,7 +224,7 @@ def load_aux_data(
     Returns (result, manifest):
       result   — {stock_code: {"sentiment": df, "guba": df, ...}}
       manifest — per-channel coverage (requested/required/loaded_stocks/
-                 coverage/errors/status) for review v7 §六.2.
+                 coverage/errors/status).
     """
     from stoke_ml.data.news_storage import NewsStorage
     from stoke_ml.data.guba_storage import GubaStorage
@@ -348,7 +348,7 @@ def load_aux_data(
 
 
 def _prebuilt_channel_coverage(panel_data: dict) -> dict:
-    """Channel coverage probed from a prebuilt panel's has_* flags (v7 §六.2).
+    """Channel coverage probed from a prebuilt panel's has_* flags.
 
     past_observed is (N, T, D); each has_* flag is True on exactly the
     (stock, day) cells where that aux channel delivered data (the pipeline
@@ -392,7 +392,7 @@ def _quality_fail_reason(close: np.ndarray) -> str | None:
     panel) — the check is inherently PIT.  Returns a reason string if the stock
     is unusable on that prefix, else None.  Row-level badness (a non-positive
     close, a dead row) is NOT a reason to eject the stock — the pipeline masks
-    those rows (review v7 §六.1); only structural corruption (all-NaN prefix,
+    those rows; only structural corruption (all-NaN prefix,
     >50 % daily vol, >1000 % forward move) excludes the stock from THAT fold.
     """
     if close.size == 0 or np.isnan(close).all():
@@ -408,7 +408,7 @@ def _quality_fail_reason(close: np.ndarray) -> str | None:
 
 
 def _fold_eligible_stocks(panel_data: dict, train_end: int) -> np.ndarray:
-    """Per-fold PIT stock-level eligibility (review v7 §六.1).
+    """Per-fold PIT stock-level eligibility.
 
     A stock is eligible for a fold iff its close path is structurally clean on
     columns [0, train_end) — ONLY data before the fold's train boundary.  The
@@ -468,18 +468,18 @@ def _cross_sectional_normalize(
 def _slice_panel(panel_data: dict, tslice: slice, price_pad: int = 0) -> dict:
     """Slice every time-axis array of the panel by `tslice`.
 
-    Static features are (N, T, D) PIT since review v4 §五 — sliced on the time
+    Static features are (N, T, D) PIT — sliced on the time
     axis like every other panel array.  Arrays that downstream code mutates in
     place (y_return z-score + clip, and their neighbours) are copied so one
     fold's normalization never corrupts the shared panel for later folds.
 
     `price_pad`: extend the close/open price columns by this many beyond
     `tslice.stop` (capped at the panel end).  The sleeve-account evaluation
-    (review v4 §四) needs open[t+h] to liquidate a position entered at open[t],
+    needs open[t+h] to liquidate a position entered at open[t],
     so the last `price_pad` sleeves get a real exit instead of a forced carry.
 
     `y_return_raw` is a copy of the RAW open-to-open return saved BEFORE the
-    caller z-scores/clips `y_return` (review v5 §五): clean IC and quintile
+    caller z-scores/clips `y_return`: clean IC and quintile
     spreads must be computed on raw returns, not on the normalized model target.
     """
     stop = tslice.stop
@@ -587,7 +587,7 @@ def _experiment_version(
     end: str,
     seed: int,
 ) -> dict:
-    """Freeze the data/code/feature versions an experiment consumed (v7 §十一 P1).
+    """Freeze the data/code/feature versions an experiment consumed.
 
     Every hash is content-addressed and deterministic — the same commit +
     source files + feature schemas + universe must yield the same digest, so a
@@ -642,7 +642,7 @@ def _experiment_version(
                 src.update(str(source_files[name].get("hash")).encode())
                 src.update(b";")
 
-    # Model hash (review v8 §五-2): content-addressed over the architecture
+    # Model hash: content-addressed over the architecture
     # source + the PanelConfig hyper-parameters, so an OOS tape row records
     # exactly which model produced it — config change or arch edit flips it.
     model_h = hashlib.sha1()
@@ -684,8 +684,8 @@ def _save_artifacts(
     version: dict | None = None,
 ) -> str:
     """Persist the experiment: args, resolved/used universes, fold summary,
-    the channel-coverage manifest (review v7 §六.2), and the frozen data/code
-    versions (review v7 §十一 P1)."""
+    the channel-coverage manifest, and the frozen data/code
+    versions."""
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "args.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
@@ -699,7 +699,7 @@ def _save_artifacts(
     with open(os.path.join(outdir, "universe_used.txt"), "w", encoding="utf-8") as f:
         f.write(f"# {universe_desc}\n"
                 f"# n={len(used)} (per-fold PIT eligibility applied inside the "
-                f"fold loop — review v7 §六.1)\n")
+                f"fold loop)\n")
         f.write("\n".join(used))
         f.write("\n")
     if channel_manifest is not None:
@@ -721,7 +721,7 @@ def _save_artifacts(
 
 
 def _predict_outer(model, outer_data, config, device) -> np.ndarray | None:
-    """Run the deployed checkpoint over the outer-test panel (review v4 §十三.2).
+    """Run the deployed checkpoint over the outer-test panel.
 
     Uses the same no-sampler DataLoader as evaluate_portfolio, so every
     (stock, window) pair is emitted in index order and the flattened return
@@ -799,7 +799,7 @@ def main():
                         help="Limit number of walk-forward folds (default: 3)")
     parser.add_argument("--lockbox-months", type=int, default=12,
                         help="Reserve the last N months as an untouched lockbox "
-                             "(review v4 §十三.3) — no fold trains on or "
+                             "— no fold trains on or "
                              "evaluates it; kept for a single final run once "
                              "the design freezes (default: 12)")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -823,7 +823,7 @@ def main():
                         help="Skip auxiliary data loading (faster startup)")
     parser.add_argument("--require-aux-channels", type=str, default="",
                         help="Comma-separated aux channels that must have "
-                             "loaded_stocks>0 (review v7 §六.2); experiment "
+                             "loaded_stocks>0; experiment "
                              "FAILS otherwise. Default: none required")
     parser.add_argument("--prebuilt", type=str, default=None,
                         help="Load panel-mode prebuilt features from this dir "
@@ -872,8 +872,8 @@ def main():
     universe_resolved = list(stock_list)
 
     # Stock-level quality is judged per-fold, point-in-time, inside the fold
-    # loop (_fold_eligible_stocks uses only columns before train_end) — review
-    # v7 §六.1: no full-history ejection up front.  Row-level badness is
+    # loop (_fold_eligible_stocks uses only columns before train_end) — no
+    # full-history ejection up front.  Row-level badness is
     # handled as masks in the pipeline, not stock ejection.
     universe_used = list(stock_list)
 
@@ -902,7 +902,8 @@ def main():
         ds = DataStorage(data_dir)
         frames = []
         for code in stock_list:
-            df = ds.load_daily(code, args.start, args.end)
+            df = ds.load_daily(code, args.start, args.end,
+                               require_valid_manifest=True)
             if df is not None and not df.empty:
                 df["stock_code"] = code
                 frames.append(df)
@@ -951,10 +952,10 @@ def main():
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the panel's
         # has_* flags instead so the experiment still records what actually got
-        # in (review v7 §六.2).
+        # in.
         channel_manifest = _prebuilt_channel_coverage(panel_data)
 
-    # Required-channel gate (review v7 §六.2): a required channel with ZERO
+    # Required-channel gate: a required channel with ZERO
     # coverage aborts the experiment instead of silently training on air.
     missing_required = sorted(
         ch for ch in required_set
@@ -978,12 +979,12 @@ def main():
         logger.info("Channel coverage manifest: %s", summary_bits)
 
     # Union trading calendar (datetime64[ns]) — fold boundaries in index space
-    # map back to real dates for the summary (review v3 §十五).
+    # map back to real dates for the summary.
     global_dates = panel_data.get("global_dates")
 
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
-    # Static features are (N, T, D) PIT (review v4 §五) — feature dim is axis 2.
+    # Static features are (N, T, D) PIT — feature dim is axis 2.
     static_dim = panel_data["static_features"].shape[2]
     dims = f"S={static_dim} " \
            f"PK={panel_data['past_known'].shape[2]} " \
@@ -1012,7 +1013,7 @@ def main():
                 config.hidden_dim, config.xlstm_num_blocks, config.xlstm_num_heads,
                 config.batch_size, config.learning_rate, config.rank_loss_weight)
 
-    # v7 §十一 P1: freeze the data/code/feature versions up front so the run
+    # Freeze the data/code/feature versions up front so the run
     # stays explainable even if every fold fails.  Written to version.json
     # unconditionally; also embedded in summary.json when folds complete.
     version_info = _experiment_version(
@@ -1034,7 +1035,7 @@ def main():
         val_len = 250      # ~62 trading days
     else:
         val_len = 126      # ~6 months daily
-    # Review v4 §十三: OOS folds are NON-OVERLAPPING — step == val_len, so
+    # OOS folds are NON-OVERLAPPING — step == val_len, so
     # adjacent folds evaluate disjoint test windows.  The old step < val_len
     # made every fold share test days with its neighbours, inflating fold
     # count and letting mean±std masquerade as independent dispersion.
@@ -1043,7 +1044,7 @@ def main():
     all_sharpes = []
     fold_histories = []
 
-    # Review v4 §十三.3: reserve the last N months as an untouched lockbox.
+    # Reserve the last N months as an untouched lockbox.
     # No fold trains on or evaluates it; it is kept for a single final run
     # once the design freezes.  Daily ≈ 21 bars/month; minute mode scales by
     # bars per day so lockbox_months spans the same wall-clock time.
@@ -1080,7 +1081,12 @@ def main():
     # fixed-width 756-day scheme left [0, n_timesteps-train_len-purge-val_len)
     # permanently unused and put short-history stocks' data entirely before
     # every fold window.
-    last_val_start = n_timesteps - val_len - lockbox_len
+    # Reserve the `horizon` steps before the lockbox as a
+    # settlement buffer — the last outer entry <= lockbox_start - horizon, so
+    # its liquidation reads prices that end BEFORE the lockbox opens.  Without
+    # this the final fold's sleeve would settle inside the untouched lockbox
+    # and those gains would be counted as "evaluated" OOS performance.
+    last_val_start = n_timesteps - config.horizon - val_len - lockbox_len
     val_start = last_val_start
     while val_start >= 0:
         if args.max_folds and fold >= args.max_folds:
@@ -1115,7 +1121,7 @@ def main():
         inner_val_data = _slice_panel(panel_data, inner_val_slice, price_pad=config.horizon)
         outer_test_data = _slice_panel(panel_data, outer_test_slice, price_pad=config.horizon)
 
-        # Per-fold PIT stock-level eligibility (review v7 §六.1): judge a stock
+        # Per-fold PIT stock-level eligibility: judge a stock
         # ONLY on data before train_end, never the full 2000→2099 history.  The
         # old global _filter_quality ejected a stock from EVERY fold because of
         # one bad 2025 row; now each fold judges its own past.  Row-level
@@ -1196,17 +1202,17 @@ def main():
             horizon=config.horizon,
             top_fraction=0.1,
             raw_returns=outer_test_data["realized_return"],
-            # review v6 §十五.2: formal training must use the chronological
+            # Formal training must use the chronological
             # sleeve account — a prebuilt panel without price paths is a data
             # bug, not a reason to silently downgrade to the legacy estimator.
             require_price_path=True,
-            # review v7 §九.2: emit the per-position ledger so the OOS tape
+            # Emit the per-position ledger so the OOS tape
             # records every fill the account actually made, offline-replayable.
             return_ledger=True,
         )
         best_epoch = history.get("best_epoch_idx", 0) + 1
 
-        # Daily OOS predictions (review v4 §十三.2): one return forecast per
+        # Daily OOS predictions: one return forecast per
         # (stock, entry day).  A window's entry is global column val_start+d,
         # so entry dates run global_dates[val_start .. val_start+val_len-1].
         oos_preds = _predict_outer(model, outer_test_data, config, device)
@@ -1216,10 +1222,10 @@ def main():
             entry_dates = [_fmt_date(global_dates, val_start + d) for d in range(n_w)]
             # Window-day grid arrays (column d ↔ panel column seq_len+d), all
             # aligned exactly as evaluate_portfolio slices them, so a tape
-            # consumer can reconstruct the sleeve account offline (review v7
-            # §九.2): the selection pool (decision & history, review v4 §三),
-            # the entry/open-validity fill gate, the clean open->open return
-            # target (saved before z-score, review v5 §五) and its mask.
+            # consumer can reconstruct the sleeve account offline: the
+            # selection pool (decision & history), the entry/open-validity
+            # fill gate, the clean open->open return target (saved before
+            # z-score) and its mask.
             dec = outer_test_data["decision_eligible_mask"][:, p0:p0 + n_w]
             hist = outer_test_data["history_eligible_mask"][:, p0:p0 + n_w]
             pool = dec & hist
@@ -1228,7 +1234,7 @@ def main():
             rt = outer_test_data["y_return_raw"][:, p0:p0 + n_w]
             # Price paths on the same grid, with `horizon` EXTRA columns so the
             # sleeve entered on the last signal day W-1 can still liquidate at
-            # open[W-1+horizon] (review v5 §三) — identical to the grid
+            # open[W-1+horizon] — identical to the grid
             # evaluate_portfolio passes to the sleeve simulator.
             price_grid = outer_test_data["close_price"][:, p0:p0 + n_w + config.horizon]
             open_grid = outer_test_data["open_price"][:, p0:p0 + n_w + config.horizon]
@@ -1252,12 +1258,12 @@ def main():
                 seq_len=config.seq_len,
                 top_fraction=0.1,
                 cost=config.txn_cost,
-                # review v8 §五-2: a tape row must identify the data + model
+                # A tape row must identify the data + model
                 # that produced it, so every return number is traceable.
                 data_version=version_info["data_manifest_hash"],
                 model_hash=version_info["model_hash"],
             )
-            # Per-position ledger (review v7 §九.2): the exact fills the long
+            # Per-position ledger: the exact fills the long
             # sleeve account made — entry/exit price, exit status, gross/net
             # PnL and attributed costs — mapped to dates and stock codes so the
             # tape is self-contained.  Sum(net_pnl) == final_nav - 1 holds per
@@ -1273,7 +1279,7 @@ def main():
                 ldf["candidate_eligible"] = pool[si, di]
                 ldf["entry_eligible"] = elig[si, di]
                 ldf["fold"] = fold
-                # review v8 §五-2: data/model provenance columns on every tape
+                # Data/model provenance columns on every tape
                 # row — realized return + executed weight make the P&L fully
                 # recomputable from prices alone.
                 ldf["data_version"] = version_info["data_manifest_hash"]
@@ -1301,11 +1307,11 @@ def main():
             all_sharpes.append(best_ls)
             # Inner-val eval nearest the deployed checkpoint — what selection
             # actually saw, reported honestly alongside the held-out outer
-            # metrics (review v4 §十一: never report a post-hoc max).
+            # metrics (never report a post-hoc max).
             inner_eval_m, inner_eval_epoch = _best_eval_metrics(history)
             # Input-context date bounds of each segment — column t of the panel
             # is global_dates[t], so a slice [a,b) covers dates [a, b-1].
-            # Semantic dates (review v4 §十三.2): entry day e buys at open[e],
+            # Semantic dates: entry day e buys at open[e],
             # the signal is produced after close[e-1], and the input context is
             # the seq_len days [e-seq_len, e).
             fold_histories.append({
@@ -1331,13 +1337,13 @@ def main():
             })
             logger.info(
                 "  Fold %d: best@epoch%d OUTER-TEST LS_Sharpe=%.2f IC=%.4f(IR=%.2f) "
-                "Long_Sharpe=%.2f Q5-Q1=%.1fbp ElgEW_Sharpe=%.2f UniEW_Sharpe=%.2f (%.1fs)",
+                "Long_Sharpe=%.2f Q5-Q1=%.1fbp ElgEW_Sharpe=%.2f SelUniEW_Sharpe=%.2f (%.1fs)",
                 fold, best_epoch, best_ls,
                 outer_m.get("ic_mean", 0), outer_m.get("ic_ir", 0),
                 outer_m.get("long_sharpe", 0),
                 outer_m.get("q5mq1_ret", 0) * 10000,
                 outer_m.get("eligible_ew_sharpe", 0),
-                outer_m.get("universe_ew_sharpe", 0),
+                outer_m.get("selected_universe_ew_sharpe", 0),
                 elapsed,
             )
         else:
@@ -1347,7 +1353,7 @@ def main():
 
         val_start -= step
 
-    # Combined daily OOS series (review v4 §十三.2): one row per (stock, entry
+    # Combined daily OOS series: one row per (stock, entry
     # day) across all non-overlapping folds — the input to the sleeve-account
     # backtest, kept separate from fold-level aggregates.
     if oos_preds_all:
@@ -1356,10 +1362,10 @@ def main():
             "stock_code": oos_stocks_all,
             "pred": np.concatenate(oos_preds_all),
             # The exact select pool the sleeve account ranked over (decision &
-            # history, review v4 §三) — review v7 §九.2: a tape must expose the
-            # candidate set it was built from, not only the selected fills.
+            # history) — a tape must expose the candidate set it was built
+            # from, not only the selected fills.
             "candidate_eligible": np.concatenate(oos_pool_all),
-            # Provenance (review v8 §五-2): data + model versions so every tape
+            # Provenance: data + model versions so every tape
             # row is traceable to the exact experiment it was produced by.
             "data_version": version_info["data_manifest_hash"],
             "model_hash": version_info["model_hash"],
@@ -1368,7 +1374,7 @@ def main():
         oos_series.to_parquet(oos_series_path)
         logger.info("OOS series: %d rows -> %s", len(oos_series), oos_series_path)
 
-    # Combined per-position ledger across all folds (review v7 §九.2) — the
+    # Combined per-position ledger across all folds — the
     # single file a consumer reads to reproduce every fill of the backtest.
     if oos_ledgers:
         oos_ledger_path = os.path.join(outdir, "oos_ledger.parquet")
@@ -1390,7 +1396,7 @@ def main():
         if all_ics:
             logger.info("IC mean: %.4f ± %.4f", np.mean(all_ics), np.std(all_ics))
         summary_data = {
-            # v7 §十一 P1: freeze the data/code/feature versions so the run
+            # Freeze the data/code/feature versions so the run
             # stays explainable days later (same info also in version.json).
             "version": version_info,
             "n_folds": len(all_sharpes),
@@ -1399,7 +1405,7 @@ def main():
             "ic_mean": float(np.mean(all_ics)) if all_ics else None,
             "ic_std": float(np.std(all_ics)) if all_ics else None,
             "universe": universe_desc,
-            # Review v4 §十三: non-overlapping folds (step == val_len) — each
+            # Non-overlapping folds (step == val_len) — each
             # fold's test days are disjoint, so mean±std is the dispersion of
             # disjoint OOS return windows.
             "folds_overlap": False,
@@ -1413,10 +1419,12 @@ def main():
                 "end": _fmt_date(global_dates, n_timesteps - 1),
                 "n_steps": lockbox_len,
                 "note": "Reserved for a single final run once the design "
-                        "freezes — no fold trains on or evaluates it.",
+                        "freezes — no fold trains on or evaluates it.  The "
+                        "horizon steps before it are a settlement buffer so "
+                        "the last fold's exits stop before the lockbox opens.",
             },
             "oos_series": "oos_series.parquet",
-            # review v7 §九.2: the per-position fill ledger written above.
+            # The per-position fill ledger written above.
             "oos_ledger": "oos_ledger.parquet" if oos_ledgers else None,
             "folds": [],
         }
@@ -1446,7 +1454,7 @@ def main():
                 "long_sharpe": m.get("long_sharpe"),
                 "q5mq1_ret": m.get("q5mq1_ret"),
                 "eligible_ew_sharpe": m.get("eligible_ew_sharpe"),
-                "universe_ew_sharpe": m.get("universe_ew_sharpe"),
+                "selected_universe_ew_sharpe": m.get("selected_universe_ew_sharpe"),
             })
     else:
         logger.warning("No valid folds completed")

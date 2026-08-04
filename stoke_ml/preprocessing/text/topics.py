@@ -16,8 +16,26 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.preprocessing.base import PreprocessingStep
+from stoke_ml.utils.error_summary import classify_error
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_to_cutoff(df, corpus_cutoff=None):
+    """Keep only rows at or before *corpus_cutoff* (PIT fold discipline).
+
+    The topic representation space must never see documents after a fold's
+    training cutoff.  Accepts either a ``date`` column or
+    a DatetimeIndex.
+    """
+    if corpus_cutoff is None:
+        return df
+    cutoff = pd.Timestamp(corpus_cutoff)
+    if "date" in getattr(df, "columns", ()):
+        return df[pd.to_datetime(df["date"]) <= cutoff].copy()
+    if isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+        return df[df.index <= cutoff].copy()
+    return df
 
 
 class TopicModeler(PreprocessingStep):
@@ -68,18 +86,41 @@ class TopicModeler(PreprocessingStep):
     def fit(self, df, **kwargs):
         """Train BERTopic on *df* and cache to disk.
 
+        The training corpus is truncated to ``corpus_cutoff`` (inclusive) when
+        given, so a fold fits ONLY on corpus up to its training cutoff — the
+        topic representation never sees later vocabulary/documents
+        The effective corpus end date is encoded into the
+        cache filename, so two runs fit on different corpora can never silently
+        reuse each other's model.
+
         Keyword Args:
             source: Name used in cache filename (e.g. ``"news"``, ``"guba"``).
             force_retrain: If True, ignore cached model.
+            corpus_cutoff: str/date — fit only on rows with date <= cutoff.
         """
-        self._record_fit_range(df)
         if df.empty or not self._enabled:
+            self._record_fit_range(df)
             return self
 
         source = kwargs.get("source", "default")
         force_retrain = kwargs.get("force_retrain", False)
+        corpus_cutoff = kwargs.get("corpus_cutoff", None)
+
+        fit_df = _truncate_to_cutoff(df, corpus_cutoff)
+        self._record_fit_range(fit_df)
+        if len(fit_df) < self.min_topic_size:
+            logger.warning(
+                "Only %d rows (min_topic_size=%d) after cutoff %s, "
+                "disabling topic modeler",
+                len(fit_df), self.min_topic_size, corpus_cutoff or "none",
+            )
+            self._enabled = False
+            return self
+
+        # Corpus version key → cache identity.
+        corpus_key = self._corpus_key(corpus_cutoff)
         cache_path = os.path.join(
-            self.model_cache_dir, f"bertopic_{source}.pkl"
+            self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}.pkl"
         )
 
         # Try loading from cache
@@ -87,15 +128,16 @@ class TopicModeler(PreprocessingStep):
             try:
                 import joblib
                 self._model = joblib.load(cache_path)
-                self._restore_embedder(source)
+                self._restore_embedder(source, corpus_key)
                 logger.info("Loaded cached BERTopic model from %s", cache_path)
                 return self
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "Corrupted BERTopic cache at %s, will retrain", cache_path
+                    "Corrupted BERTopic cache at %s (category=%s), will retrain",
+                    cache_path, classify_error(exc).value,
                 )
 
-        texts = self._build_texts(df)
+        texts = self._build_texts(fit_df)
         if len(texts) < self.min_topic_size:
             logger.warning(
                 "Only %d texts (min_topic_size=%d), disabling topic modeler",
@@ -144,10 +186,13 @@ class TopicModeler(PreprocessingStep):
             # Persist
             import joblib
             joblib.dump(self._model, cache_path)
-            self._save_metadata(source, n_found, len(texts))
+            self._save_metadata(source, corpus_key, n_found, len(texts))
 
         except Exception as e:
-            logger.warning("BERTopic training failed: %s", e)
+            logger.warning(
+                "BERTopic training failed (category=%s): %s",
+                classify_error(e).value, e,
+            )
             self._enabled = False
 
         return self
@@ -175,7 +220,10 @@ class TopicModeler(PreprocessingStep):
             df["topic_id"] = np.asarray(topics, dtype="int16")
             df["topic_probability"] = np.asarray(probs, dtype=np.float32)
         except Exception as e:
-            logger.warning("Topic transform failed: %s", e)
+            logger.warning(
+                "Topic transform failed (category=%s): %s",
+                classify_error(e).value, e,
+            )
             df["topic_id"] = -1
             df["topic_probability"] = np.float32(0.0)
 
@@ -298,16 +346,21 @@ class TopicModeler(PreprocessingStep):
             return None
 
     def _save_metadata(
-        self, source: str, n_topics: int, n_docs: int
+        self, source: str, corpus_key: str, n_topics: int, n_docs: int
     ) -> None:
         meta_path = os.path.join(
-            self.model_cache_dir, f"bertopic_{source}_meta.json"
+            self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}_meta.json"
         )
         used_embedding = "finbert" if self._finbert_model is not None else "tfidf"
         meta = {
             "source": source,
+            "corpus_cutoff": corpus_key,
             "n_topics_found": n_topics,
             "n_docs_trained": n_docs,
+            "corpus_date_min": (self.fit_start.strftime("%Y-%m-%d")
+                                if self.fit_start is not None else None),
+            "corpus_date_max": (self.fit_end.strftime("%Y-%m-%d")
+                                if self.fit_end is not None else None),
             "min_topic_size": self.min_topic_size,
             "embedding_model": used_embedding,
             "training_date": pd.Timestamp.now().isoformat(),
@@ -315,7 +368,22 @@ class TopicModeler(PreprocessingStep):
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    def _restore_embedder(self, source: str) -> None:
+    def _corpus_key(self, corpus_cutoff=None) -> str:
+        """Stable cache-key fragment for the training corpus version.
+
+        Uses the explicit cutoff when given, else the corpus end date recorded
+        by ``_record_fit_range``.  Either way the key changes whenever the
+        training corpus's end changes, so a model fit on full history can never
+        be silently reused for a fold that must stop earlier — the fix for the
+        representation-space leak.
+        """
+        if corpus_cutoff is not None:
+            return pd.Timestamp(corpus_cutoff).strftime("%Y-%m-%d")
+        if self.fit_end is not None:
+            return pd.Timestamp(self.fit_end).strftime("%Y-%m-%d")
+        return "unknown"
+
+    def _restore_embedder(self, source: str, corpus_key: str) -> None:
         """Pre-load the correct embedding model to match cached BERTopic.
 
         Called after loading a cached BERTopic model from disk to ensure
@@ -323,7 +391,8 @@ class TopicModeler(PreprocessingStep):
         trained with.
         """
         meta_path = os.path.join(
-            self.model_cache_dir, f"bertopic_{source}_meta.json"
+            self.model_cache_dir,
+            f"bertopic_{source}_cutoff_{corpus_key}_meta.json",
         )
         used_embedding = self.embedding_model  # default
         if os.path.exists(meta_path):
@@ -331,8 +400,11 @@ class TopicModeler(PreprocessingStep):
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                 used_embedding = meta.get("embedding_model", self.embedding_model)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Cannot read BERTopic meta %s (category=%s)",
+                    meta_path, classify_error(exc).value,
+                )
 
         if used_embedding == "finbert":
             try:

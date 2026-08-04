@@ -15,7 +15,7 @@
 | 沪深300 | CSI 300 | 沪市+深市市值最大300只，指数代码 000300 |
 | 中证500 | CSI 500 | 除沪深300外市值最大500只，指数代码 000905 |
 | 股票代码 | stock_code | 6位数字字符串，如 `000001`（平安银行）、`600519`（贵州茅台） |
-| 交易日 | trading day | 周一至周五，排除 A 股节假日（2015-2028 硬编码于 `calendar.py`） |
+| 交易日 | trading day | 周一至周五，排除 A 股节假日（2001-2026 已验证官方公告；2027-2028 为前瞻估计，见 `calendar.py` `VERIFIED_UNTIL`） |
 | 收盘时间 | market close | **15:00 CST** — A 股每日收盘时刻 |
 | 日K线 | daily K-line | OHLCV 日线数据 |
 
@@ -54,7 +54,7 @@
 
 ### K线存储
 
-`data/a_shares/daily/{year}/{month}/{stock_code}.parquet` — 与 Gold 层相同的年/月分区。
+`data/a_shares/daily/{code}.parquet` — 每股票一个完整文件的唯一 canonical 布局（v7 §一）。前复权 qfq 序列，每文件携带 `{code}.manifest.json` 契约 sidecar，正式读取要求 manifest 验证通过（`require_valid_manifest=True`）。
 
 ### 预构建特征存储
 
@@ -140,6 +140,7 @@
 |------|------|
 | Panel Model (VSN + xLSTM) | 主力模型：Panel联合训练，多任务学习 (方向+涨跌幅+波动率)，RTX 4090 |
 | XGBoost baseline | 展平特征 + 梯度提升树，Phase 1 |
+| Panel 基线 (Ridge / LightGBM / MLP / naive momentum) | 同 inner_val 日历口径的截面对照基线 (v8 四-2)；评估器版本 `evaluator_version 2026-08-04` |
 | LSTM | 2层单向 LSTM + PyTorch Lightning，Phase 2 |
 | class_weight | 处理涨跌样本不均衡，自动计算 neg/pos |
 

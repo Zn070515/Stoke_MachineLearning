@@ -57,7 +57,7 @@ class TushareSource(AShareSourceBase):
             ts_code = self._to_ts_code(stock_code)
             # pro_bar(adj="qfq") returns 前复权 prices, matching efinance /
             # akshare / baostock.  Plain pro.daily() returns UNadjusted bars
-            # which would inject a fake 涨跌 seam on failover (v6 §六).
+            # which would inject a fake 涨跌 seam on failover.
             df = ts.pro_bar(
                 ts_code=ts_code,
                 adj="qfq",
@@ -83,7 +83,7 @@ class TushareSource(AShareSourceBase):
                 "pct_change", "turnover"]
         available = [c for c in cols if c in df.columns]
         df = df[available].copy()
-        # Tushare units differ from the stored convention (v6 §六):
+        # Tushare units differ from the stored convention:
         #   vol    手 → ×100 股
         #   amount 千元 → ×1000 元
         if "volume" in df.columns:

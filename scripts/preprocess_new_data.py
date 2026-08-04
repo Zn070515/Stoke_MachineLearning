@@ -47,7 +47,7 @@ TYPE_MAP = {
 
 
 def _build_provenance(cfg) -> dict:
-    """Run-level provenance bound to every replace_range write (v6 §十一).
+    """Run-level provenance bound to every replace_range write.
 
     Each stock's write manifest carries run_id / git_commit / config_hash so a
     later reader can tell exactly which code + config produced the data.
@@ -195,11 +195,11 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
 
     Under ``--strict`` a stock whose daily K-line context fails to load, or
     whose transformed output trips error-level quality checks, is BLOCKED —
-    nothing is persisted and the failure is counted (v6 §十: 禁止 commit,
+    nothing is persisted and the failure is counted (禁止 commit,
     保留 staging 输出, 记录失败 manifest).
 
     Every replace_range write carries ``provenance`` and is guarded by the
-    degradation check in MarketWideStorage.save() (v6 §十一).
+    degradation check in MarketWideStorage.save().
     """
     logger.info("=== %s: %d stocks (%s to %s) ===",
                 dtype, len(stock_list), args.start, args.end)
@@ -236,7 +236,8 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
             # Load K-line daily data for market-cap context features
             daily_data = None
             try:
-                daily_data = ds.load_daily(code, args.start, args.end)
+                daily_data = ds.load_daily(
+                    code, args.start, args.end, require_valid_manifest=True)
                 if not daily_data.empty and "stock_code" not in daily_data.columns:
                     daily_data["stock_code"] = code
             except Exception as exc:
@@ -359,7 +360,8 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance):
     rejected = 0
     for code in stock_list:
         try:
-            base = ds.load_daily(code, args.start, args.end)
+            base = ds.load_daily(code, args.start, args.end,
+                                 require_valid_manifest=True)
             if base.empty:
                 continue
             processed = pp.run(
@@ -479,7 +481,8 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance):
     rejected = 0
     for i, code in enumerate(stock_list):
         try:
-            base = ds.load_daily(code, args.start, args.end)
+            base = ds.load_daily(code, args.start, args.end,
+                                 require_valid_manifest=True)
             if base.empty:
                 continue
             processed = pp.run(

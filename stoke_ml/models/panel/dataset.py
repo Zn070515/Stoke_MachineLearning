@@ -50,7 +50,7 @@ class PanelDataset(Dataset):
         self.y_return = _to_tensor(data["y_return"], torch.float32)
         self.y_volatility = _to_tensor(data["y_volatility"], torch.float32)
 
-        # Per-task target masks (review v3 §八): each loss applies its own mask
+        # Per-task target masks: each loss applies its own mask
         # instead of one y_direction != -100 ruling all tasks.  Optional for
         # backward-compat — synthetic test data without masks falls back to the
         # old single-mask behaviour.
@@ -83,7 +83,7 @@ class PanelDataset(Dataset):
             # Window [w, w+seq_len) is trainable iff the target day w+seq_len is
             # entry-eligible, the input window holds >= min_history real
             # observations (new listings with mostly zero-padded history are
-            # excluded — review v3 §四), and at least one target mask is set.
+            # excluded), and at least one target mask is set.
             target_any = (self.y_direction[:, self.seq_len:] != -100)
             if self.ret_target is not None:
                 target_any = target_any | self.ret_target[:, self.seq_len:]
@@ -91,7 +91,7 @@ class PanelDataset(Dataset):
                 target_any = target_any | self.vol_target[:, self.seq_len:]
             hist_count = _window_history_counts(self.obs_mask, self.seq_len)
             # decision_eligible[t] = close[t-1] real (signal computable after
-            # close[t-1]) — adds the review v4 §三 guard that we actually rank
+            # close[t-1]) — adds the guard that we actually rank
             # at a known point in time, not the first day after a suspension.
             decision = (
                 self.decision_eligible[:, self.seq_len:]
@@ -140,12 +140,12 @@ class PanelDataset(Dataset):
         # date used to group this sample cross-sectionally is the TARGET date,
         # not the last feature date (`end - 1`).  Ranking pairs must compare
         # stocks' outcomes on the SAME future day.  Under the open-entry
-        # convention (review v3 §六) `end` is the ENTRY date — buy at open[end],
+        # convention `end` is the ENTRY date — buy at open[end],
         # exit at open[end+horizon].
         date_idx = (self.date_indices[stock_idx, end].item()
                      if self.date_indices is not None else 0)
 
-        # Per-task target masks (review v3 §八): each loss applies its own mask.
+        # Per-task target masks: each loss applies its own mask.
         dir_mask = (self.y_direction[stock_idx, end] != -100)
         ret_mask = (self.ret_target[stock_idx, end]
                     if self.ret_target is not None else dir_mask)
@@ -153,7 +153,7 @@ class PanelDataset(Dataset):
                     if self.vol_target is not None else dir_mask)
 
         # Static context: 2D (N, D) for backward-compat synthetic data, or
-        # 3D (N, T, D) PIT (review v4 §五).  For 3D take the DECISION column
+        # 3D (N, T, D) PIT.  For 3D take the DECISION column
         # end-1 (the last feature day — known before entering at open[end]).
         if self.static_features.dim() == 3:
             static = self.static_features[stock_idx, end - 1]

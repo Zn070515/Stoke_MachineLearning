@@ -1,8 +1,8 @@
 """Unit tests for train_panel.py universe selection and honest eval reporting.
 
 These cover the Track B credibility fixes:
-- `_best_eval_metrics` reports the eval nearest the deployed (best-val-RankIC,
-  review v8 §四-1) checkpoint instead of the post-hoc max.
+- `_best_eval_metrics` reports the eval nearest the deployed best-val-RankIC
+  checkpoint instead of the post-hoc max.
 - `_resolve_universe` implements seeded/stratified/index universes that remove
   the alphabetical `sorted(...)[:N]` sampling bias.
 - `_save_artifacts` persists the resolved/used stock lists + summary.

@@ -17,6 +17,7 @@ from stoke_ml.models.panel.evaluate import (
     compute_ic_summary,
     evaluate_portfolio,
     _candidate_pool,
+    _combine_book_daily,
     _run_sleeve_sim,
     _simulate_sleeve_account,
 )
@@ -57,7 +58,7 @@ class TestSortino:
         ret = torch.tensor([0.01, 0.02, 0.015, 0.01])
         sortino = compute_sortino(ret, annualize=False)
         # No downside (< 2 downside samples) → Sortino is undefined → NaN
-        # (review v5 §十五.3), so summaries/JSON don't show an unbounded inf.
+        # so summaries/JSON don't show an unbounded inf.
         assert np.isnan(sortino)
 
 
@@ -115,7 +116,7 @@ class TestEquityCurve:
 
 
 class TestBootstrapSharpeCI:
-    """Review §十三: iid resampling of autocorrelated returns understates the
+    """IID resampling of autocorrelated returns understates the
     CI.  The bootstrap must preserve within-block time structure."""
 
     def test_finite_ci_for_iid_returns(self):
@@ -143,7 +144,7 @@ class TestBootstrapSharpeCI:
 
 
 class TestICSummaryNeweyWest:
-    """Review §十三: the plain mean/std IR ignores serial correlation in the
+    """The plain mean/std IR ignores serial correlation in the
     per-day IC series.  ic_newey_west_t must be smaller than the iid t-stat
     when the ICs are positively autocorrelated."""
 
@@ -203,7 +204,7 @@ def _make_synthetic_panel(n_stocks=24, n_timesteps=320, seed=0):
 
 
 class _ConstantReturnModel(nn.Module):
-    """Review §五 #4: every prediction identical → the evaluation pipeline must
+    """#4: every prediction identical → the evaluation pipeline must
     not manufacture alpha (zero IC, no systematic long-short / quintile spread)."""
 
     def __init__(self, ret_val: float = 0.0):
@@ -220,7 +221,7 @@ class _ConstantReturnModel(nn.Module):
 
 
 class _RandomReturnModel(nn.Module):
-    """Review §五 #3 proxy: predictions independent of the inputs, standing in
+    """#3 proxy: predictions independent of the inputs, standing in
     for a model that learned nothing from globally-shuffled labels.  If the
     evaluation pipeline is clean, this must show IC≈0 and no alpha.
 
@@ -257,7 +258,7 @@ class _StaticMarkerModel(nn.Module):
 
 
 class TestEvaluateCandidatePool:
-    """Review §二 survivor bias: the candidate pool must be ENTRY-ELIGIBLE
+    """Survivor bias: the candidate pool must be ENTRY-ELIGIBLE
     stocks (real open at the entry day), NOT stocks that happen to have a
     future label.  With carry-realized returns every entry-eligible stock has
     a tradeable outcome, so selection never conditions on survival."""
@@ -374,7 +375,7 @@ class TestEvaluateRealizedPreference:
 
 
 class TestEvaluateAllHorizonPhases:
-    """Review §五: every entry phase (offset 0..horizon-1) is evaluated and
+    """Every entry phase (offset 0..horizon-1) is evaluated and
     concatenated, so no in-sample entry days are wasted.  The old single-phase
     loop discarded (horizon-1)/horizon of the data."""
 
@@ -398,7 +399,7 @@ class TestEvaluateAllHorizonPhases:
 
 
 class TestEvaluateAntiCheat:
-    """Review §五 anti-cheat tests #3 (label shuffle) & #4 (constant preds).
+    """Anti-cheat tests #3 (label shuffle) & #4 (constant preds).
 
     Both assert the evaluation pipeline produces no alpha when there is no
     signal.  They are fast and training-free: instead of actually running
@@ -480,7 +481,7 @@ def _make_priced_panel(
     with_decision=True,
 ):
     """Synthetic panel with REAL price paths for the sleeve-account evaluation
-    path (review v4 §四).  close/open are random walks with a per-stock daily
+    path.  close/open are random walks with a per-stock daily
     drift so forward returns are rankable.  static[:, 0] holds a per-stock
     marker that _StaticMarkerModel uses as the return prediction:
 
@@ -562,7 +563,7 @@ def _make_priced_panel(
 
 
 class TestSleeveTrueDailySeries:
-    """review v4 §四 / P0-A2 + v6 §三: the priced evaluation returns a TRUE
+    """The priced evaluation returns a TRUE
     daily return series over the whole price path (n_periods == W+horizon,
     day 0 included), NOT the phase-concatenated W/h — the sleeve account marks
     to close every calendar day."""
@@ -582,8 +583,8 @@ class TestSleeveTrueDailySeries:
         m = self._eval()
         n_windows = self.N_TS - self.SEQ_LEN
         # The series is TRUE daily over the available price path (each sleeve
-        # marks to close every calendar day incl. day 0's open->close — review
-        # v6 §三), NOT the phase-concatenated W/h.  The synthetic panel holds
+        # marks to close every calendar day incl. day 0's open->close), NOT
+        # the phase-concatenated W/h.  The synthetic panel holds
         # exactly n_windows price columns after the seq_len slice (no trailing
         # horizon pad), so the sleeve series spans n_windows periods here.
         assert m["n_periods"] == n_windows, (
@@ -594,7 +595,7 @@ class TestSleeveTrueDailySeries:
 
 
 class TestSleeveDecisionHistoryPool:
-    """review v4 §三 / P0-A3: the selection pool is DECISION & HISTORY eligible
+    """The selection pool is DECISION & HISTORY eligible
     (close[t-1] real + window covered).  A stock whose signal yesterday was
     missing (decision-ineligible) must NOT be selectable even though its
     prediction is the strongest — otherwise selection would leak."""
@@ -637,7 +638,7 @@ class TestSleeveDecisionHistoryPool:
 
 
 class TestSleeveNoBackfill:
-    """review v4 §三: a selected-but-unfillable stock (no real open at entry)
+    """A selected-but-unfillable stock (no real open at entry)
     keeps its weight CASH — the allocation is NOT redistributed to fillable
     stocks (递补).  An unfilled sleeve contributes zero P&L even if another
     stock moves big that day."""
@@ -655,7 +656,7 @@ class TestSleeveNoBackfill:
             cost=0.0, mode="long")
         counts = res["exit_stats"]["counts"]
         assert counts["unfilled"] == 1, f"unfilled={counts['unfilled']}"
-        # Day 0 is now part of the series (review v6 §三): the day-0 sleeve is
+        # Day 0 is now part of the series: the day-0 sleeve is
         # unfilled, so its return is exactly 0 — the slot was NOT handed to
         # stock 1, whose +30% move never shows up.  The day-1 return is only
         # stock 0's open->close (10.5 -> 11).
@@ -667,7 +668,7 @@ class TestSleeveNoBackfill:
 
 
 class TestSleeveCosts:
-    """review v4 P0-C: transaction costs drag net below gross, and the sleeve
+    """Transaction costs drag net below gross, and the sleeve
     turns over real notional every day."""
 
     def test_gross_above_net_and_turnover_positive(self):
@@ -686,11 +687,11 @@ class TestSleeveCosts:
 
 
 class TestSleeveExitStatus:
-    """review v4 §六 / P0-A4 + v5 §四: exits are classified
+    """Exits are classified
     clean/delayed/delisted/unresolved/unfilled with P&L shares; a selected
     stock with a missing entry open is counted unfilled, never silently traded.
-    v5 renamed the old "carry" into a true DELAYED exit and split delist
-    (close<=0) from unresolved (price path ends with the position still open)."""
+    The old "carry" is a true DELAYED exit; delist (close<=0) is split
+    from unresolved (price path ends with the position still open)."""
 
     def test_exit_status_keys_and_unfilled(self):
         panel = _make_priced_panel(
@@ -710,10 +711,10 @@ class TestSleeveExitStatus:
         assert np.isclose(sum(es["pnl_share"].values()), 1.0, atol=1e-6)
 
     def test_three_leg_exit_status(self):
-        """review v6 §十四.2: the priced report must expose per-leg exit status
+        """The priced report must expose per-leg exit status
         for long / short / benchmark (equal-weight), so the short book's
         unfillable/trailing positions can be audited independently of the long
-        leg.  Each leg carries the full stable schema (review v6 §十四.3)."""
+        leg.  Each leg carries the full stable schema."""
         panel = _make_priced_panel(
             n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
             up_stocks=(1,), down_stocks=(2,), no_open_stocks=(4,), seed=3)
@@ -735,7 +736,7 @@ class TestSleeveExitStatus:
         assert m["exit_status"] == m["long_exit_status"]
 
     def test_require_price_path_fails_without_prices(self):
-        """review v6 §十五.2: formal training must fail loudly when price paths
+        """Formal training must fail loudly when price paths
         are missing, instead of silently downgrading to the legacy estimator."""
         panel = _make_priced_panel(
             n_stocks=12, n_timesteps=320, seq_len=60, horizon=5, seed=4)
@@ -749,7 +750,7 @@ class TestSleeveExitStatus:
 
 
 class TestSleeveDelayedDelist:
-    """review v5 §四: a missing exit open is a TRUE delayed exit — the position
+    """A missing exit open is a TRUE delayed exit — the position
     keeps holding and retries on later days, NOT a same-day "carry" sale at the
     stale close.  A zero close at exit is a delist; missing data with no resume
     is unresolved, never a delist."""
@@ -775,7 +776,7 @@ class TestSleeveDelayedDelist:
         assert counts["unresolved"] == 0, f"no position should dangle: {counts}"
 
     def test_zero_close_is_unresolved_not_delist(self):
-        """review v6 §十四.4: a carried close <= 0 after ffill cannot
+        """A carried close <= 0 after ffill cannot
         distinguish a real delisting from a dead data row, so the position is
         NEVER force-sold at 0 — it stays held and books as UNRESOLVED at the
         path end."""
@@ -796,7 +797,7 @@ class TestSleeveDelayedDelist:
             f"expected DATA-MISSING positions booked unresolved: {counts}")
 
     def test_delayed_exit_holds_and_captures_resumed_open(self):
-        """v5 §十七.4: scheduled exit day has no open, trading resumes 2 days
+        """Scheduled exit day has no open, trading resumes 2 days
         later.  The position is NOT liquidated on the scheduled day, keeps being
         marked to close (funds occupied), and is actually sold at the resumed
         open → DELAYED."""
@@ -814,7 +815,7 @@ class TestSleeveDelayedDelist:
         assert counts["delayed"] == 1, f"expected exactly one delayed exit, got {counts}"
         assert counts["clean"] == 0 and counts["unresolved"] == 0
         daily = np.asarray(res["daily"])
-        # review v6 §三: day 0's open->close (10.5 -> 10.0) is now part of the
+        # Day 0's open->close (10.5 -> 10.0) is now part of the
         # series, so the entry-day return is a loss.
         assert daily[0] < 0, f"day-0 open->close (10.5→10.0) should lose: {daily}"
         # Held through the suspension (d=1, d=2): NAV tracked close 11 then 12
@@ -828,7 +829,7 @@ class TestSleeveDelayedDelist:
             f"delayed exit did not capture the resumed open: {daily[3]:.4f}")
 
     def test_missing_data_is_unresolved_not_delisted(self):
-        """v5 §四 / §十七.5: a stock whose price path just ENDS (NaN, no resume)
+        """A stock whose price path just ENDS (NaN, no resume)
         is UNRESOLVED at the end — never auto-interpreted as a same-price sale
         and never a delist.  Only a carried close <= 0 is a delist."""
         preds = np.array([[0.9], [0.1]], dtype=np.float32)
@@ -847,7 +848,7 @@ class TestSleeveDelayedDelist:
 
 
 class TestLsAlgebra:
-    """review v5 §二 / §十七.1-2: `short_d` is ALREADY the short account's real
+    """`short_d` is ALREADY the short account's real
     daily return (side=-1 applied inside the simulator), so the long-short book
     is a SUM of the legs, NOT `long - short`.  When both legs profit the LS
     book must profit too — the old formula cancelled simultaneous success to
@@ -871,7 +872,7 @@ class TestLsAlgebra:
         assert m["ls_sharpe"] > 0.3, (
             f"both legs profit → LS must be positive, got {m['ls_sharpe']}")
         # The exposure metadata keeps the leverage assumption explicit
-        # (review v7 §四): `target` is the nominal 100% gross / 50-50 / net-0
+        # `target` is the nominal 100% gross / 50-50 / net-0
         # book construction, while `realized` reports the daily MEASURED
         # exposure from the sleeve simulation (unfilled slots → below target,
         # delayed exits → above), so the two are never conflated.
@@ -908,8 +909,54 @@ class TestLsAlgebra:
             f"short NAV must rise when the bottom falls: {short_d.mean():+.4f}")
 
 
+class TestLsNoRebalance:
+    """The LS metric and the ledger must be ONE account policy.
+    Both legs start at their target weight and are never rebalanced, so the
+    combined daily return is the NAV ratio of the weighted NAV blend (方案 A)
+    — NOT the arithmetic mean of the legs' daily returns (which silently
+    assumes a daily 50/50 reallocation and drifts from the ledger after day 1).
+    """
+
+    def test_combine_book_daily_matches_no_rebalance_nav(self):
+        long_d = np.array([0.10, 0.20, -0.05, 0.03])
+        short_d = np.array([0.00, -0.10, 0.15, 0.02])
+        ls = _combine_book_daily(long_d, short_d, 0.5, 0.5)
+        long_nav = np.cumprod(1.0 + long_d)
+        short_nav = np.cumprod(1.0 + short_d)
+        nav = 0.5 * long_nav + 0.5 * short_nav
+        expected = np.empty_like(nav)
+        expected[0] = nav[0] - 1.0
+        expected[1:] = nav[1:] / nav[:-1] - 1.0
+        np.testing.assert_allclose(ls, expected, rtol=1e-12)
+
+    def test_diverges_from_arithmetic_mean_after_day_one(self):
+        # The two policies coincide on day 1 (50/50 of the first-day returns)
+        # but diverge once the legs' NAVs drift apart.
+        long_d = np.array([0.10, 0.20, -0.05])
+        short_d = np.array([0.00, -0.10, 0.15])
+        ls = _combine_book_daily(long_d, short_d, 0.5, 0.5)
+        assert np.isclose(ls[0], 0.5 * (long_d[0] + short_d[0]))
+        assert not np.isclose(ls[1], 0.5 * (long_d[1] + short_d[1])), (
+            "daily-rebalance mean must NOT equal the no-rebalance NAV return")
+        assert not np.isclose(ls[2], 0.5 * (long_d[2] + short_d[2]))
+
+    def test_combine_book_daily_2x_leverage(self):
+        # 2x gross = full unit long + full unit short; the short leg's margin
+        # loan makes the book NAV = long_nav + short_nav - 1.0.
+        long_d = np.array([0.05, 0.10, -0.02])
+        short_d = np.array([0.02, -0.04, 0.03])
+        ls2x = _combine_book_daily(long_d, short_d, 1.0, 1.0, subtract=1.0)
+        long_nav = np.cumprod(1.0 + long_d)
+        short_nav = np.cumprod(1.0 + short_d)
+        nav = long_nav + short_nav - 1.0
+        expected = np.empty_like(nav)
+        expected[0] = nav[0] - 1.0
+        expected[1:] = nav[1:] / nav[:-1] - 1.0
+        np.testing.assert_allclose(ls2x, expected, rtol=1e-12)
+
+
 class TestLastSleeveExit:
-    """review v5 §三 / §十七.3: the simulation runs to the END of the price path
+    """The simulation runs to the END of the price path
     (Wp columns), so the sleeve entered on the last signal day W-1 liquidates at
     open[W-1+horizon] with its exit cost booked and no position left active."""
 
@@ -927,7 +974,7 @@ class TestLastSleeveExit:
             preds, close, open_, pool, horizon=2, top_fraction=0.5,
             cost=0.001, mode="long")
         # Simulated through the last exit day W-1+h = Wp-1 → 5 daily periods,
-        # day 0's open->close now included (review v6 §三).
+        # day 0's open->close now included.
         assert len(res["daily"]) == 5, f"len={len(res['daily'])}"
         counts = res["exit_stats"]["counts"]
         # 3 sleeves × 1 filled stock each, all exiting exactly on schedule.
@@ -941,7 +988,7 @@ class TestLastSleeveExit:
 
 
 class TestSleeveAccountIdentity:
-    """review v8 P0-1: the strongest consistency check for any backtest — the
+    """The strongest consistency check for any backtest — the
     returned daily-return series must compound to EXACTLY the account's final
     NAV, and the exit ledger must reconcile to it.  The most dangerous failure
     mode in a quant backtest is not an error but a strategy whose equity curve
@@ -977,7 +1024,7 @@ class TestSleeveAccountIdentity:
             f"final_nav={res['final_nav']:.12f}")
 
     def test_net_and_gross_series_both_reconcile(self):
-        """The net and the cost=0 gross runs are INDEPENDENT accounts (v7 §三)
+        """The net and the cost=0 gross runs are INDEPENDENT accounts
         — each must satisfy the identity internally, and the net book carries a
         cost drag so it never compounds above the gross one."""
         preds, close, open_, pool = self._inputs()
@@ -1003,7 +1050,7 @@ class TestSleeveAccountIdentity:
 
 
 class TestLastHorizonSuspendedExit:
-    """review v8 P0-3: a signal fired on the last signal day whose ENTIRE exit
+    """A signal fired on the last signal day whose ENTIRE exit
     window is suspended must NOT silently vanish at test end.  The position
     holds (pending) and either exits at the resumed open with cost booked
     (DELAYED) or books UNRESOLVED at the final carried mark — never
@@ -1096,7 +1143,7 @@ class TestLastHorizonSuspendedExit:
 
 
 class TestRawReturnUnits:
-    """review v5 §五 / §十七.6: Q5−Q1 "bp" and clean IC must be in RAW return
+    """Q5−Q1 "bp" and clean IC must be in RAW return
     units even when the training label y_return is z-scored + clipped per fold.
     y_return_raw (saved before normalization) must be preferred for both."""
 
@@ -1116,7 +1163,8 @@ class TestRawReturnUnits:
             s = float(col.std())
             z[:, t] = (col - float(col.mean())) / s if s > 1e-8 else 0.0
         panel["y_return"] = np.clip(z, -5.0, 5.0).astype(np.float32)
-        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
+                          min_stocks_per_day=5)
         m = evaluate_portfolio(
             _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
             horizon=self.HORIZON)
@@ -1130,7 +1178,7 @@ class TestRawReturnUnits:
 
 
 class TestTurnoverScaleInvariant:
-    """review v5 §六.3 / §十七.7: turnover is traded notional normalized by the
+    """Turnover is traded notional normalized by the
     day's opening NAV — a ratio, so a 1M account reports the same turnover as
     a 1 account.  Scaling the whole price level (equivalent to a bigger account,
     since sleeve weights are NAV fractions) must leave daily returns and the
@@ -1164,7 +1212,7 @@ class TestTurnoverScaleInvariant:
 
 
 class TestCleanICSeparation:
-    """review v4 §七: IC is computed over the CLEAN y_return (open->open) ×
+    """IC is computed over the CLEAN y_return (open->open) ×
     return_target_mask, separated from the exec P&L that uses fills/costs/
     carry.  A rankable market must show strong positive clean IC even though
     the exec path deducts costs."""
@@ -1173,7 +1221,7 @@ class TestCleanICSeparation:
         panel = _make_priced_panel(
             n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
             up_stocks=(1,), down_stocks=(2,), seed=3)
-        cfg = PanelConfig(seq_len=60, horizon=5)
+        cfg = PanelConfig(seq_len=60, horizon=5, min_stocks_per_day=5)
         m = evaluate_portfolio(
             _StaticMarkerModel(), panel, cfg, torch.device("cpu"), horizon=5)
         assert m["ic_mean"] > 0.3, f"clean IC not positive: {m['ic_mean']:.3f}"
@@ -1193,12 +1241,12 @@ class TestSleeveAntiCheat:
             n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
             horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=seed)
         # txn_cost=0.0: this class tests "no manufactured SELECTION alpha".
-        # Since review v6 §四 the sleeve account deducts entry costs from cash,
+        # Since the sleeve account deducts entry costs from cash,
         # a zero-alpha book honestly shows a systematic negative LS drag that
         # would trip the abs()<1.0 bound calibrated when costs were
         # under-counted.  Cost drag is covered separately by TestSleeveCosts.
         cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
-                          txn_cost=0.0)
+                          txn_cost=0.0, min_stocks_per_day=5)
         return evaluate_portfolio(
             model, panel, cfg, torch.device("cpu"), horizon=self.HORIZON)
 
@@ -1229,7 +1277,7 @@ class TestSleeveAntiCheat:
 
 
 class TestSleeveLedger:
-    """review v7 §九.2: the per-position ledger — one record per FILLED
+    """The per-position ledger — one record per FILLED
     position with entry/exit price, scheduled/actual exit day, exit status,
     gross/net PnL and attributed costs — must reconcile to the account identity
     (sum(net_pnl) == final_nav - 1) and be fully recoverable from a saved tape
@@ -1290,7 +1338,7 @@ class TestSleeveLedger:
 
     def test_tape_roundtrip_replays_long_account(self):
         """A tape holding preds + close/open price paths + pool + metadata (the
-        exact arrays train_panel.py saves per fold, review v7 §九.2) must replay
+        exact arrays train_panel.py saves per fold) must replay
         through _run_sleeve_sim to the SAME final NAV the sleeve account built,
         so an offline consumer reconstructs the backtest without the model."""
         panel = _make_priced_panel(

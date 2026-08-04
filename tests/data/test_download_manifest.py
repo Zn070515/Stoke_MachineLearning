@@ -1,4 +1,4 @@
-"""Download-run manifest tests (review v8 §二-2).
+"""Download-run manifest tests.
 
 A partially-successful download ("4990 of 5000, 10 failed, program said
 success") must never be mistaken for complete.  The manifest records requested

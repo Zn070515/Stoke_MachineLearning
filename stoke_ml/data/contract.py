@@ -1,10 +1,25 @@
-"""Data contracts — frozen, machine-enforced dataset schemas (v6 §十六).
+"""Data contracts — frozen, machine-enforced dataset schemas.
 
 Each dataset (daily K-line, margin, northbound, ...) is described by one
 ``DataContract`` so downloaders, storage, the quality gate and feature builders
 share a single source of truth for schema, primary key, units, price basis,
 timezone and calendar — instead of each module relying on local comments and
 experience.
+
+The contracts harden the schemas from documentation into real constraints:
+
+* ``validate_finite`` — key columns carry a required finite ratio and the frame
+  a minimum valid row count, so an all-NaN OHLC file is corrupt, not "valid".
+  Suspension days are represented by ABSENT rows, never NaN OHLC rows.
+* ``validate_ohlc`` — ``low <= open/close <= high`` on every bar.
+* ``validate_source_metadata`` — a ``source`` column, when present, must be
+  non-empty, and an ``adjustment_mode`` column must hold a legal value.
+* ``validate_dates(..., trading_days=...)`` — optional membership in the
+  official trading calendar.
+* Price basis is split across DISTINCT contracts (``raw_unadjusted_daily`` /
+  ``adjustment_factor`` / ``research_qfq_daily``) instead of one ``daily_equity``
+  silently covering every price system.  On-disk daily K-line is the qfq
+  research series, so ``daily_equity`` aliases it.
 
 ``CONTRACTS`` holds the frozen contracts; ``get_contract(name)`` looks one up.
 The validation helpers return a flat list of violation strings (empty == valid)
@@ -14,12 +29,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 
 @dataclass(frozen=True)
 class DataContract:
-    """One dataset's frozen contract (field names mirror v6 §十六)."""
+    """One dataset's frozen contract."""
 
     dataset_name: str
     primary_key: tuple[str, ...]
@@ -30,6 +46,11 @@ class DataContract:
     calendar: str
     source_priority: tuple[str, ...] = ()
     allowed_missingness: dict[str, str] = field(default_factory=dict)
+    # Enforced numeric constraints.
+    price_columns: tuple[str, ...] = ()
+    required_finite_ratio: dict[str, float] = field(default_factory=dict)
+    minimum_valid_rows: int = 0
+    adjustment_mode: str = "n/a"
 
 
 # ── validators ────────────────────────────────────────────────────────────
@@ -57,13 +78,23 @@ def validate_primary_key(df: pd.DataFrame, contract: DataContract) -> list[str]:
     return out
 
 
-def validate_dates(df: pd.DataFrame, contract: DataContract) -> list[str]:
+def validate_dates(
+    df: pd.DataFrame,
+    contract: DataContract,
+    *,
+    trading_days: set | None = None,
+) -> list[str]:
     """Dates parse cleanly, and — for date-keyed daily datasets — are sorted
     and never fall on a weekend (A-shares never trade weekends).
 
     The date column comes from the contract (``date`` for daily datasets,
     ``report_date`` for quarterly fundamentals); contracts with no date column
     skip date validation entirely.
+
+    ``trading_days``: an optional set of ``datetime.date`` objects
+    (or ISO date strings) from the official calendar.  When supplied, dates
+    outside it are flagged — catching rows on exchange holidays.  Passing a
+    prebuilt set avoids per-file calendar construction in batch loops.
     """
     date_col = next(
         (c for c in ("date", "report_date") if c in contract.required_columns), None
@@ -82,6 +113,14 @@ def validate_dates(df: pd.DataFrame, contract: DataContract) -> list[str]:
         n_wk = int(d.dt.dayofweek.isin([5, 6]).sum())
         if n_wk:
             out.append(f"weekend_dates:{n_wk}")
+        if trading_days is not None:
+            if trading_days and isinstance(next(iter(trading_days)), str):
+                keyed = d.dt.strftime("%Y-%m-%d")
+            else:
+                keyed = d.dt.date
+            n_off = int((~keyed.isin(trading_days)).sum())
+            if n_off:
+                out.append(f"non_trading_day:{n_off}")
     return out
 
 
@@ -91,7 +130,8 @@ def validate_units(df: pd.DataFrame, contract: DataContract) -> list[str]:
     Fully verifying a unit's magnitude (e.g. that ``volume`` is really shares,
     not lots) needs an independent reference, but the sign constraints catch the
     classic A-share corruption signatures: non-positive prices, negative
-    volume/amount.
+    volume/amount.  An all-NaN column is caught by ``validate_finite`` rather
+    than silently skipped here.
     """
     out = []
     for col, unit in contract.units.items():
@@ -112,22 +152,103 @@ def validate_units(df: pd.DataFrame, contract: DataContract) -> list[str]:
     return out
 
 
+def validate_finite(df: pd.DataFrame, contract: DataContract) -> list[str]:
+    """Required finite ratios + minimum valid rows.
+
+    Previously an all-NaN OHLC file passed because schema only checked column
+    existence and units skipped zero-finite columns.  Suspension is represented
+    by absent rows, not NaN OHLC rows, so a frame below the finite threshold is
+    corrupt, not "suspended".
+    """
+    out = []
+    if contract.minimum_valid_rows and len(df) < contract.minimum_valid_rows:
+        out.append(f"too_few_rows:{len(df)}<{contract.minimum_valid_rows}")
+    for col, min_ratio in contract.required_finite_ratio.items():
+        if col not in df.columns:
+            continue  # validate_schema reports the missing column
+        if len(df) == 0:
+            out.append(f"{col}_finite_ratio:0.0<{min_ratio}")
+            continue
+        ratio = float(df[col].notna().mean())
+        if ratio < min_ratio:
+            out.append(f"{col}_finite_ratio:{ratio:.4f}<{min_ratio}")
+    return out
+
+
+def validate_ohlc(df: pd.DataFrame, contract: DataContract) -> list[str]:
+    """low <= open/close <= high on every bar."""
+    if "low" not in contract.price_columns or "high" not in contract.price_columns:
+        return []
+    cols = [c for c in contract.price_columns if c in df.columns]
+    if not cols:
+        return []
+    out = []
+    TOL = 1e-9
+    low = pd.to_numeric(df.get("low"), errors="coerce").to_numpy(dtype="float64")
+    high = pd.to_numeric(df.get("high"), errors="coerce").to_numpy(dtype="float64")
+    for c in cols:
+        if c in ("low", "high"):
+            continue
+        v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
+        nan = np.isnan(low) | np.isnan(high) | np.isnan(v)
+        n_low = int(((v < low - TOL) & ~nan).sum())
+        n_high = int(((v > high + TOL) & ~nan).sum())
+        if n_low:
+            out.append(f"{c}<low:{n_low}")
+        if n_high:
+            out.append(f"{c}>high:{n_high}")
+    return out
+
+
+VALID_ADJUSTMENT_MODES = {"raw", "none", "qfq", "hfq", "n/a"}
+
+
+def validate_source_metadata(df: pd.DataFrame, contract: DataContract) -> list[str]:
+    """source column non-empty; adjustment_mode column legal."""
+    out = []
+    if "source" in df.columns:
+        s = df["source"].astype("string")
+        n_empty = int((s.isna() | (s.str.strip() == "")).sum())
+        if n_empty:
+            out.append(f"source_empty:{n_empty}")
+    if "adjustment_mode" in df.columns:
+        modes = df["adjustment_mode"].dropna().unique()
+        bad = sorted(str(m) for m in modes if m not in VALID_ADJUSTMENT_MODES)
+        if bad:
+            out.append(f"adjustment_mode_invalid:{','.join(bad)}")
+    return out
+
+
 def validate_contract(
-    df: pd.DataFrame, contract: DataContract, *, code: str | None = None
+    df: pd.DataFrame,
+    contract: DataContract,
+    *,
+    code: str | None = None,
+    trading_days: set | None = None,
 ) -> list[str]:
     """Run every validator; return a flat list of violation strings."""
     out = []
     out += validate_schema(df, contract)
     out += validate_primary_key(df, contract)
-    out += validate_dates(df, contract)
+    out += validate_dates(df, contract, trading_days=trading_days)
     out += validate_units(df, contract)
+    out += validate_finite(df, contract)
+    out += validate_ohlc(df, contract)
+    out += validate_source_metadata(df, contract)
     return [f"{code}:{v}" if code else v for v in out]
 
 
 # ── frozen contracts ──────────────────────────────────────────────────────
 
-DAILY_EQUITY = DataContract(
-    dataset_name="daily_equity",
+# Price basis is split across distinct contracts.  On-disk daily
+# K-line is the forward-adjusted (qfq) research series, so
+# ``daily_equity`` aliases ``research_qfq_daily`` rather than pretending the
+# same schema covers unadjusted data too.
+DAILY_PRICE_COLUMNS = ("open", "high", "low", "close")
+DAILY_REQUIRED_FINITE = {"open": 0.99, "high": 0.99, "low": 0.99, "close": 0.99}
+
+RESEARCH_QFQ_DAILY = DataContract(
+    dataset_name="research_qfq_daily",
     primary_key=("stock_code", "date"),
     required_columns=(
         "date", "stock_code", "open", "high", "low", "close",
@@ -137,7 +258,8 @@ DAILY_EQUITY = DataContract(
         "open": "price", "high": "price", "low": "price", "close": "price",
         "volume": "shares", "amount": "CNY", "turnover": "percent",
     },
-    price_basis="unadjusted",
+    price_basis="qfq",
+    adjustment_mode="qfq",
     timezone="Asia/Shanghai",
     calendar="SSE_SZSE",
     source_priority=("efinance", "akshare", "tushare", "baostock"),
@@ -147,6 +269,47 @@ DAILY_EQUITY = DataContract(
             "pipeline derives turnover_proxy from amount/close"
         ),
         "pct_change": "NaN on the first listing day",
+    },
+    price_columns=DAILY_PRICE_COLUMNS,
+    required_finite_ratio=DAILY_REQUIRED_FINITE,
+    minimum_valid_rows=1,
+)
+
+# daily_equity == the research qfq series (see contract docstring).
+DAILY_EQUITY = RESEARCH_QFQ_DAILY
+
+RAW_UNQUOTED_DAILY = DataContract(
+    dataset_name="raw_unadjusted_daily",
+    primary_key=("stock_code", "date"),
+    required_columns=(
+        "date", "stock_code", "open", "high", "low", "close",
+        "volume", "amount",
+    ),
+    units={
+        "open": "price", "high": "price", "low": "price", "close": "price",
+        "volume": "shares", "amount": "CNY",
+    },
+    price_basis="unadjusted",
+    adjustment_mode="raw",
+    timezone="Asia/Shanghai",
+    calendar="SSE_SZSE",
+    source_priority=("efinance", "akshare", "tushare", "baostock"),
+    price_columns=DAILY_PRICE_COLUMNS,
+    required_finite_ratio=DAILY_REQUIRED_FINITE,
+    minimum_valid_rows=1,
+)
+
+ADJUSTMENT_FACTOR = DataContract(
+    dataset_name="adjustment_factor",
+    primary_key=("stock_code", "date"),
+    required_columns=("stock_code", "date", "qfq_factor", "hfq_factor"),
+    units={"qfq_factor": "ratio", "hfq_factor": "ratio"},
+    price_basis="n/a",
+    adjustment_mode="n/a",
+    timezone="Asia/Shanghai",
+    calendar="SSE_SZSE",
+    allowed_missingness={
+        "hfq_factor": "optional; absent for stocks with no dividends",
     },
 )
 
@@ -219,7 +382,10 @@ FUNDAMENTALS = DataContract(
 )
 
 CONTRACTS = {
-    DAILY_EQUITY.dataset_name: DAILY_EQUITY,
+    RESEARCH_QFQ_DAILY.dataset_name: RESEARCH_QFQ_DAILY,
+    "daily_equity": RESEARCH_QFQ_DAILY,  # alias
+    RAW_UNQUOTED_DAILY.dataset_name: RAW_UNQUOTED_DAILY,
+    ADJUSTMENT_FACTOR.dataset_name: ADJUSTMENT_FACTOR,
     MARGIN.dataset_name: MARGIN,
     NORTHBOUND.dataset_name: NORTHBOUND,
     DRAGON_TIGER.dataset_name: DRAGON_TIGER,

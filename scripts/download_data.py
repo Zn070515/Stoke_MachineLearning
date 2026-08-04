@@ -86,7 +86,7 @@ def main():
                         help="Skip stocks already in data/a_shares/daily/")
     parser.add_argument("--require-complete", action="store_true",
                         help="Exit non-zero if any requested stock is missing "
-                             "after the run (review v8 §二-2 anti-fake-complete)")
+                             "after the run")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -140,9 +140,9 @@ def main():
                      dates.max().strftime("%Y-%m-%d"))
         success += 1
 
-    # Persist the download manifest so a PARTIAL run cannot pass for complete
-    # (review v8 §二-2): requested vs success vs failed vs missing is written to
-    # disk and the summary below reports `all_complete` explicitly.
+    # Persist the download manifest so a PARTIAL run cannot pass for complete:
+    # requested vs success vs failed vs missing is written to disk and the
+    # summary below reports `all_complete` explicitly.
     _, on_disk = filter_existing(codes, cfg.project.data_dir)
     manifest = write_manifest(
         default_path(cfg.project.data_dir),

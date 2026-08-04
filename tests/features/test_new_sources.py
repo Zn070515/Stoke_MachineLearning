@@ -87,6 +87,19 @@ def test_batch_fill_shift_int16_count():
     assert df["pledge_count"].iloc[1] == 1  # shifted
 
 
+def test_batch_fill_shift_lag_false_keeps_effective_date():
+    # Effective-date-mapped sources (earnings/guba/news) must NOT be shifted
+    # again in the feature layer: ZI fill only.
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=5)})
+    df["sentiment_mean"] = np.arange(1, 6, dtype=np.float32)
+    df["has_news"] = [True] * 5
+    _batch_fill_shift(df, ["sentiment_mean", "has_news"], lag=False)
+    assert df["sentiment_mean"].iloc[0] == 1.0  # kept on effective date
+    assert df["sentiment_mean"].iloc[1] == 2.0
+    assert df["sentiment_mean"].dtype == np.float32
+    assert df["has_news"].dtype == bool
+
+
 def test_ic_correctness_known_signal():
     """Inject a feature == forward return + noise; cross-sectional IC ~ high."""
     from scipy.stats import spearmanr

@@ -9,16 +9,19 @@ Tries sources in priority order:
 All providers normalize to a common convention at the adapter boundary:
 OHLC is 前复权 (qfq), ``volume`` is 股 (shares), ``amount`` is 元 (CNY).
 Cross-source backfill rebases the older segment's OHLC onto the primary
-source's 前复权 anchor to avoid a fake price jump at the seam (v6 §六).
+source's 前复权 anchor to avoid a fake price jump at the seam.
+
+Two hard guards gate the splice: if the backfill has no
+overlap day to calibrate on, or the calibrating ratio is outside [0.5, 2.0],
+the splice is REJECTED — primary data is kept as-is and
+``df.attrs["backfill_rejected"]`` records why.  Masking either condition with a
+naive append (fake price jump) or a forced rebase (unit/adjustment-mode error
+disguised as a seam) would corrupt downstream momentum features.
 """
 import time
 import logging
 import pandas as pd
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
-from stoke_ml.data.sources.a_shares.efinance_source import EfinanceSource
-from stoke_ml.data.sources.a_shares.akshare_source import AKShareSource
-from stoke_ml.data.sources.a_shares.tushare_source import TushareSource
-from stoke_ml.data.sources.a_shares.baostock_source import BaostockSource
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,16 @@ class AShareDownloader:
     """Multi-source A-share data downloader with automatic failover."""
 
     def __init__(self):
+        # Lazy source imports: the online providers carry
+        # optional crawler deps (curl_cffi), so importing this module — or even
+        # constructing the downloader for an offline/mock-sourced test — must
+        # not require them.  A source that can't be imported reports
+        # is_available()==False and is skipped by the failover loop.
+        from stoke_ml.data.sources.a_shares.efinance_source import EfinanceSource
+        from stoke_ml.data.sources.a_shares.akshare_source import AKShareSource
+        from stoke_ml.data.sources.a_shares.tushare_source import TushareSource
+        from stoke_ml.data.sources.a_shares.baostock_source import BaostockSource
+
         self._sources: list[AShareSourceBase] = [
             EfinanceSource(),
             AKShareSource(),
@@ -53,14 +66,23 @@ class AShareDownloader:
                 logger.debug(f"Circuit open for {name}, skipping")
                 continue
 
-            df = source.fetch_daily(stock_code, start_date, end_date)
-            if len(df) > 0:
+            try:
+                result = source.fetch_daily(stock_code, start_date, end_date)
+            except Exception as e:
+                # §十-1: a crash inside one provider must not kill the whole
+                # fetch — count it as a failure and move to the next source.
+                self._record_failure(name)
+                logger.warning(
+                    "Source %s raised for %s: %s", name, stock_code, e
+                )
+                continue
+            if result is not None and len(result) > 0:
                 self._record_success(name)
                 source_used = name
+                df = result
                 break
-            else:
-                self._record_failure(name)
-                logger.warning(f"Source {name} returned empty for {stock_code}")
+            self._record_failure(name)
+            logger.warning(f"Source {name} returned empty for {stock_code}")
 
         if df is None or len(df) == 0:
             logger.error(f"All sources failed for {stock_code}")
@@ -73,7 +95,11 @@ class AShareDownloader:
             # Fetch THROUGH got_start so there is an overlap day to calibrate
             # the 前复权 anchors (Baostock anchors to its returned window's
             # end, EastMoney/others to the latest date).  See _stitch_segments.
-            backfill_end = got_start + pd.Timedelta(days=5)
+            # +45 calendar days of overlap window: Baostock may only return
+            # complete (non-suspended) trading days, so a narrow +5d window
+            # frequently yields zero overlap and forces the no-calibration
+            # reject path on legitimately-adjacent series.
+            backfill_end = got_start + pd.Timedelta(days=45)
             got_start_str = str(got_start)
             got_end_str = str(pd.to_datetime(df["date"]).max().date() if len(df) else "?")
             logger.info(
@@ -88,36 +114,61 @@ class AShareDownloader:
                 )
                 if len(bs_df) > 0:
                     rebased, ratio = self._stitch_segments(bs_df, df)
-                    if ratio is not None:
+                    if ratio is not None and 0.5 <= ratio <= 2.0:
+                        # Row-level source provenance: record which provider
+                        # fed which part BEFORE the concat mutates the frames
+                        # Stamped after concat because pd.concat
+                        # copies attrs from the FIRST frame only.
+                        n_backfill = int(len(rebased))
+                        n_primary = int(len(df))
+                        segs = []
+                        if n_backfill:
+                            segs.append({
+                                "source": "baostock", "adjust": "qfq",
+                                "start": str(
+                                    pd.to_datetime(rebased["date"]).min().date()),
+                                "end": str(
+                                    pd.to_datetime(rebased["date"]).max().date()),
+                                "rows": n_backfill,
+                            })
+                        segs.append({
+                            "source": source_used, "adjust": "qfq",
+                            "start": got_start_str,
+                            "end": str(pd.to_datetime(df["date"]).max().date()),
+                            "rows": n_primary,
+                        })
                         df = pd.concat([rebased, df], ignore_index=True)
                         df = df.sort_values("date").reset_index(drop=True)
                         df = df.drop_duplicates(subset="date", keep="last")
+                        df.attrs["source_segments"] = segs
                         df.attrs["backfilled_from"] = "baostock"
+                        df.attrs["backfill_rejected"] = None
                         logger.info(
                             "  %s: stitched %d + %d = %d rows [%s → %s] "
                             "(seam rebase ratio=%.4f)",
-                            stock_code, len(rebased), len(df) - len(rebased),
-                            len(df),
+                            stock_code, n_backfill, n_primary, len(df),
                             str(pd.to_datetime(df["date"]).min().date()),
                             str(pd.to_datetime(df["date"]).max().date()),
                             ratio,
                         )
-                        if not 0.5 <= ratio <= 2.0:
-                            logger.warning(
-                                "  %s: 前复权 anchor gap %.2f× at the %s/%s seam; "
-                                "backfill OHLC was rebased to stay continuous "
-                                "(v6 §六 seam guard)",
-                                stock_code, ratio, start_date, got_start_str,
-                            )
+                    elif ratio is not None:
+                        logger.error(
+                            "  %s: 前复权 anchor gap %.2f× at the %s/%s seam — "
+                            "REFUSING to splice (would mask a unit, stock-code, "
+                            "or raw-vs-qfq error as a seam); keeping primary "
+                            "data only",
+                            stock_code, ratio, start_date, got_start_str,
+                        )
+                        df.attrs["backfill_rejected"] = f"ratio={ratio:.2f}"
                     else:
-                        logger.warning(
+                        logger.error(
                             "  %s: Baostock backfill has no overlap with primary "
-                            "(%s), cannot calibrate seam — appending raw",
+                            "(%s), cannot calibrate seam — REFUSING to splice "
+                            "(naive append would inject a fake price jump); "
+                            "keeping primary data only",
                             stock_code, got_start_str,
                         )
-                        df = pd.concat([bs_df, df], ignore_index=True)
-                        df = df.sort_values("date").reset_index(drop=True)
-                        df = df.drop_duplicates(subset="date", keep="last")
+                        df.attrs["backfill_rejected"] = "no_overlap"
                 else:
                     logger.info("  %s: Baostock backfill returned empty, keeping %d rows",
                                 stock_code, len(df))
@@ -126,13 +177,14 @@ class AShareDownloader:
 
         df.attrs["source"] = source_used
         df.attrs["adjustment_mode"] = "qfq"
+        df.attrs.setdefault("backfill_rejected", None)
         return self._repair_pct_change(df)
 
     @staticmethod
     def _stitch_segments(
         backfill: pd.DataFrame, primary: pd.DataFrame
     ) -> tuple[pd.DataFrame, float | None]:
-        """Rebase `backfill` OHLC onto `primary`'s 前复权 anchor (v6 §六).
+        """Rebase `backfill` OHLC onto `primary`'s 前复权 anchor.
 
         Both segments are 前复权 but anchored to different reference dates
         (Baostock anchors to its returned window's end, EastMoney/Tushare/

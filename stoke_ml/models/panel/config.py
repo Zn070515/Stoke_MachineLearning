@@ -19,7 +19,7 @@ class PanelConfig:
     """
 
     # Input dimensions (overridden at runtime from actual data).  Defaults track
-    # the current prebuilt panel (review v5 §十六 / v8 §三-2): S=4 PIT static,
+    # the current prebuilt panel: S=4 PIT static,
     # PK=255, PO=1418 — the docs guard (check_docs_consistency.py) enforces
     # README / CONTEXT against these, so update all three together.
     static_dim: int = 4
@@ -59,11 +59,19 @@ class PanelConfig:
     # Sequence
     seq_len: int = 60
 
-    # Sample eligibility (review v3 §四): a window is trainable only if its
+    # Sample eligibility: a window is trainable only if its
     # input has >= min_history real observations (new listings with mostly
     # zero-padded history are excluded) AND the target day is entry-eligible
     # AND at least one target mask is set.
     min_history: int = 50
+
+    # Minimum number of eligible stocks a cross-section needs before its
+    # per-day RankIC is kept.  Shared by checkpoint
+    # selection (train._compute_val_loss) and the formal clean-IC evaluator
+    # (evaluate._compute_daily_ic) so the two are the SAME quantity — the old
+    # training-side threshold of 2 let statistically weak days select a
+    # checkpoint while the report required >= 10.
+    min_stocks_per_day: int = 20
 
     # Output
     num_direction_classes: int = 3  # down / flat / up
@@ -78,7 +86,7 @@ class PanelConfig:
     rank_loss_weight: float = 0.1
 
     # One-way transaction cost (fraction of notional) applied per fill in the
-    # sleeve-account evaluation (review v4 §八 / P1-C).  0.0005 = 5 bps/side.
+    # sleeve-account evaluation.  0.0005 = 5 bps/side.
     txn_cost: float = 0.0005
 
     # Diagnostics (expensive — enable for debugging gradient collapse)

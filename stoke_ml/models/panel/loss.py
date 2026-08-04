@@ -35,7 +35,7 @@ class UncertaintyLoss(nn.Module):
         log_vars = torch.clamp(self.log_vars, -2.0, 10.0)
         total = torch.tensor(0.0, device=log_vars.device, dtype=log_vars.dtype)
         for i, loss in enumerate(task_losses):
-            # Review v4 §八: a task with no labels in this batch must not
+            # A task with no labels in this batch must not
             # contribute even its log_var regularizer — doing so pushes
             # inactive weights toward the clamp floor and distorts the
             # weights of batches where that task IS active.
@@ -134,7 +134,7 @@ class PairwiseRankingLoss(nn.Module):
             date_idx: (B,) integer date index for same-date grouping.
             stats: optional list — when given, appended a dict with
                 {n_dates, stocks_per_date, n_pairs} so the caller can detect
-                when ranking signal rests on very few pairs (review v4 §十).
+                when ranking signal rests on very few pairs.
         """
         B = pred.shape[0]
         if B < 2:
@@ -149,7 +149,7 @@ class PairwiseRankingLoss(nn.Module):
         # the whole batch (NaN * 0 == NaN propagates through the masked sum).
         pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Review v4 §十: a batch can hold several dates' head/tail slices, so
+        # A batch can hold several dates' head/tail slices, so
         # predictions are normalized PER DATE — not over the mixed batch — and
         # each date's pairwise loss is weighted by its own pair count.  The
         # date loop is cheap: DateGroupedSampler batches contain 1-2 dates.

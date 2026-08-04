@@ -428,6 +428,7 @@ class GubaSource:
         end_date: str | None = None,
         max_pages: int = 10,
         fetch_bodies: bool = True,
+        meta: dict | None = None,
     ) -> pd.DataFrame:
         """Fetch Guba forum posts for a stock.
 
@@ -441,15 +442,30 @@ class GubaSource:
             end_date: YYYY-MM-DD filter (inclusive).
             max_pages: Maximum pages to fetch (~80 posts/page).
             fetch_bodies: If True, fetch full post body from detail pages.
+            meta: Optional dict.  On return, populated with ``pages_requested``,
+                ``pages_fetched`` and ``pagination_exhausted`` (download
+                completion evidence).  ``pagination_exhausted`` is True when the
+                fetch reached the end of the provider's history (a short/empty
+                page or content older than ``start_date``), False when the loop
+                hit ``max_pages`` first — in which case the history may be
+                truncated and must NOT be marked complete.
 
         Returns:
             DataFrame with columns: date, time, title, body, post_id, url.
         """
+
+        def _set_meta(pages_fetched: int, pagination_exhausted: bool) -> None:
+            if meta is not None:
+                meta["pages_requested"] = max_pages
+                meta["pages_fetched"] = pages_fetched
+                meta["pagination_exhausted"] = pagination_exhausted
+
         # --- Phase 1: probe page 1 ---
         df_page1, _ = self._fetch_list_page(
             stock_code, 1, datetime.now().year,
         )
         if df_page1.empty:
+            _set_meta(1, False)
             return _empty_df()
 
         all_pages: list[pd.DataFrame] = []
@@ -457,6 +473,7 @@ class GubaSource:
         if not df_filt.empty:
             all_pages.append(df_filt)
         if too_old or len(df_page1) < 40:
+            _set_meta(1, True)
             return pd.concat(all_pages, ignore_index=True) if all_pages else _empty_df()
 
         # Persistent pool reused across all batches AND body fetching
@@ -466,9 +483,12 @@ class GubaSource:
         pool = ThreadPoolExecutor(max_workers=POOL_WORKERS)
 
         # --- Phase 2: fetch remaining pages in concurrent batches ---
+        pages_fetched = 1  # probe page 1 above
+        pagination_exhausted = False
         page = 2
         while page <= max_pages:
             batch_pages = list(range(page, min(page + BATCH, max_pages + 1)))
+            pages_fetched += len(batch_pages)
             page_results = self._fetch_pages_parallel(stock_code, batch_pages, pool=pool)
 
             stopped = False
@@ -490,12 +510,14 @@ class GubaSource:
                     break
 
             if stopped:
+                pagination_exhausted = True
                 break
 
             page += BATCH
 
         if not all_pages:
             pool.shutdown(wait=False)
+            _set_meta(pages_fetched, pagination_exhausted)
             return _empty_df()
 
         df = pd.concat(all_pages, ignore_index=True)
@@ -568,4 +590,5 @@ class GubaSource:
                             time.sleep(0.5)
 
         pool.shutdown(wait=False)
+        _set_meta(pages_fetched, pagination_exhausted)
         return df.reset_index(drop=True)

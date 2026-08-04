@@ -56,11 +56,18 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/check_docs_consistency.py
 
 ### Testing
 
-~46 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
+~48 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
 
 ```bash
-PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q
+PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q                    # fast smoke (default, excludes slow/network)
+PYTHONPATH=. ./.venv/Scripts/python -m pytest -m "slow or network" tests/ -q   # slow + network only
+PYTHONPATH=. ./.venv/Scripts/python -m pytest -m "" tests/ -q               # everything
 ```
+
+Tests that train a model or run a full end-to-end pipeline chain carry the
+`slow` marker; tests that hit live external APIs carry `network`. Both are
+excluded from the default smoke run (pyproject.toml addopts) — the default
+`pytest` is the fast smoke (~30-60s), `-m ""` overrides it to run everything.
 
 Docs drift is guarded by `scripts/check_docs_consistency.py` (see Commands).
 
@@ -88,7 +95,7 @@ Each source implements `AShareSourceBase` and has a `SOURCE_NAME` string. Circui
 - Gold: `*_sentiment/{year}/{month}/{stock}.parquet` — daily aggregation
 
 **Storage classes and their data:**
-- `DataStorage` — K-line, `daily/{year}/{month}/{stock}.parquet` (also flat `daily/{code}.parquet`)
+- `DataStorage` — K-line, flat `daily/{code}.parquet` (唯一 canonical 布局, 前复权 qfq) with per-stock `{code}.manifest.json` contract sidecar; formal reads enforce `require_valid_manifest=True` (v9 §九-1)
 - `NewsStorage` — news articles (3-source aggregation via `NewsPipeline`)
 - `GubaStorage` — forum posts, dedup by `post_id`, columns: `guba_sentiment_mean/std/count/positive_ratio/negative_ratio/has_guba_post` (body coverage: 14.3%, detail page blocked)
 - `CommentStorage` — AKShare comment ratings, `build_features()` returns daily ZI-filled features
@@ -97,7 +104,7 @@ Each source implements `AShareSourceBase` and has a `SOURCE_NAME` string. Circui
 - `FundamentalStorage` — quarterly financials, forward-filled to daily
 - `ETFStorage` — sector ETF flows, `etf_flow/{year}/{month}/sector_{name}.parquet`
 
-**Trading calendar** (`calendar.py` → `TradingCalendar`): Hardcoded A-share holidays 2015–2028. `get_trading_days()`, `is_trading_day()`, `next_trading_day()`.
+**Trading calendar** (`calendar.py` → `TradingCalendar`): externalized artifact `exchange_calendar/{market}.parquet` with `verified_until` (a_shares: 2026-12-31) — dates past that are forward estimates, and strict calendars fail rather than answer them. `get_trading_days()`, `is_trading_day()`, `next_trading_day()`.
 
 ### Feature Layer (`stoke_ml/features/`)
 
@@ -162,6 +169,7 @@ Pipeline steps:
 
 - `PanelModel` (`models/panel/`): VSN (Variable Selection Network) + xLSTM backbone (sLSTM+mLSTM), multi-task heads (direction/return/volatility). Trained via `scripts/train_panel.py` — reads prebuilt panel features (`--prebuilt data/features_panel`) so feature engineering runs once offline, not in the training loop.
 - `XGBoostBaseline` (`models/baseline/`): Flat mode classifier, sklearn-compatible `fit/predict/save`
+- Panel baselines (`models/baseline/panel_baselines.py`): Ridge / LightGBM / MLP / naive momentum, evaluated on the same inner_val schedule as the main model (evaluator_version 2026-08-04)
 
 Existing checkpoints: `xgboost_000001_best.json`, `xgboost_600519_best.json`
 
@@ -188,7 +196,7 @@ Key settings: `features.seq_len=60`, `features.target_horizon=1`, `training.vali
 - **No shuffle in time series**: Walk-forward splits only, chronological order preserved
 - **PIT anti-leakage**: Post-close news (15:00 CST) assigned to next trading day via `TradingCalendar.next_trading_day()`
 - **ZI method**: Days without data get zero-filled values + `has_*=False` flag
-- **Sentiment lag**: All text sentiment columns lagged 1 trading day to prevent same-day information leakage
+- **Text sentiment effective-date**: News/guba post-close events are PIT-mapped to the next trading day at the storage layer (`effective_trade_date`); the feature layer does NOT shift these again (nor earnings, also effective-date-mapped) — review v9 §十二-7 removes the double lag. Same-day pre-close text is usable at the next day's open via the decision-column convention.
 - **FeaturePipeline defaults**: ALL `use_*` flags default to `True` — must explicitly disable for ablation
 - **Data partitioned by year/month/stock**: Enables loading date ranges without scanning all files
 - **`PYTHONPATH=.` mandatory**: All scripts import from `stoke_ml` package relative to project root

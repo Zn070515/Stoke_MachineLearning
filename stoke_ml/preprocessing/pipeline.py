@@ -21,7 +21,7 @@ class PreprocessingQualityError(Exception):
 
     Carries the full quality report (``.report``) and the staged output
     DataFrame (``.df``) so callers can persist the partial result rather than
-    losing it (v6 §十: 禁止 commit，保留 staging 输出).
+    losing it (禁止 commit，保留 staging 输出).
     """
 
     def __init__(self, chain_name: str, report: list[dict], df: pd.DataFrame):
@@ -121,10 +121,17 @@ class PreprocessingPipeline:
         """
         from stoke_ml.preprocessing.config import build_pipeline_from_config
 
-        if config is not None and not isinstance(config, dict):
+        # A None config is a legitimate "no preprocessing section" → empty
+        # pipeline.  A malformed non-dict config is a real error and must
+        # BLOCK, not silently degrade to an empty pipeline.
+        if config is None:
+            config = {}
+        elif not isinstance(config, dict):
             try:
                 from omegaconf import OmegaConf
                 config = OmegaConf.to_container(config, resolve=True)
-            except Exception:
-                config = {}
+            except Exception as exc:
+                raise ValueError(
+                    f"preprocessing config could not be parsed: {exc}"
+                ) from exc
         return build_pipeline_from_config(config)

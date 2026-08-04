@@ -2,7 +2,9 @@
 import numpy as np
 import pandas as pd
 import pytest
-from stoke_ml.features.pipeline import FeaturePipeline, SENTIMENT_COLS, GUBA_COLS
+from stoke_ml.features.pipeline import (
+    FeaturePipeline, SENTIMENT_COLS, GUBA_COLS, _PIT_STATIC_COLS,
+)
 
 
 def _make_kl(n_days=200):
@@ -153,7 +155,10 @@ class TestMergeHelpers:
         result = pipe._merge_guba(df.copy(), guba)
         assert "guba_sentiment_mean" in result.columns
 
-    def test_merge_sentiment_lags_by_one_day(self):
+    def test_merge_sentiment_keeps_effective_date(self):
+        # NewsStorage maps post-close → next trading day at the storage layer,
+        # so the feature layer must NOT shift again: the
+        # value on its effective date stays put and is usable at next open.
         pipe = FeaturePipeline(use_sentiment=True)
         df = _make_kl(10)
         sentiment = pd.DataFrame({
@@ -166,10 +171,71 @@ class TestMergeHelpers:
             "has_news": [True] * 10,
         })
         result = pipe._merge_sentiment(df.copy(), sentiment)
-        # First row: shift + ZI fill → 0.0 (no prior-day sentiment available)
-        assert result["sentiment_mean"].iloc[0] == 0.0
-        # Second row should have first row's pre-shift sentiment (value 1.0)
-        assert result["sentiment_mean"].iloc[1] == 1.0
+        # No double lag: each row keeps its own effective-date value.
+        assert result["sentiment_mean"].iloc[0] == 1.0
+        assert result["sentiment_mean"].iloc[1] == 2.0
+
+    def test_merge_guba_keeps_effective_date(self):
+        pipe = FeaturePipeline(
+            use_guba=True, use_sentiment=False, use_announcements=False,
+            use_comment=False,
+        )
+        df = _make_kl(10)
+        guba = pd.DataFrame({
+            "date": df["date"],
+            "guba_sentiment_mean": np.arange(1, 11, dtype=np.float32),
+            "guba_sentiment_std": [0.1] * 10,
+            "guba_post_count": [5] * 10,
+            "guba_positive_ratio": [0.4] * 10,
+            "guba_negative_ratio": [0.2] * 10,
+            "has_guba_post": [True] * 10,
+        })
+        result = pipe._merge_guba(df.copy(), guba)
+        assert result["guba_sentiment_mean"].iloc[0] == 1.0
+        assert result["guba_sentiment_mean"].iloc[1] == 2.0
+
+    def test_merge_industry_never_emits_per_stock_relative_cols(self):
+        # ind_matched_return / stock_vs_industry mapped a
+        # stock onto its industry via the current-snapshot sector_map.json,
+        # backfilling today's classification onto historical rows.  They must
+        # not appear in the merged output, whatever the input carries.
+        pipe = FeaturePipeline(use_industry=True)
+        df = _make_kl(10)
+        ind = pd.DataFrame({
+            "date": df["date"],
+            "ind_pct_up": [0.5] * 10,
+            "ind_return_mean": [0.01] * 10,
+            "ind_return_std": [0.02] * 10,
+            "ind_return_max": [0.03] * 10,
+            "ind_return_min": [-0.02] * 10,
+            "ind_return_skew": [0.1] * 10,
+            "ind_dispersion_20d": [0.005] * 10,
+            "ind_matched_return": [0.0] * 10,   # must be dropped
+            "stock_vs_industry": [0.0] * 10,   # must be dropped
+        })
+        result = pipe._merge_industry(df.copy(), ind)
+        assert "ind_matched_return" not in result.columns
+        assert "stock_vs_industry" not in result.columns
+        assert "ind_pct_up" in result.columns
+        assert "ind_dispersion_20d" in result.columns
+
+    def test_merge_earnings_keeps_effective_date(self):
+        pipe = FeaturePipeline(
+            use_earnings=True, use_sentiment=False, use_announcements=False,
+            use_comment=False, use_guba=False,
+        )
+        df = _make_kl(10)
+        edf = pd.DataFrame({
+            "date": df["date"],
+            "net_profit_yoy_low": np.arange(1, 11, dtype=np.float32),
+            "net_profit_yoy_high": np.arange(2, 12, dtype=np.float32),
+            "net_profit_low": np.arange(3, 13, dtype=np.float32),
+            "net_profit_high": np.arange(4, 14, dtype=np.float32),
+            "has_forecast": [True] * 10,
+        })
+        result = pipe._merge_earnings(df.copy(), edf)
+        assert result["net_profit_yoy_low"].iloc[0] == 1.0
+        assert result["net_profit_yoy_low"].iloc[1] == 2.0
 
 
 def _make_panel_kl(dates, seed):
@@ -189,7 +255,7 @@ def _make_panel_kl(dates, seed):
 
 
 class TestPanelCalendarAlignment:
-    """P0-1: build_panel_features aligns every stock to ONE global calendar.
+    """build_panel_features aligns every stock to ONE global calendar.
 
     Column t of every array must be the SAME trading date for every stock;
     otherwise cross-sectional IC / Top-K / long-short evaluation (which index
@@ -243,11 +309,163 @@ class TestPanelCalendarAlignment:
         assert n_zero_valid == 0
 
 
+class TestCleanCalendarDates:
+    """Unit tests for the per-stock date-axis cleaner."""
+
+    def test_drops_weekend_and_dedupes_keep_last(self):
+        fp = FeaturePipeline()
+        df = pd.DataFrame({
+            "date": ["2020-03-16", "2020-03-17", "2020-03-18", "2020-03-19",
+                     "2020-03-20", "2020-03-21", "2020-03-16"],
+            "x": [1, 2, 3, 4, 5, 99, 6],
+        })
+        out = fp._clean_calendar_dates(df, "000001")
+        assert out is not None
+        dates = pd.to_datetime(out["date"])
+        assert "2020-03-21" not in dates.dt.date.astype(str).tolist()
+        assert len(dates) == len(dates.unique())
+        # keep-last: the later duplicate (x=6) survives
+        assert out.loc[out["date"] == "2020-03-16", "x"].iloc[0] == 6
+        assert dates.is_monotonic_increasing
+
+    def test_holiday_bar_dropped(self):
+        fp = FeaturePipeline()
+        # 2020-04-06 (清明) is a Monday holiday; neighbours are trading days.
+        df = pd.DataFrame({
+            "date": ["2020-04-03", "2020-04-06", "2020-04-07"],
+            "x": [1, 2, 3],
+        })
+        out = fp._clean_calendar_dates(df, "000001")
+        assert out["date"].tolist() == ["2020-04-03", "2020-04-07"]
+
+    def test_all_rows_bad_returns_none(self):
+        fp = FeaturePipeline()
+        df = pd.DataFrame({"date": ["2020-03-21", "2020-03-22"], "x": [1, 2]})
+        assert fp._clean_calendar_dates(df, "000001") is None
+
+
+class TestPanelCalendarDateValidity:
+    """build_panel_features keeps every stock's date axis on the
+    official A-share calendar before the UNION date axis is built, so a wrong
+    weekend/closed-day bar cannot expand the global panel time dimension."""
+
+    @staticmethod
+    def _panel_with_bad_rows():
+        base = pd.bdate_range("2020-01-02", "2020-06-30")
+        A = _make_panel_kl(list(base), seed=1)
+        A["stock_code"] = "000001"
+        B = _make_panel_kl(list(base), seed=2)
+        B["stock_code"] = "000002"
+        dup = B[B["date"] == "2020-03-16"].copy()          # duplicate date
+        wk = _make_panel_kl([pd.Timestamp("2020-03-21")], seed=9)  # Saturday
+        wk["stock_code"] = "000002"
+        B = pd.concat([B, dup, wk], ignore_index=True)
+        return pd.concat([A, B], ignore_index=True)
+
+    def _build(self):
+        return FeaturePipeline(seq_len=60).build_panel_features(
+            self._panel_with_bad_rows(), aux_data={}, horizon=5)
+
+    def test_global_calendar_is_all_trading_days(self):
+        pdata = self._build()
+        gd = pd.DatetimeIndex(pdata["global_dates"])
+        assert not (gd.dayofweek >= 5).any()            # no weekend columns
+        assert len(set(gd.tolist())) == len(gd)          # no duplicate columns
+        assert pd.Timestamp("2020-03-21") not in gd      # injected weekend dropped
+        assert pd.Timestamp("2020-04-06") not in gd      # 清明 holiday excluded
+        assert pd.Timestamp("2020-03-16") in gd          # valid trading day kept
+
+
+class TestCrossSectionCleanup:
+    """Cross-sectional statistics must not be polluted by an
+    inf, quantile ties must rank equally, and the size proxy must read the real
+    `amount` column instead of re-estimating volume×qfq-close."""
+
+    @staticmethod
+    def _dates():
+        return list(pd.bdate_range("2020-03-02", "2020-08-31"))
+
+    def _build(self, panel):
+        return FeaturePipeline(seq_len=60).build_panel_features(
+            panel, aux_data={}, horizon=5)
+
+    def test_inf_row_does_not_corrupt_the_date_cross_section(self):
+        """§十二-2: a single inf in one stock's feature must be filtered before
+        the per-date mean/std, so the OTHER stocks' z-scores on that date stay
+        intact instead of being zeroed by the final nan_to_num."""
+        dirty = self._build(self._panel(with_inf=True))
+        # No NaN/Inf may leak into the emitted feature arrays.
+        for key in ("past_known", "past_observed", "static_features"):
+            assert np.isfinite(dirty[key]).all(), f"{key} leaked non-finite"
+        gd = pd.DatetimeIndex(dirty["global_dates"])
+        idx = int(np.where(gd == pd.Timestamp("2020-06-01"))[0][0])
+        # Locate the injected raw column via the emitted column manifest.
+        cf = dirty["past_observed_cols"].index("custom_factor")
+        # Its own inf cell is sanitized to a finite 0...
+        assert dirty["past_observed"][1, idx, cf] == 0.0
+        # ...while the OTHER stocks keep live z-scores on the inf date — not
+        # zeroed by a polluted mean/std (without the finite pre-filter their
+        # z-scores would be NaN→0 because the date's mean/std becomes inf).
+        others = dirty["past_observed"][[0, 2, 3], idx, cf]
+        assert np.isfinite(others).all()
+        assert (others != 0).all(), \
+            "an inf must not zero the other stocks' z-scores on that date"
+
+    @staticmethod
+    def _panel(with_inf=False, inf_date="2020-06-01"):
+        dates = TestCrossSectionCleanup._dates()
+        frames = []
+        for i, code in enumerate(["000001", "000002", "000003", "000004"]):
+            df = _make_panel_kl(dates, seed=100 + i)
+            df["stock_code"] = code
+            # Deterministic per-stock PO feature — normalized cross-sectionally,
+            # with no downstream derivation (isolates the z-score path).
+            df["custom_factor"] = 1.0 + 0.01 * i + np.arange(len(df)) / 1000.0
+            if with_inf and code == "000002":
+                df.loc[df["date"] == pd.Timestamp(inf_date), "custom_factor"] = np.inf
+            frames.append(df)
+        return pd.concat(frames, ignore_index=True)
+
+    def test_quantile_ties_get_equal_rank(self):
+        """§十二-3: stocks with identical trailing-60d amounts must get the SAME
+        amt_60d_q quantile (rank method='average'), independent of array order."""
+        dates = self._dates()
+        frames = []
+        for code in ["000001", "000002", "000003"]:
+            df = _make_panel_kl(dates, seed=7)   # identical OHLCV for all 3
+            df["stock_code"] = code
+            df["amount"] = df["volume"] * df["close"]   # identical across stocks
+            frames.append(df)
+        p = self._build(pd.concat(frames, ignore_index=True))
+        amt_q = p["static_features"][:, :, _PIT_STATIC_COLS.index("amt_60d_q")]
+        ready = p["observation_mask"].all(axis=0) & (amt_q > 0).all(axis=0)
+        assert ready.any(), "need a cross-section where all 3 stocks are listed"
+        assert np.allclose(amt_q[0, ready], amt_q[1, ready])
+        assert np.allclose(amt_q[0, ready], amt_q[2, ready])
+
+    def test_amt_uses_real_amount_column(self):
+        """§十二-4: amt_60d_q must track the canonical `amount` column.  Stock B
+        has identical OHLCV to A but HALF the real turnover, so it must rank
+        below A — volume×qfq-close (the old proxy) would make them a tie."""
+        dates = self._dates()
+        A = _make_panel_kl(dates, seed=7)
+        A["stock_code"] = "000001"
+        B = _make_panel_kl(dates, seed=7)        # identical OHLCV to A
+        B["stock_code"] = "000002"
+        A["amount"] = A["volume"] * A["close"]
+        B["amount"] = 0.5 * B["volume"] * B["close"]  # real turnover is HALF
+        p = self._build(pd.concat([A, B], ignore_index=True))
+        amt_q = p["static_features"][:, :, _PIT_STATIC_COLS.index("amt_60d_q")]
+        a_q, b_q = amt_q[0], amt_q[1]
+        assert np.all(b_q[60:] < a_q[60:]), \
+            "B's lower real turnover must rank below A's"
+
+
 class TestPanelMasksAndCarry:
-    """Review §二/§六/§八: mask splitting + carry-last-close realization.
+    """Mask splitting + carry-last-close realization.
 
     build_panel_features must emit per-task masks and a realized-return array
-    whose semantics match the review:
+    with these semantics:
       - entry_eligible_mask ⊆ observation_mask (every open-valid day is a real
         day, but a real day may lack an open — e.g. a data gap);
       - return_target_mask = a clean open[t+h]/open[t]-1 exists;
@@ -260,8 +478,10 @@ class TestPanelMasksAndCarry:
     @staticmethod
     def _make_exact_panel():
         """12 days, open=10..21 (+1/day), close=open+0.5 — fully deterministic
-        forward returns so the carry math is asserted exactly."""
-        dates = pd.bdate_range("2020-01-01", periods=12)
+        forward returns so the carry math is asserted exactly.  Starts on
+        2020-01-02 (NOT 01-01, which is 元旦) so every bdate is an official
+        trading day — the §十二-1 calendar-clean pass drops nothing."""
+        dates = pd.bdate_range("2020-01-02", periods=12)
         open_ = np.arange(10.0, 22.0)
         close = open_ + 0.5
         return pd.DataFrame({
@@ -334,7 +554,7 @@ class TestPanelMasksAndCarry:
 
 
 class TestPanelTruncationInvariance:
-    """Review §五 anti-cheat test #2: features must not see the future.
+    """Anti-cheat test #2: features must not see the future.
 
     Build the panel twice — once truncated at 2020-12-31, once with the full
     history through 2026 — and assert the pre-2021 feature columns are
@@ -361,6 +581,7 @@ class TestPanelTruncationInvariance:
         return FeaturePipeline(seq_len=60).build_panel_features(
             panel, aux_data={}, horizon=5)
 
+    @pytest.mark.slow
     def test_features_invariant_to_future_data(self):
         full = self._make_panel(pd.bdate_range("2019-01-01", "2026-01-01"))
         trunc = full[pd.to_datetime(full["date"]) <= "2020-12-31"].copy()
@@ -390,6 +611,7 @@ class TestPanelTruncationInvariance:
                 f"{key} changes when future data is available — look-ahead bias"
             )
 
+    @pytest.mark.slow
     def test_targets_may_depend_on_future_but_features_not(self):
         """The vol target IS forward-looking; the invariant is feature-only."""
         full = self._make_panel(pd.bdate_range("2019-01-01", "2026-01-01"))
@@ -404,3 +626,47 @@ class TestPanelTruncationInvariance:
         assert not np.array_equal(tail_full, tail_trunc), (
             "expected forward-looking vol target to differ at the boundary"
         )
+
+
+def test_volatility_target_spans_full_horizon_with_suspension():
+    """A '5-day vol' label must span the FULL horizon —
+    suspended days get a 0 return and the resumption day records the close
+    gap — instead of collapsing to whichever days actually traded."""
+    from stoke_ml.data.calendar import TradingCalendar
+    # Use the OFFICIAL A-share calendar, not bdate_range: bdate_range includes
+    # non-trading days (e.g. 2024-01-01, 2024-02-09) that build_panel_features
+    # drops, which would break the column-index <-> date mapping.
+    base = pd.to_datetime(
+        TradingCalendar().get_trading_days("2024-01-01", "2024-03-01")[:30]
+    )
+    closes = 100.0 + np.arange(30, dtype=np.float64)
+    a = pd.DataFrame({
+        "date": base, "open": closes, "high": closes + 0.5,
+        "low": closes - 0.5, "close": closes, "volume": 1e6,
+        "stock_code": "000001",
+    })
+    b_idx = np.array([i for i in range(30) if i not in (10, 11, 12)])
+    b_close = closes.copy()
+    b_close[13] = b_close[9] * 1.10  # +10% gap over the 3-day suspension
+    b = pd.DataFrame({
+        "date": base[b_idx], "open": b_close[b_idx],
+        "high": b_close[b_idx] + 0.5, "low": b_close[b_idx] - 0.5,
+        "close": b_close[b_idx], "volume": 1e6, "stock_code": "000002",
+    })
+    panel = pd.concat([a, b], ignore_index=True)
+    p = FeaturePipeline(seq_len=10).build_panel_features(
+        panel, aux_data={}, horizon=5)
+
+    # Column 8 → forward window [9, 10, 11, 12, 13] for stock B (row 1):
+    # days 10-12 suspended → 0 returns; day 13 resumption → the +10% gap.
+    win = np.array([
+        b_close[9] / b_close[8] - 1.0,   # day 9: normal daily return
+        0.0, 0.0, 0.0,                     # days 10-12: suspended (zero return)
+        b_close[13] / b_close[9] - 1.0,   # day 13: resumption gap
+    ])
+    expected = float(np.std(win))
+    assert p["vol_target_mask"][1, 8]
+    assert np.isclose(p["y_volatility"][1, 8], expected)
+    # Guard: a skip-NaN / <2-finite collapse (pre-fix behavior) would either
+    # drop the label entirely or return a 2-value std — both must fail here.
+    assert not np.isclose(expected, float(np.std(win[np.array([0, 4])])))

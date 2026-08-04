@@ -1,4 +1,4 @@
-"""Tests for feature-cache sidecar manifests (v6 §十二).
+"""Tests for feature-cache sidecar manifests.
 
 A prebuilt feature is only reusable when its manifest's recorded code version,
 config signature, feature schema, and per-channel source fingerprints still

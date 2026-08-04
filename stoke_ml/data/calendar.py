@@ -5,7 +5,14 @@ A-shares NEVER trade on weekends — not even on 调休 makeup workdays
 do not follow it).  Verified against stored market data (all makeup weekend
 dates are absent from every stock's daily bars) and against the official
 exchange holiday notices.  The calendar is therefore just: weekdays MINUS
-official holiday closures.  Review v6 §五.
+official holiday closures.
+
+Only dates through ``VERIFIED_UNTIL[market]`` are verified
+exchange fact — 2027+ A-share closures are forward estimates and 2029-2030 have
+no published holiday data at all.  The artifact records the verified window
+(``verified_until`` / ``generated_at`` / ``status_after_verified_until``) and
+strict-mode calendars (used by formal OOS flows) FAIL on any query beyond the
+verified range instead of silently guessing.
 """
 import datetime as dt
 import pathlib
@@ -16,9 +23,8 @@ import pandas as pd
 class TradingCalendar:
     """Trading day calendar for a specific market."""
 
-    # Version stamp (v7 §十一 P1: experiments freeze the calendar version they
-    # were scheduled on).  Bump whenever the holiday set or its derivation
-    # changes.
+    # Version stamp — experiments freeze the calendar version they were
+    # scheduled on.  Bump whenever the holiday set or its derivation changes.
     CALENDAR_VERSION = "2026-08-04"
 
     # Holiday closures (weekday dates only).  Weekends are never trading days
@@ -26,10 +32,11 @@ class TradingCalendar:
     # - 2001-2014: derived from the union of all-stock daily bars (a weekday
     #   with zero bars market-wide but active neighbors = closure) and verified
     #   to match the SSE official trading calendar EXACTLY (265 closures, 0
-    #   false +/-, via akshare tool_trade_date_hist_sina).  Review v6 §五.
+    #   false +/-, via akshare tool_trade_date_hist_sina).
     # - 2015-2026: SSE/SZSE published notices (上证公告〔2025〕45号 etc.),
     #   verified against stored daily bars (incl. 2018-12-31).
-    # - 2027-2028: forward estimates, pending official publication.
+    # - 2027-2028: forward estimates, pending official publication (not verified
+    #   fact — see VERIFIED_UNTIL / strict mode).
     A_SHARES_HOLIDAYS = {
         # 2001
         dt.date(2001, 1, 1), dt.date(2001, 1, 22), dt.date(2001, 1, 23), dt.date(2001, 1, 24), dt.date(2001, 1, 25),
@@ -263,21 +270,30 @@ class TradingCalendar:
         self,
         market: str = "a_shares",
         calendar_dir: str | pathlib.Path | None = None,
+        strict: bool = False,
     ):
         if market not in self.HOLIDAYS:
             raise ValueError(f"Unknown market: {market}. Choose: a_shares, us")
         self.market = market
+        # Strict calendars (formal OOS flows) FAIL on any query beyond the
+        # verified range instead of guessing from forward estimates.  The
+        # non-strict default preserves downloader/scheduling behaviour.
+        self.strict = strict
         self._holidays = self.HOLIDAYS[market]
-        # review v8 §二-3: the A-share calendar is the EXCHANGE-published
-        # calendar, not "workdays minus holidays".  When an externally-published
+        # The A-share calendar is the EXCHANGE-published calendar, not "workdays
+        # minus holidays".  When an externally-published
         # calendar artifact (exchange_calendar/{market}.parquet) is supplied it
         # becomes the authoritative source of truth; the hardcoded holiday set
         # is the fallback (and the generator for the artifact).  Every consumer
         # goes through this one calendar, so a data-driven correction never
         # requires touching code.
         self._external = None
+        self.verified_until = VERIFIED_UNTIL[market]
         if calendar_dir is not None:
             self._external = load_calendar(calendar_dir, market)
+            if self._external is not None:
+                self.verified_until = pd.Timestamp(
+                    self._external["verified_until"].iloc[0]).date()
 
     def get_trading_days(
         self, start: str | dt.date, end: str | dt.date
@@ -286,6 +302,11 @@ class TradingCalendar:
             start = dt.date.fromisoformat(start)
         if isinstance(end, str):
             end = dt.date.fromisoformat(end)
+        if self.strict and end > self.verified_until:
+            raise ValueError(
+                f"strict calendar {self.market}: range up to {end} extends past "
+                f"verified_until {self.verified_until} — forward dates are "
+                f"estimates, not verified exchange fact")
         if self._external is not None:
             f = self._external
             lo, hi = f["date"].min().date(), f["date"].max().date()
@@ -300,6 +321,11 @@ class TradingCalendar:
         return [d for d in dates if d not in self._holidays]
 
     def is_trading_day(self, date: dt.date) -> bool:
+        if self.strict and date > self.verified_until:
+            raise ValueError(
+                f"strict calendar {self.market}: {date} is past verified_until "
+                f"{self.verified_until} — forward dates are estimates, not "
+                f"verified exchange fact")
         if self._external is not None:
             f = self._external
             if f["date"].min().date() <= date <= f["date"].max().date():
@@ -319,7 +345,7 @@ class TradingCalendar:
         return candidate
 
 
-# ── External calendar artifact (review v8 §二-3) ─────────────────────────────
+# ── External calendar artifact ───────────────────────────────────────────────
 # The calendar is published as a self-describing parquet so consumers never
 # parse holiday rules themselves.  `build_calendar_frame` materializes it from
 # the verified holiday set; `save_calendar`/`load_calendar` persist and read
@@ -332,7 +358,19 @@ class TradingCalendar:
 # estimates; queries outside it transparently fall back to the code formula.
 CALENDAR_WINDOW = (dt.date(2000, 1, 1), dt.date(2030, 12, 31))
 
-_CALENDAR_SCHEMA = {"date", "is_open", "exchange", "source", "version"}
+# The last date each market's holiday set is VERIFIED exchange fact.
+# A-share 2027-2028 are forward estimates and 2029-2030 have no published data;
+# US holidays are only maintained through 2024.  Anything past this date is a
+# guess, and strict calendars fail rather than answer it.
+VERIFIED_UNTIL = {
+    "a_shares": dt.date(2026, 12, 31),
+    "us": dt.date(2024, 12, 31),
+}
+
+_CALENDAR_SCHEMA = {
+    "date", "is_open", "exchange", "source", "version",
+    "verified_until", "generated_at", "status_after_verified_until",
+}
 _EXCHANGE_NAMES = {"a_shares": "SSE/SZSE/BSE", "us": "NYSE/NASDAQ"}
 _CALENDAR_SOURCES = {
     "a_shares": "sse/szse/bse_notices+verified_stored_bars",
@@ -344,26 +382,39 @@ def _calendar_path(data_dir: str | pathlib.Path, market: str = "a_shares") -> pa
     return pathlib.Path(data_dir) / "exchange_calendar" / f"{market}.parquet"
 
 
-def build_calendar_frame(market: str = "a_shares") -> pd.DataFrame:
+def build_calendar_frame(
+    market: str = "a_shares",
+    generated_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """Materialize the full trading calendar as a self-describing frame.
 
     One row per weekday in CALENDAR_WINDOW with the exact schema an external
     exchange-calendar feed would carry: date / is_open / exchange / source /
-    version.  The code holiday set (verified against official exchange notices
-    and stored bars) is the generator; the persisted parquet is the artifact
-    all modules read.
+    version / verified_until / generated_at / status_after_verified_until.  The
+    code holiday set (verified against official exchange notices and stored
+    bars) is the generator; the persisted parquet is the artifact all modules
+    read.  ``verified_until`` marks where the dates stop being verified
+    fact; rows beyond it are forward estimates flagged ``UNKNOWN``.
     """
     if market not in TradingCalendar.HOLIDAYS:
         raise ValueError(f"Unknown market: {market}. Choose: a_shares, us")
     lo, hi = CALENDAR_WINDOW
     days = pd.bdate_range(start=lo, end=hi).date
     closed = TradingCalendar.HOLIDAYS[market]
+    verified_until = VERIFIED_UNTIL[market]
+    if generated_at is None:
+        generated_at = pd.Timestamp.now(tz="UTC")
     return pd.DataFrame({
         "date": pd.Series(days, dtype="datetime64[ns]"),
         "is_open": [d not in closed for d in days],
         "exchange": _EXCHANGE_NAMES[market],
         "source": _CALENDAR_SOURCES[market],
         "version": TradingCalendar.CALENDAR_VERSION,
+        "verified_until": pd.Timestamp(verified_until),
+        "generated_at": generated_at,
+        # Forward-estimate rows exist past verified_until, so the state of the
+        # post-verified tail is unknown, not "no estimates beyond this point".
+        "status_after_verified_until": "UNKNOWN" if hi > verified_until else "NONE",
     })
 
 
@@ -388,12 +439,25 @@ def load_calendar(
     if not path.exists():
         return None
     frame = pd.read_parquet(path)
+    if frame.empty:
+        raise ValueError(f"calendar artifact {path} is empty")
     missing = _CALENDAR_SCHEMA - set(frame.columns)
     if missing:
         raise ValueError(
             f"calendar artifact {path} missing columns {sorted(missing)}")
     if frame["date"].duplicated().any():
         raise ValueError(f"calendar artifact {path} has duplicate dates")
+    # A gap INSIDE the artifact's own window hides corruption — a
+    # missing weekday must surface at load, not silently fall back to formula
+    # (which is exactly how a torn/partial artifact would get papered over).
+    dates = pd.to_datetime(frame["date"]).dt.date
+    lo, hi = dates.min(), dates.max()
+    expected = set(pd.bdate_range(start=lo, end=hi).date)
+    gaps = sorted(expected - set(dates))
+    if gaps:
+        raise ValueError(
+            f"calendar artifact {path} is incomplete: missing weekday(s) inside "
+            f"its window, e.g. {gaps[:5]}")
     return frame
 
 
@@ -402,25 +466,61 @@ def validate_calendar(
 ) -> dict:
     """Cross-check a persisted calendar artifact against the code-derived frame.
 
-    Returns a report dict (never raises on mismatch).  A persisted calendar
-    that disagrees with the verified generator is a real inconsistency that
-    must surface.
+    Returns a report dict (never raises on mismatch).  Validation is a FULL
+    OUTER JOIN on ``date`` — a missing or extra date cannot silently
+    vanish the way an inner merge lets it.  Checks six dimensions: missing
+    dates, extra dates, status (is_open) disagreement, version, source, and
+    verified-through.  A malformed artifact is reported (not raised) via
+    ``reason``.
     """
     path = _calendar_path(data_dir, market)
     if not path.exists():
         return {"path": str(path), "exists": False, "trading_days": 0,
                 "mismatches": 0, "ok": False, "reason": "artifact not present"}
-    on_disk = load_calendar(data_dir, market)
+    try:
+        on_disk = load_calendar(data_dir, market)
+    except ValueError as exc:
+        return {"path": str(path), "exists": True, "trading_days": 0,
+                "mismatches": 1, "ok": False, "reason": str(exc),
+                "problems": {"load_error": str(exc)}}
     derived = build_calendar_frame(market)
-    merged = on_disk.merge(derived[["date", "is_open"]], on="date",
+    merged = on_disk.merge(derived, on="date", how="outer",
                            suffixes=("_disk", "_derived"))
-    mismatch = merged[merged["is_open_disk"] != merged["is_open_derived"]]
+    disk_open = merged["is_open_disk"].notna()
+    derived_open = merged["is_open_derived"].notna()
+    missing = merged[derived_open & ~disk_open]
+    extra = merged[disk_open & ~derived_open]
+    both = merged[disk_open & derived_open]
+    problems = {
+        "missing_dates": int(len(missing)),
+        "extra_dates": int(len(extra)),
+        "status_mismatches": int((both["is_open_disk"] != both["is_open_derived"]).sum()),
+        "version_mismatch": int((both["version_disk"].fillna("") != both["version_derived"].fillna("")).sum()),
+        "source_mismatch": int((both["source_disk"].fillna("") != both["source_derived"].fillna("")).sum()),
+        "verified_until_mismatch": bool(
+            pd.Timestamp(on_disk["verified_until"].iloc[0]).date()
+            != pd.Timestamp(derived["verified_until"].iloc[0]).date()),
+    }
+    total = int(sum(problems.values()))
+    parts = []
+    if problems["missing_dates"]:
+        parts.append(f"{problems['missing_dates']} missing date(s)")
+    if problems["extra_dates"]:
+        parts.append(f"{problems['extra_dates']} extra date(s)")
+    if problems["status_mismatches"]:
+        parts.append(f"{problems['status_mismatches']} status disagreement(s)")
+    if problems["version_mismatch"]:
+        parts.append("version mismatch")
+    if problems["source_mismatch"]:
+        parts.append("source mismatch")
+    if problems["verified_until_mismatch"]:
+        parts.append("verified_until mismatch")
     return {
         "path": str(path),
         "exists": True,
         "trading_days": int(on_disk["is_open"].sum()),
-        "mismatches": int(len(mismatch)),
-        "ok": bool(len(mismatch) == 0),
-        "reason": ("" if len(mismatch) == 0
-                   else f"{len(mismatch)} date(s) disagree with the generator"),
+        "mismatches": total,
+        "ok": bool(total == 0),
+        "reason": "" if total == 0 else "artifact disagrees with the generator: " + ", ".join(parts),
+        "problems": problems,
     }

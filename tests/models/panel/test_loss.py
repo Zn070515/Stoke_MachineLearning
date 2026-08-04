@@ -30,7 +30,7 @@ class TestUncertaintyLoss:
             assert not torch.isnan(p.grad).any()
 
     def test_inactive_task_excluded(self):
-        """Review v4 §八: an inactive task contributes neither loss nor log_var."""
+        """An inactive task contributes neither loss nor log_var."""
         loss_fn = UncertaintyLoss(num_tasks=3)
         l1 = torch.tensor(0.5)
         l2 = torch.tensor(0.2)
@@ -46,7 +46,7 @@ class TestUncertaintyLoss:
         assert two_active < loss_fn([l1, l2, l3])
 
     def test_inactive_task_no_grad(self):
-        """Review v4 §八: an inactive task's log_var must not receive gradients."""
+        """An inactive task's log_var must not receive gradients."""
         loss_fn = UncertaintyLoss(num_tasks=2)
         loss = loss_fn([torch.tensor(0.5), torch.tensor(0.2)],
                        task_active_mask=[True, False])
@@ -115,7 +115,7 @@ class TestAdjMSELoss:
         assert not torch.isnan(pred.grad).any()
 
     def test_reduction_none(self):
-        """reduction='none' returns elementwise losses (review v4 §九 val accumulation)."""
+        """reduction='none' returns elementwise losses."""
         loss_fn = AdjMSELoss(gamma=0.1)
         pred = torch.tensor([0.05, -0.03])
         target = torch.tensor([0.02, -0.01])
@@ -126,7 +126,7 @@ class TestAdjMSELoss:
 
 class TestPairwiseRankingLoss:
     def test_per_date_spread_normalization(self):
-        """Review v4 §十: spread penalty is computed per date, not over the mixed batch.
+        """Spread penalty is computed per date, not over the mixed batch.
 
         Date 1 has 10× the target dispersion of date 0.  Whole-batch
         normalization would blend them; per-date must penalize date 1's

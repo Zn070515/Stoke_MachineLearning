@@ -10,7 +10,7 @@ A股（5530只，2000–2026）三阶段深度学习预测系统：反封锁爬�
 
 ```
 data/a_shares/
-├── daily/{year}/{month}/{stock}.parquet         日K线 (OHLCV, 5530 stocks)
+├── daily/{code}.parquet                    日K线 (OHLCV, 前复权 qfq, 5530只 + {code}.manifest.json 契约)
 ├── news_raw/{stock}.parquet                     原始新闻 + 情感分 (63,448 articles)
 ├── news_silver/{stock}.parquet                  PIT时点对齐后新闻
 ├── news_sentiment/{year}/{month}/{stock}.parquet 日聚合新闻情感
@@ -38,6 +38,7 @@ data/a_shares/
 ├── pledge_processed/{stock}.parquet             股权质押 (FE v2, 5列)
 ├── index_membership_processed/{stock}.parquet   指数成分 (FE v2, 3列, Baostock月度重建)
 ├── market_breadth/market_env_daily.parquet      市场环境面板 (FE v2, 全市场日频)
+├── exchange_calendar/{market}.parquet        官方交易日历 (verified_until 2026-12-31)
 └── macro/macro_daily.parquet                    宏观数据 (SHIBOR/汇率/CPI/利差)
 
 data/features/{code}.parquet                     预构建特征 (5530 × 3744列, 109GB)
@@ -237,6 +238,10 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --stock 000001
 PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py  # 全量
 ```
 
+### Panel 基线
+
+Ridge / LightGBM / MLP / naive momentum 四组截面基线 (`models/baseline/panel_baselines.py`)，与主模型同一 inner_val 日历、同一评价口径下对照，证明 VSN+xLSTM 的真实增益。评估器版本 `evaluator_version 2026-08-04`。
+
 ## 消融结果 (95 stocks, 1000 bootstrap)
 
 | Config | MCC | 95% CI | Δ vs technical |
@@ -300,7 +305,8 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 | `preprocessing.text.time_decay.halflife_days` | 7 | 文本时间衰减半衰期 |
 | `preprocessing.numeric.scaling.winsorize_sigma` | 3.0 | ±3σ截尾 |
 | `preprocessing.numeric.outlier.threshold` | 5.0 | MAD异常值阈值 |
-| `preprocessing.numeric.missing.medium_gap_method` | kalman | 中空档填充方法 (linear/kalman) |
+| `preprocessing.numeric.missing.short_gap_max` | 2 | 短缺口天数（因果 forward-fill） |
+| `preprocessing.numeric.missing.medium_gap_max` | 10 | 中缺口天数（Kalman filter forecast / forward-fill fallback） |
 | `preprocessing.cross_sectional.board.consecutive_lookback` | 20 | 连板回看天数 |
 | `preprocessing.concept.top_n` | 100 | 概念板块编码数量 |
 
