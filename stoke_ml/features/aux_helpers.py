@@ -5,8 +5,9 @@ staleness-feature recording (``_append_state_staleness``), vectorized
 fill → shift → fill (``_batch_fill_shift``), generic daily-aux merge
 (``_merge_daily_aux``), long→wide concept aggregation
 (``_aggregate_concept_long``), and macro-feature loading
-(``_load_macro_features``).  These are pure helpers: they reference no
-``*_COLS`` column constants, so they import nothing from ``aux_cols``.
+(``_load_macro_features``).  These are stateless helpers (aside from
+``_load_macro_features``' I/O): they reference no ``*_COLS`` column constants,
+so they import nothing from ``aux_cols``.
 """
 import os
 

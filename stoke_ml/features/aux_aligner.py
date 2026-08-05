@@ -2,9 +2,9 @@
 
 Extracted from ``stoke_ml.features.pipeline``: every per-stock aux merge
 (sentiment / margin / guba / ...) lives in :class:`AuxAligner`, which owns the
-per-dimension ``use_*`` switches, the ZI fill → PIT lag → ZI fill choreography
-(``_batch_fill_shift``), and the lazy-loaded market-wide caches (macro /
-market-env / industry).
+per-dimension ``use_*`` switches and the lazy-loaded market-wide caches (macro /
+market-env / industry), and delegates the ZI fill → PIT lag → ZI fill
+choreography to the helpers in ``stoke_ml.features.aux_helpers``.
 
 ``FeaturePipeline`` delegates to ``AuxAligner.merge_all`` during
 ``_engineer_features``; the column constants are re-imported there for the
@@ -32,7 +32,7 @@ from stoke_ml.features.aux_cols import (
     STATE_MAX_STALENESS,
 )
 from stoke_ml.features.aux_helpers import (
-    _append_state_staleness,
+    _append_state_staleness,  # noqa: F401  re-exported for import-compat (used only inside aux_helpers)
     _batch_fill_shift,
     _merge_daily_aux,
     _aggregate_concept_long,
@@ -40,6 +40,7 @@ from stoke_ml.features.aux_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 class AuxAligner:
     """Align auxiliary per-stock data onto a daily K-line frame.
