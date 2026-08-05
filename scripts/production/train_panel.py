@@ -1599,7 +1599,8 @@ def _experiment_signature(version: dict, config: PanelConfig,
                           seq_features: bool | None = None,
                           baseline_hyperparameter_hash: str | None = None,
                           baseline_input_recipe_hash: str | None = None,
-                          training_sample_policy_hash: str | None = None) -> str:
+                          training_sample_policy_hash: str | None = None,
+                          scaler_hash: str | None = None) -> str:
     """Content signature of a research trial: the keys the DSR multiplicity must
     NOT conflate.  Two runs sharing a signature ARE the same experiment (a
     re-run); differing on any key is a NEW trial (§十二.6).  `model_key` lets a
@@ -1616,10 +1617,10 @@ def _experiment_signature(version: dict, config: PanelConfig,
     'none' so the signature stays meaningful for callers that lack the switch.
 
     §十七: the baseline-run signature additionally binds the input-recipe, the
-    model hyperparameters and the training-sample policy — a baseline re-run
-    that flips --with-seq-features, changes a hyperparameter, or caps training
-    rows differently is a NEW trial.  Each defaults to 'none' so non-baseline
-    callers are unaffected.
+    model hyperparameters, the training-sample policy and the feature-scaling
+    recipe — a baseline re-run that flips --with-seq-features, changes a
+    hyperparameter, caps training rows differently, or changes the scaler is a
+    NEW trial.  Each defaults to 'none' so non-baseline callers are unaffected.
     """
     h = hashlib.sha1()
     for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
@@ -1654,15 +1655,17 @@ def _experiment_signature(version: dict, config: PanelConfig,
     h.update(f"seq_features={seq_features if seq_features is not None else 'none'};"
              .encode("utf-8"))
     # §十七: baseline identity levers — input recipe (with_seq + seq_len +
-    # construction version), model hyperparameters, and the training-sample
-    # policy (max_train_rows / sampling strategy) are all part of what a
-    # baseline trial IS; changing any of them is a new experiment.
+    # construction version), model hyperparameters, the training-sample policy
+    # (max_train_rows / sampling strategy), and the feature-scaling recipe are
+    # all part of what a baseline trial IS; changing any of them is a new
+    # experiment.
     h.update(f"baseline_hyperparameter_hash="
              f"{baseline_hyperparameter_hash or 'none'};".encode("utf-8"))
     h.update(f"baseline_input_recipe_hash="
              f"{baseline_input_recipe_hash or 'none'};".encode("utf-8"))
     h.update(f"training_sample_policy_hash="
              f"{training_sample_policy_hash or 'none'};".encode("utf-8"))
+    h.update(f"scaler_hash={scaler_hash or 'none'};".encode("utf-8"))
     h.update(f"code_tree={version.get('git_commit') or 'unknown'};".encode("utf-8"))
     return h.hexdigest()[:16]
 

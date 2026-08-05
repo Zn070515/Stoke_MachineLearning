@@ -182,6 +182,29 @@ def _training_sample_policy_hash(max_train_rows: int) -> str:
     return h.hexdigest()[:16]
 
 
+# §十七: version tag of the baseline INPUT feature-scaling recipe — the
+# StandardScaler applied to the flat training sample before fitting (line ~602
+# ``scaler = StandardScaler(); scaler.fit_transform(Xtr)``).  Bump when the
+# transform a baseline is fit on changes (a different scaler class or a
+# different fit basis).  The FITTED values are already fingerprinted per-fold
+# by ``weight_hash`` — the real content hash of the pickled ``ScaledPredictor``
+# — so this is the configuration-level identity.  The scaler itself is not a
+# versioned artifact, so the version tag is the honest way to track it (the
+# same convention as ``_BASELINE_INPUT_RECIPE_VERSION`` /
+# ``_TRAINING_SAMPLE_POLICY_VERSION``).
+_SCALER_RECIPE_VERSION = "standard-scaler-fit-train+v1"
+
+
+def _scaler_hash() -> str:
+    """SHA-256 over the baseline feature-scaling recipe (§十七): the scaler
+    class + fit basis, pinned by the construction version tag.  Distinct from
+    the input-recipe / hyperparameter / sample-policy hashes because it
+    fingerprints the transform, not the feature vector or the model."""
+    h = hashlib.sha256()
+    h.update(f"scaler={_SCALER_RECIPE_VERSION};".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
 class _LGBMWrapper:
     """LightGBM regression booster with a sklearn-like fit/predict surface."""
 
@@ -728,15 +751,17 @@ def main():
                     ).hexdigest()[:16],
                     feature_schema_hash=version_info["feature_schema_hash"],
                     # §十七: baseline identity hashes — input recipe (with_seq +
-                    # seq_len + construction version), model hyperparameters, and
-                    # the training-sample policy — so the tape is bound to
-                    # exactly what produced it, not just the model family.
+                    # seq_len + construction version), model hyperparameters,
+                    # the training-sample policy, and the feature-scaling recipe
+                    # — so the tape is bound to exactly what produced it, not
+                    # just the model family.
                     baseline_input_recipe_hash=_baseline_input_recipe_hash(
                         args.with_seq_features, config.seq_len),
                     baseline_hyperparameter_hash=_baseline_hyperparameter_hash(
                         model_name),
                     training_sample_policy_hash=_training_sample_policy_hash(
                         args.max_train_rows),
+                    scaler_hash=_scaler_hash(),
                     # §十五-3: identical policy metadata as the deep tapes, so a
                     # mixed oos_dir (deep + baseline, or two baselines) is
                     # rejected by the continuous replay instead of blended.
@@ -769,6 +794,7 @@ def main():
                         model_name)
                     ldf["training_sample_policy_hash"] = _training_sample_policy_hash(
                         args.max_train_rows)
+                    ldf["scaler_hash"] = _scaler_hash()
                     ldf = ldf[["fold", "entry_day", "entry_date", "stock",
                                "stock_code", "mode", "prediction",
                                "candidate_eligible", "entry_eligible",
@@ -781,7 +807,8 @@ def main():
                                "unrealized_pnl",
                                "baseline_input_recipe_hash",
                                "baseline_hyperparameter_hash",
-                               "training_sample_policy_hash"]]
+                               "training_sample_policy_hash",
+                               "scaler_hash"]]
                     ledger_path = os.path.join(
                         oos_dir, f"fold_{fold:03d}_{model_name}_ledger.parquet")
                     ldf.to_parquet(ledger_path)
@@ -808,14 +835,15 @@ def main():
                 # §P1-3: real content hash of the persisted pickle — re-fit
                 # changes it, so the registry can aggregate a real fingerprint.
                 "weight_hash": weight_hash,
-                # §十七: input-recipe / hyperparameter / sample-policy hashes
-                # bind each fold's tape + ledger to the exact configuration that
-                # produced it.
+                # §十七: input-recipe / hyperparameter / sample-policy / scaler
+                # hashes bind each fold's tape + ledger to the exact
+                # configuration that produced it.
                 "baseline_hyperparameter_hash": _baseline_hyperparameter_hash(model_name),
                 "baseline_input_recipe_hash": _baseline_input_recipe_hash(
                     args.with_seq_features, config.seq_len),
                 "training_sample_policy_hash": _training_sample_policy_hash(
                     args.max_train_rows),
+                "scaler_hash": _scaler_hash(),
             }
             fold_records.append(rec)
             logger.info(
@@ -1015,7 +1043,8 @@ def main():
                 baseline_input_recipe_hash=_baseline_input_recipe_hash(
                     args.with_seq_features, config.seq_len),
                 training_sample_policy_hash=_training_sample_policy_hash(
-                    args.max_train_rows)),
+                    args.max_train_rows),
+                scaler_hash=_scaler_hash()),
             "outdir": outdir,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "git_commit": version_info.get("git_commit"),
