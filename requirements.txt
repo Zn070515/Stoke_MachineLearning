@@ -25,6 +25,7 @@ curl-cffi>=0.6
 browserforge>=1.0
 playwright>=1.40
 beautifulsoup4>=4.12
+httpx>=0.24
 
 # [ml]
 # PyTorch with CUDA: install separately:
