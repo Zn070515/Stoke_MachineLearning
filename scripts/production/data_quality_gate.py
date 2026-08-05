@@ -119,11 +119,24 @@ def _get_calendar() -> TradingCalendar:
     ``<root>/exchange_calendar/a_shares.parquet`` is authoritative when present;
     a bootstrap run with no artifact transparently falls back to the code holiday
     set (formal mode refuses that fallback in main()).
+
+    A present-but-corrupt artifact (wrong schema / empty / dup-date / gapped)
+    must NOT crash the gate mid-check with a bare traceback — that would abort
+    before the report is written.  We fall back to the code-derived calendar so
+    every check still completes; ``_calendar_status()`` records the corruption
+    (``present=False`` / ``unusable``) and formal mode fails the run regardless.
     """
     root = str(Path(A_SHARES.parent).resolve())
     cal = _CALENDAR_CACHE.get(root)
     if cal is None:
-        cal = get_research_calendar(data_dir=root)
+        try:
+            cal = get_research_calendar(data_dir=root)
+        except Exception as exc:
+            logger.warning(
+                "calendar artifact unusable at %s (category=%s): %s",
+                root, classify_error(exc).value, exc,
+            )
+            cal = TradingCalendar("a_shares")
         _CALENDAR_CACHE[root] = cal
     return cal
 
@@ -1374,8 +1387,9 @@ def main():
                     choices=["bootstrap", "formal"],
                     help="required-dataset strictness profile (§六-4): "
                          "bootstrap (default, dev) or formal — a 5530-stock "
-                         "research run must clear: span >= 5y, stale <= 4d, "
-                         "unreadable = 0, readable stocks >= 98%")
+                         "research run must clear: span >= 5y, stale <= 4 "
+                         "trading days (behind the most recent completed "
+                         "session), unreadable = 0, readable stocks >= 98%")
     # §P1-7: per-requested-stock reconciliation — OPT-IN; without one of these
     # the gate runs exactly as before (the universe check never joins the run).
     ap.add_argument("--requested-universe", default=None,

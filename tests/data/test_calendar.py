@@ -458,3 +458,20 @@ class TestMostRecentCompletedTradingDay:
     def test_ref_on_weekend_is_previous_friday(self, cal):
         assert most_recent_completed_trading_day(
             cal, dt.date(2026, 8, 1)) == dt.date(2026, 7, 31)
+
+    def test_ref_before_first_session_clamps_to_first_day(self, cal):
+        """A ref_date before the market's earliest session must clamp to the
+        first trading day instead of fabricating a pre-market weekday (which an
+        unbounded backward walk would return)."""
+        assert cal.first_trading_day() == dt.date(2000, 1, 3)
+        assert most_recent_completed_trading_day(
+            cal, dt.date(1990, 1, 1)) == cal.first_trading_day()
+
+    def test_ref_before_first_session_clamps_external(self, tmp_path):
+        """The same clamp holds for an artifact-backed calendar (earliest
+        is_open row of the frozen frame)."""
+        save_calendar(tmp_path, "a_shares")
+        ext = TradingCalendar("a_shares", calendar_dir=tmp_path)
+        assert ext.first_trading_day() == dt.date(2000, 1, 3)
+        assert most_recent_completed_trading_day(
+            ext, dt.date(1990, 1, 1)) == dt.date(2000, 1, 3)

@@ -1124,6 +1124,30 @@ class TestCalendarArtifactAndFreshness:
         assert report["calendar_artifact_present"] is False
         assert report["calendar_artifact_hash"] is None
 
+    def test_formal_corrupt_artifact_fails_cleanly_with_report(self, tmp_path, monkeypatch):
+        """§九: a present-but-corrupt frozen calendar artifact (wrong schema /
+        empty / dup-date / gapped) must NOT crash the gate with a bare traceback
+        before the report is written — it fails cleanly (rc 1), still writes the
+        report, and reports the calendar as unusable / present=False."""
+        root, daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        cal_dir = root / "exchange_calendar"
+        cal_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"date": [pd.Timestamp("2026-01-01")]}).to_parquet(
+            cal_dir / "a_shares.parquet")
+        rc = _run_gate([
+            "data_quality_gate.py", "--data-dir", str(root),
+            "--check", "datasets",
+            "--profile", "formal",
+            "--output", str(tmp_path / "report"),
+        ], monkeypatch)
+        assert rc == 1
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8"))
+        assert report["passed"] is False
+        assert report["calendar_artifact_present"] is False
+        assert report["calendar_artifact_hash"] is None
+
     def test_formal_with_artifact_not_refused_on_calendar(self, tmp_path, monkeypatch):
         """With the frozen artifact present, a fully-current 5-year dataset
         clears the formal profile — the calendar artifact is not the blocker."""

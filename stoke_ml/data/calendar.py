@@ -345,6 +345,27 @@ class TradingCalendar:
             candidate += dt.timedelta(days=1)
         return candidate
 
+    def first_trading_day(self) -> dt.date:
+        """Earliest known completed trading session for this market.
+
+        The freshness clamp bound for ``most_recent_completed_trading_day``: a
+        ref_date before the market's first session must return this instead of
+        fabricating a pre-market weekday (an unbounded backward walk).  Uses the
+        earliest ``is_open`` row of the external artifact when present, else
+        walks forward from the materialized window's start to the first
+        non-holiday weekday.
+        """
+        if self._external is not None:
+            open_days = self._external.loc[self._external["is_open"], "date"]
+            if not open_days.empty:
+                return open_days.min().date()
+            return self._external["date"].min().date()
+        lo, _ = CALENDAR_WINDOW
+        d = lo
+        while not self.is_trading_day(d):
+            d += dt.timedelta(days=1)
+        return d
+
 
 def get_research_calendar(
     market: str = "a_shares",
@@ -609,6 +630,14 @@ def most_recent_completed_trading_day(
     by natural-day age (§九).
     """
     d = ref_date - dt.timedelta(days=1)
+    # Clamp degenerate input: a ref_date before the market's first session must
+    # not fabricate a pre-market weekday (an unbounded backward walk).  Return
+    # the calendar's earliest known session instead.
+    earliest = calendar.first_trading_day()
+    if d < earliest:
+        return earliest
     while not calendar.is_trading_day(d):
         d -= dt.timedelta(days=1)
+        if d < earliest:
+            return earliest
     return d
