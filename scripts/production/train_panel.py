@@ -539,7 +539,17 @@ def _enforce_universe_memory(
             action = "refuse"
         elif est_gb > _UNIVERSE_MEMORY_WARN_GB:
             action = "warn"
-    if available_gb is not None and est_gb > available_gb and action != "refuse":
+    # §七-P0 precheck (the plan's "预检 by available memory" for csi800): a
+    # risky-universe panel that cannot fit the host's ACTUAL available memory
+    # is refused even below the static lines.  Other universes have no static
+    # guard and must never be refused here (a transiently low `available`
+    # snapshot must not block a documented default run).
+    if (
+        universe in ("all", "csi800")
+        and available_gb is not None
+        and est_gb > available_gb
+        and action != "refuse"
+    ):
         action = "refuse"
     if action == "refuse" and not allow_override:
         avail = f"vs available {available_gb:.1f} GB" if available_gb is not None else \
@@ -547,9 +557,9 @@ def _enforce_universe_memory(
         raise SystemExit(
             f"universe={universe}: panel memory estimate {est_gb:.1f} GB "
             f"(n_stocks={n_stocks} x n_timesteps={n_timesteps} x "
-            f"n_features={n_features} x 4B) {avail} exceeds the §七-P0 safety "
-            f"threshold — this panel will very likely OOM the host.  Re-scope "
-            f"with a smaller --stocks cap (default 500 is safe) or pass "
+            f"n_features={n_features} x 4B) {avail} — this panel will very "
+            f"likely OOM the host (§七-P0).  Re-scope with a smaller "
+            f"--stocks cap (default 500 is safe) or pass "
             f"--allow-high-risk-universe to run it anyway."
         )
     if action in ("warn", "refuse"):

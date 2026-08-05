@@ -817,3 +817,13 @@ def test_enforce_available_gb_precheck_refuses(tp):
     msg = str(ei.value)
     assert "universe=all" in msg
     assert "available" in msg
+
+
+def test_enforce_available_gb_precheck_skips_other_universes(tp):
+    """§七-P0: the available-memory precheck applies ONLY to all/csi800 — a
+    transiently low host `available` snapshot must not refuse a documented
+    default run on a smaller universe."""
+    est, action = tp._enforce_universe_memory(
+        "random", 500, 5000, 8000, available_gb=1.0)
+    assert action == "ok"      # est ~74.5 GB > 1.0 GB, but random is not prechecked
+    assert est > 1.0
