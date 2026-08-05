@@ -7,9 +7,13 @@ present-backfilled from today.  Three guarantees are tested here:
    available (sector_map.json / stock_sector_cache.csv) are current-snapshot
    mappings with no point-in-time membership history, so a static industry
    code would backfill today's classification onto historical rows.
-2. The four remaining statics are truncation-invariant: appending future rows
+2. The remaining statics are truncation-invariant: appending future rows
    (a "build features over 2000-2026 then train a 2015 window" mistake) must
    not change the static value at any earlier column.
+3. §五 P0: no absolute qfq price reaches a model-input grid — ``price_60d_q``
+   is dropped from the statics and raw ``open/high/low/close`` from both
+   past-known and past-observed (qfq levels re-anchor with future corporate
+   actions, leaking future behaviour into historical decisions).
 3. Fundamental/valuation merges are PIT-lagged 1 day: a figure disclosed on
    day ``d`` first reaches the model at ``d+1``, never the same day.
 """
@@ -20,7 +24,8 @@ import pytest
 
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.features.pipeline import (
-    FeaturePipeline, _BOARD_ONEHOT_COLS, _PIT_STATIC_COLS, _board_index,
+    FeaturePipeline, _ABSOLUTE_PRICE_COLS, _BOARD_ONEHOT_COLS,
+    _PIT_STATIC_COLS, _board_index,
 )
 
 SEQ_LEN = 20
@@ -72,10 +77,64 @@ class TestStaticColumns:
 
     def test_all_statics_pit_derivable(self):
         assert set(_PIT_STATIC_COLS) == {
-            "price_60d_q", "amt_60d_q", "listing_days",
+            "amt_60d_q", "listing_days",
             "board_unknown", "board_sh_main", "board_star",
             "board_sz_main", "board_chinext", "board_bse",
         }
+
+    def test_price_60d_q_removed(self):
+        """§五 P0: the qfq absolute price tier must NOT be a static feature.
+        qfq history re-anchors with each future corporate action (a 2026 2:1
+        split rewrites 2025 prices to half), so an absolute qfq price tier
+        would leak future corporate behaviour into historical decisions.
+        amt_60d_q (real CNY, NOT re-anchored) stays."""
+        assert "price_60d_q" not in _PIT_STATIC_COLS
+        assert "amt_60d_q" in _PIT_STATIC_COLS
+        assert "listing_days" in _PIT_STATIC_COLS
+
+
+class TestQfqAbsolutePriceExclusion:
+    """§五 P0: absolute qfq price features must never reach a model-input grid.
+
+    Forward-adjustment re-anchors historical prices with each future corporate
+    action, so absolute OHLC / price levels leak future corporate behaviour
+    into the simulated-historical decision the model is asked to make.  Raw
+    open/close stay in the frame (targets / entry / evaluation read them) but
+    must not appear in past_known or past_observed.
+    """
+
+    def test_discover_pk_columns_excludes_ohlc(self):
+        pk = set(FeaturePipeline._discover_pk_columns(_make_synthetic_panel()))
+        assert not _ABSOLUTE_PRICE_COLS & pk
+
+    def test_discover_po_columns_excludes_ohlc(self):
+        """Excluding OHLC from PK alone would just reclassify them as PO — the
+        observed grid must exclude them too."""
+        df = _make_synthetic_panel()
+        pk = set(FeaturePipeline._discover_pk_columns(df))
+        po = FeaturePipeline._discover_po_columns(df, pk)
+        assert not _ABSOLUTE_PRICE_COLS & set(po)
+
+    def test_scale_invariant_close_relatives_stay_pk(self):
+        """Only the absolute LEVEL is excluded — close-normalized / ratio
+        features derived from OHLC remain legal PK inputs."""
+        df = pd.DataFrame({
+            "open": [10.0, 11.0], "high": [10.5, 11.5],
+            "low": [9.5, 10.5], "close": [10.0, 11.0],
+            "open0": [1.0, 1.0], "high0": [1.05, 1.045], "low0": [0.95, 0.955],
+            "kmid": [0.0, 0.01], "klen": [0.1, 0.09],
+        })
+        pk = set(FeaturePipeline._discover_pk_columns(df))
+        assert {"open0", "high0", "low0", "kmid", "klen"} <= pk
+        assert not _ABSOLUTE_PRICE_COLS & pk
+
+    def test_panel_inputs_carry_no_absolute_ohlc(self):
+        """build_panel_features must not feed absolute OHLC into either grid."""
+        panel = _make_synthetic_panel()
+        data = _pipeline().build_panel_features(panel, horizon=HORIZON)
+        assert not _ABSOLUTE_PRICE_COLS & set(data["past_known_cols"])
+        assert not _ABSOLUTE_PRICE_COLS & set(data["past_observed_cols"])
+        assert data["static_features"].shape[2] == len(_PIT_STATIC_COLS)
 
     def test_board_onehot_mutually_exclusive(self):
         """Exactly one board_* column is 1 per stock, matching _board_index —

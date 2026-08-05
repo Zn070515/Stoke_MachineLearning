@@ -318,13 +318,21 @@ def _input_fingerprint(name: str, path: str) -> str | None:
 
 
 def schema_hash(path: str) -> str:
-    """Hash of a parquet's column set (names + types). Reads only the header."""
+    """Hash of a parquet's column set (names + types). Reads only the header.
+
+    The ``except`` is a narrow whitelist (``KeyError`` / ``OSError`` /
+    ``ValueError``) so an unreadable path degrades to ``"unknown"`` without
+    crashing manifest writes, while ANY other exception — a corrupt schema or a
+    pyarrow-level bug — propagates instead of being swallowed (§二十一 D2).  The
+    old ``except Exception`` masked genuine schema-read bugs behind ``"unknown"``
+    and let a stale cache survive.
+    """
     try:
         import pyarrow.parquet as pq
         schema = pq.read_schema(path)
         cols = [(f.name, str(f.type)) for f in schema]
         return _sha1(json.dumps(cols, sort_keys=True))
-    except Exception as exc:
+    except (KeyError, OSError, ValueError) as exc:
         logger.warning(
             "schema_hash failed for %s (category=%s)", path, classify_error(exc).value,
         )

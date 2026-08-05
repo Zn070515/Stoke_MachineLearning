@@ -19,9 +19,11 @@ class PanelConfig:
     """
 
     # Input dimensions (overridden at runtime from actual data).  Defaults track
-    # the current prebuilt panel: S=9 PIT static (3 continuous + 6 board one-hot),
-    # PK=255, PO=1418 — the docs guard (check_docs_consistency.py) enforces
-    # README / CONTEXT against these, so update all three together.
+    # the current prebuilt panel: S=9 PIT static (2 continuous + 6 board one-hot;
+    # price_60d_q removed §五 P0 → fresh builds emit S=8 until the panel is
+    # rebuilt), PK=255, PO=1418 — the docs guard (check_docs_consistency.py)
+    # enforces README / CONTEXT against the frozen defaults, so keep the three
+    # in sync when the prebuilt panel is regenerated.
     static_dim: int = 9
     past_known_dim: int = 255
     past_observed_dim: int = 1418

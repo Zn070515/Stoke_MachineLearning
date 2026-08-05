@@ -1019,6 +1019,12 @@ class FeaturePipeline:
         PK columns come from: OHLCV, technical indicators, scoring,
         microstructure, calendar, intraday, and fundamental refinements.
         Everything else is PO.
+
+        §五 P0: the raw absolute qfq ``open/high/low/close`` are EXCLUDED (see
+        ``_ABSOLUTE_PRICE_COLS``) — qfq levels re-anchor with future corporate
+        actions and would leak future behaviour into historical decisions.
+        Scale-invariant close-derived relatives (open0/high0/low0, kmid/klen/
+        ... ratios) remain PK.
         """
         pk_prefixes = [
             "open", "high", "low", "close", "volume", "amount",
@@ -1063,6 +1069,10 @@ class FeaturePipeline:
                 if col == prefix or col.startswith(prefix):
                     pk.append(col)
                     break
+        # §五 P0: drop the absolute qfq price level (exact name only) — see
+        # _ABSOLUTE_PRICE_COLS docstring.  volume/amount stay: amount is real
+        # CNY (not re-anchored), volume is unchanged under qfq adjustment.
+        pk = [c for c in pk if c not in _ABSOLUTE_PRICE_COLS]
         return pk
 
     @staticmethod
@@ -1071,7 +1081,12 @@ class FeaturePipeline:
         if pk_set is None:
             pk_set = set(FeaturePipeline._discover_pk_columns(df))
         skip = {"date", "stock_code", "sector", "size_proxy", "sector_code"}
-        return [c for c in df.columns if c not in pk_set and c not in skip]
+        # §五 P0: absolute qfq OHLC must not leak into the observed grid either —
+        # excluding them from PK alone would just reclassify them as PO.
+        return [
+            c for c in df.columns
+            if c not in pk_set and c not in skip and c not in _ABSOLUTE_PRICE_COLS
+        ]
 
     def _clean_calendar_dates(self, df: pd.DataFrame, stock_code: str):
         """Keep a stock's date axis calendar-clean before the panel
@@ -1463,11 +1478,12 @@ class FeaturePipeline:
         # Computed once here and reused by the feature-array scatter below.
         stock_pos: list[np.ndarray] = [np.empty(0, dtype=np.int32) for _ in range(N_stocks)]
 
-        # Raw PIT-static inputs: trailing 60d means of close and
-        # turnover (canonical `amount`), plus first-listed global
-        # column — captured HERE because the per-date z-score normalization
-        # later mutates the feature dfs.
-        price60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
+        # Raw PIT-static inputs: trailing 60d means of turnover (canonical
+        # `amount`), plus first-listed global column — captured HERE because
+        # the per-date z-score normalization later mutates the feature dfs.
+        # §五: price_60d_q (a qfq absolute price tier) was REMOVED — qfq levels
+        # re-anchor with future corporate actions and would leak future
+        # behaviour into historical decisions.
         amt60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
         first_col = np.full(N_stocks, -1, dtype=np.int32)
         # The canonical `amount` (real CNY turnover) is REQUIRED by the formal
@@ -1512,7 +1528,7 @@ class FeaturePipeline:
             # PIT static raw inputs — trailing 60d means over the trading days
             # in each global-calendar window (NaNs from pre-listing/suspension
             # are skipped).  Computed here on the RAW df before z-scoring.
-            price60_raw[i] = _trailing_mean(close_full, 60).astype(np.float32)
+            # (price_60d_q removed §五 — see _PIT_STATIC_COLS.)
             # The formal daily contract requires canonical CNY turnover
             # (`amount`, real 成交额).  volume×qfq-close misstates historical
             # nominal turnover because qfq prices are rescaled while volume is
@@ -1868,14 +1884,12 @@ class FeaturePipeline:
                 continue
 
             # PIT static — per-row series scattered onto global-calendar columns.
-            # price_60d_q / amt_60d_q hold RAW trailing 60d means (captured in
-            # the mask loop before z-score); their cross-sectional per-date
-            # quantiles are computed over the whole (N, T) grid after the loop.
+            # amt_60d_q holds the RAW trailing 60d mean (captured in the mask
+            # loop before z-score); its cross-sectional per-date quantile is
+            # computed over the whole (N, T) grid after the loop.
             if static_dim > 0:
                 s = np.zeros((len(pos), static_dim), dtype=np.float32)
                 sidx = {c: k for k, c in enumerate(static_cols_available)}
-                if "price_60d_q" in sidx:
-                    s[:, sidx["price_60d_q"]] = price60_raw[i][pos]
                 if "amt_60d_q" in sidx:
                     s[:, sidx["amt_60d_q"]] = amt60_raw[i][pos]
                 if "listing_days" in sidx:
@@ -1893,12 +1907,14 @@ class FeaturePipeline:
             pk_arr[i, pos] = df_sorted[pk_cols_available].fillna(0.0).values.astype(np.float32)
             po_arr[i, pos] = df_sorted[po_cols_available].fillna(0.0).values.astype(np.float32)
 
-        # Cross-sectional per-date quantile for the trailing-mean size/price
+        # Cross-sectional per-date quantile for the trailing-mean size/liquidity
         # features.  Rank within each column's cross-section of stocks that are
         # genuinely listed there (obs True) with a nonzero trailing mean.
         # PIT-safe: every value in column t uses only data through close t, and
         # the within-column rank is itself known at t.
-        for qname in ("price_60d_q", "amt_60d_q"):
+        for qname in static_cols_available:
+            if not qname.endswith("_60d_q"):
+                continue
             if qname not in static_cols_available:
                 continue
             qk = static_cols_available.index(qname)
@@ -1994,17 +2010,22 @@ class FeaturePipeline:
 
 
 # PIT-static features:
-#   price_60d_q / amt_60d_q  trailing 60d means → per-date cross-sectional rank
-#   listing_days             (global col − first listed col) / 250
-#   board_*                  exchange-board one-hot derived from the stock code
-# All nine are computed purely from data known at the decision day.
+#   amt_60d_q       trailing 60d mean turnover → per-date cross-sectional rank
+#   listing_days    (global col − first listed col) / 250
+#   board_*         exchange-board one-hot derived from the stock code
+# All eight are computed purely from data known at the decision day.
+# §五 P0: `price_60d_q` (trailing 60d mean of qfq close) was REMOVED — qfq
+# absolute prices re-anchor with each future corporate action (a 2026 2:1 split
+# rewrites 2025 history to half), so an absolute qfq price tier makes historical
+# decisions read future corporate behaviour.  `amount` is real CNY and is NOT
+# re-anchored, so `amt_60d_q` is scale-invariant and retained.
 # NOTE on size: a genuine PIT float market cap (real 流通市值) is NOT currently
 # derivable from canonical on-disk data — valuation data begins 2015 and is
 # PE/PB/PS/PCF only, the daily contract has no share counts, and fundamentals
 # are quarterly without share counts.  `amt_60d_q` (trailing 60d turnover rank)
-# is the size/liquidity axis; `price_60d_q` is a price tier, NOT a size proxy.
-# Replacing these with real PIT float market cap requires new data acquisition
-# (e.g. Sina backup `float_mcap_yi` or Baostock `turn`), not a derivation (§十一-5).
+# is the size/liquidity axis.  Replacing it with real PIT float market cap
+# requires new data acquisition (e.g. Sina backup `float_mcap_yi` or Baostock
+# `turn`), not a derivation (§十一-5).
 # `industry_code` is deliberately EXCLUDED: the only available stock→industry
 # sources (sector_map.json / stock_sector_cache.csv) are current-snapshot maps
 # with no point-in-time membership history, so a static industry_code would
@@ -2016,8 +2037,19 @@ class FeaturePipeline:
 _BOARD_NAMES = ("unknown", "sh_main", "star", "sz_main", "chinext", "bse")
 _BOARD_ONEHOT_COLS = [f"board_{n}" for n in _BOARD_NAMES]
 
+# §五 P0: absolute qfq price columns must NEVER reach a model-input grid.
+# Forward-adjusted (qfq) prices re-anchor with each future corporate action
+# (a 2026 2:1 split rewrites 2025 history to half), so an absolute qfq level
+# would leak future corporate behaviour into historical decisions.  The raw
+# columns stay in the engineered frame — targets / entry / evaluation read
+# close & open — but neither the past-known nor past-observed grid may carry
+# them.  Only the EXACT OHLC names are excluded: scale-invariant relatives
+# derived from them (open0/high0/low0, kmid/klen/... ratios) are legal inputs.
+# volume/amount stay: amount is real CNY (not re-anchored); volume is unchanged
+# under qfq adjustment.
+_ABSOLUTE_PRICE_COLS = frozenset({"open", "high", "low", "close"})
+
 _PIT_STATIC_COLS = [
-    "price_60d_q",     # trailing 60d mean close → cross-sectional price tier
     "amt_60d_q",       # trailing 60d mean turnover (canonical amount) → size/liquidity
     "listing_days",    # days since first bar (scaled by 250 → years)
     *_BOARD_ONEHOT_COLS,  # exchange-board one-hot derived from the stock code
