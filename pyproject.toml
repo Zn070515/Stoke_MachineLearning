@@ -48,6 +48,8 @@ online = [
     "playwright>=1.40",
     # HTML 解析（guba/news 源，与 curl_cffi 同属在线抓取栈）
     "beautifulsoup4>=4.12",
+    # guba 源 HTTP/2 客户端（惰性导入 §十六-1，仅在线 job 需要）
+    "httpx>=0.24",
 ]
 # ML/DL — 模型训练
 ml = [

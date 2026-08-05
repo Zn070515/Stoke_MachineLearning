@@ -7,7 +7,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
 
@@ -47,8 +46,14 @@ EMPTY_COLUMNS = ["date", "time", "title", "body", "post_id", "url"]
 _local = threading.local()
 
 
-def _get_http_client(timeout: float = 20.0) -> httpx.Client:
-    """Return a per-thread httpx.Client with HTTP/2 and connection pooling."""
+def _get_http_client(timeout: float = 20.0) -> "httpx.Client":
+    """Return a per-thread httpx.Client with HTTP/2 and connection pooling.
+
+    §十六-1 lazy import: GubaSource must be importable in jobs that do not
+    install the online stack (storage-parquet only pulls data-adapters), so
+    httpx is resolved here on first network use rather than at module load.
+    """
+    import httpx
     if not hasattr(_local, "client"):
         _local.client = httpx.Client(
             http2=True,
@@ -64,7 +69,7 @@ def _empty_df() -> pd.DataFrame:
     return pd.DataFrame(columns=EMPTY_COLUMNS)
 
 
-def _fetch_with_retry(url: str, timeout: float = 20) -> httpx.Response | None:
+def _fetch_with_retry(url: str, timeout: float = 20) -> "httpx.Response | None":
     """GET a URL with retry logic using per-thread httpx HTTP/2 client.
 
     Returns the Response on success, or None after exhausting retries.
