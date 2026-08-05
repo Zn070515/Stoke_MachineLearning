@@ -115,6 +115,59 @@ class TestFilterExisting:
         assert pending == []
         assert complete == {"000001"}
 
+    def _write_ipo(self, root, rows):
+        base = root / "a_shares" / "universe"
+        base.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_parquet(base / "ipo.parquet", index=False)
+
+    def test_late_listed_stock_complete_to_list_date(self, tmp_path):
+        """§P0-3: a 2018 IPO can never start in 2000 — the effective start is
+        max(requested_start, list_date), so a global 2000→2024 request does not
+        force a late-listed stock to re-download forever."""
+        self._write_ipo(tmp_path, [
+            {"stock_code": "000001",
+             "list_date": pd.Timestamp("2018-03-01")},
+        ])
+        _save(tmp_path, "000001", ["2018-03-01", "2024-12-31"])
+        pending, complete = filter_existing(
+            ["000001"], str(tmp_path), "2000-01-01", "2024-12-31"
+        )
+        assert complete == {"000001"}
+        assert pending == []
+
+    def test_delisted_stock_complete_to_delist_date(self, tmp_path):
+        """§P0-3: a stock delisted in 2015 has no data past 2015-06-30 — the
+        effective end is min(requested_end, delist_date), so the requested
+        2024 end does not mark it incomplete."""
+        _write_delisted(tmp_path, ["000002"])
+        _save(tmp_path, "000002", ["2013-01-02", "2015-06-30"])
+        pending, complete = filter_existing(
+            ["000002"], str(tmp_path), "2013-01-02", "2024-12-31"
+        )
+        assert complete == {"000002"}
+        assert pending == []
+
+    def test_end_caps_at_last_fully_closed_day(self, tmp_path):
+        """§P0-3: the default end is the last fully closed trading day, never
+        today (which has not closed) — so a request reaching into the future is
+        satisfied by data through that last closed session and no further."""
+        from datetime import timedelta
+
+        from scripts.production.download_data import _last_fully_closed_trading_day
+        from stoke_ml.data.calendar import TradingCalendar
+
+        cal = TradingCalendar("a_shares", calendar_dir=str(tmp_path))
+        last_closed = _last_fully_closed_trading_day(cal)
+        prev_day = last_closed - timedelta(days=1)
+        _save(tmp_path, "000001", [last_closed.isoformat()])
+        _save(tmp_path, "600519", [prev_day.isoformat()])
+        pending, complete = filter_existing(
+            ["000001", "600519"], str(tmp_path),
+            last_closed.isoformat(), "2099-12-31",
+        )
+        assert complete == {"000001"}
+        assert pending == ["600519"]
+
     def test_get_stock_codes_uses_historical_member_union(self, tmp_path):
         """§七-2: the index download universe is the HISTORICAL member union, not
         today's constituents.  Both default indices covered by membership.parquet

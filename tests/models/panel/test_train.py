@@ -198,3 +198,64 @@ class TestValLossBatchSizeInvariant:
         # the end, so like v_ret it must be independent of batch boundaries —
         # the primary checkpoint-selection metric must not shift with batching.
         assert max(rankics) - min(rankics) < 1e-12, rankics
+
+
+class TestAblationTraining:
+    """§十一.3: every architecture ablation must survive the full train loop
+    on the masked synthetic panel — no NaN, history populated."""
+
+    _BASE_KWARGS = dict(
+        static_dim=4, past_known_dim=12, past_observed_dim=6,
+        hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
+        grn_layers=1, seq_len=60, dropout=0.0,
+        compile_model=False, batch_size=16, num_workers=0,
+        max_epochs=2, horizon=5, rank_loss_weight=0.1,
+        min_stocks_per_day=5,
+    )
+
+    @staticmethod
+    def _train(seed, **overrides):
+        data = _make_masked_panel(seed=seed)
+        config = PanelConfig(**{**TestAblationTraining._BASE_KWARGS, **overrides})
+        device = torch.device("cpu")
+        model, history = train_panel(
+            config, data, data, device,
+            raw_val_returns=data["realized_return"],
+        )
+        assert len(history["train_loss"]) == 2
+        assert all(np.isfinite(v) for v in history["val_loss"])
+        return model, history
+
+    @pytest.mark.slow
+    def test_plain_lstm_trains(self):
+        """backbone='lstm' → nn.LSTM backbone survives training."""
+        model, _ = self._train(seed=11, backbone="lstm")
+        assert model._is_xlstm is False
+        assert isinstance(model.backbone, torch.nn.LSTM)
+
+    @pytest.mark.slow
+    def test_return_only_trains(self):
+        """No direction/vol heads → return-only objective still trains."""
+        model, _ = self._train(seed=12, use_dir_head=False, use_vol_head=False)
+        assert model.direction_head is None
+        assert model.volatility_head is None
+        assert model.return_head is not None
+
+    @pytest.mark.slow
+    def test_fixed_task_weights_trains(self):
+        """FixedTaskWeights (UncertaintyLoss ablation) drives the loop."""
+        model, _ = self._train(seed=13, fixed_task_weights=True)
+        assert list(model.parameters())  # model still has weights
+
+    @pytest.mark.slow
+    def test_no_pit_static_trains(self):
+        """use_pit_static=False drops the static encoder, still trains."""
+        model, _ = self._train(seed=14, use_pit_static=False)
+        assert model.static_proj is None
+        assert model.static_enrich is None
+
+    @pytest.mark.slow
+    def test_no_ranking_trains(self):
+        """use_ranking_loss=False disables the ranking term, still trains."""
+        model, _ = self._train(seed=15, use_ranking_loss=False)
+        assert model.return_head is not None

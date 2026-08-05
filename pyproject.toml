@@ -12,10 +12,16 @@ include = ["stoke_ml*"]
 name = "stoke-ml"
 version = "0.1.0"
 description = "A-share (5530 stocks, 2000-2026) deep learning stock prediction: anti-block crawler → data pipeline → feature engineering → model training → backtesting"
-requires-python = ">=3.10"
+# >=3.12 (not >=3.10): declared dep pandas-ta>=0.3 requires >=3.12; the local
+# venv and CI both run 3.12. Declaring 3.10 made the dependency set formally
+# unsatisfiable and blocked lockfile generation (uv lock).
+# <3.14 cap: the universal lock must cover python >=3.14 too, but pandas 3.x
+# has no 3.14 wheels, so uv would pin pandas 2.3.3 and drift from the local
+# venv (pandas 3.0.3). We only test on 3.12; capping keeps the lock on pandas 3.
+requires-python = ">=3.12,<3.14"
 dependencies = [
     # Core — always needed (config, storage, dataframe)
-    "pandas>=2.0",
+    "pandas>=3.0",
     "numpy>=1.24",
     "polars>=0.20",
     "pyarrow>=14.0",

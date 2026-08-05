@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import pickle
 import sys
 import time
 from datetime import datetime
@@ -36,7 +37,7 @@ from sklearn.preprocessing import StandardScaler
 # Import fold helpers from train_panel.py so boundaries stay identical.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from stoke_ml.config import load_config
+from stoke_ml.config import get_project_root, load_config
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.baseline.panel_baselines import (
     FittedScoreAdapter,
@@ -49,15 +50,28 @@ from stoke_ml.models.baseline.panel_baselines import (
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.evaluate import EVALUATOR_VERSION, evaluate_portfolio
 from train_panel import (  # noqa: E402  (same-module fold logic)
+    _append_experiment_registry,
+    _apply_candidate_gates,
+    _check_verified_until_scope,
     _cross_sectional_normalize,
     _discover_stocks,
+    _distinct_trial_count,
+    _EXPERIMENT_REGISTRY_PATH,
+    _experiment_signature,
     _experiment_version,
     _fmt_date,
+    _fold_delist_day,
     _fold_eligible_stocks,
+    _fold_universe_gates,
+    _load_experiment_registry,
     _mask_stocks,
+    _objective_desc,
     _prebuilt_channel_coverage,
+    _predict_outer,
+    _require_quality_gate,
     _resolve_universe,
     _slice_panel,
+    _universe_artifact_hashes,
 )
 
 logging.basicConfig(
@@ -170,6 +184,18 @@ def main():
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--outdir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--no-require-quality-gate", action="store_true",
+                        help="Skip the required quality-gate report check "
+                             "(dev smoke only; §六-2 wants a matching report "
+                             "before any real training run)")
+    parser.add_argument("--no-formal", action="store_true",
+                        help="Exploratory mode: allow degraded universe gates "
+                             "when a required PIT artifact is missing, with a "
+                             "prominent warning, instead of refusing to start "
+                             "(§P0-7; formal is the default)")
+    parser.add_argument("--quality-gate-report", type=str, default=None,
+                        help="Path to the quality-gate report to verify "
+                             "(default: <repo>/reports/data_quality_gate.json)")
     args = parser.parse_args()
 
     if args.end is None:
@@ -180,6 +206,16 @@ def main():
 
     cfg = load_config()
     data_dir = cfg.project.data_dir
+
+    # §六-2: the SAME formal quality-gate contract as train_panel.py — a
+    # baseline result on data the gate has not validated (or that changed since
+    # the gate PASS) is not a research result (§P0-5).
+    if not args.no_require_quality_gate:
+        _report_path = args.quality_gate_report or str(
+            get_project_root() / "reports" / "data_quality_gate.json"
+        )
+        _require_quality_gate(data_dir, args.prebuilt, _report_path)
+        logger.info("Quality-gate report verified: %s", _report_path)
 
     all_stocks = _discover_stocks(data_dir, None)
     stock_list, universe_desc = _resolve_universe(
@@ -229,6 +265,33 @@ def main():
     channel_manifest = _prebuilt_channel_coverage(panel_data)
 
     global_dates = panel_data.get("global_dates")
+
+    # §九-3: same strict formal-run scope as train_panel.py — a baseline
+    # spanning forward-estimate calendar days must be refused, not silently run
+    # on guessed holidays (§P0-5).
+    refusal = _check_verified_until_scope(
+        global_dates, enforce=not args.no_require_quality_gate)
+    if refusal:
+        raise SystemExit(refusal)
+
+    # §七-1/§七-3: the SAME whole-run universe gates the deep model consumes —
+    # 未退市 (nd_mask), per-day index membership (mem_mask) and the delisting
+    # days feeding each fold's sleeve force-sell (delist_global).  A baseline
+    # that ranked delisted / non-member stocks as tradable candidates would not
+    # be measuring the same task (§P0-5).
+    nd_mask, mem_mask, delist_global, universe_status = _fold_universe_gates(
+        global_dates, panel_stocks, args.universe, data_dir,
+        formal=not args.no_formal,
+    )
+    universe_hashes = _universe_artifact_hashes(
+        universe_status, data_dir, args.universe,
+    )
+
+    # §十五-1 / §十二.6: same DSR multiplicity basis as the deep model — the
+    # registry counts DISTINCT experiments.  Each baseline model in this run is
+    # its own trial, so N = prior distinct trials + len(models).
+    experiment_registry = _load_experiment_registry(_EXPERIMENT_REGISTRY_PATH)
+
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
     static_dim = panel_data["static_features"].shape[2]
@@ -272,8 +335,15 @@ def main():
         "reports", "experiments", "baselines_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
     )
     os.makedirs(outdir, exist_ok=True)
+    # §P0-5: per-fold OOS prediction tapes (same layout/contract as the deep
+    # model's fold_XXX.npz) so a baseline number is offline-replayable.
+    oos_dir = os.path.join(outdir, "oos_preds")
+    os.makedirs(oos_dir, exist_ok=True)
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
+    # §十二.6: distinct-experiment DSR multiplicity basis — each baseline model
+    # in this run is its own trial.
+    n_trials = _distinct_trial_count(experiment_registry) + len(models)
     summary_rows: list[dict] = []
     fold_records: list[dict] = []
     rng = np.random.RandomState(args.seed)
@@ -329,6 +399,16 @@ def main():
                          price_pad=config.horizon),
             fold_eligible,
         )
+
+        # §七-3: the SAME universe candidate gates the deep model applies to its
+        # inner_val + outer_test pools (§P0-5) — a baseline must not rank
+        # delisted / non-member stocks as tradable when the xLSTM could not.
+        rows = np.where(fold_eligible)[0]
+        for name, tslice, dd in (
+            ("inner_val", slice(inner_val_context_start, train_end), inner_val_data),
+            ("outer_test", slice(val_context_start, val_end), outer_test_data),
+        ):
+            _apply_candidate_gates(dd, tslice, rows, nd_mask, mem_mask)
 
         # Same target normalization as train_panel.py: cross-sectional z-score
         # per date (clean open-to-open returns), then clip to [-5, 5].
@@ -410,6 +490,11 @@ def main():
                     ScaledPredictor(model, scaler),
                     with_seq=args.with_seq_features)
             adapter.reset()
+            # §P0-6: force-sell delist-day grid in THIS fold's sim column space
+            # (same mapping as train_panel.py) so a baseline tape replays the
+            # delisting force-sell exactly as the sleeve account executed it.
+            Wp = outer_test_data["close_price"].shape[1] - config.seq_len
+            delist_day = _fold_delist_day(delist_global, fold_eligible, val_start, Wp)
             outer_m = evaluate_portfolio(
                 adapter, outer_test_data, config, device,
                 horizon=config.horizon,
@@ -417,8 +502,102 @@ def main():
                 raw_returns=outer_test_data["realized_return"],
                 require_price_path=True,
                 n_boot=500,
+                return_ledger=True,
+                delist_day=delist_day,
+                n_trials=n_trials,
             )
             elapsed = time.time() - t0
+            # §P0-5: persist the fitted baseline (ridge/lgbm/mlp) alongside the
+            # tape so fold_XXX_<model>.npz maps to exact fitted weights — the
+            # analogue of the deep model's fold_XXX_model.pt.  A pickle is best
+            # effort: a score tape without weights is still replayable from the
+            # saved preds grid, so a serialization hiccup must not kill a fold.
+            try:
+                model_path = os.path.join(
+                    oos_dir, f"fold_{fold:03d}_{model_name}.pkl")
+                with open(model_path, "wb") as f:
+                    pickle.dump(adapter, f)
+            except Exception as exc:  # noqa: BLE001 — best-effort artifact
+                logger.warning("  Fold %d %s: model pickle failed (%s) — "
+                               "tape saved without weights", fold, model_name, exc)
+            # §P0-5: per-fold OOS prediction tape, same layout/contract as the
+            # deep model's fold_XXX.npz — a baseline number must be
+            # offline-replayable through the same sleeve account.  The adapter's
+            # replay grid was consumed by evaluate_portfolio, so reset before
+            # re-running for the tape.
+            adapter.reset()
+            oos_preds = _predict_outer(adapter, outer_test_data, config, device)
+            if oos_preds is not None:
+                n_w = oos_preds.shape[1]
+                p0 = config.seq_len
+                entry_dates = [_fmt_date(global_dates, val_start + d)
+                               for d in range(n_w)]
+                dec = outer_test_data["decision_eligible_mask"][:, p0:p0 + n_w]
+                hist = outer_test_data["history_eligible_mask"][:, p0:p0 + n_w]
+                pool = dec & hist
+                elig = outer_test_data["entry_eligible_mask"][:, p0:p0 + n_w]
+                rt_mask = outer_test_data["return_target_mask"][:, p0:p0 + n_w]
+                rt = outer_test_data["y_return_raw"][:, p0:p0 + n_w]
+                price_grid = outer_test_data["close_price"][:, p0:p0 + n_w + config.horizon]
+                open_grid = outer_test_data["open_price"][:, p0:p0 + n_w + config.horizon]
+                price_dates = [_fmt_date(global_dates, val_start + d)
+                               for d in range(n_w + config.horizon)]
+                np.savez(
+                    os.path.join(oos_dir, f"fold_{fold:03d}_{model_name}.npz"),
+                    preds=oos_preds,
+                    dates=np.array(entry_dates),
+                    stocks=np.array(fold_stocks),
+                    decision_eligible=dec,
+                    history_eligible=hist,
+                    pool=pool,
+                    entry_eligible=elig,
+                    return_target_mask=rt_mask,
+                    return_target=rt,
+                    close_price=price_grid,
+                    open_price=open_grid,
+                    price_dates=np.array(price_dates),
+                    horizon=config.horizon,
+                    seq_len=config.seq_len,
+                    top_fraction=0.1,
+                    cost=config.txn_cost,
+                    delist_day=delist_day,
+                    universe_status_hash=universe_hashes["universe_status_hash"],
+                    membership_hash=universe_hashes["membership_hash"],
+                    data_version=version_info["data_manifest_hash"],
+                    model_hash="baseline-" + model_name,
+                    seed=args.seed,
+                    evaluator_version=EVALUATOR_VERSION,
+                )
+                # Per-position ledger, same contract as train_panel.py — the
+                # tape is self-contained, so each realized number is traceable.
+                ledger_rows = outer_m.get("long_ledger")
+                if ledger_rows:
+                    ldf = pd.DataFrame(ledger_rows)
+                    si = ldf["stock"].to_numpy(dtype=int)
+                    di = ldf["entry_day"].to_numpy(dtype=int)
+                    ldf["entry_date"] = [entry_dates[c] for c in di]
+                    ldf["stock_code"] = [fold_stocks[i] for i in si]
+                    ldf["prediction"] = oos_preds[si, di]
+                    ldf["candidate_eligible"] = pool[si, di]
+                    ldf["entry_eligible"] = elig[si, di]
+                    ldf["fold"] = fold
+                    ldf["data_version"] = version_info["data_manifest_hash"]
+                    ldf["model_hash"] = "baseline-" + model_name
+                    ldf = ldf[["fold", "entry_day", "entry_date", "stock",
+                               "stock_code", "mode", "prediction",
+                               "candidate_eligible", "entry_eligible",
+                               "entry_price", "entry_notional", "target_weight",
+                               "executed_weight", "entry_nav",
+                               "shares", "scheduled_exit_day", "actual_exit_day",
+                               "exit_status", "exit_price", "realized_return",
+                               "mark_day", "mark_price", "gross_pnl",
+                               "entry_cost", "exit_cost", "net_pnl",
+                               "unrealized_pnl"]]
+                    ledger_path = os.path.join(
+                        oos_dir, f"fold_{fold:03d}_{model_name}_ledger.parquet")
+                    ldf.to_parquet(ledger_path)
+                    logger.info("  Fold %d %s: ledger %d filled positions -> %s",
+                                fold, model_name, len(ldf), ledger_path)
             rec = {
                 "model": model_name,
                 "fold": fold,
@@ -436,6 +615,7 @@ def main():
                 "entry_start": _fmt_date(global_dates, val_start),
                 "entry_end": _fmt_date(global_dates, val_start + val_len - 1),
                 "seconds": round(elapsed, 1),
+                "dsr_n_trials": outer_m.get("dsr_n_trials", 0),
             }
             fold_records.append(rec)
             logger.info(
@@ -518,6 +698,45 @@ def main():
                     r["eligible_ew_sharpe"]["mean"] or 0.0,
                     r["selected_universe_ew_sharpe"]["mean"] or 0.0)
     logger.info("Artifacts saved to %s", outdir)
+
+    # §十二.6: register each baseline model as a distinct research trial in the
+    # project-wide experiment ledger, so future DSR deflations count baseline
+    # trials too (and this run's N).  One entry per model, deduped by its own
+    # baseline signature — a re-run of the same baseline into a new outdir
+    # replaces the old row instead of double-counting.
+    for model_name in models:
+        sub = rows[rows["model"] == model_name]
+        if sub.empty:
+            continue
+        long_vals = sub["long_sharpe"].dropna().astype(float)
+        # §十二.3: trial Sharpe on the LONG sleeve basis — the deep model's
+        # oos_continuous_sharpe is a long account, so baseline trials use the
+        # same basis to keep the historical DSR variance pool comparable.
+        sharpe = float(long_vals.mean()) if len(long_vals) else None
+        baseline_entry = {
+            "experiment_signature": _experiment_signature(
+                version_info, config, model_key=f"baseline-{model_name}"),
+            "outdir": outdir,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "git_commit": version_info.get("git_commit"),
+            "data_manifest_hash": version_info.get("data_manifest_hash"),
+            "feature_schema_hash": version_info.get("feature_schema_hash"),
+            "model_hash": f"baseline-{model_name}",
+            "universe_hash": version_info.get("universe_hash"),
+            "horizon": config.horizon,
+            "objective": _objective_desc(config),
+            "n_folds": int(sub["fold"].nunique()),
+            "aborted": sharpe is None,
+            "ls_sharpe_mean": float(sub["ls_sharpe"].mean()) if len(sub) else None,
+            "oos_continuous_sharpe": sharpe,
+            "psr": None,
+            "dsr": None,
+            "dsr_n_trials": n_trials,
+            "model_family": "baseline",
+        }
+        _append_experiment_registry(_EXPERIMENT_REGISTRY_PATH, baseline_entry)
+        logger.info("Baseline registered: %-8s -> trial signature %s",
+                    model_name, baseline_entry["experiment_signature"])
 
 
 if __name__ == "__main__":

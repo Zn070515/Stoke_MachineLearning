@@ -379,6 +379,21 @@ class DataStorage:
                 if os.path.isfile(manifest_path):
                     with open(manifest_path, "r", encoding="utf-8") as f:
                         old_manifest = json.load(f)
+                # Refuse to splice price-basis segments (§四.1 / P0-2): a
+                # qfq history must never silently gain a raw tail (or vice
+                # versa).  "unknown" is the honest legacy declaration, so a
+                # mismatch can only be proven when BOTH sides declare a
+                # concrete basis.
+                old_adjust = (old_manifest or {}).get("adjust", "unknown")
+                if (old_adjust not in ("unknown", "n/a", "")
+                        and adjust not in ("unknown", "n/a", "")
+                        and old_adjust != adjust):
+                    raise ValueError(
+                        f"{code}: refusing to merge price-basis segments "
+                        f"(old={old_adjust!r}, new={adjust!r}) — run an "
+                        f"explicit re-adjustment migration instead of "
+                        f"silently splicing mixed-basis history"
+                    )
                 existing = None
                 if os.path.isfile(out_path):
                     existing = pd.read_parquet(out_path)

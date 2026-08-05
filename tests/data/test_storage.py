@@ -94,6 +94,58 @@ class TestSaveDaily:
         assert len(b) == 1
 
 
+class TestPriceBasisMismatch:
+    """v11 §四.1 / P0-2: save_daily must never silently splice price-basis
+    segments.  A concrete mismatch (qfq history + raw tail, or vice versa)
+    raises instead of merging; "unknown" legacy basis stays permissive."""
+
+    def test_rejects_qfq_then_raw(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        qfq = _frame(["2024-01-05", "2024-01-06"])
+        qfq.attrs["source"] = "efinance"
+        qfq.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(qfq)
+        raw = _frame(["2024-01-07"])
+        raw.attrs["source"] = "efinance"
+        raw.attrs["adjustment_mode"] = "raw"
+        with pytest.raises(ValueError, match="price-basis"):
+            store.save_daily(raw)
+
+    def test_rejects_raw_then_qfq(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        raw = _frame(["2024-01-05", "2024-01-06"])
+        raw.attrs["source"] = "efinance"
+        raw.attrs["adjustment_mode"] = "raw"
+        store.save_daily(raw)
+        qfq = _frame(["2024-01-07"])
+        qfq.attrs["source"] = "efinance"
+        qfq.attrs["adjustment_mode"] = "qfq"
+        with pytest.raises(ValueError, match="price-basis"):
+            store.save_daily(qfq)
+
+    def test_same_basis_merges(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        a = _frame(["2024-01-05", "2024-01-06"])
+        a.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(a)
+        b = _frame(["2024-01-07", "2024-01-08"])
+        b.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(b)
+        m = store.manifest("000001")
+        assert m["adjust"] == "qfq" and m["rows"] == 4
+
+    def test_unknown_old_with_concrete_new_merges(self, tmp_path):
+        """Legacy files carry adjust=unknown; a concrete new batch upgrades the
+        manifest without proving a mismatch."""
+        store = DataStorage(str(tmp_path))
+        legacy = _frame(["2024-01-05", "2024-01-06"])  # no attrs → unknown
+        store.save_daily(legacy)
+        fresh = _frame(["2024-01-07"])
+        fresh.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(fresh)
+        assert store.manifest("000001")["adjust"] == "qfq"
+
+
 class TestLoadDaily:
     def test_reads_flat_file(self, tmp_path):
         _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])

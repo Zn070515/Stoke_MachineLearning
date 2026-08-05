@@ -1,5 +1,9 @@
+import inspect
+
 import torch
-from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, PairwiseRankingLoss
+from stoke_ml.models.panel.loss import (
+    UncertaintyLoss, FixedTaskWeights, AdjMSELoss, PairwiseRankingLoss,
+)
 
 
 class TestUncertaintyLoss:
@@ -54,6 +58,47 @@ class TestUncertaintyLoss:
         assert loss_fn.log_vars.grad is not None
         assert loss_fn.log_vars.grad[1] == 0.0  # inactive task untouched
         assert loss_fn.log_vars.grad[0] != 0.0
+
+
+class TestFixedTaskWeights:
+    """§十一.3: the UncertaintyLoss ablation — equal-weight multi-task loss.
+
+    Carries no learnable parameters (nothing in the optimizer's loss group)
+    and matches UncertaintyLoss's forward(losses, task_active_mask) signature
+    so train.py swaps one for the other without branching.
+    """
+
+    def test_equal_weight_mean_over_active_tasks(self):
+        loss_fn = FixedTaskWeights(num_tasks=3)
+        total = loss_fn([torch.tensor(0.4), torch.tensor(0.1), torch.tensor(0.1)],
+                        task_active_mask=[True, True, False])
+        assert torch.allclose(total, torch.tensor(0.25), atol=1e-6)  # (0.4+0.1)/2
+
+    def test_scale_independent_of_task_count(self):
+        """Mean over active tasks, not their sum — enabling/disabling a task
+        must not rescale the combined loss."""
+        loss_fn = FixedTaskWeights(num_tasks=2)
+        total2 = loss_fn([torch.tensor(0.4), torch.tensor(0.2)],
+                         task_active_mask=[True, True])
+        total1 = loss_fn([torch.tensor(0.4), torch.tensor(0.2)],
+                         task_active_mask=[True, False])
+        assert torch.allclose(total2, torch.tensor(0.3), atol=1e-6)
+        assert torch.allclose(total1, torch.tensor(0.4), atol=1e-6)
+
+    def test_all_inactive_returns_zero(self):
+        loss_fn = FixedTaskWeights(num_tasks=3)
+        total = loss_fn([torch.tensor(0.4), torch.tensor(0.1), torch.tensor(0.1)],
+                        task_active_mask=[False, False, False])
+        assert torch.allclose(total, torch.zeros(()), atol=1e-6)
+
+    def test_no_learnable_params(self):
+        loss_fn = FixedTaskWeights(num_tasks=3)
+        assert list(loss_fn.parameters()) == []
+
+    def test_forward_signature_matches_uncertainty(self):
+        sig_a = inspect.signature(FixedTaskWeights.forward)
+        sig_b = inspect.signature(UncertaintyLoss.forward)
+        assert list(sig_a.parameters) == list(sig_b.parameters)
 
 
 class TestAdjMSELoss:

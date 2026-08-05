@@ -64,7 +64,7 @@
 
 **数据契约** `stoke_ml/data/contract.py`（v6 §十六）— 每个数据集（daily_equity / margin / northbound / dragon_tiger / fundamentals）用一份冻结的 `DataContract` 描述 schema、主键、单位、复权口径、时区、日历与源优先级，下载器 / 存储 / 质量门禁 / 特征构建器共享同一份契约。质量门禁的 `contract_schema` 检查按 `DAILY_EQUITY` 验证每个 daily 文件（必需列、主键唯一、日期规则、单位符号），任一违反即 fail。
 
-**特征缓存 manifest** `stoke_ml/features/cache_manifest.py`（v6 §十二 / v10 §十一）— 每个预构建特征 parquet 携带 sidecar JSON manifest（`data/features/.manifests/{code}.json`），记录 git_commit、config_hash、feature_schema_hash、horizon、seq_len、panel_mode 与逐通道源文件指纹。`config_hash` 覆盖完整特征相关 config.yaml 区块（features / preprocessing / universe / fundamental，含技术指标开关、缺失处理、阈值、横截面归一化参数与源 effective-date/persistence 策略），同一 commit 下改 config 也会使缓存失效；start/end 单独以源文件 range 校验。`build_features.py` 缓存命中必须比较这些 hash；训练侧 `FeaturePipeline` 对 prebuilt 目录做 lineage 校验，`--require-feature-manifest`（默认开）时缺失 / stale（schema 漂移、git commit 不一致、config 漂移）直接 fail。
+**特征缓存 manifest** `stoke_ml/features/cache_manifest.py`（v6 §十二 / v10 §十一 / v11 §十.1）— 每个预构建特征 parquet 携带 sidecar JSON manifest（`data/features/.manifests/{code}.json`），记录 git_commit、config_hash、feature_schema_hash、horizon、seq_len、panel_mode 与逐通道源文件指纹。`config_hash` 覆盖完整特征相关 config.yaml 区块（features / preprocessing / universe / fundamental，含技术指标开关、缺失处理、阈值、横截面归一化参数与源 effective-date/persistence 策略），同一 commit 下改 config 也会使缓存失效；start/end 单独以源文件 range 校验。`build_features.py` 缓存命中必须比较这些 hash；训练侧 `FeaturePipeline` 对 prebuilt 目录做 lineage 校验，`--require-feature-manifest`（默认开）时缺失 / stale（schema 漂移、git commit 不一致、config 漂移）直接 fail。v11 §十.1 起 manifest 额外指纹化**市场级共享输入**（macro_daily / market_env_daily / industry_returns / stock_sector_cache.csv / exchange_calendar/a_shares.parquet / 整个 etf_flow 目录，目录按内容整体哈希），任一变化即失效旧特征缓存；旧版缺共享指纹的 manifest 一律视为 stale 强制重建。面板构成工件（universe/ipo、universe/delisted、index_constituents_hist/membership）不在此列——它们改变进入面板的股票/日期而非每股特征值，由 fold 级 universe/membership hash（train_panel FoldResearchContext）覆盖。
 
 ### 格式
 
@@ -101,7 +101,7 @@
 | 规则 | 说明 |
 |------|------|
 | 收盘后新闻 → 下一交易日 | 15:00 CST 之后的新闻归属 T+1 |
-| ZI 方法 | Zeros & Imputation：无新闻的交易日情感特征填 0，`has_news=False` |
+| ZI 方法（通道区分，§九-4） | 事件型通道（新闻/公告/龙虎榜/大宗...）缺失日填 0 + `has_*=False`；状态型通道（两融余额/北向持仓/估值/基本面/宏观利率/市场环境/股东/质押）缺失日向前填充 ffill（状态缺失=未变，绝不归零） |
 | 无时间戳时 | 当前所有新闻仅有日期无时间戳，视为同日新闻 |
 
 ---
@@ -126,11 +126,11 @@
 
 **特征工程顺序**（不可改变）：
 1. 合并情感列（左连接 date）
-2. ZI 填充缺失情感日
+2. 按通道策略填充缺失日（事件型 ZI，状态型 ffill）——§九-4
 3. 技术指标
 4. 趋势评分
 5. 时序特征（滞后+滚动+日历）
-6. （FE v2）新家族（pledge / index_membership / market_env / macro regime）与其它辅助维度同一管道：步骤 1 左连接合并，步骤 2 ZI 填充，统一 PIT lag(1)
+6. （FE v2）新家族（pledge / index_membership / market_env / macro regime）与其它辅助维度同一管道：步骤 1 左连接合并，步骤 2 按通道策略填充（事件型 ZI，状态型 ffill），统一 PIT lag(1)
 
 ---
 
@@ -214,7 +214,7 @@
 - XGBoost/LSTM: 2年训练 / 3月验证 / 3月步长
 - Panel: 增长式训练窗口（[0, val_start−purge) 逐 fold 增长）/ 非重叠 fold（step=val_len）/ inner_val 选择最佳 epoch + outer_test 单次评估 / purge=seq_len（walk-backward，从最新数据倒排 + 末尾 lockbox 保留）
 - Panel OOS 连续账户：把全部 fold 的 OOS 预测按时间排序接到一个账户上重放（fold 边界处切换模型），最终 Sharpe/MDD/CAGR 只取该连续账户 → 产出 `oos_continuous.parquet` / `oos_continuous_ledger.parquet`（替代逐 fold 各自归一的 NAV）
-- 多重试验修正（§十五-1）：PSR（Probabilistic Sharpe，非正态 SR 显著性）/ DSR（Deflated Sharpe，按项目累计实验数 N 与试验 Sharpe 离散度折价）/ SPA（Hansen 2005，best-of-K 相对基准的重采样 p 值），报告同时输出 `long_psr / long_dsr / ls_psr / ls_dsr / spa_*`，连续 OOS 账户也带 `psr / dsr / dsr_n_trials`。实验注册表落在 `reports/experiments/experiment_registry.json`（每次训练原子追加一行），DSR 的 N = 注册表已有实验数 + 1
+- 多重试验修正（§十五-1）：PSR（Probabilistic Sharpe，非正态 SR 显著性）/ DSR（Deflated Sharpe，按项目累计实验数 N 与试验 Sharpe 离散度折价）/ Block-bootstrap max-mean reality check（best-of-K 相对基准的重采样 p 值；非完整 Hansen SPA，§十二.4），报告同时输出 `long_psr / long_dsr / ls_psr / ls_dsr / bbmm_*`，连续 OOS 账户也带 `psr / dsr / dsr_n_trials`。实验注册表落在仓库根 `reports/experiments/experiment_registry.json`（每次训练原子追加一行，带 `experiment_signature` = SHA1(data_manifest_hash, feature_schema_hash, universe_hash, model_hash, horizon, objective)；同签名同 outdir 去重，异 outdir 各计一次；baseline 各占一个 `baseline-{name}` trial；损坏时抛错而非静默复位）。DSR 的 N = 历史注册表中**不同实验签名**的计数（当前签名不重复计），DSR 的试验 Sharpe 离散度来自历史注册表 OOS Sharpe 分布（不足 2 条时退化为文档化的 block-bootstrap 代理），来源以 `dsr_trial_variance_source` 标注
 
 ---
 
@@ -264,6 +264,16 @@
 | use_limit_up | False（deferred） | pipeline.py 构造器 |
 | market_env 源文件 | market_breadth/market_env_daily.parquet | pipeline.py → _merge_market_env |
 | macro 源文件 | macro/macro_daily.parquet | pipeline.py → _merge_macro |
+
+---
+
+## 环境方案（Windows CUDA 开发 / Linux CPU CI，§十三-3）
+
+依赖唯一事实源是 `pyproject.toml`；`uv.lock`（`uv lock` 生成，universal 锁，覆盖 win32/linux/emscripten × python 3.12/3.13）提交入库，`uv lock --check` 校验新鲜度。改任何依赖后必须 `uv lock` 重新生成。`.python-version` = 3.12 固定 uv 的 Python 版本（本地、CI 一致），避免 `uv sync` 自动挑到 3.13。
+
+- **Windows CUDA 开发机**：本地 `.venv`（Python 3.12.10，`torch==2.11.0` CUDA 版，RTX 4090）。所有命令经 `PYTHONPATH=. ./.venv/Scripts/python`，禁裸 `python`（Anaconda 缺依赖）。本地 CI 镜像：`PYTHONPATH=. ./.venv/Scripts/python scripts/maintenance/current/ci.py`。
+- **Linux CPU CI（GitHub Actions）**：各 job 用 `astral-sh/setup-uv@v4` + `actions/setup-python@v5`(3.12)，`uv sync --frozen --extra <组>` 从提交的 `uv.lock` 装对应依赖组，`uv run python -m pytest ...` 跑测试。组 → extras 映射见 `.github/workflows/ci.yml`（core-fast=dev；storage-parquet=+data-adapters；ml=+ml/nlp/ta/data-adapters；slow-nightly=全组；optional-online=+online/data-adapters）。
+- `requires-python = ">=3.12"`：声明的 `pandas-ta>=0.3` 需要 >=3.12，声明 3.10 会让依赖集形式不可满足而阻塞 `uv lock`；本机 venv 与 CI 均为 3.12。
 
 ---
 

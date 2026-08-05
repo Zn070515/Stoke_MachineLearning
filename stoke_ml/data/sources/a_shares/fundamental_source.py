@@ -3,6 +3,8 @@ import logging
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code
+
 logger = logging.getLogger(__name__)
 
 FUNDAMENTAL_COLS = [
@@ -94,7 +96,7 @@ class FundamentalSource:
             index="report_date", columns="indicator", values="value", aggfunc="first"
         ).reset_index()
 
-        result["stock_code"] = str(stock_code).zfill(6)
+        result["stock_code"] = normalize_stock_code(stock_code)
 
         # No disclose_date from this API — use report_date as proxy
         result["disclose_date"] = result["report_date"]

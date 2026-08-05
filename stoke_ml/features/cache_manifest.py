@@ -6,6 +6,7 @@ fingerprints.  Cache hits compare these hashes — not just file size — so a
 config / code / data change invalidates a stale feature instead of silently
 reusing it during training.
 """
+import functools
 import hashlib
 import json
 import logging
@@ -47,6 +48,32 @@ SNAPSHOT_FILES = {
     "earnings_express": ("earnings", "express.parquet"),
 }
 
+# Market-wide shared inputs (relative to data_dir) that CHANGE FEATURE VALUES
+# but are not per-stock files (§十-1).  Macro rates, market-environment breadth,
+# industry cross-sectional returns, the stock→sector mapper (which sector ETF
+# flow a stock reads), the trading calendar (date alignment) and the whole
+# sector-ETF-flow directory must each invalidate a prebuilt feature when they
+# change.  Without them a stale macro/calendar/mapper would be silently reused.
+# Panel-composition artifacts (universe/ipo.parquet, universe/delisted.parquet,
+# index_constituents_hist/membership.parquet) are deliberately NOT here: they
+# change which stocks/dates enter the training panel, not per-stock feature
+# values, so they are covered by the fold-level universe/membership hash
+# (train_panel FoldResearchContext), not the per-stock feature manifest.
+SHARED_FILES = {
+    "macro": ("a_shares", "macro", "macro_daily.parquet"),
+    "market_env": ("a_shares", "market_env_daily.parquet"),
+    "industry": ("a_shares", "industry", "industry_returns.parquet"),
+    "sector_mapper": ("a_shares", "stock_sector_cache.csv"),
+    "calendar": ("exchange_calendar", "a_shares.parquet"),
+}
+
+# Shared DIRECTORY inputs — hashed as a whole (any file change invalidates).
+SHARED_DIRS = {
+    "etf_flow": ("a_shares", "etf_flow"),
+}
+
+_SHARED_NAMES = frozenset((*SHARED_FILES, *SHARED_DIRS))
+
 # Build-time config keys whose values change the feature output (flat form).
 # The production path hashes a full config snapshot instead (config_snapshot),
 # so this whitelist only backs the legacy flat-dict form (unit tests / callers
@@ -73,6 +100,14 @@ _CONFIG_KEYS = [
 # source effective-date / persistence strategy, universe gates) invalidates
 # the feature cache — the git-commit field alone cannot see it (§十一-3).
 _CONFIG_SECTIONS = ["features", "preprocessing", "universe", "fundamental"]
+
+# Package subdirectories whose source CODE determines feature VALUES.  When git
+# is unavailable git_commit degrades to 'unknown' and code drift would go
+# undetected (§十-2) — feature_code_tree_hash() hashes these trees as a
+# fallback.  Model-layer code is deliberately excluded: it consumes features but
+# does not change them, so hashing it would invalidate the cache on every model
+# edit.
+_FEATURE_CODE_DIRS = ("features", "preprocessing")
 
 
 def _sha1(text: str) -> str:
@@ -144,6 +179,39 @@ def git_head() -> str:
         return "unknown"
 
 
+@functools.lru_cache(maxsize=1)
+def feature_code_tree_hash() -> str:
+    """Content hash of the feature/preprocessing source tree; 'unknown' if absent.
+
+    When git is unavailable (ZIP distribution, non-git checkout) git_commit
+    degrades to 'unknown' and two code versions become indistinguishable — a
+    stale feature cache would then survive a code change (§十-2).  Hashing the
+    feature code tree's bytes restores that distinction: any edit to a feature /
+    preprocessing module changes the hash and invalidates the cache.  Memoized
+    because build pipelines call it once per stock and the tree cannot change
+    mid-process.
+    """
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    entries: dict[str, str] = {}
+    for name in _FEATURE_CODE_DIRS:
+        base = os.path.join(pkg_root, name)
+        if not os.path.isdir(base):
+            continue
+        for root, _dirs, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(root, fn)
+                digest = _content_hash(path)
+                if digest is None:
+                    continue
+                entries[os.path.relpath(path, pkg_root)] = digest
+    if not entries:
+        return "unknown"
+    joined = "\n".join(f"{p}:{h}" for p, h in sorted(entries.items()))
+    return _sha1(joined)
+
+
 def _upstream_manifest_hash(path: str) -> str | None:
     """Content checksum recorded in an upstream storage sidecar manifest.
 
@@ -177,6 +245,27 @@ def _content_hash(path: str) -> str | None:
     return h.hexdigest()
 
 
+def _dir_content_hash(path: str) -> str | None:
+    """Content digest of every file under ``path`` (relative names + bytes).
+
+    Used for shared DIRECTORY inputs (e.g. sector ETF flows) where a change to
+    ANY file must invalidate the feature cache.  Returns None only when nothing
+    readable is under the directory.
+    """
+    entries: dict[str, str] = {}
+    for root, _dirs, files in os.walk(path):
+        for fn in files:
+            full = os.path.join(root, fn)
+            digest = _content_hash(full)
+            if digest is None:
+                continue
+            entries[os.path.relpath(full, path)] = digest
+    if not entries:
+        return None
+    joined = "\n".join(f"{p}:{h}" for p, h in sorted(entries.items()))
+    return _sha1(joined)
+
+
 def file_fingerprint(path: str) -> str | None:
     """Content-based fingerprint of a source file; None if the file is absent.
 
@@ -192,6 +281,28 @@ def file_fingerprint(path: str) -> str | None:
     if upstream is not None:
         return _sha1(f"upstream:{upstream}")
     return _content_hash(path)
+
+
+@functools.lru_cache(maxsize=128)
+def _shared_fingerprint(path: str) -> str | None:
+    """Fingerprint of a market-wide shared input, memoized by path.
+
+    Shared inputs are byte-identical for every stock, so re-hashing one per
+    stock would cost O(#stocks × file_size).  Memoizing by path hashes each
+    shared input exactly once per process.  The tradeoff (accepted, as for
+    ``feature_code_tree_hash``) is that a mid-process data edit is not re-read
+    — shared data does not change during a build run.
+    """
+    if os.path.isdir(path):
+        return _dir_content_hash(path)
+    return file_fingerprint(path)
+
+
+def _input_fingerprint(name: str, path: str) -> str | None:
+    """Fingerprint for one lineage entry: shared market-wide inputs memoized."""
+    if name in _SHARED_NAMES:
+        return _shared_fingerprint(path)
+    return file_fingerprint(path)
 
 
 def schema_hash(path: str) -> str:
@@ -225,13 +336,23 @@ def config_hash(config: dict) -> str:
 
 
 def source_paths(data_dir: str, code: str) -> dict[str, str]:
-    """Canonical per-channel source file path for a stock."""
+    """Canonical per-channel source file path for a stock.
+
+    Includes per-stock channel files, market-wide snapshot files and the
+    shared market-wide inputs (§十-1) — the latter are identical for every
+    code but must still be fingerprinted so a macro / market-env / industry /
+    sector-mapper / calendar / ETF-flow change invalidates a stale feature.
+    """
     a_shares = os.path.join(data_dir, "a_shares")
     out = {}
     for name, sub in SOURCE_SUBDIRS.items():
         out[name] = os.path.join(a_shares, *sub, f"{code}.parquet")
     for name, rel in SNAPSHOT_FILES.items():
         out[name] = os.path.join(a_shares, *rel)
+    for name, rel in SHARED_FILES.items():
+        out[name] = os.path.join(data_dir, *rel)
+    for name, rel in SHARED_DIRS.items():
+        out[name] = os.path.join(data_dir, *rel)
     return out
 
 
@@ -241,7 +362,7 @@ def channels_and_source_files(
     """Per-channel status + per-channel fingerprint for a fresh manifest."""
     channels, source_files = {}, {}
     for name, path in source_paths(data_dir, code).items():
-        fp = file_fingerprint(path)
+        fp = _input_fingerprint(name, path)
         source_files[name] = {"hash": fp}
         channels[name] = "complete" if fp is not None else "missing_optional"
     source_files["daily"]["range"] = [start, end]
@@ -275,6 +396,7 @@ def make_manifest(
         "stock_code": code,
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "git_commit": commit,
+        "feature_code_tree_hash": feature_code_tree_hash(),
         "config_hash": cfg_hash,
         "feature_schema_hash": schema_hash(output_path),
         "horizon": config.get("horizon"),
@@ -310,6 +432,21 @@ def manifest_matches(
         m.get("seq_len") == config.get("seq_len"),
     ]):
         return False
+    # §十-1: a manifest written before shared inputs were fingerprinted cannot
+    # vouch for them — rebuild to record complete lineage.  Without this, a
+    # macro / calendar / ETF-flow change would silently keep old features valid.
+    missing_shared = _SHARED_NAMES - set((m.get("source_files") or {}).keys())
+    if missing_shared:
+        return False
+    if (
+        m.get("git_commit") == "unknown"
+        and m.get("feature_code_tree_hash")
+        and m["feature_code_tree_hash"] != feature_code_tree_hash()
+    ):
+        # §十-2: outside a git repo both sides record git_commit=unknown, so
+        # the git check above passes regardless of code version — only the
+        # feature code-tree hash can tell a changed build from an unchanged one.
+        return False
     # start/end are NOT part of config_hash (build and training resolve them
     # differently) — they are recorded as the daily source range and compared
     # here so a date-window change still invalidates the cache (§十一-3).
@@ -320,6 +457,6 @@ def manifest_matches(
         path = source_paths(data_dir, code).get(name)
         if path is None:
             continue
-        if rec.get("hash") != file_fingerprint(path):
+        if rec.get("hash") != _input_fingerprint(name, path):
             return False
     return True

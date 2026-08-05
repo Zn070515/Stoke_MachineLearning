@@ -113,7 +113,11 @@ SPARSE_NONZERO_RATIO = 0.005
 
 # Gate's own version, recorded in every report so a consuming run (train_panel's
 # required quality-gate check, §六-2) can verify it reviewed THIS gate.
-QUALITY_GATE_VERSION = "1.0"
+# 2.0 (§七.2/§七.3/§七.4): content-aware dataset fingerprint + explicit run
+# scope/sample fields + always-full manifest/contract scan.  Any semantic change
+# to what PASS means MUST bump this — a consuming run refuses a gate whose
+# semantics it can't name.
+QUALITY_GATE_VERSION = "2.0"
 
 # Frozen formal-research profile (§六-4).  The bootstrap defaults are fine for
 # dev, but a 5530-stock research run must clear these floors: readable stocks
@@ -230,13 +234,15 @@ def contract_version() -> str:
 def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
     """Deterministic content-aware hash over the required dataset directories.
 
-    Hashes each parquet's name + size + mtime_ns (never reads file contents),
-    so any dataset a training run consumes that changed after the gate PASS —
-    a rebuild, a partial overwrite, an incremental download — flips the digest
-    and train_panel's report-match check fails (§六-2).  ``datasets`` resolve
-    against ``root`` explicitly (NOT the module-level dir globals), so a
-    consuming script that imports this function hashes the root it actually
-    reads, not the gate's last --data-dir.
+    §七.3: hashes the parquet file BYTES (streamed, never trusting size/mtime),
+    so a same-size replacement that preserves mtime_ns still flips the digest —
+    name+size+mtime hashing let an in-place overwrite of identical size/mtime
+    slip past.  Any dataset a training run consumes that changed after the gate
+    PASS — a rebuild, a partial overwrite, an incremental download, a
+    re-adjustment — flips the digest and train_panel's report-match check fails
+    (§六-2).  ``datasets`` resolve against ``root`` explicitly (NOT the
+    module-level dir globals), so a consuming script that imports this function
+    hashes the root it actually reads, not the gate's last --data-dir.
     """
     def _resolve(name: str) -> Path:
         if name == "daily":
@@ -246,6 +252,22 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
         if name == "features_panel":
             return Path(root) / "features_panel"
         return Path(root) / "a_shares" / "daily"
+
+    def _hash_file(fp: Path, h) -> None:
+        # Stream the raw bytes in bounded chunks: a content-aware fingerprint
+        # cannot trust stat() metadata, which an in-place same-size rewrite
+        # preserves verbatim.  Unreadable files hash a marker so a corrupt /
+        # permission-blocked file still changes the digest from "absent".
+        try:
+            with open(fp, "rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except OSError:
+            h.update(fp.name.encode("utf-8"))
+            h.update(b":unreadable;")
 
     h = hashlib.sha1()
     for ds in sorted(datasets):
@@ -259,17 +281,10 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
             h.update(b";")
             continue
         for fp in sorted(d.glob("*.parquet")):
-            try:
-                st = fp.stat()
-                h.update(fp.name.encode("utf-8"))
-                h.update(b":")
-                h.update(str(st.st_size).encode("utf-8"))
-                h.update(b":")
-                h.update(str(st.st_mtime_ns).encode("utf-8"))
-                h.update(b";")
-            except OSError:
-                h.update(fp.name.encode("utf-8"))
-                h.update(b":stat-error;")
+            h.update(fp.name.encode("utf-8"))
+            h.update(b":")
+            _hash_file(fp, h)
+            h.update(b";")
     return h.hexdigest()[:16]
 
 
@@ -737,9 +752,15 @@ def check_contract_schema(sample: int) -> CheckResult:
     the storage/downloader layers share one source of truth.  The trading-day
     set is always supplied (never opt-in), so official holidays are caught, not
     just weekends.
+
+    §七.2: this check is ALWAYS full-scan — the ``sample`` argument is ignored.
+    A sampled schema audit could miss a corrupt file that a formal training run
+    then consumes; the reviewer's floor for a non-full run is "at least full
+    manifest/contract + sampled deep feature audit", and contract conformance is
+    the cheapest full-coverage layer worth enforcing unconditionally.
     """
     res = CheckResult("contract_schema", True, "")
-    files = _sample_files(sorted(glob.glob(str(DAILY_DIR / "*.parquet"))), sample)
+    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
     res.files_scanned = len(files)
     contract = get_contract("daily_equity")
     for fp in files:
@@ -787,9 +808,13 @@ def check_manifest(sample: int) -> CheckResult:
     after an in-place edit, a partial write or a re-adjustment — fails here, so
     the gate independently enforces the §四-4 division rather than trusting
     "file exists".
+
+    §七.2: this check is ALWAYS full-scan — the ``sample`` argument is ignored
+    (a manifest gap in a skipped file is a silently unverifiable range claim).
+    The sidecar is a few KB per stock, so full coverage costs little.
     """
     res = CheckResult("manifest", True, "")
-    files = _sample_files(sorted(glob.glob(str(DAILY_DIR / "*.parquet"))), sample)
+    files = sorted(glob.glob(str(DAILY_DIR / "*.parquet")))
     res.files_scanned = len(files)
     # Storage root is derived from the daily dir the gate is actually scanning,
     # so a --data-dir redirect validates the same root (not a hardcoded data/).
@@ -918,6 +943,17 @@ def main():
 
     passed = all(r.passed for r in results)
     os.makedirs(args.output, exist_ok=True)
+    # §七.2: record the run's audit scope so a consumer can tell a full scan
+    # from a --quick sample.  manifest/contract_schema are always full-scan
+    # (see their docstrings), so formal training can accept a sampled run only
+    # when those two really covered every file — the reviewer's "at least full
+    # manifest/contract + sampled deep feature audit" floor.  A consumer reads
+    # manifest_contract_full_scan to prove that half before trusting a sample.
+    total_daily = len(glob.glob(str(DAILY_DIR / "*.parquet")))
+    full_audit = [r for r in results if r.name in ("manifest", "contract_schema")]
+    manifest_contract_full_scan = bool(full_audit) and all(
+        r.files_scanned == total_daily for r in full_audit
+    )
     # §六-2: a consuming run (train_panel) must be able to verify this report
     # really covers the data it reads — gate version, data root, calendar +
     # contract fingerprints, the required-dataset list and the run-level
@@ -932,6 +968,10 @@ def main():
         "contract_version": contract_version(),
         "required_datasets": list(REQUIRED_DATASETS),
         "profile": args.profile,
+        "scope": "full" if sample == 0 else "sample",
+        "sample_size": sample,
+        "sample_seed": SAMPLE_SEED,
+        "manifest_contract_full_scan": manifest_contract_full_scan,
         "data_manifest_hash": dataset_fingerprint(A_SHARES.parent, REQUIRED_DATASETS),
         "checks": [
             {

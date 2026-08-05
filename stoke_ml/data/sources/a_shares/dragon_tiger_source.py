@@ -5,6 +5,7 @@ import time
 import pandas as pd
 
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.codes import normalize_stock_code_series
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class DragonTigerSource:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
         if "stock_code" in df.columns:
-            df["stock_code"] = df["stock_code"].astype(str).str.replace(".0", "").str.zfill(6)
+            df["stock_code"] = normalize_stock_code_series(df["stock_code"])
 
         # Ensure numeric columns (only those present)
         for col in ["buy_amount", "sell_amount", "net_amount"]:

@@ -15,6 +15,7 @@ import json
 import os
 
 import numpy as np
+import pandas as pd
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -256,3 +257,149 @@ def test_experiment_version_embeds_calendar_freeze(tp, tmp_path):
     assert len(ver["calendar_artifact_hash"]) == 16
     assert ver["verified_until"] == "2026-12-31"
     assert ver["calendar_source"]
+
+
+# ── _require_universe_artifacts (§P0-7) ────────────────────────────────
+
+def _write_universe_artifacts(root, *, membership=False, delisted=False, ipo=False):
+    base = root / "a_shares"
+    if membership:
+        d = base / "index_constituents_hist"
+        d.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"stock_code": ["600000"], "index_code": ["000300"],
+                      "in_date": [pd.Timestamp("2015-01-31")],
+                      "out_date": [pd.NaT]}).to_parquet(d / "membership.parquet")
+    if delisted:
+        d = base / "universe"
+        d.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"公司代码": ["000002"],
+                      "暂停上市日期": [pd.Timestamp("2015-06-30")]}).to_parquet(
+            d / "delisted.parquet")
+    if ipo:
+        d = base / "universe"
+        d.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"stock_code": ["000001"],
+                      "list_date": [pd.Timestamp("2000-01-01")]}).to_parquet(
+            d / "ipo.parquet")
+
+
+def test_formal_missing_membership_blocks_csi_universe(tp, tmp_path):
+    """§P0-7: csi300 with no membership.parquet must REFUSE to start in formal
+    mode — the per-day membership gate would silently no-op into the historical
+    union, measuring the wrong task."""
+    _write_universe_artifacts(tmp_path, delisted=True)
+    with pytest.raises(SystemExit):
+        tp._require_universe_artifacts(str(tmp_path), "csi300", formal=True)
+
+
+def test_formal_missing_delist_records_blocks_every_universe(tp, tmp_path):
+    """§P0-7: delisting records feed the force-sell exit policy, so a formal
+    run with no delisted.parquet must fail even for the default random
+    universe."""
+    _write_universe_artifacts(tmp_path, ipo=True)
+    with pytest.raises(SystemExit):
+        tp._require_universe_artifacts(str(tmp_path), "random", formal=True)
+
+
+def test_formal_missing_ipo_blocks_all_universe(tp, tmp_path):
+    """§P0-7: the `all` universe merges delisted stocks via IPO records; without
+    them the survivorship-free merge is fake, so formal mode must fail."""
+    _write_universe_artifacts(tmp_path, delisted=True)
+    with pytest.raises(SystemExit):
+        tp._require_universe_artifacts(str(tmp_path), "all", formal=True)
+
+
+def test_exploratory_missing_artifact_degrades_without_exit(tp, tmp_path):
+    """§P0-7: exploratory (--no-formal) may proceed with a degraded gate — the
+    run is explicitly marked, not silently treated as complete."""
+    _write_universe_artifacts(tmp_path, delisted=True)
+    tp._require_universe_artifacts(str(tmp_path), "csi300", formal=False)
+
+
+def test_formal_all_artifacts_present_passes(tp, tmp_path):
+    _write_universe_artifacts(tmp_path, membership=True, delisted=True, ipo=True)
+    tp._require_universe_artifacts(str(tmp_path), "csi300", formal=True)
+    tp._require_universe_artifacts(str(tmp_path), "all", formal=True)
+
+
+def test_empty_membership_counts_as_missing(tp, tmp_path):
+    """§P0-7: an EMPTY membership.parquet is as silent a no-op as a missing one
+    — formal mode must treat it as missing too."""
+    d = tmp_path / "a_shares" / "index_constituents_hist"
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=["stock_code", "index_code", "in_date", "out_date"]).to_parquet(
+        d / "membership.parquet")
+    _write_universe_artifacts(tmp_path, delisted=True)
+    with pytest.raises(SystemExit):
+        tp._require_universe_artifacts(str(tmp_path), "csi500", formal=True)
+
+
+# ── §八.3 gate labeling + strict-index-training ────────────────────────
+
+def test_gate_inner_train_membership_ands_into_entry_mask(tp):
+    """§八.3 strict mode: per-day membership ANDs into the inner-train
+    entry_eligible_mask; both the stock's own eligibility and membership must
+    be True for the sample to stay trainable (only True&True survives).  mem is
+    the FULL panel grid (rows index into it); rows/cols pull the fold's
+    submatrix."""
+    inner = {"entry_eligible_mask": np.ones((3, 5), dtype=bool)}
+    mem = np.zeros((12, 5), dtype=bool)
+    mem[7] = [True, True, False, False, True]    # off-member mid-window
+    mem[9] = [False, True, True, True, True]     # not a member day 0
+    mem[11] = [True, True, True, True, True]     # always a member
+    tp._gate_inner_train_membership(
+        inner, mem, rows=np.array([7, 9, 11]), cols=np.arange(5))
+    # Entry mask is AND of all-True with the selected membership rows.
+    assert inner["entry_eligible_mask"].tolist() == [
+        [True, True, False, False, True],
+        [False, True, True, True, True],
+        [True, True, True, True, True],
+    ]
+
+
+def test_gate_inner_train_membership_never_restores_disqualified(tp):
+    """Membership is ANDed, never ORed: a stock already disqualified by the
+    pipeline (entry_eligible_mask False) stays False even if it IS a member."""
+    inner = {"entry_eligible_mask": np.array([
+        [True, True, True],
+        [False, False, False],   # stock 1 already excluded everywhere
+    ])}
+    mem = np.ones((2, 3), dtype=bool)
+    tp._gate_inner_train_membership(
+        inner, mem, rows=np.array([0, 1]), cols=np.arange(3))
+    assert inner["entry_eligible_mask"][1].tolist() == [False, False, False]
+    assert inner["entry_eligible_mask"][0].tolist() == [True, True, True]
+
+
+def test_gate_inner_train_membership_row_col_subselection(tp):
+    """rows/cols must pick the right submatrix from the full grid — a fold that
+    keeps only some stocks (rows) and some inner-train columns (cols) gets
+    exactly the corresponding membership cells, aligned to the fold's own
+    row/column order."""
+    mem = np.full((4, 6), False, dtype=bool)
+    mem[1, 2] = True   # (grid row 1, grid col 2) is the only member cell
+    inner = {"entry_eligible_mask": np.ones((2, 3), dtype=bool)}
+    tp._gate_inner_train_membership(
+        inner, mem, rows=np.array([0, 1]), cols=np.array([2, 3, 4]))
+    # inner row 0 ← grid row 0 (no members), inner row 1 ← grid row 1:
+    # grid col 2 → inner col 0 is True, rest False.
+    assert inner["entry_eligible_mask"].tolist() == [
+        [False, False, False],
+        [True, False, False],
+    ]
+
+
+def test_gate_descriptions_default_vs_strict(tp):
+    """§八.3 summary labeling: default trains on the broad union (ungated)
+    while evaluation gates 未退市 (+ membership when consumed); strict mode
+    gates the train loss by per-day membership."""
+    # csi universe consumes membership; strict off → train union.
+    assert tp._gate_descriptions(True, False) == (
+        "not_delisted + per-day-membership", "union (ungated)")
+    # csi universe consumes membership; strict on → train membership-gated.
+    assert tp._gate_descriptions(True, True) == (
+        "not_delisted + per-day-membership", "per-day-membership")
+    # non-membership universe (all/stratified) → eval is not_delisted only;
+    # strict has no membership to gate, so train stays union.
+    assert tp._gate_descriptions(False, False) == ("not_delisted", "union (ungated)")
+    assert tp._gate_descriptions(False, True) == ("not_delisted", "union (ungated)")

@@ -5,6 +5,8 @@ import time
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code, normalize_stock_code_series
+
 logger = logging.getLogger(__name__)
 
 # AKShare internally calls requests.get() without a timeout parameter,
@@ -59,7 +61,7 @@ class NorthboundSource:
                         time.sleep(1)
             if df is not None and not df.empty:
                 df = self._normalize(df)
-                df["stock_code"] = str(code).replace(".0", "").zfill(6)
+                df["stock_code"] = normalize_stock_code(code)
                 if "date" in df.columns:
                     df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
                 if not df.empty:
@@ -120,7 +122,7 @@ class NorthboundSource:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
         if "stock_code" in df.columns:
-            df["stock_code"] = df["stock_code"].astype(str).str.replace(".0", "").str.zfill(6)
+            df["stock_code"] = normalize_stock_code_series(df["stock_code"])
 
         for col in ["north_hold_pct", "north_net_buy"]:
             if col in df.columns:

@@ -1,38 +1,121 @@
 name: ci
 
-# Minimal CI (§十八-4): compileall → docs consistency → fast pytest →
-# production smoke. Mirrors scripts/maintenance/current/ci.py so the local
+# Parallel CI split (§十三-4) with a committed `uv.lock` (§十三-3). PRs / master
+# pushes run the three fast jobs — core-fast, storage-parquet, ml — each
+# installing only the dependency groups its slice needs, so a PR no longer
+# pulls BERTopic / Playwright. The heavy stacks run nightly (and on demand via
+# workflow_dispatch): slow-nightly (-m slow, full deps) and optional-online
+# (-m network, online stack). All installs go through `uv sync --frozen`
+# against the committed lockfile, so every job runs the exact pinned versions —
+# the same repo installed in different months cannot drift (§十三-3). pyproject.toml
+# remains the single source of truth; `uv lock` regenerates uv.lock after any
+# dependency change. Mirrors scripts/maintenance/current/ci.py so the local
 # pre-commit pass and the remote run cannot diverge.
 on:
   push:
     branches: [master]
   pull_request:
+  schedule:
+    # nightly ~02:37 CST (18:37 UTC, off :00/:30 to avoid fleet collisions)
+    - cron: '37 18 * * *'
+  workflow_dispatch:
 
 jobs:
-  check:
+  core-fast:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     env:
       PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
-
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install dependencies (pyproject = single source of truth)
-        run: |
-          pip install --upgrade pip
-          pip install -e ".[ml,nlp,online,analysis,dev,data-adapters]"
-
+      - name: Install core deps (uv sync --frozen, uv.lock = pinned)
+        run: uv sync --frozen --extra dev
       - name: compileall
-        run: python -m compileall -q stoke_ml scripts tests
-
+        run: uv run python -m compileall -q stoke_ml scripts tests
       - name: docs consistency
-        run: python scripts/production/check_docs_consistency.py
+        run: uv run python scripts/production/check_docs_consistency.py
+      - name: lockfile freshness
+        run: uv lock --check
+      - name: pytest (utils + evaluation)
+        run: uv run python -m pytest tests/utils tests/evaluation -q
 
-      - name: fast pytest
-        run: python -m pytest tests/ -q
+  storage-parquet:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install data deps (uv sync --frozen, uv.lock = pinned)
+        run: uv sync --frozen --extra dev --extra data-adapters
+      - name: pytest (tests/data — storage, parquet, manifests, sources)
+        run: uv run python -m pytest tests/data -q
 
-      - name: production smoke
-        run: python -m pytest tests/models/panel/test_production_smoke.py -q
+  ml:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ml/nlp/ta deps (uv sync --frozen, uv.lock = pinned)
+        run: uv sync --frozen --extra dev --extra ml --extra nlp --extra ta --extra data-adapters
+      # The non-slow production smoke lives here (tests/models covers it);
+      # the slow-marked smoke tests run in slow-nightly. No standalone smoke
+      # step — that would re-run the same tests (§十三-4).
+      - name: pytest (models + features + preprocessing + scripts)
+        run: uv run python -m pytest tests/models tests/features tests/preprocessing tests/scripts -q
+
+  slow-nightly:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install full deps (uv sync --frozen, uv.lock = pinned)
+        run: uv sync --frozen --extra dev --extra ml --extra nlp --extra online --extra analysis --extra ta --extra data-adapters
+      - name: pytest (slow)
+        run: uv run python -m pytest -m slow tests/ -q
+
+  optional-online:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install online deps (uv sync --frozen, uv.lock = pinned)
+        run: uv sync --frozen --extra dev --extra online --extra data-adapters
+      - name: pytest (network)
+        run: uv run python -m pytest -m network tests/ -q

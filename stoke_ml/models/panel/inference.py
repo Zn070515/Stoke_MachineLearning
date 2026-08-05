@@ -15,14 +15,17 @@ Newey-West / bootstrap machinery in evaluate.py:
   inflates the apparent Sharpe (data snooping).  DSR deflates the benchmark by
   the multiplicity N and the cross-trial dispersion of the tried Sharpes.
 
-* **SPA / Reality Check (RC)** — Hansen (2005), a recentered, more powerful
-  variant of White's (2000) Reality Check.  Is the *best of K* strategies
-  genuinely better than a benchmark, after accounting for the fact that the
-  best one was picked?  A block bootstrap over the (strategy − benchmark)
-  differences produces a p-value for the max-mean statistic, recentered by the
-  positive part of each sample mean so the null (no edge) is actually imposed
-  — White's un-recentered RC re-centers the bootstrap at the observed mean and
-  is severely underpowered for a genuine edge.
+* **Block-bootstrap max-mean reality check** — a recentered variant of White's
+  (2000) Reality Check.  Is the *best of K* strategies genuinely better than a
+  benchmark, after accounting for the fact that the best one was picked?  A
+  block bootstrap over the (strategy − benchmark) differences produces a
+  p-value for the max-mean statistic, recentered by the positive part of each
+  sample mean so the null (no edge) is actually imposed — White's un-recentered
+  RC re-centers the bootstrap at the observed mean and is severely underpowered
+  for a genuine edge.  It is deliberately NOT labelled a full Hansen (2005) SPA:
+  it lacks the complete studentization and nuisance-parameter treatment of
+  Hansen's statistic, so a high-volatility strategy can dominate the max-mean
+  statistic (§十二.4).
 
 All Sharpe math is on the *per-period* (daily) scale internally — skewness /
 kurtosis are computed from the same daily returns the Sharpe comes from, so the
@@ -66,6 +69,51 @@ def _moments(
     sk = float(skew(returns, bias=False))
     ku = float(kurtosis(returns, fisher=False, bias=False))
     return sr, sk, ku, n
+
+
+def effective_sample_size(
+    returns: np.ndarray,
+    max_lag: int | None = None,
+    horizon: int = 1,
+) -> float:
+    """Newey-West / Lo (2002) effective sample size under serial correlation.
+
+    The iid Sharpe-estimator standard error overstates precision when daily
+    returns share overlapping holdings or volatility clustering, so PSR/DSR
+    probabilities computed with ``n = len(returns)`` come out optimistic
+    (§十二.5).  Returns ``n / VIF`` where the variance-inflation factor uses the
+    Bartlett-kernel (Newey-West) truncation
+
+        VIF = 1 + 2 Σ_{k=1}^{L} (1 − k/(L+1)) ρ̂_k,
+
+    i.e. the long-run-variance correction for the sample-mean estimator scaled
+    to sample-count units.  ``max_lag`` defaults to the block-length convention
+    used elsewhere in this module (``max(2, ⌈n^{1/3}⌉, horizon)``), capped at
+    n−1.  Degenerate input is left uncorrected: n < 4 or zero variance returns
+    n (nothing to adjust); VIF ≤ 1 (no positive autocorrelation) returns n.
+    The result is floored at 3.0 so an extreme-viscosity series still yields a
+    (very wide) SE rather than tripping the callers' ``n < 3 → NaN`` guard.
+    """
+    arr = _as_1d(returns)
+    n = int(arr.size)
+    if n < 4:
+        return float(n)
+    std = float(arr.std(ddof=1))
+    if std < 1e-12:
+        return float(n)
+    L = max_lag or max(2, int(np.ceil(n ** (1 / 3))), int(horizon))
+    L = min(L, n - 1)
+    mu = float(arr.mean())
+    c0 = float(np.dot(arr - mu, arr - mu)) / n
+    if c0 < 1e-16:
+        return float(n)
+    vif = 1.0
+    for k in range(1, L + 1):
+        ck = float(np.dot(arr[:-k] - mu, arr[k:] - mu)) / n
+        vif += 2.0 * (1.0 - k / (L + 1)) * (ck / c0)
+    if vif <= 1.0:
+        return float(n)
+    return max(float(n) / vif, 3.0)
 
 
 def _sharpe_se2(sr_daily: float, sk: float, ku: float, n: int) -> float:
@@ -177,7 +225,12 @@ def compute_deflated_sharpe(
         if n < 3:
             return float("nan")
     sr_ann = sr_daily * math.sqrt(252.0 / horizon)
-    vals = [float(x) for x in (trial_sharpes or []) if np.isfinite(x)]
+    # `or []` breaks on np.ndarray (ambiguous truth value); always ravel to a
+    # flat finite list (§十二.7).
+    vals = [float(x)
+            for x in ([] if trial_sharpes is None
+                      else np.asarray(trial_sharpes).ravel())
+            if np.isfinite(x)]
     if len(vals) >= 2:
         sr_var = float(np.var(np.array(vals), ddof=1))
     else:
@@ -191,7 +244,7 @@ def compute_deflated_sharpe(
     return float(norm.cdf(z))
 
 
-def spa_test(
+def block_bootstrap_max_mean(
     strategy_returns: np.ndarray,
     benchmark_returns: np.ndarray,
     n_boot: int = 2000,
@@ -199,7 +252,14 @@ def spa_test(
     horizon: int = 1,
     seed: int = 42,
 ) -> dict:
-    """Hansen's (2005) SPA p-value for the best-of-K strategies vs a benchmark.
+    """Block-bootstrap max-mean reality-check p-value for best-of-K strategies.
+
+    §十二.4: this is deliberately NOT called a full Hansen (2005) SPA.  It is a
+    recentered, un-studentized max-mean Reality Check: it performs the block
+    bootstrap but skips Hansen's complete studentization and nuisance-parameter
+    treatment, so a high-volatility strategy can dominate the max-mean
+    statistic.  Read it as a selection-robustness screen, not a calibrated SPA
+    p-value.
 
     The K strategies are evaluated on the SAME calendar days, so the excess
     (strategy − benchmark) rows are resampled as BLOCKS — all K together — to

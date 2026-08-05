@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.codes import normalize_stock_code
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ class FundamentalStorage:
         ]
 
         result = daily_df.copy()
-        result["stock_code"] = str(stock_code).zfill(6)
+        result["stock_code"] = normalize_stock_code(stock_code)
 
         for col in value_cols:
             result[col] = np.nan

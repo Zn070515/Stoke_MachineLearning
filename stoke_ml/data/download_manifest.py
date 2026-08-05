@@ -9,7 +9,7 @@ import datetime as dt
 import json
 import os
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 
 def default_path(data_dir: str) -> str:
@@ -81,7 +81,10 @@ def write_manifest(
     presence.  `missing` (requested but not complete) is the number that
     matters: a parquet on disk does not mean the history is complete, so
     `all_complete` only holds when every requested stock is validated AND
-    range-covered (§五-4).
+    range-covered (§五-4).  The ``requested`` and ``complete`` lists are
+    persisted so "is the ENTIRE requested universe complete" is auditable after
+    the fact — a run that skipped already-complete stocks still reports the
+    full request (§P0-4).
     """
     requested_sorted = sorted(set(requested))
     failed_sorted = sorted(set(failed))
@@ -100,6 +103,8 @@ def write_manifest(
         "missing_count": len(missing),
         "failed": failed_sorted,
         "missing": missing,
+        "requested": requested_sorted,
+        "complete": sorted(complete),
         "all_complete": len(missing) == 0,
     }
     parent = os.path.dirname(path)

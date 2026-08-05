@@ -46,6 +46,38 @@ class UncertaintyLoss(nn.Module):
         return total
 
 
+class FixedTaskWeights(nn.Module):
+    """Fixed equal-weight multi-task loss — the UncertaintyLoss ablation.
+
+    Kendall-style learned log-variances are one weighting scheme; fixing all
+    active tasks to equal weight tests whether the learned re-weighting is
+    where performance comes from (§十一.3).  Carries NO learnable parameters
+    (nothing in the optimizer's loss group), and matches UncertaintyLoss's
+    ``forward(losses, task_active_mask)`` signature so train.py swaps one for
+    the other without branching.
+    """
+
+    def __init__(self, num_tasks: int = 3):
+        super().__init__()
+        self.num_tasks = num_tasks
+
+    def forward(
+        self,
+        task_losses: list[torch.Tensor],
+        task_active_mask: list[bool] | None = None,
+    ) -> torch.Tensor:
+        assert len(task_losses) == self.num_tasks
+        if task_active_mask is None:
+            task_active_mask = [True] * self.num_tasks
+        active = [l for l, a in zip(task_losses, task_active_mask) if a]
+        if not active:
+            return torch.zeros(
+                (), device=task_losses[0].device, dtype=task_losses[0].dtype)
+        # Equal weight: the mean over active tasks, not their sum, so the
+        # combined loss scale is independent of how many tasks are enabled.
+        return torch.stack(active).sum() / len(active)
+
+
 class AdjMSELoss(nn.Module):
     """Sign-aware MSE — penalises wrong-sign predictions more heavily.
 

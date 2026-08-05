@@ -11,6 +11,7 @@ Artifacts (args.json, universe_resolved.txt, universe_used.txt, summary.json)
 are saved to --outdir (default reports/experiments/<timestamp>).
 """
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import io
@@ -26,7 +27,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from stoke_ml.config import load_config
+from stoke_ml.config import get_project_root, load_config
 from stoke_ml.data.calendar import (
     TradingCalendar,
     build_calendar_frame,
@@ -57,6 +58,7 @@ from stoke_ml.models.panel.evaluate import (
 from stoke_ml.models.panel.inference import (
     compute_deflated_sharpe,
     compute_psr,
+    effective_sample_size,
 )
 from scripts.production.data_quality_gate import (
     QUALITY_GATE_VERSION, contract_version, dataset_fingerprint,
@@ -136,6 +138,18 @@ def _require_quality_gate(
         )
     if report.get("contract_version") != contract_version():
         problems.append("daily contract changed since the gate ran")
+    # §七.2: a sampled-scope report is only acceptable for a formal run when
+    # the two cheap-to-scan-audit layers (manifest + contract) really covered
+    # every file — the reviewer's "at least full manifest/contract + sampled
+    # deep feature audit" floor.  A sampled report that skipped them means the
+    # gate never saw whole files it could have refused on.
+    if (report.get("scope") == "sample"
+            and not report.get("manifest_contract_full_scan")):
+        problems.append(
+            "sample-scope gate without a full manifest/contract scan — §七.2 "
+            "requires formal training to consume at least a full "
+            "manifest+contract audit"
+        )
     consumed = {"daily"}
     if prebuilt_dir:
         name = os.path.basename(os.path.normpath(prebuilt_dir))
@@ -549,6 +563,235 @@ def _mask_stocks(data: dict, keep: np.ndarray) -> dict:
     return out
 
 
+def _require_universe_artifacts(
+    data_dir: str, universe_name: str, formal: bool,
+) -> None:
+    """§P0-7: a FORMAL experiment must never silently no-op its universe gates.
+
+    ``exploratory`` runs (``--no-formal``) may degrade with a prominent marker;
+    a formal run REFUSES to start when a gate's required artifact is missing:
+
+      - csi300/csi500/csi800 require PIT ``membership.parquet`` intervals
+        (without them the "per-day member" gate collapses to the historical
+        union — the exact silent no-op §P0-7 calls out);
+      - every universe requires delisting records (``delisted.parquet``) — the
+        sleeve's force-sell policy (§七-1) is part of the executed task;
+      - ``all`` additionally requires IPO records so the delisted merge is real.
+
+    Returns normally when everything present; exits 1 with a precise list when
+    a required artifact is missing in formal mode.
+    """
+    missing: list[str] = []
+
+    def _present(*relparts: str) -> bool:
+        path = os.path.join(data_dir, *relparts)
+        if not os.path.isfile(path):
+            return False
+        try:
+            return not pd.read_parquet(path).empty
+        except Exception as exc:  # noqa: BLE001 — a corrupt artifact is as bad as absent
+            logger.warning("universe artifact unreadable: %s (%s)", path, exc)
+            return False
+
+    if universe_name in ("csi300", "csi500", "csi800"):
+        if not _present("a_shares", "index_constituents_hist", "membership.parquet"):
+            missing.append("membership.parquet (PIT index-membership gate)")
+    if not _present("a_shares", "universe", "delisted.parquet"):
+        missing.append("delisted.parquet (delisting force-sell policy)")
+    if universe_name == "all":
+        if not _present("a_shares", "universe", "ipo.parquet"):
+            missing.append("ipo.parquet (delisted-stock universe merge)")
+
+    if not missing:
+        return
+    if formal:
+        logger.error(
+            "universe=%s: required PIT artifacts missing — %s.  A formal "
+            "experiment must NOT silently no-op its universe gates (that would "
+            "measure a different task than intended); rerun with --no-formal "
+            "for an explicitly-degraded exploratory run (§P0-7).",
+            universe_name, "; ".join(missing),
+        )
+        sys.exit(1)
+    logger.warning(
+        "[exploratory] universe=%s: %s missing — universe gate DEGRADED "
+        "(silent no-op); formal runs refuse to start in this state (§P0-7).",
+        universe_name, "; ".join(missing),
+    )
+
+
+def _fold_universe_gates(
+    global_dates: np.ndarray,
+    panel_stocks: list[str],
+    universe_name: str,
+    data_dir: str,
+    formal: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, pd.DataFrame]:
+    """§七-1/§七-3: compute the whole-run universe gates ONCE, before the fold loop.
+
+    Both the deep model (train_panel.py) and the baselines
+    (train_baselines_panel.py) must consume the SAME candidate-pool gates
+    (§P0-5), so this is the single shared construction.  Returns, all in the
+    panel's (N_stocks, T) grid space:
+
+      nd_mask       — 未退市: blocks ENTRY from a known delisting column on.
+      mem_mask      — per-day index membership (in_date <= date < out_date) for
+                      csi300/csi500/csi800; None for other universes so fold
+                      gates become a no-op for the "all A" / stratified studies.
+      delist_global — per-stock delisting day in global panel-column space
+                      (each fold's delist_day for the sleeve simulator).
+      universe_status — the raw universe frame; returned so callers can hash
+                      it into their artifacts (§P0-6 universe_status_hash).
+
+    Missing universe parquets → empty status → delist_global all -1 and
+    nd_mask all True (no force-sell, no entry gate), so a data-dir without
+    records never crashes — the strict formal-mode failure for missing
+    artifacts is enforced here up front (§P0-7).
+    """
+    _require_universe_artifacts(data_dir, universe_name, formal)
+    universe_status = load_universe_status(data_dir)
+    delist_global = delist_global_index(
+        global_dates, universe_status, panel_stocks,
+    )
+    nd_mask = not_delisted_mask(global_dates, panel_stocks, universe_status)
+    universe_index_codes = {
+        "csi300": {"000300"},
+        "csi500": {"000905"},
+        "csi800": {"000300", "000905"},
+    }.get(universe_name, set())
+    mem_mask = None
+    if universe_index_codes:
+        membership_df = load_index_membership(data_dir, sorted(universe_index_codes))
+        if membership_df.empty:
+            logger.warning(
+                "universe=%s: no membership.parquet intervals — per-day "
+                "index-membership gate is a no-op (candidate pool keeps the "
+                "full historical-member union)", universe_name,
+            )
+        else:
+            mem_mask = index_membership_mask(global_dates, panel_stocks, membership_df)
+    return nd_mask, mem_mask, delist_global, universe_status
+
+
+def _apply_candidate_gates(
+    dd: dict,
+    tslice: slice,
+    rows: np.ndarray,
+    nd_mask: np.ndarray,
+    mem_mask: np.ndarray | None,
+) -> None:
+    """§七-3: merge the universe gates into ONE evaluation candidate pool.
+
+    ``dd`` is a fold slice already masked to eligible stocks; ``rows`` maps its
+    row axis back to original panel-stock rows and ``tslice`` maps its columns
+    to global panel columns, so the gates AND into
+    ``dd["decision_eligible_mask"]`` in this fold's row/column space and
+    ``_candidate_pool`` picks them up automatically.  §八.3: inner_train is by
+    default left ungated — the model still learns from the broad
+    historical-member union; only what gets RANKED as a tradable candidate is
+    restricted.  ``--strict-index-training`` instead ANDs the per-day
+    membership gate into inner_train's ``entry_eligible_mask`` (the dataset
+    valid_mask) so the training loss matches the evaluation candidate pool.
+    """
+    cols = np.arange(tslice.start, tslice.stop)
+    gate = nd_mask[np.ix_(rows, cols)]
+    if mem_mask is not None:
+        gate = gate & mem_mask[np.ix_(rows, cols)]
+    dd["decision_eligible_mask"] &= gate
+
+
+def _gate_inner_train_membership(
+    inner_train: dict,
+    mem_mask: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+) -> None:
+    """§八.3 strict mode: AND per-day index membership into the inner-TRAIN
+    ``entry_eligible_mask`` (which feeds the dataset valid_mask, the per-sample
+    training-loss mask) so the model learns only from index-member days —
+    matching the evaluation candidate pool.  ``rows`` maps the fold's row axis
+    back to original panel-stock rows and ``cols`` are the inner_train grid
+    columns (both aligned by the fold's slicing order).
+    """
+    inner_train["entry_eligible_mask"] &= mem_mask[np.ix_(rows, cols)]
+
+
+def _gate_descriptions(
+    consumes_membership: bool, strict_index_training: bool,
+) -> tuple[str, str]:
+    """§八.3: human-readable ``(eval_gate, train_gate)`` descriptions for the
+    summary.  eval_gate always gates 未退市, plus per-day membership for
+    universes that consume membership.parquet.  train_gate is the broad
+    historical-member union (ungated) unless strict_index_training gates it by
+    per-day membership.
+    """
+    eval_gate = "not_delisted" + (
+        " + per-day-membership" if consumes_membership else "")
+    train_gate = (
+        "per-day-membership"
+        if strict_index_training and consumes_membership
+        else "union (ungated)"
+    )
+    return eval_gate, train_gate
+
+
+def _fold_delist_day(
+    delist_global: np.ndarray,
+    fold_eligible: np.ndarray,
+    val_start: int,
+    Wp: int,
+) -> np.ndarray:
+    """Delist-day index in the fold's simulation column space.
+
+    Sim column d ↔ global column val_start+d (evaluate_portfolio slices prices
+    at seq_len within the outer_test window starting at val_context_start =
+    val_start - seq_len), so subtract val_start.  Values outside [0, Wp) clamp
+    to -1 — the force-sell never fires within this window.
+    """
+    dd_global = delist_global[fold_eligible]
+    return np.where(
+        (dd_global >= val_start) & (dd_global < val_start + Wp),
+        dd_global - val_start, -1,
+    )
+
+
+def _universe_artifact_hashes(
+    universe_status: pd.DataFrame,
+    data_dir: str,
+    universe_name: str,
+) -> dict:
+    """§P0-6: content hashes of the universe artifacts a run's gates consumed.
+
+    ``universe_status_hash`` covers the delist/list records that drive
+    ``delist_global`` and ``nd_mask``; ``membership_hash`` covers the
+    index-membership intervals that drive ``mem_mask`` for csi300/csi500/csi800
+    (None for universes where membership is not consumed).  Every fold tape and
+    summary embeds these so a later replay can prove it used the SAME universe
+    records — a delist-file or membership edit between runs invalidates the
+    OOS tape instead of passing silently.
+    """
+    status_hash = hashlib.sha1()
+    if universe_status is not None and not universe_status.empty:
+        status_hash.update(universe_status.to_csv(index=False).encode("utf-8"))
+    membership_hash: str | None = None
+    universe_index_codes = {
+        "csi300": {"000300"},
+        "csi500": {"000905"},
+        "csi800": {"000300", "000905"},
+    }.get(universe_name, set())
+    if universe_index_codes:
+        path = os.path.join(
+            data_dir, "a_shares", "index_constituents_hist", "membership.parquet")
+        h = hashlib.sha1()
+        if os.path.isfile(path):
+            h.update(pd.read_parquet(path).to_csv(index=False).encode("utf-8"))
+        membership_hash = h.hexdigest()[:16]
+    return {
+        "universe_status_hash": status_hash.hexdigest()[:16],
+        "membership_hash": membership_hash,
+    }
+
+
 def _cross_sectional_normalize(
     y_arr: np.ndarray,
     mask_arr: np.ndarray,
@@ -654,18 +897,27 @@ def _augment_sequence(
     feat_dropout: float = 0.02,
     rng: np.random.RandomState | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Lightweight time-series augmentation for financial data.
+    """FIXED per-fold corruption pass on a training panel (§十一.1).
 
-    Three independent augmentations:
-    1. Gaussian noise ~ N(0, noise_std) — improves robustness
-    2. Time masking — zero out random contiguous segments (simulates missing data)
-    3. Feature dropout — zero out random feature dimensions
+    This is NOT online, per-sample augmentation.  It corrupts a whole
+    (n_stocks, T, F) block once and returns a fixed copy that every epoch
+    reuses verbatim, so the model never sees re-sampled noise:
 
-    All augmentations are conservative (small magnitudes) to avoid
-    distorting the financial signal.  Gaussian noise is gated by `obs_mask`
-    (True = real observation) so zero-padded history of new listings stays
-    exactly zero instead of gaining fake noise that the model would read as
-    real data.
+    1. Gaussian noise ~ N(0, noise_std) — per-element independent, gated by
+       `obs_mask` (True = real observation) so zero-padded history of new
+       listings stays exactly zero instead of gaining fake noise the model
+       would read as real data.
+    2. Time masking — ONE global contiguous segment is zeroed for EVERY
+       stock in the block (a single ``start``/``mask_len`` shared across the
+       stock axis), not an independent segment per stock.
+    3. Feature dropout — ONE global feature subset is zeroed for EVERY
+       stock (a single boolean mask over the feature axis), not an
+       independent subset per stock.
+
+    Conservative magnitudes are the point: this exists to probe robustness,
+    not to expand the effective sample size.  Because the corruption is
+    global and static across epochs, it is opt-in ablation only and OFF by
+    default in the formal baseline.
     """
     if rng is None:
         rng = np.random.RandomState()
@@ -815,7 +1067,7 @@ def _experiment_version(
     # exactly which model produced it — config change or arch edit flips it.
     model_h = hashlib.sha1()
     model_h.update(repr(config).encode("utf-8"))
-    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _root = str(get_project_root())
     for rel in ("stoke_ml/models/panel/model.py",
                 "stoke_ml/models/panel/vsn.py",
                 "stoke_ml/models/panel/xlstm.py",
@@ -845,37 +1097,193 @@ def _experiment_version(
     }
 
 
-# §十五-1 experiment registry — a durable count of every research run, so the
+# §十五-1 experiment registry — a durable count of every research trial, so the
 # DSR deflation has a defensible N (the number of trials iterated across the
 # project, not just the strategies inside one report).  Lives at a STABLE path
 # (independent of the timestamped outdir) so it accumulates across runs.
-_EXPERIMENT_REGISTRY_PATH = os.path.join(
-    "reports", "experiments", "experiment_registry.json")
+#
+# §十二.6: hardened as a real experiment ledger —
+#   * path is anchored to the project root (a relative path silently breaks
+#     when the script runs from another cwd);
+#   * the append is a read → dedup → atomic-replace guarded by a cross-process
+#     file lock, so two concurrent experiments cannot overwrite each other;
+#   * entries are deduplicated by `experiment_signature` (data + features +
+#     model + universe + horizon + objective): re-running the SAME experiment
+#     into a NEW outdir replaces the old row instead of double-counting;
+#   * a corrupt registry FAILS LOUDLY (never silently returns [] and resets
+#     the DSR trial count).
+_EXPERIMENT_REGISTRY_PATH = str(
+    get_project_root() / "reports" / "experiments" / "experiment_registry.json")
+
+
+# §十一.3 architecture-ablation switchboard.  Each entry maps a human name to
+# PanelConfig field overrides that switch OFF one component of the production
+# architecture, isolating where the model's edge comes from.  All default to
+# the production config, so a run WITHOUT --ablation is the formal baseline.
+_ABLATIONS: dict[str, dict] = {
+    "plain_lstm": {"backbone": "lstm"},
+    "vsn_lstm": {"backbone": "lstm", "use_vsn": True},
+    "xlstm_no_vsn": {"use_vsn": False},
+    "return_only": {"use_dir_head": False, "use_vol_head": False},
+    "no_vol_head": {"use_vol_head": False},
+    "no_dir_head": {"use_dir_head": False},
+    "fixed_task_weights": {"fixed_task_weights": True},
+    "no_ranking": {"use_ranking_loss": False},
+    "no_pit_static": {"use_pit_static": False},
+}
+
+
+def _ablation_desc(config: PanelConfig) -> str:
+    """Human-readable description of the active architecture-ablation switches."""
+    parts = []
+    if config.backbone != "xlstm":
+        parts.append(f"backbone={config.backbone}")
+    if not config.use_vsn:
+        parts.append("no-vsn")
+    if not config.use_dir_head:
+        parts.append("no-dir-head")
+    if not config.use_vol_head:
+        parts.append("no-vol-head")
+    if not config.use_ranking_loss:
+        parts.append("no-ranking")
+    if config.fixed_task_weights:
+        parts.append("fixed-task-weights")
+    if not config.use_pit_static:
+        parts.append("no-pit-static")
+    return ";".join(parts) if parts else "full"
+
+
+def _objective_desc(config: PanelConfig) -> str:
+    """Stable description of the training objective for the trial signature."""
+    return (f"multi-task(direction/return/vol);rank_loss_weight={config.rank_loss_weight}"
+            f";ablation={_ablation_desc(config)}")
+
+
+def _experiment_signature(version: dict, config: PanelConfig,
+                          model_key: str | None = None) -> str:
+    """Content signature of a research trial: the keys the DSR multiplicity must
+    NOT conflate.  Two runs sharing a signature ARE the same experiment (a
+    re-run); differing on any key is a NEW trial (§十二.6).  `model_key` lets a
+    caller override the model identity (e.g. baselines, whose version's
+    model_hash is computed for the deep architecture)."""
+    h = hashlib.sha1()
+    for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
+        h.update(f"{key}={version.get(key) or 'unknown'};".encode("utf-8"))
+    model_hash = model_key if model_key else version.get("model_hash")
+    h.update(f"model_hash={model_hash or 'unknown'};".encode("utf-8"))
+    h.update(f"horizon={config.horizon};".encode("utf-8"))
+    h.update(f"objective={_objective_desc(config)};".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _distinct_trial_count(entries: list[dict],
+                          current_signature: str | None = None) -> int:
+    """DSR multiplicity N: distinct experiments among `entries`, where a prior
+    row whose signature equals `current_signature` is the SAME experiment being
+    re-run (replaced, not counted twice).  Legacy rows without a signature each
+    count as one distinct trial.  `current_signature` None → N counts only the
+    given entries (caller adds its own trials separately)."""
+    sigs = {e.get("experiment_signature")
+            for e in entries if e.get("experiment_signature")}
+    if current_signature is not None:
+        sigs.discard(current_signature)
+    legacy = sum(1 for e in entries if not e.get("experiment_signature"))
+    return len(sigs) + legacy + (1 if current_signature is not None else 0)
+
+
+@contextlib.contextmanager
+def _registry_lock(lock_path: str, timeout_s: float = 60.0,
+                   stale_s: float = 120.0):
+    """Cross-process exclusive lock via an O_CREAT|O_EXCL lockfile.
+
+    The registry critical section (read → dedup → atomic replace) is short, so
+    a lock older than `stale_s` — its writer presumably crashed mid-append — is
+    reclaimed rather than wedging every later run.  Raises TimeoutError if the
+    lock cannot be acquired in time.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({
+                "pid": os.getpid(),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }).encode("utf-8"))
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                stale = time.time() - os.path.getmtime(lock_path) > stale_s
+            except OSError:
+                stale = True
+            if stale:
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"could not acquire experiment-registry lock {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
 
 
 def _load_experiment_registry(path: str) -> list[dict]:
-    """Prior experiment entries; [] when missing or corrupt (never aborts a run)."""
+    """Prior experiment entries; [] only when the registry does not exist yet.
+
+    §十二.6: a corrupt or non-list registry FAILS LOUDLY — silently returning []
+    would reset the DSR trial count and deflate every future run's multiplicity.
+    A missing file (first run) is the one legitimate empty case.
+    """
     if not os.path.isfile(path):
         return []
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(
+            f"experiment registry {path} is corrupt (could not parse JSON): "
+            f"{exc}.  Inspect/repair it before re-running — a fresh registry "
+            "would silently reset the DSR trial count.") from exc
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"experiment registry {path} has an unexpected shape "
+            f"({type(data).__name__}, expected a list of entries).")
+    return data
 
 
 def _append_experiment_registry(path: str, entry: dict) -> None:
-    """Atomically append an entry; an existing row for the same outdir is replaced
-    (a re-run of the same directory must not double-count the trial)."""
-    entries = _load_experiment_registry(path)
-    entries = [e for e in entries if e.get("outdir") != entry.get("outdir")]
-    entries.append(entry)
+    """Atomically append/replace an entry under a cross-process lock.
+
+    An existing row with the same experiment_signature is REPLACED — re-running
+    the same experiment into a NEW outdir is one trial, not two (§十二.6); an
+    existing row for the same outdir is likewise replaced.  The whole
+    read → dedup → atomic-replace happens under `_registry_lock` so concurrent
+    experiments cannot overwrite each other.
+    """
+    sig = entry.get("experiment_signature")
+    outdir = entry.get("outdir")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(entries, f, ensure_ascii=False, indent=2, default=str)
-    os.replace(tmp, path)
+    lock_path = path + ".lock"
+    with _registry_lock(lock_path):
+        entries = _load_experiment_registry(path)
+        kept = [
+            e for e in entries
+            if not (e.get("outdir") == outdir
+                    or (sig and e.get("experiment_signature") == sig))
+        ]
+        kept.append(entry)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(kept, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp, path)
 
 
 def _save_artifacts(
@@ -958,7 +1366,11 @@ def _predict_outer(model, outer_data, config, device) -> np.ndarray | None:
     return preds.reshape(n_stocks, val_ds.n_windows).numpy()
 
 
-def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | None:
+def _replay_continuous_oos(
+    oos_dir: str,
+    n_trials: int | None = None,
+    trial_sharpes: list[float] | None = None,
+) -> dict | None:
     """§十四-4: replay ONE continuous long sleeve account across ALL fold tapes.
 
     Each fold tape is a self-contained grid: (fold stocks, fold signal days,
@@ -982,12 +1394,18 @@ def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | 
     occupy the first columns, so a fold whose window came out shorter than
     `val_len` (gap days) is handled honestly too.
 
-    `delist_day` is intentionally None: the tape stores prices but not the
-    delisting record, so a known-delisted stock degrades to a carried-close
-    UNRESOLVED hold instead of the force-sold DELISTED exit the original
-    per-fold run booked.  The tape is the persisted source of truth for this
-    re-run; the delist force-sell needs the universe record only the live run
-    had.
+    `delist_day` (per-stock, in this fold's sim column space) is persisted in
+    the tape (§P0-6), so this replay maps it onto the union price axis and
+    passes it to `_run_sleeve_sim`: a known-delisted stock is force-sold at the
+    delisting close exactly as the live per-fold run booked — no silent
+    degradation to a carried-close UNRESOLVED hold.
+
+    §十二.2: building the union grid asserts every overlapping price cell is
+    equal within tolerance across the folds that own it (identical real prices,
+    same data version) and that all tapes share the same data_version /
+    universe_status_hash / membership_hash / calendar_hash — a silent
+    overwrite, a delist-file/membership edit, or a calendar-content change
+    between runs fails the replay instead of passing.
 
     Returns the account dict (see `_run_sleeve_sim`), the global price dates,
     union stock codes, ledger, and headline metrics; None when no fold tapes
@@ -1019,10 +1437,37 @@ def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | 
             "horizon": int(z["horizon"]),
             "cost": float(z["cost"]),
             "top_fraction": float(z["top_fraction"]),
+            # §P0-6 tape keys: optional so legacy/test tapes (written without
+            # the delist record) replay with their historical no-force-sell
+            # semantics instead of crashing on a missing key.
+            "delist_day": z["delist_day"] if "delist_day" in z.files else None,
+            "data_version": (str(z["data_version"])
+                             if "data_version" in z.files else None),
+            "universe_status_hash": (str(z["universe_status_hash"])
+                                     if "universe_status_hash" in z.files else None),
+            "membership_hash": (str(z["membership_hash"])
+                                if "membership_hash" in z.files else None),
+            "calendar_hash": (str(z["calendar_hash"])
+                              if "calendar_hash" in z.files else None),
         })
     # fold index grows as val_start walks BACKWARD, so chronological order is
     # the reverse of the lexicographic tape order.
     recs = list(reversed(recs))
+
+    # §十二.2: every fold tape must describe the SAME data + universe records —
+    # a fold re-downloaded mid-run, or a delist-file/membership edit between
+    # runs, would otherwise be silently blended into one continuous account.
+    def _consistent(name: str, values: list) -> None:
+        known = [v for v in values if v is not None]
+        if len(set(known)) > 1:
+            raise ValueError(
+                f"§十二.2: fold tapes disagree on {name}: {sorted(set(known))}")
+
+    _consistent("data_version", [r["data_version"] for r in recs])
+    _consistent("universe_status_hash",
+                [r["universe_status_hash"] for r in recs])
+    _consistent("membership_hash", [r["membership_hash"] for r in recs])
+    _consistent("calendar_hash", [r["calendar_hash"] for r in recs])
 
     union_stocks: list[str] = []
     for r in recs:
@@ -1045,6 +1490,29 @@ def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | 
     for r in recs:
         rows = np.array([row_of[s] for s in r["stocks"]], dtype=int)
         pcols = np.array([pcol_of[d] for d in r["price_dates"]], dtype=int)
+        # §十二.2: a (stock, day) cell owned by two folds MUST carry the same
+        # real price — a silent later-write-overwrites-earlier would hide a
+        # data-version split mid-run.  Fail loudly instead.
+        old_c = close_glob[np.ix_(rows, pcols)]
+        new_c = r["close"]
+        both_c = np.isfinite(old_c) & np.isfinite(new_c)
+        if np.any(both_c & ~np.isclose(old_c, new_c, rtol=1e-6, atol=1e-9)):
+            ri, ci = np.nonzero(
+                both_c & ~np.isclose(old_c, new_c, rtol=1e-6, atol=1e-9))
+            raise ValueError(
+                "§十二.2: overlapping fold close prices disagree for "
+                f"{r['stocks'][int(ri[0])]} on {r['price_dates'][int(ci[0])]}: "
+                f"{old_c[ri[0], ci[0]]!r} vs {new_c[ri[0], ci[0]]!r}")
+        old_o = open_glob[np.ix_(rows, pcols)]
+        new_o = r["open"]
+        both_o = np.isfinite(old_o) & np.isfinite(new_o)
+        if np.any(both_o & ~np.isclose(old_o, new_o, rtol=1e-6, atol=1e-9)):
+            ri, ci = np.nonzero(
+                both_o & ~np.isclose(old_o, new_o, rtol=1e-6, atol=1e-9))
+            raise ValueError(
+                "§十二.2: overlapping fold open prices disagree for "
+                f"{r['stocks'][int(ri[0])]} on {r['price_dates'][int(ci[0])]}: "
+                f"{old_o[ri[0], ci[0]]!r} vs {new_o[ri[0], ci[0]]!r}")
         close_glob[np.ix_(rows, pcols)] = r["close"]
         open_glob[np.ix_(rows, pcols)] = r["open"]
         # Signal columns sit at their true price positions; other columns keep
@@ -1053,6 +1521,27 @@ def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | 
         preds_glob[np.ix_(rows, scols)] = r["preds"]
         pool_glob[np.ix_(rows, scols)] = r["pool"]
 
+    # §P0-6: map each tape's per-stock delist index (its own sim column space)
+    # onto the union price axis so the replayed account force-sells delisted
+    # positions at the same global day the live per-fold runs did.
+    delist_glob = np.full(n_glob, -1, dtype=int)
+    for r in recs:
+        if r["delist_day"] is None:
+            continue
+        dd = np.asarray(r["delist_day"], dtype=int)
+        pdates = r["price_dates"]
+        for i, s in enumerate(r["stocks"]):
+            d = int(dd[i])
+            if d < 0 or d >= len(pdates):
+                continue  # force-sell outside this fold's window — never fired
+            gcol = pcol_of[pdates[d]]
+            row = row_of[s]
+            if delist_glob[row] >= 0 and delist_glob[row] != gcol:
+                raise ValueError(
+                    "§十二.1: fold tapes disagree on the delist day of "
+                    f"{s}: union column {delist_glob[row]} vs {gcol}")
+            delist_glob[row] = gcol
+
     acc = _run_sleeve_sim(
         preds_glob, close_glob, open_glob, pool_glob,
         horizon=recs[0]["horizon"],
@@ -1060,6 +1549,7 @@ def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | 
         cost=recs[0]["cost"],
         mode="long",
         return_ledger=True,
+        delist_day=delist_glob,
     )
 
     daily = np.asarray(acc["daily"], dtype=np.float64)
@@ -1077,14 +1567,25 @@ def _replay_continuous_oos(oos_dir: str, n_trials: int | None = None) -> dict | 
         "n_days": n_days,
         "n_stocks": n_glob,
     }
-    # §十五-1: the continuous account's Sharpe read against data-snooping.  The
-    # trial-Sharpe dispersion comes from the block-bootstrap proxy (the replay
-    # only runs the long sleeve, so there are no sibling-trial Sharpes here);
-    # `n_trials` is the project-wide registry count from the training script.
-    metrics["psr"] = compute_psr(daily, 0.0, 1)
+    # §十五-1 / §十二.3: the continuous account's Sharpe read against
+    # data-snooping.  The trial-Sharpe dispersion is the HISTORICAL research-
+    # trial OOS Sharpe distribution (prior registry rows), NOT the same-run
+    # leverage/benchmark variants the review rejected; when fewer than two
+    # historical Sharpes exist, the block-bootstrap proxy of this account's
+    # returns is the documented fallback.  `n_trials` is the project-wide
+    # DISTINCT-experiment count from the training script.
+    # §十二.5: the sleeve's daily returns share overlapping holdings, so PSR/DSR
+    # use the autocorrelation-adjusted effective sample size, never raw n.
+    n_eff = effective_sample_size(daily, horizon=1)
+    metrics["n_eff"] = int(n_eff)
+    metrics["psr"] = compute_psr(daily, 0.0, 1, n_obs=n_eff)
     metrics["dsr"] = compute_deflated_sharpe(
-        daily, n_trials, None, 1) if (n_trials is not None and n_trials >= 2) else float("nan")
+        daily, n_trials, trial_sharpes, 1, n_obs=n_eff) if (n_trials is not None and n_trials >= 2) else float("nan")
     metrics["dsr_n_trials"] = int(n_trials) if n_trials is not None else None
+    hist = [float(x) for x in (trial_sharpes or []) if np.isfinite(x)]
+    metrics["dsr_trial_sharpes_n"] = len(hist)
+    metrics["dsr_trial_variance_source"] = (
+        "historical_registry" if len(hist) >= 2 else "bootstrap_proxy")
 
     ledger = acc.get("ledger") or []
     ldf = None
@@ -1164,8 +1665,21 @@ def main():
                         help="Number of xLSTM blocks (default: 2)")
     parser.add_argument("--rank-weight", type=float, default=0.1,
                         help="Ranking loss weight (0=disable, default: 0.1)")
-    parser.add_argument("--no-augment", action="store_true",
-                        help="Disable time-series data augmentation")
+    parser.add_argument("--ablation", type=str, default=None,
+                        choices=sorted(_ABLATIONS),
+                        help="§十一.3: switch OFF ONE architecture component to "
+                             "isolate where performance comes from.  Choices: "
+                             + ", ".join(sorted(_ABLATIONS))
+                             + ".  Default: full production architecture "
+                             "(the formal baseline).")
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="§十一.1: apply the fixed per-fold corruption pass "
+                             "(Gaussian noise + one global time mask + one global "
+                             "feature dropout, generated once and reused across "
+                             "all epochs).  OFF by default — this is a fixed "
+                             "data-corruption, not online per-sample augmentation, "
+                             "so it is opt-in ablation only.")
     parser.add_argument("--log-gradient-flow", action="store_true",
                         help="Log per-parameter-group gradient norms each epoch "
                              "(after optimizer.step, before zero_grad)")
@@ -1195,6 +1709,20 @@ def main():
                         help="Skip the required quality-gate report check "
                              "(dev smoke only; §六-2 wants a matching report "
                              "before any real training run)")
+    parser.add_argument("--no-formal", action="store_true",
+                        help="Exploratory mode: allow degraded universe gates "
+                             "when a required PIT artifact is missing, with a "
+                             "prominent warning, instead of refusing to start "
+                             "(§P0-7; formal is the default)")
+    parser.add_argument("--strict-index-training",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="§八.3: gate the inner-TRAIN loss by per-day index "
+                             "membership for csi300/csi500/csi800.  Default: "
+                             "off — inner_train learns from the broad "
+                             "historical-member union and only the RANKED "
+                             "candidate pools (inner_val/outer_test) are "
+                             "membership-gated.  Only meaningful when the "
+                             "universe consumes membership.parquet")
     parser.add_argument("--quality-gate-report", type=str, default=None,
                         help="Path to the quality-gate report to verify "
                              "(default: <repo>/reports/data_quality_gate.json)")
@@ -1218,9 +1746,8 @@ def main():
     data_dir = cfg.project.data_dir
 
     if not args.no_require_quality_gate:
-        _report_path = args.quality_gate_report or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "reports", "data_quality_gate.json",
+        _report_path = args.quality_gate_report or str(
+            get_project_root() / "reports" / "data_quality_gate.json"
         )
         _require_quality_gate(data_dir, args.prebuilt, _report_path)
         logger.info("Quality-gate report verified: %s", _report_path)
@@ -1366,39 +1893,30 @@ def main():
     if refusal:
         raise SystemExit(refusal)
 
-    # Per-stock delisting day in global panel-column space, from the universe
-    # delisting records (§七-1).  The sleeve simulator force-sells a
-    # known-delisted position at the delisting close; without this, a stock
-    # whose data simply ends would stay UNRESOLVED even when the universe says
-    # it was really delisted.  Missing universe parquets → empty status → all
-    # -1 (no force-sell), so this never crashes on a data-dir without records.
-    universe_status = load_universe_status(data_dir)
-    delist_global = delist_global_index(
-        global_dates, universe_status, panel_stocks,
+    # §七-1/§七-3: the whole-run universe gates, computed ONCE via the shared
+    # helper so the baselines (train_baselines_panel.py) consume the SAME
+    # candidate-pool gates (§P0-5).  nd_mask blocks ENTRY from a known
+    # delisting column on; mem_mask enforces per-day index membership for
+    # csi300/csi500/csi800; delist_global feeds each fold's delist_day so the
+    # sleeve simulator force-sells known-delisted positions.  Missing universe
+    # parquets → empty status → all -1 / all-True gates (no crash); strict
+    # formal-mode failure for missing artifacts is enforced separately (§P0-7).
+    nd_mask, mem_mask, delist_global, universe_status = _fold_universe_gates(
+        global_dates, panel_stocks, args.universe, data_dir,
+        formal=not args.no_formal,
     )
-
-    # §七-3 universe gates, both in the panel's (N_stocks, T) grid space:
-    #   nd_mask  — 未退市: blocks ENTRY from a known delisting column on.
-    #   mem_mask — per-day index membership (in_date <= date < out_date) for
-    #              csi300/csi500/csi800; None for other universes so the fold
-    #              gates become a no-op for the "all A" / stratified studies.
-    nd_mask = not_delisted_mask(global_dates, panel_stocks, universe_status)
-    universe_index_codes = {
-        "csi300": {"000300"},
-        "csi500": {"000905"},
-        "csi800": {"000300", "000905"},
-    }.get(args.universe, set())
-    mem_mask = None
-    if universe_index_codes:
-        membership_df = load_index_membership(data_dir, sorted(universe_index_codes))
-        if membership_df.empty:
-            logger.warning(
-                "universe=%s: no membership.parquet intervals — per-day "
-                "index-membership gate is a no-op (candidate pool keeps the "
-                "full historical-member union)", args.universe,
-            )
-        else:
-            mem_mask = index_membership_mask(global_dates, panel_stocks, membership_df)
+    # §P0-6: content hashes of the exact universe records the gates consumed —
+    # every fold tape embeds these so replay can prove it used the same
+    # delist / membership artifacts.
+    universe_hashes = _universe_artifact_hashes(
+        universe_status, data_dir, args.universe)
+    # §八.3: record what gates each split consumes so a run is self-describing.
+    # inner_train default is the broad historical-member union (ungated);
+    # --strict-index-training additionally gates its loss by per-day index
+    # membership.  Evaluation always gates 未退市, plus per-day membership for
+    # universes that consume membership.parquet.
+    eval_gate_desc, train_gate_desc = _gate_descriptions(
+        mem_mask is not None, args.strict_index_training)
 
     n_stocks = panel_data["static_features"].shape[0]
     n_timesteps = panel_data["past_known"].shape[1]
@@ -1427,9 +1945,16 @@ def main():
         seed=args.seed,
         log_gradient_flow=args.log_gradient_flow,
     )
-    logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e rank_w=%.2f",
+    # §十一.3: apply the architecture-ablation overrides AFTER the base config
+    # is built, so a plain run is byte-for-byte the formal baseline and an
+    # ablation run only flips the switches in _ABLATIONS.
+    if args.ablation:
+        config = dataclasses.replace(config, **_ABLATIONS[args.ablation])
+    logger.info("VSN+xLSTM config: hidden=%d blocks=%d heads=%d batch=%d lr=%.1e "
+                "rank_w=%.2f ablation=%s",
                 config.hidden_dim, config.xlstm_num_blocks, config.xlstm_num_heads,
-                config.batch_size, config.learning_rate, config.rank_loss_weight)
+                config.batch_size, config.learning_rate, config.rank_loss_weight,
+                args.ablation or "full")
 
     # Freeze the data/code/feature versions up front so the run
     # stays explainable even if every fold fails.  Written to version.json
@@ -1484,11 +2009,14 @@ def main():
     )
     oos_dir = os.path.join(outdir, "oos_preds")
     os.makedirs(oos_dir, exist_ok=True)
-    # §十五-1: this run is one more trial in the project-wide experiment
-    # registry — the DSR deflation N counts ALL research trials iterated so
-    # far, not just the strategies inside a single report.
+    # §十五-1 / §十二.6: this run is one more DISTINCT experiment in the
+    # project-wide registry — the DSR deflation N counts distinct experiments
+    # iterated so far, not runs and not the strategies inside one report.  A
+    # prior row with this run's experiment_signature is the SAME experiment
+    # re-run, so it is replaced and N does not grow.
     experiment_registry = _load_experiment_registry(_EXPERIMENT_REGISTRY_PATH)
-    n_trials = len(experiment_registry) + 1
+    experiment_signature = _experiment_signature(version_info, config)
+    n_trials = _distinct_trial_count(experiment_registry, experiment_signature)
     oos_dates_all: list[str] = []
     oos_stocks_all: list[str] = []
     oos_preds_all: list[np.ndarray] = []
@@ -1593,21 +2121,27 @@ def main():
 
         # Merge the §七-3 universe gates into the EVALUATION candidate pools:
         # 未退市 for every universe, plus 当日是该指数成员 (per-day index
-        # membership) for csi300/csi500/csi800.  inner_train is left ungated —
-        # the model still learns from all data; only what gets RANKED as a
-        # tradable candidate is restricted.  Applied in this fold's row/column
-        # space (rows = surviving original stock rows, cols = the slice's
-        # global columns) so _candidate_pool picks the gates up automatically.
+        # membership) for csi300/csi500/csi800.  §八.3: inner_train is by
+        # DEFAULT left ungated — the model learns from the broad
+        # historical-member union; only what gets RANKED as a tradable
+        # candidate (inner_val/outer_test) is restricted.  That asymmetry is
+        # recorded in the summary (train_gate/eval_gate).  Applied in this
+        # fold's row/column space (rows = surviving original stock rows, cols
+        # = the slice's global columns) so _candidate_pool picks the gates up
+        # automatically.
         rows = np.where(fold_eligible)[0]
         for name, tslice, dd in (
             ("inner_val", inner_val_slice, inner_val_data),
             ("outer_test", outer_test_slice, outer_test_data),
         ):
-            cols = np.arange(tslice.start, tslice.stop)
-            gate = nd_mask[np.ix_(rows, cols)]
-            if mem_mask is not None:
-                gate = gate & mem_mask[np.ix_(rows, cols)]
-            dd["decision_eligible_mask"] &= gate
+            _apply_candidate_gates(dd, tslice, rows, nd_mask, mem_mask)
+
+        # §八.3 strict mode: also gate the inner-TRAIN loss by per-day index
+        # membership (see _gate_inner_train_membership).  Default: off —
+        # inner_train learns from the broad historical-member union.
+        if args.strict_index_training and mem_mask is not None:
+            _gate_inner_train_membership(
+                inner_train_data, mem_mask, rows, np.arange(0, inner_train_end))
 
         # y_return: cross-sectional z-score per date — preserves relative
         # ordering across stocks so ranking loss and IC evaluation work on a
@@ -1634,11 +2168,15 @@ def main():
         for dd in (inner_train_data, inner_val_data, outer_test_data):
             np.clip(dd["y_return"], -5.0, 5.0, out=dd["y_return"])
 
-        # Time-series data augmentation on the inner-training data.
-        # Each stock's sequence gets independent noise/masking/dropout —
-        # Gaussian noise gated by observation_mask so zero-padded history
-        # (new listings) stays exactly zero instead of gaining fake noise.
-        if not args.no_augment:
+        # §十一.1: OPTIONAL fixed corruption pass on the inner-training data.
+        # OFF by default.  This is NOT online per-sample augmentation — the
+        # Gaussian noise is per-element independent (gated by observation_mask
+        # so zero-padded history of new listings stays exactly zero), but the
+        # time mask zeroes the SAME global time segment and the feature dropout
+        # the SAME feature set for every stock; the pass runs once per fold and
+        # every epoch reuses the identical corrupted copy.  Use --augment for
+        # ablation only.
+        if args.augment:
             pk_aug, po_aug = _augment_sequence(
                 inner_train_data["past_known"],
                 inner_train_data["past_observed"],
@@ -1722,17 +2260,12 @@ def main():
 
         # Evaluate the exact deployed checkpoint ONCE on the held-out outer
         # test — the honest out-of-sample number, never used for selection.
-        # Delist-day index in the fold's simulation column space: sim column d
-        # ↔ global column val_start+d (evaluate_portfolio slices prices at
-        # seq_len within the outer_test window that starts at val_context_start
-        # = val_start - seq_len), so subtract val_start.  Clamp values outside
-        # [0, Wp) to -1 (never fires within this window).
-        dd_global = delist_global[fold_eligible]
+        # Delist-day index in the fold's simulation column space, via the
+        # shared helper (§P0-5) so the baselines force-sell delisted positions
+        # exactly as the deep model does.
         Wp = outer_test_data["close_price"].shape[1] - config.seq_len
-        delist_day = np.where(
-            (dd_global >= val_start) & (dd_global < val_start + Wp),
-            dd_global - val_start, -1,
-        )
+        delist_day = _fold_delist_day(
+            delist_global, fold_eligible, val_start, Wp)
         outer_m = evaluate_portfolio(
             model, outer_test_data, config, device,
             horizon=config.horizon,
@@ -1799,6 +2332,16 @@ def main():
                 seq_len=config.seq_len,
                 top_fraction=0.1,
                 cost=config.txn_cost,
+                # §P0-6: the force-sell delist-day grid (in this fold's sim
+                # column space) so an offline replay force-sells delisted
+                # positions exactly as the live sleeve did, and the content
+                # hashes of the universe records the gates consumed.
+                delist_day=delist_day,
+                universe_status_hash=universe_hashes["universe_status_hash"],
+                membership_hash=universe_hashes["membership_hash"],
+                # §十二.2: calendar content hash — the tape must not blend folds
+                # trained under a different holiday set / verified_until.
+                calendar_hash=version_info["calendar_artifact_hash"],
                 # A tape row must identify the data + model
                 # that produced it, so every return number is traceable.
                 data_version=version_info["data_manifest_hash"],
@@ -1877,6 +2420,10 @@ def main():
                 "inner_eval_ls_sharpe": inner_eval_m.get("ls_sharpe"),
                 "inner_eval_ic": inner_eval_m.get("ic_mean"),
                 "weight_hash": weight_hash,
+                # §P0-6: the universe records this fold's gates consumed, so the
+                # fold result is provably tied to those delist/membership files.
+                "universe_status_hash": universe_hashes["universe_status_hash"],
+                "membership_hash": universe_hashes["membership_hash"],
                 "model_path": f"oos_preds/fold_{fold:03d}_model.pt",
                 "train_start": _fmt_date(global_dates, 0),
                 "train_end": _fmt_date(global_dates, inner_train_end - 1),
@@ -1962,7 +2509,17 @@ def main():
     # boundaries (the previous fold's sleeves keep settling while the next
     # fold's model signals), and the FINAL Sharpe/MDD/CAGR come from THIS
     # account only.
-    cont = _replay_continuous_oos(oos_dir, n_trials=n_trials) if oos_preds_all else None
+    # §十二.3: the DSR trial-Sharpe dispersion is the HISTORICAL OOS Sharpe
+    # distribution from the registry (prior rows only — this run appends after),
+    # so the deflation reflects real past research trials, not this account.
+    historical_sharpes = [
+        e.get("oos_continuous_sharpe")
+        for e in experiment_registry
+        if isinstance(e.get("oos_continuous_sharpe"), (int, float))
+    ]
+    cont = (_replay_continuous_oos(oos_dir, n_trials=n_trials,
+                                   trial_sharpes=historical_sharpes)
+            if oos_preds_all else None)
     if cont is not None:
         daily = np.asarray(cont["account"]["daily"], dtype=np.float64)
         # The account starts at NAV 1.0 on the close BEFORE day 0, so the NAV
@@ -2008,12 +2565,27 @@ def main():
             # §十五-1: how many research trials (incl. this one) the DSR
             # multiplicity was computed against.
             "n_trials": n_trials,
+            "experiment_signature": experiment_signature,
             "n_folds": len(all_sharpes),
             "ls_sharpe_mean": float(np.mean(all_sharpes)),
             "ls_sharpe_std": float(np.std(all_sharpes)),
             "ic_mean": float(np.mean(all_ics)) if all_ics else None,
             "ic_std": float(np.std(all_ics)) if all_ics else None,
             "universe": universe_desc,
+            # §八.3: which universe gates applied to which split — the summary
+            # is self-describing about the train/eval gate asymmetry.  The
+            # default trains on the broad historical-member union (ungated);
+            # --strict-index-training additionally gates the inner-train loss
+            # by per-day membership so training matches the eval candidate
+            # pool.
+            "strict_index_training": bool(args.strict_index_training),
+            "train_gate": train_gate_desc,
+            "eval_gate": eval_gate_desc,
+            # §P0-6: content hashes of the universe records the whole-run gates
+            # consumed (delist status + index membership), so the summary is
+            # provably tied to those artifact files.
+            "universe_status_hash": universe_hashes["universe_status_hash"],
+            "membership_hash": universe_hashes["membership_hash"],
             # Non-overlapping folds (step == val_len) — each
             # fold's test days are disjoint, so mean±std is the dispersion of
             # disjoint OOS return windows.
@@ -2105,6 +2677,8 @@ def main():
     # NEXT run's DSR multiplicity counts it.  Written even when no fold
     # completed — an aborted / short run is still a research trial.
     registry_entry = {
+        # §十二.6: signature for dedup + distinct-trial counting.
+        "experiment_signature": experiment_signature,
         "outdir": outdir,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "git_commit": version_info.get("git_commit"),
@@ -2112,12 +2686,18 @@ def main():
         "feature_schema_hash": version_info.get("feature_schema_hash"),
         "model_hash": version_info.get("model_hash"),
         "universe_hash": version_info.get("universe_hash"),
+        "horizon": config.horizon,
+        "objective": _objective_desc(config),
+        "ablation": _ablation_desc(config),
         "lockbox": {
             "months": args.lockbox_months,
             "start": _fmt_date(global_dates, lockbox_start),
             "end": _fmt_date(global_dates, n_timesteps - 1),
         },
         "n_folds": len(all_sharpes) if all_sharpes else 0,
+        # §十二.6: an aborted run (no completed fold / no continuous account)
+        # is still a registered trial for the DSR N — made explicit here.
+        "aborted": not (all_sharpes and cont is not None),
         "ls_sharpe_mean": float(np.mean(all_sharpes)) if all_sharpes else None,
         "oos_continuous_sharpe": (
             cont["metrics"]["sharpe"] if cont is not None else None),
@@ -2127,8 +2707,9 @@ def main():
     }
     _append_experiment_registry(_EXPERIMENT_REGISTRY_PATH, registry_entry)
     logger.info(
-        "Experiment registry: %d prior trials -> this is trial #%d (%s)",
-        len(experiment_registry), n_trials, outdir,
+        "Experiment registry: %d prior distinct trials -> this is trial #%d "
+        "(signature=%s, %s)",
+        len(experiment_registry), n_trials, experiment_signature, outdir,
     )
 
 

@@ -126,6 +126,10 @@ def main():
                         help="Block stocks whose output fails error-level quality "
                              "checks or whose daily K-line context cannot be loaded; "
                              "never persist degraded output")
+    parser.add_argument("--no-formal", action="store_true",
+                        help="§九-1: allow fold_train_only chains on the offline "
+                             "full-history path (dev smoke only; production runs "
+                             "must be formal so the validation chain is honest)")
     parser.add_argument("--degrade-threshold", type=float, default=0.2,
                         help="Max fraction of previously-present dates a "
                              "replace_range write may drop before it is rejected "
@@ -262,7 +266,7 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
                     "features degraded (%s)", dtype, code, exc,
                 )
             processed = pp.run(
-                chain_name, raw, strict=args.strict,
+                chain_name, raw, strict=args.strict, formal=not args.no_formal,
                 daily_data=daily_data,
                 close_prices=daily_data,
                 trading_dates=trading_dates,
@@ -374,7 +378,7 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance):
             if base.empty:
                 continue
             processed = pp.run(
-                chain_name, base, strict=args.strict,
+                chain_name, base, strict=args.strict, formal=not args.no_formal,
                 pools=pools, sentiment=sentiment,
                 concept_map=concept_map if concept_map else None,
             )
@@ -559,7 +563,7 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance):
                         on="date", direction="backward",
                     )
             processed = pp.run(
-                chain_name, base, strict=args.strict,
+                chain_name, base, strict=args.strict, formal=not args.no_formal,
                 industry_ranking=industry_ranking,
                 sector_map=None if membership is not None else sector_map,
                 sector_features=sector_features,

@@ -10,6 +10,7 @@ import re
 
 import pandas as pd
 import numpy as np
+from stoke_ml.data.codes import normalize_stock_code
 from stoke_ml.features import cache_manifest
 from stoke_ml.features.technical import TechnicalIndicators
 from stoke_ml.features.scoring import TrendScorer
@@ -1195,6 +1196,15 @@ class FeaturePipeline:
                             os.path.join(prebuilt_dir, f"{code}.parquet")
                         )
                         or m.get("git_commit") != commit
+                        or (
+                            # §十-2: git_commit=unknown outside a repo — the
+                            # git check cannot see code drift; fall back to the
+                            # feature code-tree hash recorded at build time.
+                            m.get("git_commit") == "unknown"
+                            and m.get("feature_code_tree_hash")
+                            and m["feature_code_tree_hash"]
+                            != cache_manifest.feature_code_tree_hash()
+                        )
                         or (cfg_hash is not None and m.get("config_hash") != cfg_hash)
                     ):
                         stale_manifest.append(code)
@@ -1948,7 +1958,9 @@ def _not_long_suspended(
 
 def _board_index(code) -> int:
     """Map a 6-digit A-share code to an index into _BOARD_ONEHOT_COLS."""
-    s = str(code).zfill(6)
+    s = normalize_stock_code(code)
+    if s is None:
+        return 0
     if s.startswith("60"):
         return 1   # SH main board
     if s.startswith("68"):

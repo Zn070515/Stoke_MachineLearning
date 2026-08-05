@@ -100,6 +100,47 @@ def test_batch_fill_shift_lag_false_keeps_effective_date():
     assert df["has_news"].dtype == bool
 
 
+def test_batch_fill_shift_ffill_carries_state_across_gaps():
+    """§九-4: a state-type channel (margin balance) missing on a day means
+    "unchanged", never zero — the gap forward-fills the last known value.
+    The old uniform ZI policy zeroed those days (→ balance "hit 0")."""
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=5)})
+    df["margin_balance"] = [100.0, np.nan, np.nan, 110.0, np.nan]
+    _batch_fill_shift(df, ["margin_balance"], policy="ffill")
+    # ffill: [100,100,100,110,110] → shift(1): [NaN,100,100,100,110]
+    # → post-lag 0 (series head): [0,100,100,100,110]
+    assert df["margin_balance"].tolist() == [0.0, 100.0, 100.0, 100.0, 110.0]
+    assert df["margin_balance"].dtype == np.float32
+
+
+def test_batch_fill_shift_zero_event_channel_unchanged():
+    """§九-4: an event-type channel (LHB net amount) still zero-fills gaps —
+    a day with no record genuinely means "no event", so the historical ZI
+    convention is preserved for it."""
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=5)})
+    df["lhb_net_amount"] = [1.0, np.nan, 2.0, np.nan, 0.0]
+    _batch_fill_shift(df, ["lhb_net_amount"])
+    assert df["lhb_net_amount"].tolist() == [0.0, 1.0, 0.0, 2.0, 0.0]
+
+
+def test_merge_margin_ffill_gap():
+    """End-to-end: _merge_margin wires policy=ffill, so a sparse margin
+    series forward-fills instead of fabricating zero balances."""
+    from stoke_ml.features.aux_aligner import AuxAligner
+    df = _kline(n=6)
+    margin = pd.DataFrame({
+        "date": df["date"].iloc[[0, 3]],
+        "margin_balance": [100.0, 110.0],
+    })
+    out = AuxAligner()._merge_margin(df.copy(), margin)
+    assert out["margin_balance"].iloc[0] == 0.0
+    assert out["margin_balance"].iloc[1] == 100.0
+    assert out["margin_balance"].iloc[2] == 100.0
+    assert out["margin_balance"].iloc[3] == 100.0
+    assert out["margin_balance"].iloc[4] == 110.0
+    assert out["margin_balance"].iloc[5] == 110.0
+
+
 def test_ic_correctness_known_signal():
     """Inject a feature == forward return + noise; cross-sectional IC ~ high."""
     from scipy.stats import spearmanr

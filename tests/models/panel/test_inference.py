@@ -9,10 +9,11 @@ import numpy as np
 import pytest
 
 from stoke_ml.models.panel.inference import (
+    block_bootstrap_max_mean,
     compute_deflated_sharpe,
     compute_psr,
     deflated_sharpe_benchmark,
-    spa_test,
+    effective_sample_size,
 )
 
 # A deterministic, strongly positive, low-volatility daily series (mean 0.002,
@@ -75,6 +76,21 @@ def test_dsr_bootstrap_fallback_without_trial_sharpes():
     assert 0.0 < dsr <= 1.0
 
 
+def test_dsr_accepts_numpy_trial_array():
+    """v11 §十二.7 dynamic repro: a NumPy trial_sharpes array previously
+    crashed (`trial_sharpes or []` → ambiguous truth value)."""
+    dsr = compute_deflated_sharpe(
+        _POS, 50, trial_sharpes=np.array([1.0, 1.2, 0.8, 0.5])
+    )
+    assert np.isfinite(dsr)
+    assert 0.0 < dsr <= 1.0
+    # A 2-D array must ravel, not crash either.
+    dsr2 = compute_deflated_sharpe(
+        _POS, 50, trial_sharpes=np.array([[1.0, 1.2], [0.8, 0.5]])
+    )
+    assert np.isfinite(dsr2)
+
+
 def test_dsr_constant_returns_nan():
     assert np.isnan(compute_deflated_sharpe(np.full(50, 0.001), 20, [0.5, 1.0]))
 
@@ -94,54 +110,89 @@ def _noise(seed: int, n: int = 500, scale: float = 0.01) -> np.ndarray:
     return np.random.RandomState(seed).normal(0.0, scale, n)
 
 
-def test_spa_no_edge():
+def _ar1(seed: int, n: int, rho: float) -> np.ndarray:
+    rng = np.random.RandomState(seed)
+    x = np.empty(n)
+    x[0] = rng.normal(0.0, 0.01)
+    for t in range(1, n):
+        x[t] = rho * x[t - 1] + rng.normal(0.0, 0.01)
+    return x
+
+
+def test_effective_sample_size_iid_close_to_n():
+    # IID normal → no autocorrelation → VIF ≈ 1 → n_eff ≈ n (never above n).
+    x = _noise(11)
+    n_eff = effective_sample_size(x)
+    assert n_eff <= len(x)
+    assert n_eff > 0.6 * len(x)
+
+
+def test_effective_sample_size_ar1_discounts_heavily():
+    # §十二.5: strongly autocorrelated returns (position overlap / vol
+    # clustering) must be discounted to a small effective N — this is the
+    # whole point of the adjustment.
+    x = _ar1(5, n=2000, rho=0.9)
+    n_eff = effective_sample_size(x)
+    assert 3.0 <= n_eff < 0.3 * len(x)
+
+
+def test_effective_sample_size_degenerate_uncorrected():
+    const = np.full(50, 0.001)
+    assert effective_sample_size(const) == 50
+    assert effective_sample_size(np.array([1.0, 2.0])) == 2
+    # Negative autocorrelation (anti-persistent) must not INFLATE the count.
+    alt = np.tile([-1.0, 1.0], 100)
+    assert effective_sample_size(alt) <= len(alt)
+
+
+def test_bbmm_no_edge():
     strategy = _noise(123)
     benchmark = strategy  # identical → excess is exactly zero.
-    out = spa_test(strategy, benchmark, n_boot=500)
+    out = block_bootstrap_max_mean(strategy, benchmark, n_boot=500)
     assert out["stat"] == 0.0
     assert out["p_value"] == 1.0
     assert out["n_strategies"] == 1
 
 
-def test_spa_genuine_edge_rejected_null():
+def test_bbmm_genuine_edge_rejected_null():
     benchmark = _noise(7)
     strategy = benchmark + 0.01  # constant, clearly positive edge.
-    out = spa_test(strategy, benchmark, n_boot=500)
+    out = block_bootstrap_max_mean(strategy, benchmark, n_boot=500)
     assert out["p_value"] < 0.05
 
 
-def test_spa_losing_strategy_not_superior():
+def test_bbmm_losing_strategy_not_superior():
     benchmark = _noise(7)
     strategy = benchmark - 0.01  # clearly worse.
-    out = spa_test(strategy, benchmark, n_boot=500)
+    out = block_bootstrap_max_mean(strategy, benchmark, n_boot=500)
     assert out["p_value"] > 0.3
 
 
-def test_spa_best_of_many_drives_result():
+def test_bbmm_best_of_many_drives_result():
     benchmark = _noise(7)
     loser = benchmark - 0.02
     winner = benchmark + 0.02
-    out_good = spa_test(np.stack([loser, winner]), benchmark, n_boot=500)
+    out_good = block_bootstrap_max_mean(np.stack([loser, winner]), benchmark, n_boot=500)
     assert out_good["n_strategies"] == 2
     assert out_good["p_value"] < 0.05
-    out_bad = spa_test(np.stack([loser, loser - 0.005]), benchmark, n_boot=500)
+    out_bad = block_bootstrap_max_mean(np.stack([loser, loser - 0.005]), benchmark, n_boot=500)
     assert out_bad["p_value"] > 0.3
 
 
-def test_spa_length_mismatch_nan():
-    out = spa_test(_POS, np.ones(10), n_boot=100)
+def test_bbmm_length_mismatch_nan():
+    out = block_bootstrap_max_mean(_POS, np.ones(10), n_boot=100)
     assert np.isnan(out["stat"])
     assert np.isnan(out["p_value"])
 
 
-def test_spa_accepts_horizon_block_floor():
+def test_bbmm_accepts_horizon_block_floor():
     # §十五-3: `horizon` floors the resampled block length (overlapping
     # holdings); the interface must accept it and still detect a genuine edge.
     benchmark = _noise(7)
     strategy = benchmark + 0.01
-    out = spa_test(strategy, benchmark, n_boot=500, horizon=20)
+    out = block_bootstrap_max_mean(strategy, benchmark, n_boot=500, horizon=20)
     assert out["p_value"] < 0.05
     assert out["stat"] > 0.0
     # horizon=1 (default) is unchanged from the old behavior.
-    out1 = spa_test(strategy, benchmark, n_boot=500, horizon=1)
+    out1 = block_bootstrap_max_mean(strategy, benchmark, n_boot=500, horizon=1)
     assert out1["p_value"] < 0.05

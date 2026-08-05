@@ -11,7 +11,9 @@ from torch.amp import GradScaler, autocast
 
 from stoke_ml.models.panel.config import PanelConfig
 from stoke_ml.models.panel.model import PanelModel
-from stoke_ml.models.panel.loss import UncertaintyLoss, AdjMSELoss, PairwiseRankingLoss
+from stoke_ml.models.panel.loss import (
+    UncertaintyLoss, FixedTaskWeights, AdjMSELoss, PairwiseRankingLoss,
+)
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateGroupedSampler
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
@@ -148,10 +150,11 @@ def _compute_val_loss(
     val_data: dict,
     config: PanelConfig,
     ret_loss: AdjMSELoss,
-    loss_fn: UncertaintyLoss,
+    loss_fn: nn.Module,
     device: torch.device,
     use_amp: bool,
     vol_enabled: bool = True,
+    dir_enabled: bool = True,
     diag: dict | None = None,
 ) -> tuple[float, float, float, float, float]:
     """Validation metrics accumulated per VALID SAMPLE, not per batch.
@@ -201,28 +204,31 @@ def _compute_val_loss(
                         or torch.isnan(pred_vol).any()):
                     nan_batches += 1
                     continue
-                dir_valid = dir_mask > 0
                 ret_valid = ret_mask > 0
                 vol_valid = vol_mask > 0
 
                 # Per-task elementwise losses: each loss is
                 # computed ONLY over its valid samples, and a batch whose
                 # direction labels are all -100 must not produce NaN CE.
+                # Task slots are positional (dir first, ret, vol) so the
+                # uncertainty log-var indices stay aligned with train().
                 losses_elem: list[torch.Tensor] = []
                 counts: list[int] = []
                 active: list[bool] = []
 
-                if dir_valid.any():
-                    losses_elem.append(F.cross_entropy(
-                        torch.clamp(pred_dir, -5, 5)[dir_valid], y_dir[dir_valid],
-                        reduction="none",
-                    ))
-                    counts.append(int(dir_valid.sum().item()))
-                    active.append(True)
-                else:
-                    losses_elem.append(torch.zeros((), device=device))
-                    counts.append(0)
-                    active.append(False)
+                if dir_enabled:
+                    dir_valid = dir_mask > 0
+                    if dir_valid.any():
+                        losses_elem.append(F.cross_entropy(
+                            torch.clamp(pred_dir, -5, 5)[dir_valid], y_dir[dir_valid],
+                            reduction="none",
+                        ))
+                        counts.append(int(dir_valid.sum().item()))
+                        active.append(True)
+                    else:
+                        losses_elem.append(torch.zeros((), device=device))
+                        counts.append(0)
+                        active.append(False)
 
                 if ret_valid.any():
                     losses_elem.append(ret_loss(
@@ -253,27 +259,40 @@ def _compute_val_loss(
                     continue
 
                 # Per-task sums over valid samples — sample-weighted averages.
-                if active[0]:
+                i_ret = 1 if dir_enabled else 0
+                i_vol = (2 if dir_enabled else 1) if vol_enabled else -1
+                if dir_enabled and active[0]:
                     ce_sum += float(losses_elem[0].sum())
                     ce_cnt += counts[0]
-                if active[1]:
-                    ret_sum += float(losses_elem[1].sum())
-                    ret_cnt += counts[1]
-                if vol_enabled and active[2]:
-                    vol_sum += float(losses_elem[2].sum())
-                    vol_cnt += counts[2]
+                if active[i_ret]:
+                    ret_sum += float(losses_elem[i_ret].sum())
+                    ret_cnt += counts[i_ret]
+                if vol_enabled and active[i_vol]:
+                    vol_sum += float(losses_elem[i_vol].sum())
+                    vol_cnt += counts[i_vol]
 
-                # Uncertainty-weighted total, accumulated per valid sample so
-                # the combined val_loss is independent of batch boundaries.
-                log_vars = torch.clamp(loss_fn.log_vars, -2.0, 10.0)
-                num = torch.tensor(0.0, device=device, dtype=log_vars.dtype)
-                den = 0
-                for i, (l_elem, cnt, act) in enumerate(zip(losses_elem, counts, active)):
-                    if not act:
-                        continue
-                    precision = torch.exp(-log_vars[i])
-                    num = num + 0.5 * (precision * l_elem.sum() + log_vars[i] * cnt)
-                    den += cnt
+                # Combined total, accumulated so the val_loss is independent of
+                # batch boundaries.  UncertaintyLoss re-weights each task by its
+                # learned log-var; FixedTaskWeights is a plain equal-weight mean
+                # over active tasks (its forward() has no log_vars).
+                if hasattr(loss_fn, "log_vars"):
+                    log_vars = torch.clamp(loss_fn.log_vars, -2.0, 10.0)
+                    num = torch.tensor(0.0, device=device, dtype=log_vars.dtype)
+                    den = 0
+                    for i, (l_elem, cnt, act) in enumerate(zip(losses_elem, counts, active)):
+                        if not act:
+                            continue
+                        precision = torch.exp(-log_vars[i])
+                        num = num + 0.5 * (precision * l_elem.sum() + log_vars[i] * cnt)
+                        den += cnt
+                else:
+                    num = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    den = 0
+                    for l_elem, cnt, act in zip(losses_elem, counts, active):
+                        if not act:
+                            continue
+                        num = num + l_elem.sum() / cnt  # cnt >= 1 when act
+                        den += 1
                 uncer_num += float(num)
                 uncer_den += den
     if nan_batches > 0 or skipped_batches > 0:
@@ -364,18 +383,32 @@ def train_panel(
     # horizon==1 leaves no room for an intra-window vol estimate (vol window
     # needs >= 2 daily returns), so the vol task is dropped entirely rather than
     # learning a degenerate uncertainty weight on an all-zero target.
-    vol_enabled = config.horizon != 1
-    loss_fn = UncertaintyLoss(num_tasks=3 if vol_enabled else 2).to(device)
+    # §十一.3 ablation: the dir/vol heads can be disabled (the model then emits
+    # zero tensors) — their tasks leave the multi-task pool entirely so an
+    # ablated head neither updates a learned log-var nor dilutes an equal-weight
+    # mean.  Task slot order is positional (dir, ret, vol) and must match
+    # _compute_val_loss, which re-derives the same indices from dir_enabled.
+    dir_enabled = config.use_dir_head
+    vol_enabled = config.use_vol_head and config.horizon != 1
+    num_tasks = (1 if dir_enabled else 0) + 1 + (1 if vol_enabled else 0)
+    if config.fixed_task_weights:
+        loss_fn = FixedTaskWeights(num_tasks=num_tasks).to(device)
+    else:
+        loss_fn = UncertaintyLoss(num_tasks=num_tasks).to(device)
     ce_loss = nn.CrossEntropyLoss()
     ret_loss = AdjMSELoss(gamma=0.1)
     rank_loss = PairwiseRankingLoss(
         margin=0.0, tau=0.1, spread_target=1.0, spread_weight=0.5,
     )
 
-    optimizer = torch.optim.AdamW([
-        {"params": model.parameters()},
-        {"params": loss_fn.parameters(), "weight_decay": 0.0},
-    ], lr=config.learning_rate, weight_decay=config.weight_decay)
+    # FixedTaskWeights carries no learnable parameters — drop its (empty) param
+    # group so AdamW never holds a no-op group.  The uncertainty scheme keeps
+    # weight_decay=0 on its log_vars.
+    loss_groups = [{"params": model.parameters()}]
+    if list(loss_fn.parameters()):
+        loss_groups.append({"params": loss_fn.parameters(), "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(
+        loss_groups, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
     train_ds = PanelDataset(train_data, seq_len=config.seq_len,
@@ -508,16 +541,21 @@ def train_panel(
                 # valid samples.  A batch whose direction labels are all -100
                 # must not produce NaN CrossEntropy, and an inactive task must
                 # not update its uncertainty log-var.
-                dir_valid = dir_mask > 0
                 ret_valid = ret_mask > 0
                 vol_valid = vol_mask > 0
-                l_ce = (
-                    ce_loss(torch.clamp(pred_dir, -5, 5)[dir_valid], y_dir[dir_valid])
-                    if dir_valid.any()
-                    else torch.zeros((), device=device)
-                )
-                losses = [l_ce]
-                task_active = [bool(dir_valid.any().item())]
+                # Task slots are positional (dir first, ret, vol) and must
+                # match loss_fn's num_tasks + _compute_val_loss's indices.
+                losses = []
+                task_active = []
+                if dir_enabled:
+                    dir_valid = dir_mask > 0
+                    l_ce = (
+                        ce_loss(torch.clamp(pred_dir, -5, 5)[dir_valid], y_dir[dir_valid])
+                        if dir_valid.any()
+                        else torch.zeros((), device=device)
+                    )
+                    losses.append(l_ce)
+                    task_active.append(bool(dir_valid.any().item()))
                 if ret_valid.any():
                     losses.append(ret_loss(pred_ret.squeeze(-1)[ret_valid],
                                            y_ret[ret_valid]))
@@ -536,7 +574,9 @@ def train_panel(
 
                 # Pairwise ranking loss — directly optimises for cross-sectional
                 # ordering (the same signal IC and Sharpe evaluate on).  Ranks
-                # clean return targets only.
+                # clean return targets only.  Computed every batch so the
+                # monitoring trace stays populated even when the ablation drops
+                # it from the optimised loss.
                 batch_rank_stats: list[dict] = []
                 l_rank = rank_loss(
                     pred_ret.squeeze(-1), y_ret,
@@ -549,7 +589,8 @@ def train_panel(
                     continue
 
                 total_loss = loss_fn(losses, task_active_mask=task_active)
-                total_loss = total_loss + config.rank_loss_weight * l_rank
+                if config.use_ranking_loss:
+                    total_loss = total_loss + config.rank_loss_weight * l_rank
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 logger.warning(
@@ -636,7 +677,8 @@ def train_panel(
 
         val_loss, v_ce, v_ret, v_vol, v_rankic = _compute_val_loss(
             model, val_loader, val_data, config, ret_loss, loss_fn, device,
-            use_amp, vol_enabled=vol_enabled, diag=val_diag,
+            use_amp, vol_enabled=vol_enabled, dir_enabled=dir_enabled,
+            diag=val_diag,
         )
         if np.isfinite(v_rankic):
             finite_rankic_count += 1

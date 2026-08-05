@@ -23,6 +23,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code_series
+
 logger = logging.getLogger(__name__)
 
 SNAPSHOT_FILES = ["forecasts.parquet", "express.parquet"]
@@ -89,7 +91,7 @@ class EarningsStorage:
         if "stock_code" not in df.columns or "announce_date" not in df.columns:
             return pd.DataFrame()
         df = df.copy()
-        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         df["announce_date"] = pd.to_datetime(df["announce_date"], errors="coerce")
         yoy = pd.to_numeric(df.get("net_profit_yoy"), errors="coerce")
         profit = pd.to_numeric(df.get("net_profit"), errors="coerce")

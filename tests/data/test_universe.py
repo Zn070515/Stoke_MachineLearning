@@ -51,7 +51,8 @@ class TestLoadUniverseStatus:
         status = load_universe_status(str(tmp_path))
         assert status.empty
         assert list(status.columns) == [
-            "stock_code", "list_date", "delist_date"]
+            "stock_code", "list_date", "delist_date",
+            "suspension_date", "delist_effective_date", "delist_reason"]
 
     def test_listing_and_delisting_merge(self, tmp_path):
         _write_universe(str(tmp_path))
@@ -64,6 +65,10 @@ class TestLoadUniverseStatus:
         assert rows.loc["000002", "list_date"] == pd.Timestamp("1991-06-25")
         assert rows.loc["000002", "delist_date"] == pd.Timestamp("2024-05-15")
         assert rows.loc["600002", "delist_date"] == pd.Timestamp("2019-08-23")
+        # §八-2: the legacy format reports 暂停上市日期 → it lands in both
+        # suspension_date and the resolved delist_date, effective stays NaT.
+        assert rows.loc["000002", "suspension_date"] == pd.Timestamp("2024-05-15")
+        assert pd.isna(rows.loc["000002", "delist_effective_date"])
         # SSE stock whose delisted row has NaN stock_code is keyed by 公司代码.
         assert rows.loc["600999", "delist_date"] == pd.Timestamp("2015-06-30")
         assert pd.isna(rows.loc["600999", "list_date"])
@@ -74,6 +79,77 @@ class TestLoadUniverseStatus:
 
     def test_no_universe_dir_delisted_codes_empty(self, tmp_path):
         assert delisted_codes(str(tmp_path)) == []
+
+    def test_szse_effective_date_resolves_delist_date(self, tmp_path):
+        """§八-2 regression: real AKShare output gives SZSE rows only
+        终止上市日期 (暂停上市日期 is the literal string "None").  The old
+        single-field reader coerced every SZSE delisting to NaT → survivorship
+        bias; the resolved delist_date must come from the effective date."""
+        self._write_mixed_legacy(str(tmp_path))
+        status = load_universe_status(str(tmp_path))
+        rows = status.set_index("stock_code")
+        # SSE row: suspension date drives the exit, effective stays NaT.
+        assert rows.loc["600999", "delist_date"] == pd.Timestamp("2015-06-30")
+        assert rows.loc["600999", "suspension_date"] == pd.Timestamp("2015-06-30")
+        assert pd.isna(rows.loc["600999", "delist_effective_date"])
+        # SZSE rows: only 终止上市日期 present → it resolves delist_date.
+        assert rows.loc["000002", "delist_date"] == pd.Timestamp("2024-05-15")
+        assert pd.isna(rows.loc["000002", "suspension_date"])
+        assert rows.loc["000002", "delist_effective_date"] == pd.Timestamp(
+            "2024-05-15")
+        assert rows.loc["000002", "delist_reason"] == "暂停上市后终止"
+        assert rows.loc["000999", "delist_date"] == pd.Timestamp("2007-09-14")
+        assert rows.loc["000999", "delist_reason"] == "吸收合并"
+        assert delisted_codes(str(tmp_path)) == ["000002", "000999", "600999"]
+
+    def test_new_format_delisted_parquet_reads(self, tmp_path):
+        """IPOStSource now writes semantic columns directly; the reader must
+        accept that new format with no legacy fallback."""
+        import os
+
+        uni = os.path.join(str(tmp_path), "a_shares", "universe")
+        os.makedirs(uni, exist_ok=True)
+        pd.DataFrame({
+            "stock_code": ["000001", "600001"],
+            "list_date": pd.to_datetime(["1991-04-03", "1990-12-19"]),
+        }).to_parquet(os.path.join(uni, "ipo.parquet"))
+        pd.DataFrame({
+            "stock_code": ["000001", "600001"],
+            "list_date": pd.to_datetime(["1991-04-03", "1990-12-19"]),
+            "suspension_date": [pd.NaT, pd.Timestamp("2019-08-23")],
+            "delist_effective_date": [pd.Timestamp("2024-05-15"), pd.NaT],
+            "delist_reason": ["暂停上市", None],
+            "market": ["SZSE", "SSE"],
+        }).to_parquet(os.path.join(uni, "delisted.parquet"))
+
+        status = load_universe_status(str(tmp_path))
+        rows = status.set_index("stock_code")
+        assert rows.loc["000001", "delist_date"] == pd.Timestamp("2024-05-15")
+        assert pd.isna(rows.loc["000001", "suspension_date"])
+        assert rows.loc["000001", "delist_reason"] == "暂停上市"
+        assert rows.loc["600001", "delist_date"] == pd.Timestamp("2019-08-23")
+        assert pd.isna(rows.loc["600001", "delist_effective_date"])
+
+    @staticmethod
+    def _write_mixed_legacy(data_dir: str) -> None:
+        """Legacy-format delisted.parquet mirroring real AKShare output: SSE rows
+        carry 暂停上市日期 + 公司代码 with 终止上市日期 = literal "None"; SZSE rows
+        carry 终止上市日期 + stock_code with 暂停上市日期 = literal "None"."""
+        import os
+
+        uni = os.path.join(data_dir, "a_shares", "universe")
+        os.makedirs(uni, exist_ok=True)
+        pd.DataFrame({
+            "stock_code": ["000002", "000999"],
+            "list_date": pd.to_datetime(["1991-06-25", "1998-04-01"]),
+        }).to_parquet(os.path.join(uni, "ipo.parquet"))
+        pd.DataFrame({
+            "公司代码": ["600999", None, None],
+            "stock_code": [None, "000002", "000999"],
+            "暂停上市日期": ["2015-06-30", "None", "None"],
+            "终止上市日期": ["None", "2024-05-15", "2007-09-14"],
+            "终止上市原因": [None, "暂停上市后终止", "吸收合并"],
+        }).to_parquet(os.path.join(uni, "delisted.parquet"))
 
 
 class TestDelistGlobalIndex:

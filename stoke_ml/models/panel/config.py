@@ -91,6 +91,19 @@ class PanelConfig:
     # Ranking loss weight (0 = disabled, 0.1–0.5 recommended)
     rank_loss_weight: float = 0.1
 
+    # ── Architecture ablation (§十一.3) ─────────────────────────────────
+    # Answers "does performance come from xLSTM, VSN, multi-task, ranking,
+    # or more history input?" by switching each component off in isolation.
+    # train_panel.py --ablation NAME maps to these overrides.  All default to
+    # the production architecture so the formal baseline is unchanged.
+    backbone: str = "xlstm"          # "xlstm" | "lstm" (plain nn.LSTM, zero-init)
+    use_vsn: bool = True             # False → per-group linear projection instead
+    use_dir_head: bool = True        # False → model emits zero direction logits
+    use_vol_head: bool = True        # False → model emits zero volatility
+    use_ranking_loss: bool = True    # False → train without the ranking term
+    fixed_task_weights: bool = False # True → equal fixed weights (no learned log-vars)
+    use_pit_static: bool = True      # False → model ignores PIT static features
+
     # One-way transaction cost (fraction of notional) applied per fill in the
     # sleeve-account evaluation.  0.0005 = 5 bps/side.
     txn_cost: float = 0.0005

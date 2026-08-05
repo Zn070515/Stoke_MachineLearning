@@ -4,13 +4,14 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import akshare as ak
 import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data import universe
+from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.download_manifest import default_path, write_manifest
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.sources.a_shares.failover import AShareDownloader
@@ -91,6 +92,53 @@ def get_all_a_share_codes(data_dir: str | None = None) -> list[str]:
     return sorted(codes)
 
 
+def _last_fully_closed_trading_day(calendar: TradingCalendar) -> date:
+    """Most recent trading day strictly before today whose session has fully
+    closed (and, we assume, been published by the data source) — the default
+    completeness end.  Today's bar is never required (it has not closed), and
+    the result is capped at the calendar's ``verified_until`` so forward
+    estimates never count as published fact (§P0-3).
+    """
+    bound = min(date.today() - timedelta(days=1), calendar.verified_until)
+    d = bound
+    while not calendar.is_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _effective_range(
+    code: str,
+    req_start: pd.Timestamp | None,
+    req_end: pd.Timestamp | None,
+    status_by_code: dict[str, tuple],
+    last_closed: date,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    """Per-stock lifecycle window (§P0-3).
+
+    A completeness claim must be judged against the stock's OWN tradable life,
+    not a global 2000→today ask: a 2018 IPO can never start in 2000, and a
+    delisted stock can never have data past its last trading day.  So
+
+        effective_start = max(requested_start, list_date)
+        effective_end   = min(requested_end, delist_date, last_closed)
+
+    ``req_end=None`` (caller did not bound the request) keeps no upper bound —
+    the CLI default already resolves to ``last_closed``.
+    """
+    eff_start = req_start
+    eff_end = req_end
+    ld, dd = status_by_code.get(code, (None, None))
+    if pd.notna(ld):
+        ts = pd.Timestamp(ld)
+        eff_start = max(eff_start, ts) if eff_start is not None else ts
+    if pd.notna(dd):
+        ts = pd.Timestamp(dd)
+        eff_end = min(eff_end, ts) if eff_end is not None else ts
+    if eff_end is not None:
+        eff_end = min(eff_end, pd.Timestamp(last_closed))
+    return eff_start, eff_end
+
+
 def filter_existing(
     codes: list[str], data_dir: str,
     start_date: str | None = None, end_date: str | None = None,
@@ -100,13 +148,26 @@ def filter_existing(
     File presence alone is NOT enough to skip (§五-3): a stock is skipped only
     when its per-stock manifest exists, validates against the parquet via
     ``DataStorage.validate_manifest`` (rows / start / end / schema-hash /
-    provenance) AND covers the requested date range.  A stale or invalid
-    manifest, a schema drift, a partial file, or a file ending before the
-    requested ``end_date`` is re-downloaded.
+    provenance) AND covers the stock's *effective* date range — the requested
+    window clipped to the stock's own list/delist dates and the last fully
+    closed trading day (§P0-3).  A stale or invalid manifest, a schema drift, a
+    partial file, or a file ending before the effective ``end_date`` is
+    re-downloaded.
 
     Returns ``(to_download, complete_codes)``.
     """
     storage = DataStorage(data_dir)
+    status = universe.load_universe_status(data_dir)
+    status_by_code: dict[str, tuple] = {}
+    if not status.empty:
+        status_by_code = {
+            str(c).zfill(6): (ld, dd)
+            for c, ld, dd in zip(
+                status["stock_code"].astype(str).str.zfill(6),
+                status["list_date"], status["delist_date"])
+        }
+    calendar = TradingCalendar("a_shares", calendar_dir=data_dir)
+    last_closed = _last_fully_closed_trading_day(calendar)
     req_start = pd.Timestamp(start_date) if start_date else None
     req_end = pd.Timestamp(end_date) if end_date else None
     complete: set[str] = set()
@@ -117,9 +178,11 @@ def filter_existing(
         actual = report.get("actual") or {}
         a = actual.get("start")
         b = actual.get("end")
-        if req_start is not None and (a is None or pd.Timestamp(a) > req_start):
+        eff_start, eff_end = _effective_range(
+            code, req_start, req_end, status_by_code, last_closed)
+        if eff_start is not None and (a is None or pd.Timestamp(a) > eff_start):
             continue
-        if req_end is not None and (b is None or pd.Timestamp(b) < req_end):
+        if eff_end is not None and (b is None or pd.Timestamp(b) < eff_end):
             continue
         complete.add(code)
     to_download = [c for c in codes if c not in complete]
@@ -152,8 +215,12 @@ def main():
     storage = DataStorage(cfg.project.data_dir)
     downloader = AShareDownloader()
 
+    # Default end is the last fully closed trading day (§P0-3) — never today,
+    # which has not closed and may not be published yet, nor a forward estimate
+    # past verified_until.  An explicit --end is honored as-is.
+    _cal = TradingCalendar("a_shares", calendar_dir=cfg.project.data_dir)
     start_date = args.start or cfg.markets.a_shares.start_date
-    end_date = args.end or datetime.now().strftime("%Y-%m-%d")
+    end_date = args.end or _last_fully_closed_trading_day(_cal).strftime("%Y-%m-%d")
 
     if args.stocks:
         codes = [c.strip() for c in args.stocks.split(",")]
@@ -168,12 +235,17 @@ def main():
         logger.error("No stock codes to download.")
         sys.exit(1)
 
+    # §P0-4: the run manifest must answer "is the ENTIRE requested universe
+    # complete?", so the original request is captured before --skip-existing
+    # narrows the working set, and skipped-complete stocks stay in `complete`.
+    requested_codes = list(codes)
     n_skipped = 0
+    complete_prior: set[str] = set()
     if args.skip_existing:
-        codes, existing = filter_existing(
+        codes, complete_prior = filter_existing(
             codes, cfg.project.data_dir, start_date, end_date
         )
-        n_skipped = len(existing)
+        n_skipped = len(complete_prior)
         logger.info("Skipping %d complete stocks, %d to download",
                      n_skipped, len(codes))
 
@@ -204,16 +276,21 @@ def main():
     # Persist the download manifest so a PARTIAL run cannot pass for complete.
     # `complete` comes from filter_existing — validated manifest AND full
     # requested-date coverage — never from file presence, so "every parquet on
-    # disk" does not imply `all_complete` (§五-4).
-    _, complete = filter_existing(codes, cfg.project.data_dir, start_date, end_date)
+    # disk" does not imply `all_complete` (§五-4).  Stocks already complete
+    # before this run (skipped) are unioned back in so the manifest reports the
+    # whole requested universe, not just what this run touched (§P0-4).
+    _, newly_complete = filter_existing(
+        codes, cfg.project.data_dir, start_date, end_date
+    )
+    complete_all = complete_prior | newly_complete
     manifest = write_manifest(
         default_path(cfg.project.data_dir),
         market="a_shares",
         start_date=start_date,
         end_date=end_date,
-        requested=codes,
+        requested=requested_codes,
         failed=failed_codes,
-        complete=complete,
+        complete=complete_all,
         success_count=success,
         skipped_existing_count=n_skipped,
     )

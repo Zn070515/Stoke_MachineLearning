@@ -23,7 +23,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from stoke_ml.config import load_config
+from stoke_ml.config import get_project_root, load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.market_wide_storage import MarketWideStorage
@@ -393,7 +393,7 @@ def main():
         feat = "features_panel" if args.panel_mode else "features"
         cmd = [sys.executable, gate, "--quick", "--profile", "formal",
                "--data-dir", data_dir, "--require", f"daily,{feat}"]
-        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        env = dict(os.environ, PYTHONPATH=str(get_project_root()))
         logger.info("Running data quality gate (quick, formal profile) on %s...",
                     data_dir)
         rc = subprocess.call(cmd, env=env)

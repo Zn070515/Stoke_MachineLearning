@@ -91,7 +91,7 @@ MARKET_ENV_COLS = [
 
 
 def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
-                      lag: bool = True) -> None:
+                      lag: bool = True, policy: str = "zero") -> None:
     """Vectorized fill → shift → fill for merged aux columns.
 
     Groups columns by dtype and does each operation in a single block
@@ -102,6 +102,21 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
     mapped events to their ``effective_trade_date`` (earnings/guba/news:
     post-close → next trading day).  Their date column IS the PIT-effective
     day, so an extra shift would double-lag the signal.
+
+    ``policy`` is the channel's aux missingness policy (§九-4):
+
+    * ``"zero"`` — event-type channels (news count, announcements, LHB, ...):
+      a day with no record genuinely means "no event", so gaps are zero-filled
+      (the historical ZI convention).
+    * ``"ffill"`` — state-type channels (margin balance, valuation, macro
+      rates, fundamentals, ...): the value persists between observations, so a
+      missing day means "unchanged", never zero.  Gaps forward-fill the last
+      known value; only the pre-history head (before the first record) is
+      zero-filled as the conventional "unknown state" boundary.
+
+    Counts / ``has_*`` / streak / quadrant indicators keep their zero/False
+    fill under both policies — a count of 0 or an absent flag is meaningful
+    regardless of channel type.
     """
     available = [c for c in cols if c in df.columns]
     if not available:
@@ -121,7 +136,10 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
 
     # Pre-lag fill
     if float_cols:
-        df[float_cols] = df[float_cols].fillna(0.0).astype(np.float32)
+        if policy == "ffill":
+            df[float_cols] = df[float_cols].ffill().astype(np.float32)
+        else:
+            df[float_cols] = df[float_cols].fillna(0.0).astype(np.float32)
     if int_cols:
         df[int_cols] = df[int_cols].fillna(0).astype("int16")
     if bool_cols:
@@ -140,11 +158,14 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
         df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
 
 
-def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
-    """Merge a preprocessed auxiliary DataFrame on date with ZI fill + PIT lag.
+def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame,
+                     policy: str = "zero") -> pd.DataFrame:
+    """Merge a preprocessed auxiliary DataFrame on date with fill + PIT lag.
 
     Any column that exists in *aux* (except date, stock_code, has_* flags and
-    K-line derived columns) is merged and lagged by 1 trading day.
+    K-line derived columns) is merged and lagged by 1 trading day.  ``policy``
+    selects the channel's aux missingness policy (§九-4): "zero" for event-type
+    channels, "ffill" for state-type channels (see :func:`_batch_fill_shift`).
     """
     a = aux.copy()
     a["date"] = pd.to_datetime(a["date"])
@@ -174,7 +195,7 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
         return df
 
     df = df.merge(a[["date"] + available], on="date", how="left")
-    _batch_fill_shift(df, available)
+    _batch_fill_shift(df, available, policy=policy)
     return df
 
 
@@ -380,7 +401,8 @@ class AuxAligner:
         if not available:
             return df
         df = df.merge(m[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # Margin balance is a state: a missing day means "unchanged", never 0.
+        _batch_fill_shift(df, available, policy="ffill")
         return df
 
     def _merge_northbound(self, df: pd.DataFrame,
@@ -398,7 +420,8 @@ class AuxAligner:
         if not available:
             return df
         df = df.merge(nb[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # Holdings are a state snapshot — forward-fill gaps, never zero.
+        _batch_fill_shift(df, available, policy="ffill")
         return df
 
     def _merge_dragon_tiger(self, df: pd.DataFrame,
@@ -473,7 +496,8 @@ class AuxAligner:
             fd = fd.drop_duplicates(subset="date", keep="last")
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # Fundamentals are a state snapshot — forward-fill any residual gap.
+        _batch_fill_shift(df, available, policy="ffill")
         return df
 
     def _merge_earnings(self, df: pd.DataFrame,
@@ -499,7 +523,8 @@ class AuxAligner:
             return df
         df = df.merge(ed[["date"] + available], on="date", how="left")
         # date is the storage-mapped effective_trade_date → no extra shift.
-        _batch_fill_shift(df, available, lag=False)
+        # A forecast band is a state that persists until superseded → ffill.
+        _batch_fill_shift(df, available, lag=False, policy="ffill")
         return df
 
     def _merge_valuation(self, df: pd.DataFrame,
@@ -516,7 +541,8 @@ class AuxAligner:
         if not available:
             return df
         df = df.merge(vd[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # Valuation ratios are a state snapshot — forward-fill, never zero.
+        _batch_fill_shift(df, available, policy="ffill")
         return df
 
     def _merge_etf_flow(self, df: pd.DataFrame,
@@ -609,7 +635,8 @@ class AuxAligner:
         if sh_df is None or sh_df.empty:
             self._warn_if_missing("shareholder")
             return df
-        return _merge_daily_aux(df, sh_df)
+        # Shareholder count is a state snapshot between disclosures.
+        return _merge_daily_aux(df, sh_df, policy="ffill")
 
     def _merge_lockup(self, df: pd.DataFrame,
                       lu_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -676,7 +703,8 @@ class AuxAligner:
         if pledge_df is None or pledge_df.empty:
             self._warn_if_missing("pledge")
             return df
-        return _merge_daily_aux(df, pledge_df)
+        # Pledge ratio is outstanding state — forward-fill between records.
+        return _merge_daily_aux(df, pledge_df, policy="ffill")
 
     def _merge_index_membership(self, df: pd.DataFrame,
                                 im_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -717,7 +745,8 @@ class AuxAligner:
         if not available:
             return df
         df = df.merge(macro[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # Macro rates/levels are state — forward-fill gaps, never zero.
+        _batch_fill_shift(df, available, policy="ffill")
         return df
 
     def _merge_market_env(self, df: pd.DataFrame,
@@ -754,7 +783,8 @@ class AuxAligner:
         if not available:
             return df
         df = df.merge(me[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
+        # Market-breadth stats are state — forward-fill gaps, never zero.
+        _batch_fill_shift(df, available, policy="ffill")
         return df
 
     def _merge_industry(self, df: pd.DataFrame,
@@ -809,8 +839,6 @@ class AuxAligner:
             return df
 
         df = df.merge(ind[["date"] + available], on="date", how="left")
-        # Batch fill → shift → fill (vectorized block assignment, no fragmentation)
-        df[available] = df[available].fillna(0.0).astype(np.float32)
-        df[available] = df[available].shift(1)
-        df[available] = df[available].fillna(0.0).astype(np.float32)
+        # Industry cross-sectional stats are state — forward-fill, never zero.
+        _batch_fill_shift(df, available, policy="ffill")
         return df

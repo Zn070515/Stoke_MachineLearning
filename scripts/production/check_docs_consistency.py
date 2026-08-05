@@ -226,6 +226,68 @@ def main():
     else:
         check("baseline list", False, "code lost Ridge/LightGBM/MLP baselines")
 
+    # ── Path / file-existence checks (§十四 next-steps) ─────────────────
+    # A doc/script that names a file which no longer exists is the same drift
+    # class as a wrong constant — an agent following it hits a dead end.
+
+    prod_dir = os.path.join(ROOT, "scripts", "production")
+
+    # every scripts/**/*.py path named in the docs must exist on disk
+    doc_script_refs = sorted({
+        m for doc_key in DOCS
+        for m in re.findall(r"scripts/[A-Za-z0-9_/]+\.py", docs[doc_key])
+    })
+    for ref in doc_script_refs:
+        ok = os.path.isfile(os.path.join(ROOT, ref))
+        check(f"doc ref {ref}", ok, f"docs name {ref} but no such file")
+
+    # cross-script references inside production scripts must resolve:
+    # a sibling script invoked via subprocess (os.path.join(__file__-dir,
+    # "sibling.py")) or imported as scripts.production.<module>.  The scanner
+    # itself is excluded — it reads source paths, not sibling-script deps.
+    prod_refs = []
+    for fn in sorted(os.listdir(prod_dir)):
+        if not fn.endswith(".py") or fn == "check_docs_consistency.py":
+            continue
+        src = read(os.path.join(prod_dir, fn))
+        for m in re.finditer(r'os\.path\.join\([^)]*__file__[^)]*"([A-Za-z0-9_]+\.py)"', src):
+            prod_refs.append((fn, os.path.join("scripts", "production", m.group(1))))
+        for m in re.finditer(r"from scripts\.production\.([A-Za-z0-9_]+) import", src):
+            prod_refs.append((fn, os.path.join("scripts", "production", m.group(1) + ".py")))
+    for src_name, target in sorted(set(prod_refs)):
+        ok = os.path.isfile(os.path.join(ROOT, target))
+        check(f"prod ref {src_name}→{target}", ok,
+              f"{src_name} references {target} but no such file")
+
+    # fit_topic_model.py reference must resolve (§十-2 production workflow)
+    check("fit_topic_model exists",
+          os.path.isfile(os.path.join(prod_dir, "fit_topic_model.py")),
+          "docs/config demand scripts/production/fit_topic_model.py but file missing")
+
+    # formal baseline must carry the same quality-gate guard as the deep model
+    baseline_guard = "_require_quality_gate" in read_src(
+        os.path.join("scripts", "production", "train_baselines_panel.py"))
+    check("formal baseline gate guard", baseline_guard,
+          "expect _require_quality_gate wired in train_baselines_panel.py")
+
+    # default quality-gate report path must be repo-anchored + the reports/
+    # dir it lands in must exist (§十四 default-path reality)
+    anchored = ("get_project_root()" in read_src(
+                    os.path.join("scripts", "production", "train_panel.py"))
+                and "reports" in read_src(
+                    os.path.join("scripts", "production", "train_panel.py")))
+    check("gate report path anchored", anchored,
+          "expect train_panel default report path to anchor get_project_root()/reports")
+    check("reports dir exists", os.path.isdir(os.path.join(ROOT, "reports")),
+          "default gate report writes to <root>/reports but dir missing")
+
+    # contract price basis (qfq) must agree with storage adjustment handling
+    storage_adjust = ("price_basis" in storage_src
+                      and "adjust" in storage_src
+                      and "qfq" in storage_src)
+    check("contract↔storage basis", storage_adjust,
+          "storage must derive price_basis from adjustment_mode and enforce qfq consistency")
+
     # ── Report ──
     width = max(len(n) for n, _, _ in results)
     failed = 0

@@ -50,14 +50,18 @@ def main():
             logger.error("%s: %s", name, str(e)[:120])
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
+    # §五.3: the manifest is the completion record — if it cannot be written the
+    # run must fail loudly, not warn, or a consumer sees a verifiable universe
+    # where none was actually recorded.
     try:
         write_run_manifest(
-            data_dir, "a_shares/universe",
+            cfg.project.data_dir, "a_shares/universe",
             requested=list(data.keys()), failed=failed, complete=done,
             success_count=len(done),
         )
     except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+        logger.error("run manifest write failed: %s", exc)
+        raise SystemExit(1)
 
     logger.info("Done.")
 

@@ -27,27 +27,40 @@ class PanelModel(nn.Module):
         super().__init__()
         self.config = config
         h = config.hidden_dim
+        # §十一.3 "去掉 PIT static": the static encoder, VSN context, c_h init
+        # and post-backbone enrichment are all driven by the same PIT static
+        # input, so turning it off drops every one of them (equivalent to
+        # static_dim == 0) without touching the data pipeline.
+        sdim = config.static_dim if config.use_pit_static else 0
 
-        # ── Variable Selection Networks (scalar path, memory-efficient) ──
-        self.vsn_past = VariableSelectionNetwork(
-            input_dim=1, hidden_dim=h,
-            num_features=config.past_known_dim, dropout=config.dropout,
-            context_dim=h if config.static_dim > 0 else None,
-        ) if config.past_known_dim > 0 else None
-
-        self.vsn_obs = VariableSelectionNetwork(
-            input_dim=1, hidden_dim=h,
-            num_features=config.past_observed_dim, dropout=config.dropout,
-            context_dim=h if config.static_dim > 0 else None,
-        ) if config.past_observed_dim > 0 else None
+        # ── Variable Selection (VSN) or plain linear projection (§十一.3) ──
+        # VSN: per-feature scalar path with softmax gate + context; when
+        # use_vsn=False a per-group Linear(dim, h) replaces it, keeping the
+        # (B, T, h) output contract so feat_proj downstream is unchanged.
+        if config.use_vsn:
+            self.vsn_past = VariableSelectionNetwork(
+                input_dim=1, hidden_dim=h,
+                num_features=config.past_known_dim, dropout=config.dropout,
+                context_dim=h if sdim > 0 else None,
+            ) if config.past_known_dim > 0 else None
+            self.vsn_obs = VariableSelectionNetwork(
+                input_dim=1, hidden_dim=h,
+                num_features=config.past_observed_dim, dropout=config.dropout,
+                context_dim=h if sdim > 0 else None,
+            ) if config.past_observed_dim > 0 else None
+        else:
+            self.vsn_past = nn.Linear(config.past_known_dim, h) \
+                if config.past_known_dim > 0 else None
+            self.vsn_obs = nn.Linear(config.past_observed_dim, h) \
+                if config.past_observed_dim > 0 else None
 
         # ── Static Encoder: 4 context vectors from stock metadata ──
         #  ζ = StaticProj(static) →
-        #    c_e  = GRN(ζ)  → static enrichment (post-xLSTM)
+        #    c_e  = GRN(ζ)  → static enrichment (post-backbone)
         #    c_h  = GRN(ζ)  → xLSTM initial state (sLSTM hidden)
         #    c_vs = GRN(ζ)  → VSN context (per-stock feature selection)
-        if config.static_dim > 0:
-            self.static_proj = nn.Linear(config.static_dim, h)
+        if sdim > 0:
+            self.static_proj = nn.Linear(sdim, h)
             self.static_enrich_context = GRN(
                 input_dim=h, hidden_dim=h, output_dim=h, dropout=config.dropout,
             )
@@ -63,25 +76,39 @@ class PanelModel(nn.Module):
             self.static_hidden_context = None
             self.static_vs_context = None
 
-        # ── xLSTM backbone (replaces LSTM + Attention + post_attn_GRN) ──
-        self.xlstm = xLSTMBackbone(
-            hidden_dim=h,
-            num_blocks=config.xlstm_num_blocks,
-            slstm_ratio=config.xlstm_slstm_ratio,
-            num_heads=config.xlstm_num_heads,
-            dropout=config.dropout,
-        )
+        # ── Backbone: xLSTM (production) or plain nn.LSTM (§十一.3) ──
+        if config.backbone == "xlstm":
+            self.backbone = xLSTMBackbone(
+                hidden_dim=h,
+                num_blocks=config.xlstm_num_blocks,
+                slstm_ratio=config.xlstm_slstm_ratio,
+                num_heads=config.xlstm_num_heads,
+                dropout=config.dropout,
+            )
+            self._is_xlstm = True
+        elif config.backbone == "lstm":
+            self.backbone = nn.LSTM(
+                input_size=h, hidden_size=h,
+                num_layers=config.xlstm_num_blocks, batch_first=True,
+                dropout=(config.dropout if config.xlstm_num_blocks > 1 else 0.0),
+            )
+            self._is_xlstm = False
+        else:
+            raise ValueError(f"unknown backbone: {config.backbone!r}")
+
         # Per-block c_h projections: each sLSTM block gets its own
         # initial state, derived from xLSTMBackbone.num_slstm_blocks
-        # so the count never diverges from the actual block layout.
-        if config.static_dim > 0:
+        # so the count never diverges from the actual block layout.  Plain
+        # nn.LSTM uses standard zero-init states — the ablation's point is a
+        # stock LSTM without the custom static-initialised sLSTM path.
+        if sdim > 0 and self._is_xlstm:
             self.c_h_projections = nn.ModuleList([
-                nn.Linear(h, h) for _ in range(self.xlstm.num_slstm_blocks)
+                nn.Linear(h, h) for _ in range(self.backbone.num_slstm_blocks)
             ])
         else:
             self.c_h_projections = nn.ModuleList()
 
-        # VSN output → xLSTM input projection
+        # VSN/linear output → backbone input projection
         n_vsn = (1 if config.past_known_dim > 0 else 0) + (1 if config.past_observed_dim > 0 else 0)
         if n_vsn == 2:
             self.feat_proj = nn.Linear(2 * h, h)
@@ -90,12 +117,12 @@ class PanelModel(nn.Module):
         else:
             self.feat_proj = None
 
-        # ── Post-xLSTM processing ──
+        # ── Post-backbone processing ──
         # GateAddNorm: GLU gating + residual + LayerNorm (TFT canonical pattern)
         self.post_xlstm_gate = GateAddNorm(h, dropout=config.dropout)
 
         # Static enrichment: modulate temporal features with c_e per stock
-        if config.static_dim > 0:
+        if sdim > 0:
             self.static_enrich = GRN(
                 input_dim=h, hidden_dim=h, output_dim=h,
                 dropout=config.dropout, context_dim=h,
@@ -110,11 +137,17 @@ class PanelModel(nn.Module):
         ])
 
         # ── Output heads (bottleneck + ELU + head-specific dropout) ──
-        self.direction_head = DirectionHead(
-            h, config.num_direction_classes, config.head_dropout,
+        # The return head is the core signal and is always present; the
+        # direction / volatility heads are the §十一.3 ablation switches
+        # (disabled heads emit zeros so evaluation code keeps working).
+        self.direction_head = (
+            DirectionHead(h, config.num_direction_classes, config.head_dropout)
+            if config.use_dir_head else None
         )
         self.return_head = ReturnHead(h, config.head_dropout)
-        self.volatility_head = VolatilityHead(h, config.head_dropout)
+        self.volatility_head = (
+            VolatilityHead(h, config.head_dropout) if config.use_vol_head else None
+        )
 
     def forward(
         self,
@@ -144,12 +177,18 @@ class PanelModel(nn.Module):
         )
         vsn_outputs = []
         if self.vsn_past is not None:
-            pk_vars = past_known.unsqueeze(-1)  # (B, T, P, 1)
-            pk_feat, _ = self.vsn_past(pk_vars, context=c_vs_ctx)  # (B, T, h)
+            if isinstance(self.vsn_past, VariableSelectionNetwork):
+                pk_vars = past_known.unsqueeze(-1)  # (B, T, P, 1)
+                pk_feat, _ = self.vsn_past(pk_vars, context=c_vs_ctx)  # (B, T, h)
+            else:
+                pk_feat = self.vsn_past(past_known)  # (B, T, h) linear path
             vsn_outputs.append(pk_feat)
         if self.vsn_obs is not None:
-            po_vars = past_observed.unsqueeze(-1)  # (B, T, O, 1)
-            po_feat, _ = self.vsn_obs(po_vars, context=c_vs_ctx)  # (B, T, h)
+            if isinstance(self.vsn_obs, VariableSelectionNetwork):
+                po_vars = past_observed.unsqueeze(-1)  # (B, T, O, 1)
+                po_feat, _ = self.vsn_obs(po_vars, context=c_vs_ctx)  # (B, T, h)
+            else:
+                po_feat = self.vsn_obs(past_observed)  # (B, T, h) linear path
             vsn_outputs.append(po_feat)
 
         if len(vsn_outputs) == 2:
@@ -159,19 +198,22 @@ class PanelModel(nn.Module):
         else:
             feat = torch.zeros(B, T, h, device=device)
 
-        # ── 3. xLSTM backbone ──
-        # Per-block initial states from c_h: each sLSTM block gets its own
-        # learned projection so blocks can specialise.
-        if c_h is not None and len(self.c_h_projections) > 0:
-            num_heads = self.config.xlstm_num_heads
-            states = []
-            for proj in self.c_h_projections:
-                h_init = proj(c_h).reshape(B, num_heads, -1)
-                zero = torch.zeros_like(h_init)
-                states.append((h_init, zero.clone(), zero.clone(), zero.clone()))
+        # ── 3. Backbone (xLSTM or plain LSTM) ──
+        if self._is_xlstm:
+            # Per-block initial states from c_h: each sLSTM block gets its own
+            # learned projection so blocks can specialise.
+            if c_h is not None and len(self.c_h_projections) > 0:
+                num_heads = self.config.xlstm_num_heads
+                states = []
+                for proj in self.c_h_projections:
+                    h_init = proj(c_h).reshape(B, num_heads, -1)
+                    zero = torch.zeros_like(h_init)
+                    states.append((h_init, zero.clone(), zero.clone(), zero.clone()))
+            else:
+                states = None
+            xlstm_out, _ = self.backbone(feat, states=states)  # (B, T, h)
         else:
-            states = None
-        xlstm_out, _ = self.xlstm(feat, states=states)  # (B, T, h)
+            xlstm_out, _ = self.backbone(feat)  # (B, T, h) zero-init nn.LSTM
 
         # GateAddNorm: GLU(xlstm_out) + skip(feat) + LayerNorm
         xlstm_out = self.post_xlstm_gate(xlstm_out, feat)
@@ -187,8 +229,15 @@ class PanelModel(nn.Module):
             decoder_out = grn(decoder_out)
 
         # ── 6. Output heads ──
-        direction = self.direction_head(decoder_out)
+        # Ablation-disabled heads emit zeros so evaluation code keeps working.
+        if self.direction_head is not None:
+            direction = self.direction_head(decoder_out)
+        else:
+            direction = torch.zeros(B, self.config.num_direction_classes, device=device)
         return_pct = self.return_head(decoder_out)
-        volatility = self.volatility_head(decoder_out)
+        if self.volatility_head is not None:
+            volatility = self.volatility_head(decoder_out)
+        else:
+            volatility = torch.zeros(B, 1, device=device)
 
         return direction, return_pct, volatility

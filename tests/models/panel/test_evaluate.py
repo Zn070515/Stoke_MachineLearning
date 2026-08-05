@@ -1676,18 +1676,25 @@ class TestContinuousOosReplay:
     and the final Sharpe/MDD/CAGR come from that account only."""
 
     def _write_tape(self, path, *, stocks, dates, price_dates, preds, pool,
-                    close, open, horizon, seq_len, top_fraction, cost):
+                    close, open, horizon, seq_len, top_fraction, cost,
+                    delist_day=None, data_version="test",
+                    universe_status_hash="u", membership_hash="m"):
+        kw = dict(decision_eligible=pool, history_eligible=pool, pool=pool,
+                  entry_eligible=np.ones_like(pool),
+                  return_target_mask=np.ones_like(pool),
+                  return_target=np.zeros_like(pool),
+                  close_price=close, open_price=open,
+                  price_dates=np.array(price_dates),
+                  horizon=horizon, seq_len=seq_len,
+                  top_fraction=top_fraction, cost=cost,
+                  data_version=data_version,
+                  universe_status_hash=universe_status_hash,
+                  membership_hash=membership_hash,
+                  model_hash="test", weight_hash="test")
+        if delist_day is not None:
+            kw["delist_day"] = np.asarray(delist_day, dtype=int)
         np.savez(path, preds=preds, dates=np.array(dates),
-                 stocks=np.array(stocks), decision_eligible=pool,
-                 history_eligible=pool, pool=pool,
-                 entry_eligible=np.ones_like(pool),
-                 return_target_mask=np.ones_like(pool),
-                 return_target=np.zeros_like(pool),
-                 close_price=close, open_price=open,
-                 price_dates=np.array(price_dates),
-                 horizon=horizon, seq_len=seq_len,
-                 top_fraction=top_fraction, cost=cost,
-                 data_version="test", model_hash="test", weight_hash="test")
+                 stocks=np.array(stocks), **kw)
 
     def test_account_carries_across_fold_boundary(self, tmp_path):
         from scripts.production.train_panel import _replay_continuous_oos
@@ -1813,3 +1820,94 @@ class TestContinuousOosReplay:
         from scripts.production.train_panel import _replay_continuous_oos
 
         assert _replay_continuous_oos(str(tmp_path)) is None
+
+    def test_replay_force_sells_delisted_position(self, tmp_path):
+        """§十二.1: a tape's delist_day (per-stock, in the fold's sim column
+        space) is mapped onto the union price axis and forwarded to the sleeve
+        simulator, so the continuous account books a DELISTED force-sell exactly
+        as the live per-fold run did — no silent UNRESOLVED degradation."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 8)]
+        stocks = ["000001"]
+        close = np.arange(10, 17, dtype=np.float32)  # 10..16, monotonic
+        # delist_day=2 → force-sell at price_dates[2] = 2025-01-03.
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks,
+            dates=dates[0:2],
+            price_dates=dates,
+            preds=np.array([[0.9, 0.9]], dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close]),
+            open=np.stack([close]),
+            horizon=3, seq_len=60, top_fraction=0.5, cost=0.0,
+            delist_day=np.array([2], dtype=int),
+        )
+
+        cont = _replay_continuous_oos(str(tmp_path))
+        assert cont is not None
+        led = cont["ledger"]
+        assert led is not None and len(led) > 0
+        assert set(led["exit_status"]) == {"delisted"}, (
+            "delisted force-sell must fire in the continuous replay")
+
+    def test_overlapping_close_mismatch_fails(self, tmp_path):
+        """§十二.2: two folds owning the same (stock, day) MUST carry identical
+        prices; a later write must not silently overwrite an earlier one."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 7)]
+        stocks = ["000001"]
+        a_close = np.arange(10, 16, dtype=np.float32)   # 10..15
+        b_close = a_close.copy()
+        b_close[3] = 999.0                               # disagree on 01-04
+        # fold_000 = NEWEST (later window), fold_001 = OLDEST (covers 0..5).
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks, dates=dates[3:6], price_dates=dates[3:6],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([a_close[3:6]]), open=np.stack([a_close[3:6]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0)
+        self._write_tape(
+            str(tmp_path / "fold_001.npz"),
+            stocks=stocks, dates=dates[0:3], price_dates=dates[0:6],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([b_close[0:6]]), open=np.stack([b_close[0:6]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0)
+
+        with pytest.raises(ValueError, match="overlapping fold close prices"):
+            _replay_continuous_oos(str(tmp_path))
+
+    def test_tape_version_or_universe_hash_mismatch_fails(self, tmp_path):
+        """§十二.2: all tapes must describe the same data_version and the same
+        universe/membership records — a fold re-downloaded mid-run or a
+        delist-file edit between runs invalidates the continuous account."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 7)]
+        stocks = ["000001"]
+        close = np.arange(10, 16, dtype=np.float32)
+        # Non-overlapping windows (dates[0:3] vs dates[3:6]) so the ONLY
+        # inconsistency is the version/hash — the price assertion must not fire.
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks, dates=dates[3:6], price_dates=dates[3:6],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([close[3:6]]), open=np.stack([close[3:6]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            data_version="v1", universe_status_hash="u1")
+        self._write_tape(
+            str(tmp_path / "fold_001.npz"),
+            stocks=stocks, dates=dates[0:3], price_dates=dates[0:3],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([close[0:3]]), open=np.stack([close[0:3]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            data_version="v2", universe_status_hash="u2")
+
+        with pytest.raises(ValueError, match="data_version"):
+            _replay_continuous_oos(str(tmp_path))

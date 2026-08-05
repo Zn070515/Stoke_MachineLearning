@@ -6,9 +6,11 @@ Free sources via AKShare:
   - stock_info_sh_delist() / stock_info_sz_delist() — delisted stocks
 """
 import logging
-from datetime import datetime
 
+import numpy as np
 import pandas as pd
+
+from stoke_ml.data.codes import normalize_stock_code_series
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ class IPOStSource:
             "总发行数量": "total_shares",
             "发行市盈率": "pe_ratio",
         })
-        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         df["ipo_date"] = pd.to_datetime(df["ipo_date"], errors="coerce")
         df["list_date"] = pd.to_datetime(df["list_date"], errors="coerce")
         df["issue_price"] = pd.to_numeric(df["issue_price"], errors="coerce")
@@ -64,15 +66,23 @@ class IPOStSource:
             "名称": "stock_name",
             "相关性": "st_type",
         })
-        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         logger.info("ST list: %d stocks", len(df))
         return df
 
     def fetch_delisted(self) -> pd.DataFrame:
         """Fetch delisted stocks from SSE + SZSE.
 
-        Returns DataFrame with columns: stock_code, stock_name, list_date,
-        delist_date, delist_reason.
+        Returns DataFrame with explicit semantic columns: stock_code,
+        stock_name, list_date, suspension_date, delist_effective_date,
+        delist_reason, market.
+
+        The two exchanges report the exit in DIFFERENT fields — SSE's
+        ``stock_info_sh_delist`` gives 暂停上市日期 (suspension = the day trading
+        stopped), SZSE's ``stock_info_sz_delist`` gives 终止上市日期 (formal
+        removal).  §八-2: both are kept as SEPARATE columns rather than collapsed
+        into one Chinese field, so the universe layer can resolve a conservative
+        exit date per market without guessing which single field to trust.
         """
         import akshare as ak
         logger.info("Fetching delisted stocks...")
@@ -88,17 +98,41 @@ class IPOStSource:
         if not frames:
             return pd.DataFrame()
         result = pd.concat(frames, ignore_index=True)
-        # Column names vary by AKShare version; map common ones
-        col_map = {
-            "证券代码": "stock_code", "股票代码": "stock_code",
-            "证券简称": "stock_name", "股票简称": "stock_name",
-            "上市日期": "list_date", "退市日期": "delist_date",
-            "终止上市原因": "delist_reason",
-        }
-        result = result.rename(columns={k: v for k, v in col_map.items()
-                                         if k in result.columns})
-        if "stock_code" in result.columns:
-            result["stock_code"] = result["stock_code"].astype(str).str.zfill(6)
+
+        # Both markets put the code in a different column — SSE rows carry only
+        # 公司代码, SZSE rows only 证券代码/股票代码.
+        for col in ("公司代码", "证券代码", "股票代码"):
+            if col not in result.columns:
+                result[col] = np.nan
+        code = result["公司代码"].where(result["公司代码"].notna(), result["证券代码"])
+        code = code.where(code.notna(), result["股票代码"])
+        result["stock_code"] = normalize_stock_code_series(code)
+
+        for col in ("公司简称", "证券简称", "股票简称"):
+            if col not in result.columns:
+                result[col] = np.nan
+        name = result["公司简称"].where(result["公司简称"].notna(), result["证券简称"])
+        name = name.where(name.notna(), result["股票简称"])
+        result["stock_name"] = name
+
+        for out, src in (
+            ("list_date", "上市日期"),
+            ("suspension_date", "暂停上市日期"),
+            ("delist_effective_date", "终止上市日期"),
+        ):
+            result[out] = pd.to_datetime(
+                result[src] if src in result.columns
+                else pd.Series(pd.NaT, index=result.index),
+                errors="coerce",
+            )
+        result["delist_reason"] = (
+            result["终止上市原因"] if "终止上市原因" in result.columns
+            else pd.Series(np.nan, index=result.index)
+        )
+
+        keep = ["stock_code", "stock_name", "list_date", "suspension_date",
+                "delist_effective_date", "delist_reason", "market"]
+        result = result[keep].dropna(subset=["stock_code"])
         logger.info("Delisted: %d stocks", len(result))
         return result
 

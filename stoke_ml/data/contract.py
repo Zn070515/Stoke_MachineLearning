@@ -277,6 +277,36 @@ def validate_required_metadata(
             if k not in declared]
 
 
+def validate_adjustment_mode(
+    df: pd.DataFrame,
+    contract: DataContract,
+    *,
+    manifest: dict | None = None,
+) -> list[str]:
+    """The declared adjustment basis must actually match the contract's mode.
+
+    ``RESEARCH_QFQ_DAILY`` pins ``adjustment_mode="qfq"``; a frame that
+    explicitly declares ``raw`` (in ``df.attrs``, an ``adjustment_mode`` column,
+    or the storage manifest's ``adjust`` field) must NOT pass the QFQ contract.
+    ``unknown`` is the honest legacy declaration for pre-provenance files and is
+    not treated as a concrete mismatch — the economic-semantics check only fires
+    on an explicit declaration of the WRONG basis (§四.1 / P0-2).
+    """
+    if contract.adjustment_mode in ("", "n/a"):
+        return []
+    actual: set[str] = set()
+    if df.attrs.get("adjustment_mode"):
+        actual.add(str(df.attrs["adjustment_mode"]))
+    if "adjustment_mode" in df.columns:
+        actual.update(str(m) for m in df["adjustment_mode"].dropna().unique())
+    if manifest and manifest.get("adjust"):
+        actual.add(str(manifest["adjust"]))
+    concrete = {m for m in actual if m not in ("unknown", "n/a", "")}
+    bad = sorted(f"{m}!={contract.adjustment_mode}" for m in concrete
+                 if m != contract.adjustment_mode)
+    return [f"adjustment_mode_mismatch:{b}" for b in bad]
+
+
 def validate_contract(
     df: pd.DataFrame,
     contract: DataContract,
@@ -301,6 +331,7 @@ def validate_contract(
     out += validate_ohlc(df, contract)
     out += validate_source_metadata(df, contract)
     out += validate_required_metadata(df, contract, manifest=manifest)
+    out += validate_adjustment_mode(df, contract, manifest=manifest)
     return [f"{code}:{v}" if code else v for v in out]
 
 

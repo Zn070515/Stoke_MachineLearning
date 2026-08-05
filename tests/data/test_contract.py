@@ -320,6 +320,74 @@ class TestRequiredMetadata:
         assert validate_contract(df, c) == []
 
 
+class TestAdjustmentMode:
+    """v11 §四.1 / P0-2: a contract that pins qfq must reject an explicit
+    declaration of any OTHER concrete basis — raw data must not pass the QFQ
+    contract.  ``unknown`` stays the honest legacy pass-through."""
+
+    def test_qfq_contract_rejects_raw_attrs(self):
+        df = _daily()
+        df.attrs["adjustment_mode"] = "raw"
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("adjustment_mode_mismatch:raw!=qfq" in v for v in out)
+
+    def test_qfq_contract_rejects_raw_column(self):
+        df = _daily(adjustment_mode=["raw"] * 3)
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("adjustment_mode_mismatch:raw!=qfq" in v for v in out)
+
+    def test_qfq_contract_rejects_raw_manifest(self):
+        df = _daily()
+        df.attrs = {}
+        manifest = {"source": "efinance", "adjust": "raw"}
+        out = validate_contract(df, DAILY_EQUITY, manifest=manifest)
+        assert any("adjustment_mode_mismatch:raw!=qfq" in v for v in out)
+
+    def test_qfq_contract_rejects_hfq(self):
+        df = _daily()
+        df.attrs["adjustment_mode"] = "hfq"
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("adjustment_mode_mismatch:hfq!=qfq" in v for v in out)
+
+    def test_qfq_contract_passes_qfq(self):
+        assert validate_contract(_daily(), DAILY_EQUITY) == []
+
+    def test_unknown_is_not_a_mismatch(self):
+        """Legacy files honestly record unknown basis; that is not a proof of
+        the WRONG basis, so it passes the economic-semantics check."""
+        df = _daily()
+        df.attrs["adjustment_mode"] = "unknown"
+        assert validate_contract(df, DAILY_EQUITY) == []
+
+    def test_manifest_unknown_is_not_a_mismatch(self):
+        df = _daily()
+        df.attrs = {}
+        manifest = {"source": "unknown", "adjust": "unknown"}
+        assert validate_contract(df, DAILY_EQUITY, manifest=manifest) == []
+
+    def test_raw_contract_rejects_qfq_attrs(self):
+        df = _daily()
+        df.attrs["adjustment_mode"] = "qfq"
+        out = validate_contract(df, RAW_UNQUOTED_DAILY)
+        assert any("adjustment_mode_mismatch:qfq!=raw" in v for v in out)
+
+    def test_raw_contract_passes_raw(self):
+        df = _daily()
+        df.attrs["adjustment_mode"] = "raw"
+        assert validate_contract(df, RAW_UNQUOTED_DAILY) == []
+
+    def test_n_a_contract_skips_check(self):
+        df = _daily()
+        df.attrs = {"source": "x", "adjustment_mode": "raw"}
+        c = DataContract(
+            dataset_name="custom", primary_key=("id", "ts"),
+            required_columns=("id", "ts", "v"), units={}, price_basis="n/a",
+            timezone="Asia/Shanghai", calendar="x",
+        )
+        out = validate_contract(df, c)
+        assert not any("adjustment_mode_mismatch" in v for v in out)
+
+
 class TestCalendarMembership:
     """Optional official-calendar membership check."""
 

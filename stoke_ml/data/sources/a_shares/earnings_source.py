@@ -14,6 +14,8 @@ import logging
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code_series
+
 logger = logging.getLogger(__name__)
 
 # Columns emitted by fetch_forecasts() regardless of akshare schema version.
@@ -95,7 +97,7 @@ class EarningsSource:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         if "stock_code" in df.columns:
-            df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+            df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         logger.info("业绩快报: %d rows", len(df))
         return df
 
@@ -137,7 +139,7 @@ class EarningsSource:
             df["net_profit_high"] = df["预告净利润上限"]
 
         if "stock_code" in df.columns:
-            df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+            df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         for col in ["net_profit_yoy", "net_profit_yoy_high",
                     "net_profit", "net_profit_high"]:
             if col in df.columns:

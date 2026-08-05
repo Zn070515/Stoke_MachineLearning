@@ -8,6 +8,8 @@ import logging
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code_series
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,7 @@ class AnalystSource:
             "2027预测每股收益": "eps_2027",
             "2028预测每股收益": "eps_2028",
         })
-        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         for col in ["report_count", "rating_buy", "rating_overweight",
                      "rating_neutral", "rating_underweight", "rating_sell"]:
             if col in df.columns:

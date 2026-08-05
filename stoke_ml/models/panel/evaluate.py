@@ -9,7 +9,8 @@ from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from stoke_ml.models.panel.inference import (
     compute_deflated_sharpe,
     compute_psr,
-    spa_test,
+    effective_sample_size,
+    block_bootstrap_max_mean,
 )
 
 logger = logging.getLogger(__name__)
@@ -1055,9 +1056,11 @@ def _sleeve_account_metrics(
     """Run long / short / equal-weight sleeve accounts and assemble metrics.
 
     When `n_trials` is given (>1), the report also carries the §十五-1
-    multiple-testing corrections — PSR, DSR and the SPA p-value vs the
-    selected-universe equal-weight benchmark — so the headline Sharpe is read
-    together with how much of it survives data-snooping.
+    multiple-testing corrections — PSR, DSR and the block-bootstrap max-mean
+    reality-check p-value vs the selected-universe equal-weight benchmark — so
+    the headline Sharpe is read together with how much of it survives
+    data-snooping.  The reality check is an un-studentized max-mean screen, not
+    a full Hansen SPA (§十二.4).
     """
     long_a = _simulate_sleeve_account(preds_np, close_np, open_np, select_pool,
                                       horizon, top_fraction, cost, "long",
@@ -1141,14 +1144,20 @@ def _sleeve_account_metrics(
     # research trials iterated across the project (experiment registry); the
     # registry count is passed in by the training script, else it defaults to
     # the number of strategies in this report.
-    long_psr = compute_psr(long_d, 0.0, 1)
-    ls_psr = compute_psr(ls_d, 0.0, 1)
+    # §十二.5: sleeve daily returns share overlapping holdings and volatility
+    # clustering, so PSR/DSR must read the autocorrelation-adjusted effective
+    # sample size — the raw n overstates precision and inflates the probabilities.
+    long_n_eff = effective_sample_size(long_d, horizon=1)
+    ls_n_eff = effective_sample_size(ls_d, horizon=1)
+    long_psr = compute_psr(long_d, 0.0, 1, n_obs=long_n_eff)
+    ls_psr = compute_psr(ls_d, 0.0, 1, n_obs=ls_n_eff)
     trial_sharpes = [long_m["sharpe"], ls_m["sharpe"], ls2x_m["sharpe"],
                      eligible_ew_sharpe, selected_universe_ew_sharpe]
     nt = n_trials if (n_trials is not None and n_trials >= 2) else len(trial_sharpes)
-    long_dsr = compute_deflated_sharpe(long_d, nt, trial_sharpes, 1)
-    ls_dsr = compute_deflated_sharpe(ls_d, nt, trial_sharpes, 1)
-    spa = spa_test(np.stack([long_d, ls_d, ls2x_d]), sel_uni_d, horizon=horizon)
+    long_dsr = compute_deflated_sharpe(long_d, nt, trial_sharpes, 1, n_obs=long_n_eff)
+    ls_dsr = compute_deflated_sharpe(ls_d, nt, trial_sharpes, 1, n_obs=ls_n_eff)
+    bbmm = block_bootstrap_max_mean(np.stack([long_d, ls_d, ls2x_d]),
+                                    sel_uni_d, horizon=horizon)
 
     out = {
         "n_periods": int(long_d.size),
@@ -1176,10 +1185,14 @@ def _sleeve_account_metrics(
         "long_dsr": long_dsr,
         "ls_psr": ls_psr,
         "ls_dsr": ls_dsr,
+        # §十二.5: effective (autocorrelation-adjusted) sample sizes behind the
+        # PSR/DSR above — the reader can see how much the overlap discount was.
+        "long_n_eff": int(long_n_eff),
+        "ls_n_eff": int(ls_n_eff),
         "dsr_n_trials": nt,
-        "spa_stat": spa["stat"],
-        "spa_p_value": spa["p_value"],
-        "spa_n_strategies": spa["n_strategies"],
+        "bbmm_stat": bbmm["stat"],
+        "bbmm_p_value": bbmm["p_value"],
+        "bbmm_n_strategies": bbmm["n_strategies"],
         # The short leg is a theoretical bottom-quantile factor book (A-share
         # stocks cannot be shorted directly) — the exposure metadata keeps the
         # leverage assumption explicit.  The
@@ -1448,9 +1461,9 @@ def evaluate_portfolio(
             "ls_psr": pm["ls_psr"],
             "ls_dsr": pm["ls_dsr"],
             "dsr_n_trials": pm["dsr_n_trials"],
-            "spa_stat": pm["spa_stat"],
-            "spa_p_value": pm["spa_p_value"],
-            "spa_n_strategies": pm["spa_n_strategies"],
+            "bbmm_stat": pm["bbmm_stat"],
+            "bbmm_p_value": pm["bbmm_p_value"],
+            "bbmm_n_strategies": pm["bbmm_n_strategies"],
             "long_turnover": pm["long_turnover"],
             "ls_turnover": pm["ls_turnover"],
             "ew_turnover": pm["ew_turnover"],
@@ -1563,8 +1576,8 @@ def evaluate_portfolio(
         "long_psr": float("nan"), "long_dsr": float("nan"),
         "ls_psr": float("nan"), "ls_dsr": float("nan"),
         "dsr_n_trials": 0,
-        "spa_stat": float("nan"), "spa_p_value": float("nan"),
-        "spa_n_strategies": 0,
+        "bbmm_stat": float("nan"), "bbmm_p_value": float("nan"),
+        "bbmm_n_strategies": 0,
     }
 
 
@@ -1700,8 +1713,8 @@ def _empty_result() -> dict:
         "long_psr": float("nan"), "long_dsr": float("nan"),
         "ls_psr": float("nan"), "ls_dsr": float("nan"),
         "dsr_n_trials": 0,
-        "spa_stat": float("nan"), "spa_p_value": float("nan"),
-        "spa_n_strategies": 0,
+        "bbmm_stat": float("nan"), "bbmm_p_value": float("nan"),
+        "bbmm_n_strategies": 0,
         "long_ledger": None,
         "short_ledger": None,
         "ls_ledger": None,

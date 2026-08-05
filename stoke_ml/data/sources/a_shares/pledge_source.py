@@ -16,6 +16,8 @@ import time
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code
+
 logger = logging.getLogger(__name__)
 
 # AKShare internally calls requests.get() without a timeout parameter,
@@ -29,7 +31,7 @@ class PledgeSource:
 
     @staticmethod
     def _zfill(code: str) -> str:
-        return str(code).zfill(6)
+        return normalize_stock_code(code)
 
     def fetch_pledge_ratio(self, code: str) -> pd.DataFrame:
         """Fetch individual pledge ratio detail for one stock.

@@ -30,10 +30,16 @@ def test_write_manifest_full_report(tmp_path):
     assert manifest["missing_count"] == 2
     assert manifest["missing"] == ["000002", "000003"]
     assert manifest["all_complete"] is False
+    # §P0-4: the full request and the validated-complete set are persisted so
+    # "is the ENTIRE requested universe complete" is auditable after the fact.
+    assert manifest["requested"] == [f"{i:06d}" for i in range(1, 501)]
+    assert manifest["complete"] == [
+        f"{i:06d}" for i in range(1, 501) if i not in (2, 3)
+    ]
     # Round-trips through disk.
     assert load_manifest(path) == manifest
     with open(path, "r", encoding="utf-8") as f:
-        assert json.load(f)["schema_version"] == "1.1"
+        assert json.load(f)["schema_version"] == "1.2"
 
 
 def test_write_manifest_all_complete(tmp_path):

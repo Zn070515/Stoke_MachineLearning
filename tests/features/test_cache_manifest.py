@@ -268,6 +268,72 @@ class TestManifest:
         assert payload["source_files"]["margin"]["hash"] is None
 
 
+class TestCodeTreeHash:
+    """§十-2: non-git fallback for code-version tracking in manifests."""
+
+    def test_returns_deterministic_hash_in_repo(self):
+        h1 = cache_manifest.feature_code_tree_hash()
+        h2 = cache_manifest.feature_code_tree_hash()
+        assert h1 != "unknown"
+        assert h1 == h2
+        # Recorded in every fresh manifest alongside git_commit.
+        payload = cache_manifest.make_manifest(
+            "000001", _base_config(), "/tmp/fake.parquet",
+            "/tmp/fake", "unknown", "hash",
+        )
+        assert payload["git_commit"] == "unknown"
+        assert payload["feature_code_tree_hash"] != "unknown"
+
+    def test_non_git_roundtrip_matches(self, tmp_path, monkeypatch):
+        # Both build and use are outside git (git_commit=unknown on both
+        # sides) and the code tree is unchanged → cache still valid.
+        tree_hash = cache_manifest.feature_code_tree_hash()
+        monkeypatch.setattr(
+            cache_manifest, "feature_code_tree_hash", lambda: tree_hash
+        )
+        data_dir, feature, mpath, cfg, cfg_hash, _commit = \
+            TestManifest()._setup(tmp_path)
+        payload = cache_manifest.make_manifest(
+            "000001", cfg, feature, data_dir, "unknown", cfg_hash,
+        )
+        cache_manifest.write_manifest(payload, mpath)
+        assert cache_manifest.manifest_matches(
+            mpath, "000001", cfg, feature, data_dir, "unknown", cfg_hash
+        )
+
+    def test_non_git_code_change_invalidates(self, tmp_path, monkeypatch):
+        # Same non-git setup, but the feature code tree changed between build
+        # and use → the manifest must now fail, where the git_commit=unknown
+        # check alone would have let it through.
+        data_dir, feature, mpath, cfg, cfg_hash, _commit = \
+            TestManifest()._setup(tmp_path)
+        payload = cache_manifest.make_manifest(
+            "000001", cfg, feature, data_dir, "unknown", cfg_hash,
+        )
+        cache_manifest.write_manifest(payload, mpath)
+        monkeypatch.setattr(
+            cache_manifest, "feature_code_tree_hash", lambda: "cafebabe"
+        )
+        assert not cache_manifest.manifest_matches(
+            mpath, "000001", cfg, feature, data_dir, "unknown", cfg_hash
+        )
+
+    def test_git_build_skips_tree_hash(self, tmp_path):
+        # When git IS available, the git-commit check is authoritative and a
+        # stale code-tree hash must NOT invalidate (backward compatible).
+        data_dir, feature, mpath, cfg, cfg_hash, commit = \
+            TestManifest()._setup(tmp_path)
+        assert commit != "unknown"
+        payload = cache_manifest.make_manifest(
+            "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        payload["feature_code_tree_hash"] = "stale-from-old-build"
+        cache_manifest.write_manifest(payload, mpath)
+        assert cache_manifest.manifest_matches(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash
+        )
+
+
 class TestPaths:
     def test_source_paths_shape(self, tmp_path):
         paths = cache_manifest.source_paths(str(tmp_path), "600519")
@@ -280,3 +346,112 @@ class TestPaths:
         assert paths["earnings_forecasts"] == os.path.join(
             str(tmp_path), "a_shares", "earnings", "forecasts.parquet"
         )
+        # Shared market-wide inputs are also exposed (same for every code).
+        assert paths["macro"] == os.path.join(
+            str(tmp_path), "a_shares", "macro", "macro_daily.parquet"
+        )
+        assert paths["calendar"] == os.path.join(
+            str(tmp_path), "exchange_calendar", "a_shares.parquet"
+        )
+        assert paths["etf_flow"] == os.path.join(
+            str(tmp_path), "a_shares", "etf_flow"
+        )
+
+
+class TestSharedInputs:
+    """§十-1: market-wide shared inputs (macro / market-env / industry /
+    sector-mapper / calendar / ETF-flow dir) must be fingerprinted in every
+    per-stock manifest so their change invalidates a stale feature cache."""
+
+    def _write_shared(self, data_dir, rel, rows=10):
+        p = os.path.join(data_dir, *rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        df = pd.DataFrame({
+            "date": pd.date_range("2024-01-01", periods=rows),
+            "value": [float(i) for i in range(rows)],
+        })
+        pq.write_table(pa.Table.from_pandas(df), p, compression="lz4")
+        return p
+
+    def _built(self, tmp_path, code="000001"):
+        data_dir = _make_data_dir(tmp_path, code)
+        feature = os.path.join(str(tmp_path / "out"), f"{code}.parquet")
+        _write_parquet(feature, cols=("date", "f1"))
+        cfg = _base_config()
+        mpath = os.path.join(str(tmp_path / "out"), ".manifests", f"{code}.json")
+        cache_manifest.write_manifest(
+            cache_manifest.make_manifest(
+                code, cfg, feature, data_dir, "c1", cache_manifest.config_hash(cfg)),
+            mpath,
+        )
+        return data_dir, feature, mpath, cfg
+
+    def test_manifest_records_shared_inputs(self, tmp_path):
+        data_dir = _make_data_dir(tmp_path, "000001")
+        self._write_shared(data_dir, ("a_shares", "macro", "macro_daily.parquet"))
+        self._write_shared(data_dir, ("exchange_calendar", "a_shares.parquet"))
+        feature = os.path.join(str(tmp_path / "out"), "000001.parquet")
+        _write_parquet(feature, cols=("date", "f1"))
+        cfg = _base_config()
+        payload = cache_manifest.make_manifest(
+            "000001", cfg, feature, data_dir, "c1", cache_manifest.config_hash(cfg),
+        )
+        assert payload["source_files"]["macro"]["hash"] is not None
+        assert payload["source_files"]["calendar"]["hash"] is not None
+        assert payload["channels"]["macro"] == "complete"
+        # Directory absent -> optional-missing, never "complete".
+        assert payload["source_files"]["etf_flow"]["hash"] is None
+        assert payload["channels"]["etf_flow"] == "missing_optional"
+
+    def test_shared_input_missing_optional_when_absent(self, tmp_path):
+        data_dir, feature, _mpath, cfg = self._built(tmp_path)
+        payload = cache_manifest.make_manifest(
+            "000001", cfg, feature, data_dir, "c1", cache_manifest.config_hash(cfg),
+        )
+        assert payload["channels"]["macro"] == "missing_optional"
+        assert payload["source_files"]["calendar"]["hash"] is None
+
+    def test_shared_input_change_invalidates(self, tmp_path):
+        data_dir, feature, mpath, cfg = self._built(tmp_path)
+        self._write_shared(data_dir, ("a_shares", "macro", "macro_daily.parquet"))
+        cache_manifest._shared_fingerprint.cache_clear()
+        cfg_hash = cache_manifest.config_hash(cfg)
+        # Rebuild manifest WITH the macro file present.
+        cache_manifest.write_manifest(
+            cache_manifest.make_manifest(
+                "000001", cfg, feature, data_dir, "c1", cfg_hash), mpath)
+        assert cache_manifest.manifest_matches(mpath, "000001", cfg, feature, data_dir, "c1", cfg_hash)
+        # Macro content changes -> same manifest must now FAIL (fresh process
+        # semantics: the memo is per-process, so clear it to simulate a rerun).
+        self._write_shared(data_dir, ("a_shares", "macro", "macro_daily.parquet"), rows=99)
+        cache_manifest._shared_fingerprint.cache_clear()
+        assert not cache_manifest.manifest_matches(mpath, "000001", cfg, feature, data_dir, "c1", cfg_hash)
+
+    def test_shared_dir_change_invalidates(self, tmp_path):
+        data_dir, feature, mpath, cfg = self._built(tmp_path)
+        self._write_shared(data_dir, ("a_shares", "etf_flow", "sector_test.parquet"))
+        cache_manifest._shared_fingerprint.cache_clear()
+        cfg_hash = cache_manifest.config_hash(cfg)
+        cache_manifest.write_manifest(
+            cache_manifest.make_manifest(
+                "000001", cfg, feature, data_dir, "c1", cfg_hash), mpath)
+        assert cache_manifest.manifest_matches(mpath, "000001", cfg, feature, data_dir, "c1", cfg_hash)
+        # ANY file under the shared dir changing invalidates the whole cache.
+        self._write_shared(data_dir, ("a_shares", "etf_flow", "sector_test.parquet"), rows=7)
+        cache_manifest._shared_fingerprint.cache_clear()
+        assert not cache_manifest.manifest_matches(mpath, "000001", cfg, feature, data_dir, "c1", cfg_hash)
+
+    def test_old_manifest_without_shared_inputs_invalidates(self, tmp_path):
+        """A manifest written before §十-1 cannot vouch for the shared inputs —
+        it must be rebuilt even if every other field still matches."""
+        code = "000001"
+        data_dir, feature, mpath, cfg, cfg_hash, commit = TestManifest()._setup(tmp_path)
+        with open(mpath, encoding="utf-8") as f:
+            m = json.load(f)
+        for name in ("macro", "market_env", "industry", "sector_mapper",
+                     "calendar", "etf_flow"):
+            m["source_files"].pop(name, None)
+            m["channels"].pop(name, None)
+        cache_manifest.write_manifest(m, mpath)
+        assert not cache_manifest.manifest_matches(
+            mpath, code, cfg, feature, data_dir, commit, cfg_hash)

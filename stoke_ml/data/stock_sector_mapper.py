@@ -8,6 +8,8 @@ import os
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code
+
 logger = logging.getLogger(__name__)
 
 # Simplified industry→sector mapping based on common Chinese
@@ -68,7 +70,7 @@ class StockSectorMapper:
         """Return the sector name for a stock, or None if unknown."""
         if not self._loaded:
             self._load_cache()
-        return self._mapping.get(str(stock_code).zfill(6))
+        return self._mapping.get(normalize_stock_code(stock_code))
 
     def _load_cache(self) -> None:
         """Load stock→sector mapping from cache or build from AKShare."""
@@ -128,7 +130,7 @@ class StockSectorMapper:
                 continue
 
             for _, srow in stocks.iterrows():
-                code = str(srow.get("代码", "")).zfill(6)
+                code = normalize_stock_code(srow.get("代码", ""))
                 if code and len(code) == 6:
                     self._mapping[code] = sector
 

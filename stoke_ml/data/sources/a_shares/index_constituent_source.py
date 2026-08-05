@@ -14,6 +14,8 @@ from datetime import datetime
 
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code_series
+
 logger = logging.getLogger(__name__)
 
 # Major CSI indices for universe construction
@@ -71,7 +73,7 @@ class IndexConstituentSource:
         df = df.rename(columns={k: v for k, v in col_map.items()
                                  if k in df.columns})
         if "stock_code" in df.columns:
-            df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+            df["stock_code"] = normalize_stock_code_series(df["stock_code"])
         if "weight" not in df.columns:
             df["weight"] = 0.0
         now = datetime.now().strftime("%Y-%m-%d")
