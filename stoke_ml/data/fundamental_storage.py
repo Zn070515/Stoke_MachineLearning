@@ -125,6 +125,22 @@ class FundamentalStorage:
         fill_col = "disclose_date" if "disclose_date" in raw.columns else "report_date"
         raw["_fill_from"] = pd.to_datetime(raw[fill_col])
 
+        # A row with no valid disclosure date cannot anchor a forward-fill
+        # window.  Previously this was silently ignored: the NaT _fill_from
+        # matched no daily row (date >= NaT is always False) so the whole
+        # quarter was dropped without any signal.  Surface it so a missing
+        # disclosure date never passes unnoticed.
+        na_fill = raw["_fill_from"].isna()
+        if na_fill.any():
+            for _, row in raw.loc[na_fill, ["report_date"]].iterrows():
+                logger.warning(
+                    "FundamentalStorage: %s has no valid %s for report period "
+                    "%s — this quarter's values are skipped (no disclosure "
+                    "date to forward-fill from)",
+                    stock_code, fill_col, row["report_date"],
+                )
+            raw = raw[~na_fill].reset_index(drop=True)
+
         value_cols = [
             c for c in raw.columns
             if c not in ("stock_code", "report_date", "disclose_date", "_fill_from")

@@ -33,6 +33,40 @@ INDICATOR_MAP = {
 }
 
 
+def _statutory_disclosure_date(report_date):
+    """Map a report-period end to its statutory disclosure deadline.
+
+    A-share quarterly/annual financial reports carry legal disclosure
+    deadlines (法定披露截止日):
+        Q1   (period end 03-31) → 04-30 of the SAME year
+        H1   (period end 06-30) → 08-31 of the SAME year
+        Q3   (period end 09-30) → 10-31 of the SAME year
+        Annual (period end 12-31) → 04-30 of the FOLLOWING year
+
+    Conservative alignment: the statutory deadline is the LATEST legal date a
+    company may disclose, so anchoring on it never reveals information before
+    that date passes — no lookahead into an unpublished filing.  Most
+    companies actually disclose well before the deadline (e.g. an annual
+    report often lands in March), so this alignment is deliberately LATE
+    relative to the true announcement: safe, but not the real publish time.
+    It is used as a leakage-free proxy because the upstream API
+    (``ak.stock_financial_abstract``) does not return an announcement-date
+    field.
+
+    ``report_date`` may be ``pd.Timestamp``, ``datetime.date`` or ``str``.
+    """
+    report_date = pd.Timestamp(report_date)
+    quarter = (report_date.month - 1) // 3  # 0=Q1, 1=Q2, 2=Q3, 3=Q4
+    year = report_date.year + (1 if quarter == 3 else 0)
+    y, m, d = {
+        0: (year, 4, 30),
+        1: (year, 8, 31),
+        2: (year, 10, 31),
+        3: (year, 4, 30),
+    }[quarter]
+    return pd.Timestamp(y, m, d)
+
+
 class FundamentalSource:
     """Fetch quarterly financial indicators for A-share stocks."""
 
@@ -98,8 +132,14 @@ class FundamentalSource:
 
         result["stock_code"] = normalize_stock_code(stock_code)
 
-        # No disclose_date from this API — use report_date as proxy
-        result["disclose_date"] = result["report_date"]
+        # No disclose_date from this API.  Anchoring on the statutory
+        # disclosure deadline (法定披露截止日) instead of report_date: the
+        # report-period end (e.g. 2025-03-31) is months before the filing is
+        # actually published (often late April), so using it as the disclosure
+        # day would leak the figures forward into the model.  The statutory
+        # deadline is the LATEST legal publish date — conservative, never
+        # early, hence leakage-free (see _statutory_disclosure_date).
+        result["disclose_date"] = result["report_date"].map(_statutory_disclosure_date)
 
         # PE and PB not available from financial_abstract — leave as NaN
         # They will be None/missing in the output; can be added from daily data later
