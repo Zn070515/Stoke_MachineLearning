@@ -8,6 +8,7 @@ training cutoff.  We verify:
   * fitting with two different cutoffs writes two distinct cache files.
 """
 
+import os
 import sys
 import types
 
@@ -166,7 +167,7 @@ def test_different_cutoffs_never_share_cache(
     tm3.fit(posts.copy(), source="news")  # full corpus
 
     assert len(dumped) == 3
-    names = sorted(p.split("\\")[-1] for p in dumped)
+    names = sorted(os.path.basename(p) for p in dumped)
     assert names == [
         "bertopic_news_cutoff_2024-01-31.pkl",
         "bertopic_news_cutoff_2024-02-29.pkl",
