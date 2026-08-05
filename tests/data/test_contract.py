@@ -451,6 +451,18 @@ class TestFormalAdjustmentMode:
     def test_formal_passes_concrete_qfq(self):
         assert validate_contract(_daily(), DAILY_EQUITY, formal=True) == []
 
+    def test_formal_no_attrs_concrete_manifest_passes(self):
+        """§十三-1 (v14): provenance comes from the validated manifest, not
+        ``df.attrs``.  A canonical file whose attrs were lost in transit (the
+        parquet engine didn't round-trip them) still passes the FORMAL contract
+        when the sidecar manifest records concrete provenance — this is exactly
+        the load_daily(require_valid_manifest=True) path, which passes the
+        already-validated manifest into the contract."""
+        df = _daily()
+        df.attrs = {}
+        manifest = {"source": "efinance", "adjust": "qfq"}
+        assert validate_contract(df, DAILY_EQUITY, manifest=manifest, formal=True) == []
+
     def test_formal_still_rejects_wrong_concrete(self):
         df = _daily()
         df.attrs["adjustment_mode"] = "raw"
