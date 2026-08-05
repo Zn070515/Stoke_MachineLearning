@@ -183,8 +183,8 @@ def _training_sample_policy_hash(max_train_rows: int) -> str:
 
 
 # §十七: version tag of the baseline INPUT feature-scaling recipe — the
-# StandardScaler applied to the flat training sample before fitting (line ~602
-# ``scaler = StandardScaler(); scaler.fit_transform(Xtr)``).  Bump when the
+# StandardScaler applied to the flat training sample before fitting
+# (``scaler = StandardScaler(); scaler.fit_transform(Xtr)``).  Bump when the
 # transform a baseline is fit on changes (a different scaler class or a
 # different fit basis).  The FITTED values are already fingerprinted per-fold
 # by ``weight_hash`` — the real content hash of the pickled ``ScaledPredictor``
