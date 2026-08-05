@@ -390,7 +390,12 @@ def main():
         # different root or an empty dir is worse than no gate.  The formal
         # profile (§六-4) enforces research-run floors: span>=5y, stale<=4d,
         # 0 unreadable, readable stocks>=98%.
-        feat = "features_panel" if args.panel_mode else "features"
+        # §九.1: bind the gate to the REAL output dir this mode wrote, not a
+        # fixed basename — a custom --output-dir (features_panel_v2, my_features)
+        # must be the dataset the gate validates.  The gate's _dataset_dir
+        # resolves the basename under the data root; an out-of-root output fails
+        # loudly (missing_dir) instead of silently validating the wrong place.
+        feat = os.path.basename(os.path.normpath(output_dir))
         cmd = [sys.executable, gate, "--quick", "--profile", "formal",
                "--data-dir", data_dir, "--require", f"daily,{feat}"]
         env = dict(os.environ, PYTHONPATH=str(get_project_root()))

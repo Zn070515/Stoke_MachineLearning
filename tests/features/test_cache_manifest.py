@@ -267,6 +267,43 @@ class TestManifest:
         assert payload["source_files"]["daily"]["hash"] is not None
         assert payload["source_files"]["margin"]["hash"] is None
 
+    def test_manifest_records_shared_inputs_hash(self, tmp_path):
+        """§十二.3/§P1-1: the aggregate over all market-wide shared inputs is
+        recorded in every manifest, so a lineage-DEFINITION change (a new shared
+        input added later) invalidates old manifests instead of trusting them."""
+        code = "000001"
+        data_dir = _make_data_dir(tmp_path, code)
+        feature = os.path.join(str(tmp_path / "out"), f"{code}.parquet")
+        _write_parquet(feature, cols=("date", "f1"))
+        cfg = _base_config()
+        payload = cache_manifest.make_manifest(
+            code, cfg, feature, data_dir,
+            "commit-1", cache_manifest.config_hash(cfg),
+        )
+        assert payload["shared_inputs_hash"] == cache_manifest.shared_inputs_hash(data_dir)
+        # Changing any shared input's content flips the aggregate.  Shared
+        # fingerprints are memoized per path (shared data is frozen during a
+        # build), so the test clears the memo to simulate a fresh build.
+        macro = os.path.join(data_dir, "a_shares", "macro", "macro_daily.parquet")
+        _write_parquet(macro)
+        cache_manifest._shared_fingerprint.cache_clear()
+        assert cache_manifest.shared_inputs_hash(data_dir) != payload["shared_inputs_hash"]
+
+    def test_manifest_without_shared_inputs_hash_is_stale(self, tmp_path):
+        """§P1-1: a manifest written before the shared-inputs aggregate existed
+        cannot vouch for the shared lineage — it is treated as stale so the
+        cache rebuilds and records complete lineage."""
+        data_dir, feature, mpath, cfg, cfg_hash, commit = \
+            TestManifest()._setup(tmp_path)
+        payload = cache_manifest.make_manifest(
+            "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        payload.pop("shared_inputs_hash", None)  # emulate a pre-P1-1 manifest
+        cache_manifest.write_manifest(payload, mpath)
+        assert not cache_manifest.manifest_matches(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash
+        )
+
 
 class TestCodeTreeHash:
     """§十-2: non-git fallback for code-version tracking in manifests."""
@@ -318,17 +355,32 @@ class TestCodeTreeHash:
             mpath, "000001", cfg, feature, data_dir, "unknown", cfg_hash
         )
 
-    def test_git_build_skips_tree_hash(self, tmp_path):
-        # When git IS available, the git-commit check is authoritative and a
-        # stale code-tree hash must NOT invalidate (backward compatible).
+    def test_git_build_stale_tree_invalidates(self, tmp_path, monkeypatch):
+        # §十二.2: git IS available but the feature code tree changed between
+        # build and use (uncommitted edit under an unchanged commit SHA) — the
+        # manifest must now FAIL.  The old behavior trusted git_commit alone
+        # and let a stale cache survive this exact case.
         data_dir, feature, mpath, cfg, cfg_hash, commit = \
             TestManifest()._setup(tmp_path)
         assert commit != "unknown"
-        payload = cache_manifest.make_manifest(
-            "000001", cfg, feature, data_dir, commit, cfg_hash,
+        monkeypatch.setattr(
+            cache_manifest, "feature_code_tree_hash", lambda: "cafebabe"
         )
-        payload["feature_code_tree_hash"] = "stale-from-old-build"
-        cache_manifest.write_manifest(payload, mpath)
+        assert not cache_manifest.manifest_matches(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash
+        )
+
+    def test_git_build_matching_tree_valid(self, tmp_path, monkeypatch):
+        # §十二.2: same git setup with the code tree UNCHANGED → the manifest
+        # stays valid.  The always-compare rule must not reject a genuine cache
+        # hit whose recorded tree hash still matches the current tree.
+        tree_hash = cache_manifest.feature_code_tree_hash()
+        monkeypatch.setattr(
+            cache_manifest, "feature_code_tree_hash", lambda: tree_hash
+        )
+        data_dir, feature, mpath, cfg, cfg_hash, commit = \
+            TestManifest()._setup(tmp_path)
+        assert commit != "unknown"
         assert cache_manifest.manifest_matches(
             mpath, "000001", cfg, feature, data_dir, commit, cfg_hash
         )

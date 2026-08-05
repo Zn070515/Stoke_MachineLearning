@@ -335,6 +335,25 @@ def config_hash(config: dict) -> str:
     return _sha1(sig)
 
 
+def shared_inputs_hash(data_dir: str) -> str:
+    """Aggregate fingerprint of every market-wide shared input.
+
+    §十二.3/§P1-1: the per-channel ``source_files`` entries already fingerprint
+    each shared input individually; this aggregate is a lineage-DEFINITION
+    guard.  If the SHARED_FILES/SHARED_DIRS schema later grows (a new shared
+    input that changes feature values), the aggregate differs from older
+    manifests and the cache rebuilds with complete lineage instead of silently
+    trusting a manifest written before that input existed.  Feature-selection
+    is deliberately not a shared input here: it is derived deterministically
+    from the source data + config, so the config hash covers it.
+    """
+    entries: dict[str, str | None] = {}
+    for name in sorted((*SHARED_FILES, *SHARED_DIRS)):
+        rel = SHARED_FILES.get(name) or SHARED_DIRS.get(name)
+        entries[name] = _shared_fingerprint(os.path.join(data_dir, *rel))
+    return _sha1(_stable_dumps(entries))
+
+
 def source_paths(data_dir: str, code: str) -> dict[str, str]:
     """Canonical per-channel source file path for a stock.
 
@@ -404,6 +423,9 @@ def make_manifest(
         "panel_mode": config.get("panel_mode"),
         "source_files": source_files,
         "channels": channels,
+        # §十二.3/§P1-1: aggregate over all market-wide shared inputs — a
+        # lineage-definition guard (see shared_inputs_hash).
+        "shared_inputs_hash": shared_inputs_hash(data_dir),
     }
 
 
@@ -438,14 +460,19 @@ def manifest_matches(
     missing_shared = _SHARED_NAMES - set((m.get("source_files") or {}).keys())
     if missing_shared:
         return False
-    if (
-        m.get("git_commit") == "unknown"
-        and m.get("feature_code_tree_hash")
-        and m["feature_code_tree_hash"] != feature_code_tree_hash()
-    ):
-        # §十-2: outside a git repo both sides record git_commit=unknown, so
-        # the git check above passes regardless of code version — only the
-        # feature code-tree hash can tell a changed build from an unchanged one.
+    # §十二.2: the feature code-tree hash is ALWAYS compared, git or not.  In a
+    # repo, git_commit can match while uncommitted source edits change the
+    # feature code — trusting the commit alone would let a stale cache survive;
+    # outside a repo both sides record git_commit=unknown and only this hash
+    # distinguishes versions.  Both git_commit AND the code-tree hash must match
+    # for reuse; a manifest that cannot vouch for its code provenance (missing /
+    # None field) is treated as stale rather than trusted.
+    if m.get("feature_code_tree_hash") != feature_code_tree_hash():
+        return False
+    # §十二.3/§P1-1: the shared-inputs aggregate must match too.  A manifest
+    # written before a shared input existed (or before this field was recorded)
+    # cannot vouch for it — rebuild to record complete lineage.
+    if m.get("shared_inputs_hash") != shared_inputs_hash(data_dir):
         return False
     # start/end are NOT part of config_hash (build and training resolve them
     # differently) — they are recorded as the daily source range and compared

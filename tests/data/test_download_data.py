@@ -40,7 +40,7 @@ def _frame(dates, code="000001"):
     dates = list(pd.to_datetime(dates))
     n = len(dates)
     closes = [10.0 + 0.1 * i for i in range(n)]
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "date": dates,
         "open": [float(c) for c in closes],
         "high": [float(c) + 0.5 for c in closes],
@@ -50,6 +50,15 @@ def _frame(dates, code="000001"):
         "amount": [1e8] * n,
         "stock_code": code,
     })
+    # §八-1: save_daily now enforces the RESEARCH_QFQ_DAILY contract, so the
+    # fixture must carry pct_change (NaN on the first row) + provenance attrs.
+    pct = pd.Series([float("nan")] * n)
+    if n > 1:
+        pct.iloc[1:] = 100.0 * pd.Series(closes).pct_change().iloc[1:].to_numpy()
+    df["pct_change"] = pct
+    df.attrs["source"] = "test"
+    df.attrs["adjustment_mode"] = "qfq"
+    return df
 
 
 def _save(root, code, dates):
@@ -140,9 +149,12 @@ class TestFilterExisting:
         effective end is min(requested_end, delist_date), so the requested
         2024 end does not mark it incomplete."""
         _write_delisted(tmp_path, ["000002"])
-        _save(tmp_path, "000002", ["2013-01-02", "2015-06-30"])
+        # 2013-01-02 is a market holiday (A_SHARES_HOLIDAYS); 2013-01-04 is the
+        # first trading day of 2013, and the request must start there too or the
+        # actual start would exceed the requested start and mark it incomplete.
+        _save(tmp_path, "000002", ["2013-01-04", "2015-06-30"])
         pending, complete = filter_existing(
-            ["000002"], str(tmp_path), "2013-01-02", "2024-12-31"
+            ["000002"], str(tmp_path), "2013-01-04", "2024-12-31"
         )
         assert complete == {"000002"}
         assert pending == []
@@ -158,7 +170,8 @@ class TestFilterExisting:
 
         cal = TradingCalendar("a_shares", calendar_dir=str(tmp_path))
         last_closed = _last_fully_closed_trading_day(cal)
-        prev_day = last_closed - timedelta(days=1)
+        prev_day = cal.get_trading_days(
+            last_closed - timedelta(days=10), last_closed)[-2]
         _save(tmp_path, "000001", [last_closed.isoformat()])
         _save(tmp_path, "600519", [prev_day.isoformat()])
         pending, complete = filter_existing(

@@ -27,6 +27,7 @@ import pandas as pd
 
 from stoke_ml.crawler.eastmoney import EastMoneyClient
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.codes import normalize_stock_code
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,13 @@ def _safe_int(val, default=0):
         return default
 
 
+def _norm_code(val) -> str:
+    """Canonical 6-digit stock code via the single sanitizer (§六), or ``""``
+    when unusable — never a bare ``str(x).zfill(6)`` that would turn a float
+    code into the illegal ``"600001.0"``."""
+    return normalize_stock_code(val) or ""
+
+
 def _date8(date_str: str) -> str:
     """Normalize date string to YYYYMMDD."""
     return date_str.replace("-", "")
@@ -166,7 +174,7 @@ class LimitUpSource:
         for p in self._em_zt_api("getTopicZTPool", "fbt:asc", date):
             rows.append({
                 "date": date,
-                "stock_code": str(p.get("c", "")).zfill(6),
+                "stock_code": _norm_code(p.get("c")),
                 "stock_name": p.get("n", ""),
                 "price": _safe_float(p.get("p")) / 1000,
                 "pct": round(_safe_float(p.get("zdp")), 2),
@@ -193,7 +201,7 @@ class LimitUpSource:
         for p in self._em_zt_api("getTopicZBPool", "fbt:asc", date):
             rows.append({
                 "date": date,
-                "stock_code": str(p.get("c", "")).zfill(6),
+                "stock_code": _norm_code(p.get("c")),
                 "stock_name": p.get("n", ""),
                 "price": _safe_float(p.get("p")) / 1000,
                 "limit_price": _safe_float(p.get("ztp")) / 1000,
@@ -218,7 +226,7 @@ class LimitUpSource:
         for p in self._em_zt_api("getTopicDTPool", "fund:asc", date):
             rows.append({
                 "date": date,
-                "stock_code": str(p.get("c", "")).zfill(6),
+                "stock_code": _norm_code(p.get("c")),
                 "stock_name": p.get("n", ""),
                 "price": _safe_float(p.get("p")) / 1000,
                 "pct": round(_safe_float(p.get("zdp")), 2),
@@ -243,7 +251,7 @@ class LimitUpSource:
         for p in self._em_zt_api("getYesterdayZTPool", "zs:desc", date):
             rows.append({
                 "date": date,
-                "stock_code": str(p.get("c", "")).zfill(6),
+                "stock_code": _norm_code(p.get("c")),
                 "stock_name": p.get("n", ""),
                 "price": _safe_float(p.get("p")) / 1000,
                 "pct": round(_safe_float(p.get("zdp")), 2),
@@ -418,7 +426,7 @@ class LimitUpSource:
             ft = it.get("first_limit_up_time")
             rows.append({
                 "date": date,
-                "stock_code": str(it.get("code", "")).zfill(6),
+                "stock_code": _norm_code(it.get("code")),
                 "stock_name": it.get("name", ""),
                 "price": _safe_float(it.get("latest")),
                 "pct": _safe_float(it.get("change_rate")),

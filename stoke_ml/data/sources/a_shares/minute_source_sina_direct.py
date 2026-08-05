@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from stoke_ml.data.codes import normalize_stock_code
+
 logger = logging.getLogger(__name__)
 
 _SINA_MINUTE_URL = (
@@ -33,7 +35,10 @@ class SinaDirectMinuteSource:
 
     @staticmethod
     def _to_sina_symbol(stock_code: str) -> str:
-        code = str(stock_code).zfill(6)
+        # §六: single sanitizer, never bare str().zfill(6).
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise ValueError(f"Unusable stock code for minute fetch: {stock_code!r}")
         if code.startswith(("6", "9")):
             return f"sh{code}"
         return f"sz{code}"

@@ -138,6 +138,7 @@ class CheckResult:
     summary: str
     files_scanned: int = 0
     rows_scanned: int = 0
+    scanned_files: int = 0  # files actually row-read (<= files_scanned under --quick, §九.2)
     unreadable_files: int = 0  # files that existed but failed to parse (§六-3)
     issues: list = field(default_factory=list)  # list of (file, detail)
 
@@ -196,14 +197,21 @@ ALLOW_EMPTY = False
 
 
 def _dataset_dir(name: str) -> Path:
-    """Resolve a required-dataset directory from the current data root."""
+    """Resolve a required-dataset directory from the current data root.
+
+    §九.1: names resolve against the REAL data root, never a fixed basename
+    whitelist.  The three canonical names map to their canonical dirs; any
+    other required dataset (e.g. a custom prebuilt like ``features_panel_v2``)
+    resolves to ``<data_root>/<name>`` so the gate validates the ACTUAL dir a
+    consuming run reads instead of silently scanning DAILY_DIR.
+    """
     if name == "daily":
         return DAILY_DIR
     if name == "features":
         return FEAT_DIR
     if name == "features_panel":
         return A_SHARES.parent / "features_panel"
-    return DAILY_DIR  # unknown names are flagged by check_datasets
+    return A_SHARES.parent / name
 
 
 def contract_version() -> str:
@@ -245,13 +253,15 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
     hashes the root it actually reads, not the gate's last --data-dir.
     """
     def _resolve(name: str) -> Path:
+        # §九.1: mirror _dataset_dir — a custom (non-canonical) dataset resolves
+        # under the root by its real name instead of silently re-hashing daily.
         if name == "daily":
             return Path(root) / "a_shares" / "daily"
         if name == "features":
             return Path(root) / "features"
         if name == "features_panel":
             return Path(root) / "features_panel"
-        return Path(root) / "a_shares" / "daily"
+        return Path(root) / name
 
     def _hash_file(fp: Path, h) -> None:
         # Stream the raw bytes in bounded chunks: a content-aware fingerprint
@@ -323,21 +333,22 @@ def _sample_files(files: list[str], n: int, seed: int = SAMPLE_SEED) -> list[str
     return out[:n]
 
 
-def _scan_dataset(name: str, d: Path, sample: int) -> tuple[list, int, int, int]:
-    """Return (issues, n_files, n_rows, unreadable) for one required dataset.
+def _scan_dataset(name: str, d: Path, sample: int) -> tuple[list, int, int, int, int]:
+    """Return (issues, n_files, n_scanned, n_rows, unreadable).
 
-    ``n_files`` is the true on-disk parquet count; the expensive row/date
-    reads only cover a stratified sample when ``sample > 0`` (--quick).
-    ``unreadable`` counts files that exist but failed to parse — each is
-    reported by name (file, "unreadable") and the dataset FAILS when the
-    unreadable share exceeds ``MAX_UNREADABLE_RATIO`` (§六-3).  Under the
+    ``n_files`` is the true on-disk parquet count; ``n_scanned`` is how many
+    of those were actually row-read (a stratified sample when ``sample > 0``,
+    --quick).  The gap between the two is the audit scope a consumer reads
+    (§九.2).  ``unreadable`` counts files that existed but failed to parse —
+    each is reported by name (file, "unreadable") and the dataset FAILS when
+    the unreadable share exceeds ``MAX_UNREADABLE_RATIO`` (§六-3).  Under the
     formal profile ``FORMAL_STOCK_RATIO`` additionally demands readable
     stocks >= that fraction of the scanned pool (§六-4).
     """
     issues: list = []
     if not d.exists():
         issues.append((f"{name}", "missing_dir"))
-        return issues, 0, 0, 0
+        return issues, 0, 0, 0, 0
     files = sorted(glob.glob(str(d / "*.parquet")))
     if len(files) < MIN_FILES:
         issues.append((f"{name}", f"files={len(files)} < min={MIN_FILES}"))
@@ -395,7 +406,7 @@ def _scan_dataset(name: str, d: Path, sample: int) -> tuple[list, int, int, int]
                            f"{VERIFIED_UNTIL}"))
     elif scan:
         issues.append((f"{name}", "empty_rows"))
-    return issues, len(files), total_rows, unreadable
+    return issues, len(files), len(scan), total_rows, unreadable
 
 
 def check_datasets(sample: int) -> CheckResult:
@@ -404,20 +415,33 @@ def check_datasets(sample: int) -> CheckResult:
     if ALLOW_EMPTY:
         res.summary = "skipped (--allow-empty)"
         return res
-    n_files = n_rows = 0
+    n_files = n_scanned = n_rows = 0
     issues: list = []
+    root = A_SHARES.parent.resolve()
+    canonical = ("daily", "features", "features_panel")
     for name in REQUIRED_DATASETS:
-        if name not in ("daily", "features", "features_panel"):
-            issues.append((name, "unknown_dataset"))
+        d = _dataset_dir(name)
+        # §九.1: a custom (non-canonical) required dataset must live INSIDE
+        # the data root — resolve against the REAL path, not the basename.  A
+        # name that escapes the root (e.g. "../features") is refused outright
+        # instead of being scanned somewhere the gate never intended.
+        # Canonical names map to explicit dirs and skip the guard.
+        if name not in canonical and not d.resolve().is_relative_to(root):
+            issues.append((name, "outside_data_root"))
             continue
-        iss, nf, nr, nu = _scan_dataset(name, _dataset_dir(name), sample)
+        iss, nf, ns, nr, nu = _scan_dataset(name, d, sample)
         n_files += nf
+        n_scanned += ns
         n_rows += nr
         res.unreadable_files += nu
         issues.extend(iss)
     res.files_scanned = n_files
     res.rows_scanned = n_rows
     res.issues = issues
+    # §九.2: record the audit denominator — how many files really exist vs how
+    # many were row-read under --quick.  A consumer (train_panel) reads
+    # scanned_files/total_files to judge whether a sampled gate is enough.
+    res.scanned_files = n_scanned
     if issues:
         res.passed = False
     first = issues[0] if issues else ("", "")
@@ -959,6 +983,14 @@ def main():
     # contract fingerprints, the required-dataset list and the run-level
     # dataset fingerprint are frozen alongside PASS so a stale/mismatched
     # report is refused instead of silently accepted.
+    # §九.1: dataset_paths binds each required dataset to the ABSOLUTE dir the
+    # gate validated, so a consumer compares it against the real path it reads
+    # (a custom prebuilt basename can no longer pass a wrong-dir gate).
+    datasets_check = next((r for r in results if r.name == "datasets"), None)
+    total_files = datasets_check.files_scanned if datasets_check else total_daily
+    scanned_files = (
+        datasets_check.scanned_files if datasets_check else total_daily
+    )
     report = {
         "timestamp": pd.Timestamp.now().isoformat(),
         "passed": passed,
@@ -967,10 +999,16 @@ def main():
         "calendar_version": TradingCalendar.CALENDAR_VERSION,
         "contract_version": contract_version(),
         "required_datasets": list(REQUIRED_DATASETS),
+        "dataset_paths": {
+            name: str(_dataset_dir(name).resolve())
+            for name in REQUIRED_DATASETS
+        },
         "profile": args.profile,
         "scope": "full" if sample == 0 else "sample",
         "sample_size": sample,
         "sample_seed": SAMPLE_SEED,
+        "scanned_files": scanned_files,   # files actually row-read (§九.2)
+        "total_files": total_files,       # true on-disk parquet count (§九.2)
         "manifest_contract_full_scan": manifest_contract_full_scan,
         "data_manifest_hash": dataset_fingerprint(A_SHARES.parent, REQUIRED_DATASETS),
         "checks": [

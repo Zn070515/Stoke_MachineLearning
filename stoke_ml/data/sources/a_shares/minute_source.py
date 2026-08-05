@@ -17,6 +17,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code
+
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT = 0.6  # seconds between calls (Sina is lenient but be polite)
@@ -31,7 +33,11 @@ class MinuteSource:
     @staticmethod
     def _to_sina_symbol(stock_code: str) -> str:
         """Map stock code to Sina symbol (sh/sz prefix)."""
-        code = str(stock_code).zfill(6)
+        # §六: route through the single sanitizer — a bare str().zfill(6)
+        # turns the float 600001.0 into the illegal "600001.0".
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise ValueError(f"Unusable stock code for minute fetch: {stock_code!r}")
         if code.startswith(("6", "9")):
             return f"sh{code}"
         return f"sz{code}"

@@ -1241,10 +1241,15 @@ class FeaturePipeline:
                     stale_manifest[:10],
                 )
 
-        N = len(codes)
-
         # Engineer features per stock (reuses existing pipeline)
         all_feat_dfs = []
+        # §v12-P0: valid_codes tracks the codes whose features SURVIVED cleaning
+        # (a stock with all-invalid dates or an emptied prebuilt parquet drops
+        # out of all_feat_dfs).  Array row i MUST map to valid_codes[i], never to
+        # the original `codes[i]` — a dropped stock would otherwise mislabel every
+        # subsequent row (feature→stock, board one-hot, universe mask, delist day,
+        # OOS artifact codes) without any error being raised.
+        valid_codes: list[str] = []
         for code in codes:
             if prebuilt_dir:
                 path = os.path.join(prebuilt_dir, f"{code}.parquet")
@@ -1315,6 +1320,7 @@ class FeaturePipeline:
             # subsequent operations.
             feats = feats.copy()
             all_feat_dfs.append(feats)
+            valid_codes.append(code)
 
         # ── Compute targets from RAW close BEFORE cross-sectional normalization ──
         # Cross-sectional z-score normalization mutates close (and all PK/PO
@@ -1443,7 +1449,7 @@ class FeaturePipeline:
             # is not a real turnover measure (§十一-5).
             if "amount" not in df_sorted.columns:
                 raise ValueError(
-                    f"Stock {codes[i]}: daily K-line lacks canonical `amount` — "
+                    f"Stock {valid_codes[i]}: daily K-line lacks canonical `amount` — "
                     "the formal daily contract requires it (§十一-5); no "
                     "volume×close / price fallback."
                 )
@@ -1617,7 +1623,9 @@ class FeaturePipeline:
                     for i, df in enumerate(all_feat_dfs):
                         if len(df) == 0 or "sector_code" not in df.columns:
                             continue
-                        stock_code = codes[i]
+                        # §v12-P0: index into valid_codes, not codes — a stock
+                        # dropped during cleaning shifts all_feat_dfs vs codes.
+                        stock_code = valid_codes[i]
                         stock_cs = cs_panel[cs_panel["stock_code"] == stock_code]
                         if stock_cs.empty:
                             continue
@@ -1670,6 +1678,11 @@ class FeaturePipeline:
         finite_cols = [c for c in norm_cols if c in all_feat.columns]
         for c in finite_cols:
             vals = all_feat[c]
+            # np.isfinite is undefined for bool (numpy 2.x raises TypeError)
+            # and meaningless for non-numeric dtypes; a bool state flag
+            # (has_ever_observed / is_stale) is always finite by construction.
+            if vals.dtype.kind not in "biuf":
+                continue
             if not np.isfinite(vals.to_numpy()).all():
                 all_feat[c] = vals.replace([np.inf, -np.inf], np.nan)
 
@@ -1761,7 +1774,7 @@ class FeaturePipeline:
                     if first_col[i] >= 0:
                         glob_col = np.maximum(glob_col - first_col[i], 0.0)
                     s[:, sidx["listing_days"]] = glob_col / 250.0
-                bid = _board_index(codes[i])
+                bid = _board_index(valid_codes[i])
                 bcol = _BOARD_ONEHOT_COLS[bid]
                 if bcol in sidx:
                     s[:, sidx[bcol]] = 1.0
@@ -1856,6 +1869,10 @@ class FeaturePipeline:
             # per-fold dead-column removal happens in train_panel after slicing.
             "past_known_cols": list(pk_cols_available),
             "past_observed_cols": list(po_cols_available),
+            # §v12-P0: the stock identity of each array row — the pipeline's
+            # valid_codes (survived cleaning), so callers must NOT re-derive the
+            # code list from the raw panel (misaligns after a dropped stock).
+            "stock_codes": list(valid_codes),
         }
 
 

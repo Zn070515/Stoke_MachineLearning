@@ -30,6 +30,10 @@ def test_write_manifest_full_report(tmp_path):
     assert manifest["missing_count"] == 2
     assert manifest["missing"] == ["000002", "000003"]
     assert manifest["all_complete"] is False
+    assert manifest["status"] == "complete"
+    assert manifest["requested_end"] is None
+    assert manifest["effective_end"] is None
+    assert manifest["latest_available_end"] is None
     # §P0-4: the full request and the validated-complete set are persisted so
     # "is the ENTIRE requested universe complete" is auditable after the fact.
     assert manifest["requested"] == [f"{i:06d}" for i in range(1, 501)]
@@ -39,7 +43,7 @@ def test_write_manifest_full_report(tmp_path):
     # Round-trips through disk.
     assert load_manifest(path) == manifest
     with open(path, "r", encoding="utf-8") as f:
-        assert json.load(f)["schema_version"] == "1.2"
+        assert json.load(f)["schema_version"] == "1.3"
 
 
 def test_write_manifest_all_complete(tmp_path):
@@ -70,6 +74,40 @@ def test_missing_detects_save_failures_too(tmp_path):
 
 def test_load_manifest_none_when_absent(tmp_path):
     assert load_manifest(str(tmp_path / "nope.json")) is None
+
+
+def test_bounded_future_end_never_claims_full_coverage(tmp_path):
+    """§七-2: an explicit future end whose request got bounded to the latest
+    available trading day is recorded as ``bounded_complete`` and must NOT
+    report ``all_complete`` — even when every requested stock is on disk —
+    because the run did not cover the original request."""
+    codes = [f"{i:06d}" for i in range(3)]
+    manifest = write_manifest(
+        str(tmp_path / "b.json"), market="a_shares",
+        start_date="2020-01-01",
+        requested_end="2026-12-31",
+        effective_end="2026-08-04",
+        latest_available_end="2026-08-04",
+        requested=codes, failed=[], complete=set(codes), success_count=3,
+    )
+    assert manifest["status"] == "bounded_complete"
+    assert manifest["requested_end"] == "2026-12-31"
+    assert manifest["effective_end"] == "2026-08-04"
+    assert manifest["latest_available_end"] == "2026-08-04"
+    assert manifest["missing"] == []
+    assert manifest["all_complete"] is False  # must not claim the future range
+
+
+def test_bounded_end_equal_to_available_is_plain_complete(tmp_path):
+    """A request whose end equals the latest available day is NOT bounded."""
+    codes = [f"{i:06d}" for i in range(3)]
+    manifest = write_manifest(
+        str(tmp_path / "c.json"), market="a_shares",
+        requested_end="2026-08-04", effective_end="2026-08-04",
+        requested=codes, failed=[], complete=set(codes), success_count=3,
+    )
+    assert manifest["status"] == "complete"
+    assert manifest["all_complete"] is True
 
 
 def test_write_run_manifest_dataset_scoped(tmp_path):

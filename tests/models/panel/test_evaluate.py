@@ -1678,7 +1678,10 @@ class TestContinuousOosReplay:
     def _write_tape(self, path, *, stocks, dates, price_dates, preds, pool,
                     close, open, horizon, seq_len, top_fraction, cost,
                     delist_day=None, data_version="test",
-                    universe_status_hash="u", membership_hash="m"):
+                    universe_status_hash="u", membership_hash="m",
+                    calendar_hash=None, evaluator_version=None,
+                    price_convention=None, exit_policy=None,
+                    strategy_mode=None):
         kw = dict(decision_eligible=pool, history_eligible=pool, pool=pool,
                   entry_eligible=np.ones_like(pool),
                   return_target_mask=np.ones_like(pool),
@@ -1691,6 +1694,16 @@ class TestContinuousOosReplay:
                   universe_status_hash=universe_status_hash,
                   membership_hash=membership_hash,
                   model_hash="test", weight_hash="test")
+        # §十五-1/§十五-2: the policy + full metadata keys a FORMAL replay
+        # requires.  Omitted by default so legacy-behaviour tests (missing
+        # keys → tolerated in non-formal mode) keep exercising that path.
+        for k, v in [("calendar_hash", calendar_hash),
+                     ("evaluator_version", evaluator_version),
+                     ("price_convention", price_convention),
+                     ("exit_policy", exit_policy),
+                     ("strategy_mode", strategy_mode)]:
+            if v is not None:
+                kw[k] = v
         if delist_day is not None:
             kw["delist_day"] = np.asarray(delist_day, dtype=int)
         np.savez(path, preds=preds, dates=np.array(dates),
@@ -1911,3 +1924,195 @@ class TestContinuousOosReplay:
 
         with pytest.raises(ValueError, match="data_version"):
             _replay_continuous_oos(str(tmp_path))
+
+    def test_mixed_policy_horizon_fails(self, tmp_path):
+        """§十五-1: all tapes must share the same STRATEGY POLICY.  A horizon=5
+        fold mixed with a horizon=20 fold must not be explained by the first
+        tape's horizon — the account would silently misread every later fold."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 7)]
+        stocks = ["000001"]
+        close = np.arange(10, 16, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks, dates=dates[3:6], price_dates=dates[3:6],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([close[3:6]]), open=np.stack([close[3:6]]),
+            horizon=5, seq_len=60, top_fraction=0.5, cost=0.0)
+        self._write_tape(
+            str(tmp_path / "fold_001.npz"),
+            stocks=stocks, dates=dates[0:3], price_dates=dates[0:3],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([close[0:3]]), open=np.stack([close[0:3]]),
+            horizon=20, seq_len=60, top_fraction=0.5, cost=0.0)
+
+        with pytest.raises(ValueError, match="horizon"):
+            _replay_continuous_oos(str(tmp_path))
+
+    def test_mixed_policy_cost_fails(self, tmp_path):
+        """§十五-1: the transaction-cost policy must match across folds too."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 7)]
+        stocks = ["000001"]
+        close = np.arange(10, 16, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks, dates=dates[3:6], price_dates=dates[3:6],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([close[3:6]]), open=np.stack([close[3:6]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.001)
+        self._write_tape(
+            str(tmp_path / "fold_001.npz"),
+            stocks=stocks, dates=dates[0:3], price_dates=dates[0:3],
+            preds=np.ones((1, 3), dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=np.stack([close[0:3]]), open=np.stack([close[0:3]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.003)
+
+        with pytest.raises(ValueError, match="cost"):
+            _replay_continuous_oos(str(tmp_path))
+
+    def test_formal_replay_refuses_legacy_tape(self, tmp_path):
+        """§十五-2: a FORMAL replay (the production headline account) must
+        refuse a tape that lacks required metadata (calendar_hash here) instead
+        of replaying it under legacy semantics — the final headline can never
+        silently blend a legacy tape."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 6)]
+        stocks = ["000001"]
+        close = np.arange(10, 15, dtype=np.float32)
+        # fold_000 is complete (all metadata); fold_001 lacks calendar_hash.
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks, dates=dates[0:2], price_dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close[0:2]]), open=np.stack([close[0:2]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            calendar_hash="c1")
+        self._write_tape(
+            str(tmp_path / "fold_001.npz"),
+            stocks=stocks, dates=dates[2:4], price_dates=dates[2:4],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close[2:4]]), open=np.stack([close[2:4]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0)
+
+        # Non-formal: legacy tolerance keeps replaying.
+        assert _replay_continuous_oos(str(tmp_path)) is not None
+        # Formal: missing calendar_hash on any tape → hard failure.
+        with pytest.raises(ValueError, match="calendar_hash"):
+            _replay_continuous_oos(str(tmp_path), formal=True)
+
+    def test_formal_replay_accepts_full_metadata(self, tmp_path):
+        """§十五-2: a FORMAL replay passes when every tape carries the full
+        required metadata + a consistent policy."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 6)]
+        stocks = ["000001"]
+        close = np.arange(10, 15, dtype=np.float32)
+        for fname, sl in [("fold_000.npz", (0, 2)), ("fold_001.npz", (2, 4))]:
+            self._write_tape(
+                str(tmp_path / fname),
+                stocks=stocks, dates=dates[sl[0]:sl[1]],
+                price_dates=dates[sl[0]:sl[1]],
+                preds=np.ones((1, sl[1] - sl[0]), dtype=np.float32),
+                pool=np.ones((1, sl[1] - sl[0]), dtype=bool),
+                close=np.stack([close[sl[0]:sl[1]]]),
+                open=np.stack([close[sl[0]:sl[1]]]),
+                horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+                data_version="test", universe_status_hash="u",
+                membership_hash="m", calendar_hash="c1",
+                evaluator_version="ev1", price_convention="open_to_open",
+                exit_policy="scheduled_horizon_delayed_delist_force_sell",
+                strategy_mode="long_top_fraction",
+                delist_day=np.array([-1], dtype=int))
+
+        cont = _replay_continuous_oos(str(tmp_path), formal=True)
+        assert cont is not None
+        assert cont["account"]["final_nav"] > 0
+
+    def test_model_name_filter_isolates_baseline_tapes(self, tmp_path):
+        """§十五-3: the continuous replay filters tapes by model.  A baseline
+        tape (fold_000_lgbm.npz) sharing an oos_dir must never join the deep
+        replay (default scan matches only digit-stem fold_NNN.npz), and
+        model_name="lgbm" must replay ONLY the lgbm tapes — never the deep tape
+        nor another model's."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 7)]
+        close_up = np.arange(10, 16, dtype=np.float32)      # 000001 rises
+        close_dn = np.arange(16, 10, -1, dtype=np.float32)  # 000002 falls
+        kw_common = dict(horizon=1, seq_len=60, top_fraction=0.5, cost=0.0)
+        # Deep tape: 000001 only.
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"), stocks=["000001"],
+            dates=dates[0:2], price_dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close_up[0:2]]), open=np.stack([close_up[0:2]]),
+            **kw_common)
+        # Two lgbm folds: 000002 only.
+        for fname, sl in [("fold_000_lgbm.npz", (0, 2)),
+                          ("fold_001_lgbm.npz", (2, 4))]:
+            self._write_tape(
+                str(tmp_path / fname), stocks=["000002"],
+                dates=dates[sl[0]:sl[1]], price_dates=dates[sl[0]:sl[1]],
+                preds=np.ones((1, sl[1] - sl[0]), dtype=np.float32),
+                pool=np.ones((1, sl[1] - sl[0]), dtype=bool),
+                close=np.stack([close_dn[sl[0]:sl[1]]]),
+                open=np.stack([close_dn[sl[0]:sl[1]]]),
+                **kw_common)
+
+        # Default scan: digit-stem deep tape only — baseline tapes excluded.
+        deep = _replay_continuous_oos(str(tmp_path))
+        assert deep is not None
+        assert deep["stocks"] == ["000001"]
+        # model_name filter: ONLY the lgbm tapes — deep tape excluded.
+        lgbm = _replay_continuous_oos(str(tmp_path), model_name="lgbm")
+        assert lgbm is not None
+        assert lgbm["stocks"] == ["000002"]
+        assert len(lgbm["account"]["daily"]) == 4
+        # A model with no tapes in the dir yields None.
+        assert _replay_continuous_oos(str(tmp_path), model_name="ridge") is None
+
+    def test_baseline_formal_replay_under_model_name(self, tmp_path):
+        """§十五-3: a baseline's named fold tapes (fold_000_lgbm.npz) replay as
+        ONE continuous account under model_name with formal=True when every
+        tape carries the full metadata — mirroring what train_baselines_panel.py
+        writes for each baseline model."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 6)]
+        stocks = ["000001"]
+        close = np.arange(10, 15, dtype=np.float32)
+        for fname, sl in [("fold_000_lgbm.npz", (0, 2)),
+                          ("fold_001_lgbm.npz", (2, 4))]:
+            self._write_tape(
+                str(tmp_path / fname),
+                stocks=stocks, dates=dates[sl[0]:sl[1]],
+                price_dates=dates[sl[0]:sl[1]],
+                preds=np.ones((1, sl[1] - sl[0]), dtype=np.float32),
+                pool=np.ones((1, sl[1] - sl[0]), dtype=bool),
+                close=np.stack([close[sl[0]:sl[1]]]),
+                open=np.stack([close[sl[0]:sl[1]]]),
+                horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+                data_version="test", universe_status_hash="u",
+                membership_hash="m", calendar_hash="c1",
+                evaluator_version="ev1", price_convention="open_to_open",
+                exit_policy="scheduled_horizon_delayed_delist_force_sell",
+                strategy_mode="long_top_fraction",
+                delist_day=np.array([-1], dtype=int))
+        cont = _replay_continuous_oos(
+            str(tmp_path), model_name="lgbm", formal=True)
+        assert cont is not None
+        assert cont["account"]["final_nav"] > 0
+        # Without the filter the default scan must NOT pick up these tapes.
+        assert _replay_continuous_oos(str(tmp_path), formal=True) is None

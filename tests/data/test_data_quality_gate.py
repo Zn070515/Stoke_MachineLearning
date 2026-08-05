@@ -494,12 +494,69 @@ class TestDatasetsPreGate:
         res = check_datasets(0)
         assert res.passed is True
 
-    def test_unknown_dataset_flag(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("scripts.production.data_quality_gate.REQUIRED_DATASETS", ["bogus"])
-        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", tmp_path / "daily")
+    def test_custom_dataset_resolves_under_data_root(self, tmp_path, monkeypatch):
+        """§九.1: a non-canonical required dataset resolves under the REAL data
+        root and is scanned there — no fixed-basename whitelist rejects it."""
+        data_root = tmp_path / "data"
+        custom = data_root / "features_panel_v2"
+        custom.mkdir(parents=True)
+        n = len(pd.bdate_range("2024-01-01", "2025-06-30"))
+        pd.DataFrame({
+            "date": pd.to_datetime(pd.bdate_range("2024-01-01", "2025-06-30")),
+            "x": np.arange(n, dtype="float64"),
+        }).to_parquet(custom / "000001.parquet", index=False)
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.A_SHARES", data_root / "a_shares"
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.DAILY_DIR",
+            data_root / "a_shares" / "daily",
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.REQUIRED_DATASETS",
+            ["features_panel_v2"],
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.MAX_STALE_DAYS", 10000
+        )
+        res = check_datasets(0)
+        assert res.passed is True
+
+    def test_custom_dataset_missing_dir_fails(self, tmp_path, monkeypatch):
+        """A custom name whose dir is absent FAILS (missing_dir) — it must not
+        silently scan DAILY_DIR the way the old fixed-basename fallback did."""
+        data_root = tmp_path / "data"
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.A_SHARES", data_root / "a_shares"
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.DAILY_DIR",
+            data_root / "a_shares" / "daily",
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.REQUIRED_DATASETS",
+            ["features_panel_v2"],
+        )
         res = check_datasets(0)
         assert res.passed is False
-        assert any("unknown_dataset" in d for _f, d in res.issues)
+        assert any("missing_dir" in d for _f, d in res.issues)
+
+    def test_custom_dataset_outside_data_root_fails(self, tmp_path, monkeypatch):
+        """§九.1: a custom name that escapes the data root is refused outright."""
+        data_root = tmp_path / "data"
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.A_SHARES", data_root / "a_shares"
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.DAILY_DIR",
+            data_root / "a_shares" / "daily",
+        )
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate.REQUIRED_DATASETS", ["../features"]
+        )
+        res = check_datasets(0)
+        assert res.passed is False
+        assert any("outside_data_root" in d for _f, d in res.issues)
 
 
 class TestStratifiedSample:

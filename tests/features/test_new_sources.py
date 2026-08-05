@@ -157,3 +157,78 @@ def test_ic_correctness_known_signal():
         ics.append(rho)
     mean_ic = float(np.mean(ics))
     assert mean_ic > 0.7
+
+
+# ── §P1-7 state-channel staleness ─────────────────────────────────────
+
+def test_state_staleness_columns_emitted():
+    """A state channel (ffill) with prefix emits staleness / has_ever_observed /
+    days_since_first_available / is_stale — so a 60-day-old balance is never
+    silently consumed as the latest true state."""
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=5)})
+    df["margin_balance"] = [100.0, np.nan, np.nan, 110.0, np.nan]
+    _batch_fill_shift(df, ["margin_balance"], policy="ffill",
+                      prefix="margin", max_staleness=5)
+    for c in ("margin_staleness_days", "margin_has_ever_observed",
+              "margin_days_since_first_available", "margin_is_stale"):
+        assert c in df.columns
+
+
+def test_state_staleness_flags_old_value():
+    """A value older than max_staleness trips the stale flag; a fresh one does
+    not.  Rows are PIT-shifted like the value column (feature at t == state at
+    t-1)."""
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=10)})
+    # obs at row 0; nothing until row 9 (a 12-day gap across the weekend+week).
+    df["pledge_ratio"] = [30.0] + [np.nan] * 8 + [32.0]
+    _batch_fill_shift(df, ["pledge_ratio"], policy="ffill",
+                      prefix="pledge", max_staleness=5)
+    # pre-shift staleness at rows 1..8 = 3,4,5,6,7,10,11,12 (bday gaps) — after
+    # shift(1) these land one row later; row where age>5 is stale.
+    assert df["pledge_is_stale"].sum() >= 3
+    assert not df["pledge_is_stale"].iloc[0]   # pre-history head (unknown)
+    assert df["pledge_has_ever_observed"].iloc[1]  # obs at row0 → known from t=1
+    assert not df["pledge_has_ever_observed"].iloc[0]
+
+
+def test_state_staleness_distinguishes_unknown_from_zero():
+    """§8.3: before the first disclosure, has_ever_observed=False marks the
+    value 0 as 'unknown state' — NOT a real zero balance."""
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=6)})
+    df["valuation_pe"] = [np.nan] * 3 + [20.0, np.nan, 20.5]
+    _batch_fill_shift(df, ["valuation_pe"], policy="ffill",
+                      prefix="valuation", max_staleness=5)
+    # Pre-history rows: value is 0 but has_ever_observed=False (unknown).
+    assert df["valuation_pe"].iloc[0] == 0.0
+    assert not df["valuation_has_ever_observed"].iloc[0]
+    assert not df["valuation_has_ever_observed"].iloc[1]
+    assert not df["valuation_has_ever_observed"].iloc[2]
+    # Once observed (PIT-shifted, so the first-obs row lands one index later),
+    # the flag flips and days_since_first_available grows.
+    assert df["valuation_has_ever_observed"].iloc[4]
+    assert df["valuation_days_since_first_available"].iloc[4] == 0
+    assert df["valuation_days_since_first_available"].iloc[5] == 1
+
+
+def test_event_channel_has_no_staleness_columns():
+    """An event channel (policy="zero") must NOT emit staleness columns — the
+    §P1-7 tracking is state-channel-only."""
+    df = pd.DataFrame({"date": pd.bdate_range("2021-01-01", periods=5)})
+    df["lhb_net_amount"] = [1.0, np.nan, 2.0, np.nan, 0.0]
+    _batch_fill_shift(df, ["lhb_net_amount"])
+    assert not any("staleness" in c or "has_ever" in c for c in df.columns)
+
+
+def test_state_staleness_integrated_via_merge_margin():
+    """End-to-end: _merge_margin wires prefix + max_staleness, so the margin
+    staleness family lands on the merged frame."""
+    from stoke_ml.features.aux_aligner import AuxAligner
+    df = _kline(n=6)
+    margin = pd.DataFrame({
+        "date": df["date"].iloc[[0, 3]],
+        "margin_balance": [100.0, 110.0],
+    })
+    out = AuxAligner()._merge_margin(df.copy(), margin)
+    assert "margin_staleness_days" in out.columns
+    assert "margin_has_ever_observed" in out.columns
+    assert not bool(out["margin_has_ever_observed"].iloc[0])

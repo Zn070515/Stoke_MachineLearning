@@ -50,7 +50,9 @@ import uuid
 
 import pandas as pd
 
-from stoke_ml.data.calendar import VERIFIED_UNTIL
+from stoke_ml.data.calendar import VERIFIED_UNTIL, TradingCalendar
+from stoke_ml.data.codes import normalize_stock_code_series
+from stoke_ml.data.contract import RESEARCH_QFQ_DAILY, validate_contract
 
 _LOCK_TIMEOUT = 30.0  # seconds to wait for a concurrent writer
 _LOCK_STALE = 600.0   # a dead lock older than this is a crashed writer's leftover
@@ -65,6 +67,11 @@ _DEFAULT_UNITS = {
 }
 _DATA_CONVENTION_VERSION = "kline-v1"
 _CALENDAR_VERSION = f"a_shares:{VERIFIED_UNTIL['a_shares'].isoformat()}"
+
+# Official trading-day set per (data_dir, lo, hi) span.  A full download
+# revisits the same date spans across thousands of save_daily calls, so the
+# calendar set is built once per span instead of per write (§八-1).
+_TRADING_CACHE: dict[tuple, frozenset] = {}
 
 
 def _units_tag() -> str:
@@ -354,9 +361,35 @@ class DataStorage:
         Existing rows (by ``date``) are kept on last-write-wins, new rows are
         appended, the file is sorted by date and atomically replaced under a
         per-file lock.  Only the flat canonical layout is touched.
+
+        §八 write gate: before anything lands on disk the frame must survive
+        the canonical ``RESEARCH_QFQ_DAILY`` contract — every stock code run
+        through the single sanitizer, then schema / PK / OHLC / units / dates
+        (official calendar) / provenance / adjustment-mode validated — and the
+        price basis checked against the existing manifest.  The parquet is
+        written to staging, read back and re-validated before the atomic swap,
+        so a frame that violates the contract (or a basis that would splice
+        onto a legacy ``unknown`` history) is refused instead of persisted: a
+        manifest that matches a corrupt file is still corrupt.
         """
+        if "stock_code" not in df.columns:
+            raise ValueError("save_daily: frame has no stock_code column")
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
+        if df.empty:
+            return
+        # §八-3: Storage is the last canonical boundary — every code goes
+        # through the single sanitizer, so 600001.0 / SH600001 / -1 can never
+        # become a mangled file name or a split-key pair of files.
+        norm = normalize_stock_code_series(df["stock_code"])
+        bad = norm.isna()
+        if bad.any():
+            offenders = sorted({str(v) for v in df.loc[bad, "stock_code"].tolist()})[:5]
+            raise ValueError(
+                f"save_daily: {int(bad.sum())} unusable stock_code value(s) "
+                f"{offenders} — refusing to write a corrupted canonical key"
+            )
+        df = df.assign(stock_code=norm)
         drop_cols = [c for c in ("year", "month") if c in df.columns]
         base = self._daily_dir(market)
         os.makedirs(base, exist_ok=True)
@@ -379,15 +412,26 @@ class DataStorage:
                 if os.path.isfile(manifest_path):
                     with open(manifest_path, "r", encoding="utf-8") as f:
                         old_manifest = json.load(f)
-                # Refuse to splice price-basis segments (§四.1 / P0-2): a
-                # qfq history must never silently gain a raw tail (or vice
-                # versa).  "unknown" is the honest legacy declaration, so a
-                # mismatch can only be proven when BOTH sides declare a
-                # concrete basis.
+                # §八-2 price-basis gate BEFORE the merge: a concrete basis
+                # must never splice onto (a) an explicitly-declared DIFFERENT
+                # concrete basis, or (b) a legacy file whose basis is
+                # "unknown" — that history cannot be proven consistent with the
+                # new rows, so "unknown" is only legal for migration /
+                # exploration / audit, never as a seam to a formal QFQ store
+                # (§四.1 / P0-2 / v12 §八-2).
                 old_adjust = (old_manifest or {}).get("adjust", "unknown")
-                if (old_adjust not in ("unknown", "n/a", "")
-                        and adjust not in ("unknown", "n/a", "")
-                        and old_adjust != adjust):
+                has_legacy = old_manifest is not None or os.path.isfile(out_path)
+                old_concrete = old_adjust not in ("unknown", "n/a", "")
+                new_concrete = adjust not in ("unknown", "n/a", "")
+                if has_legacy and not old_concrete and new_concrete:
+                    raise ValueError(
+                        f"{code}: refusing to append {adjust!r} rows to a "
+                        f"legacy file that declares adjust={old_adjust!r} — "
+                        f"the existing basis is unknown, so a mixed-basis "
+                        f"history would be undetectable; run save_daily_repair() "
+                        f"(an explicit migration) instead"
+                    )
+                if old_concrete and new_concrete and old_adjust != adjust:
                     raise ValueError(
                         f"{code}: refusing to merge price-basis segments "
                         f"(old={old_adjust!r}, new={adjust!r}) — run an "
@@ -402,13 +446,16 @@ class DataStorage:
                     combined = pd.concat(
                         [existing, save_df], ignore_index=True
                     )
-                    combined = (
-                        combined.drop_duplicates(subset="date", keep="last")
-                        .sort_values("date")
-                        .reset_index(drop=True)
-                    )
+                    combined = combined.drop_duplicates(
+                        subset="date", keep="last")
                 else:
                     combined = save_df
+                combined = combined.sort_values("date").reset_index(drop=True)
+                # §八-1: the date check must cover the FULL combined span.  A
+                # set built only from the new batch's dates would flag every
+                # existing row that predates the batch as non_trading_day on
+                # the next incremental merge.
+                trading_days = self._official_trading_days(combined["date"])
                 # Stamp provenance into the frame so both the parquet footer
                 # (round-tripped by pandas) and the manifest record it.
                 combined.attrs["source"] = source
@@ -416,8 +463,35 @@ class DataStorage:
                 combined.attrs["units"] = _units_tag()
                 combined.attrs["calendar_version"] = _CALENDAR_VERSION
                 combined.attrs["data_convention_version"] = _DATA_CONVENTION_VERSION
+                # §八-1: the FULL contract gate runs before the write — a file
+                # whose manifest "matches itself" but whose economic semantics
+                # are corrupt must never land in the canonical store.
+                violations = validate_contract(
+                    combined, RESEARCH_QFQ_DAILY, code=code,
+                    trading_days=trading_days, manifest=old_manifest,
+                )
+                if violations:
+                    raise ValueError(
+                        f"{code}: refusing to persist a frame violating the "
+                        f"{RESEARCH_QFQ_DAILY.dataset_name} contract: "
+                        f"{'; '.join(violations[:8])}"
+                    )
                 tmp_path = f"{out_path}.tmp.{os.getpid()}"
                 combined.to_parquet(tmp_path, index=False, compression="lz4")
+                # Round-trip read: parquet writes can coerce dtypes / drop
+                # attrs, so the exact bytes that will be atomically swapped are
+                # re-validated against the contract before the replace.
+                back = pd.read_parquet(tmp_path)
+                rt_violations = validate_contract(
+                    back, RESEARCH_QFQ_DAILY, code=code,
+                    trading_days=trading_days, manifest=old_manifest,
+                )
+                if rt_violations:
+                    raise ValueError(
+                        f"{code}: parquet round-trip failed the "
+                        f"{RESEARCH_QFQ_DAILY.dataset_name} contract: "
+                        f"{'; '.join(rt_violations[:8])}"
+                    )
                 os.replace(tmp_path, out_path)
                 segments = _build_source_segments(
                     old_manifest, combined, save_df["date"], source, adjust,
@@ -428,6 +502,22 @@ class DataStorage:
                 _write_manifest(base, code, combined, segments, run_id)
             finally:
                 _release_lock(handle)
+
+    def _official_trading_days(self, dates: pd.Series) -> frozenset:
+        """Frozenset of official-calendar trading days covering a batch's span.
+
+        Cached per ``(data_dir, lo, hi)`` because a full download revisits the
+        same date spans across thousands of writes.
+        """
+        dts = pd.to_datetime(dates)
+        lo, hi = dts.min().date(), dts.max().date()
+        key = (self._root, lo, hi)
+        cached = _TRADING_CACHE.get(key)
+        if cached is None:
+            cal = TradingCalendar("a_shares", calendar_dir=self._root)
+            cached = frozenset(cal.get_trading_days(lo, hi))
+            _TRADING_CACHE[key] = cached
+        return cached
 
     def save_daily_repair(
         self, df: pd.DataFrame, market: str = "a_shares",

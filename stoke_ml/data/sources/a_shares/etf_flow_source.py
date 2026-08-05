@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from stoke_ml.data.codes import normalize_stock_code
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAPPING_PATH = os.path.join(
@@ -46,7 +48,11 @@ class SectorETFFlowSource:
     @staticmethod
     def _to_sina_symbol(etf_code: str) -> str:
         """Convert 6-digit code to Sina symbol (shXXXXXX or szXXXXXX)."""
-        code = str(etf_code).zfill(6)
+        # §六: route through the canonical sanitizer (ETF codes carry no market
+        # prefix, so the market check does not fire; bare zfill is forbidden).
+        code = normalize_stock_code(etf_code)
+        if code is None:
+            raise ValueError(f"Unusable ETF code: {etf_code!r}")
         if code.startswith(("5", "6", "9")):
             return f"sh{code}"
         return f"sz{code}"

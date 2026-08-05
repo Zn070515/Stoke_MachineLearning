@@ -10,6 +10,7 @@ These cover the Track B credibility fixes:
 None of these read the 109GB feature store.
 """
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -403,3 +404,120 @@ def test_gate_descriptions_default_vs_strict(tp):
     # strict has no membership to gate, so train stays union.
     assert tp._gate_descriptions(False, False) == ("not_delisted", "union (ungated)")
     assert tp._gate_descriptions(False, True) == ("not_delisted", "union (ungated)")
+
+
+# ── _experiment_signature (§十二.5 / §P1-8) ───────────────────────────
+
+def test_signature_changes_with_seed(tp):
+    """§P1-8: two runs differing ONLY in the random seed are DIFFERENT
+    trials — the review's canonical keep-best-of-N-seeds case.  The old
+    signature (no seed) conflated them into one trial, undercounting DSR N."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    s42 = tp._experiment_signature(base, cfg)
+    assert s42 != tp._experiment_signature(base, dataclasses.replace(cfg, seed=7))
+    # Same research choices → same signature (a re-run, not a new trial).
+    assert tp._experiment_signature(base, cfg) == s42
+
+
+def test_signature_changes_with_research_choices(tp):
+    """§P1-8: horizon / seq_len / txn_cost / calendar / evaluator all enter
+    the signature — changing any research choice is a NEW trial."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    base_sig = tp._experiment_signature(base, cfg)
+    assert (tp._experiment_signature(base, dataclasses.replace(cfg, horizon=5))
+            != base_sig)
+    assert (tp._experiment_signature(base, dataclasses.replace(cfg, seq_len=30))
+            != base_sig)
+    assert (tp._experiment_signature(base, dataclasses.replace(cfg, txn_cost=0.001))
+            != base_sig)
+    assert (tp._experiment_signature({**base, "evaluator_version": "ev2"}, cfg)
+            != base_sig)
+    assert (tp._experiment_signature({**base, "calendar_artifact_hash": "ch2"}, cfg)
+            != base_sig)
+
+
+# ── _require_quality_gate (§九.1 custom-prebuilt binding) ─────────────
+
+def _gate_report(tp, data_dir, required, dataset_paths=None, passed=True,
+                 scope="full", manifest_contract_full_scan=True,
+                 fingerprint=None):
+    """Build a report that would PASS every §六-2 check except the ones the
+    caller intentionally varies, so a test isolates the §九.1 behavior."""
+    d = os.path.realpath(str(data_dir))
+    req = sorted(required)
+    return {
+        "passed": passed,
+        "quality_gate_version": tp.QUALITY_GATE_VERSION,
+        "data_root": d,
+        "calendar_version": tp.TradingCalendar.CALENDAR_VERSION,
+        "contract_version": tp.contract_version(),
+        "required_datasets": req,
+        "dataset_paths": dataset_paths or {},
+        "scope": scope,
+        "manifest_contract_full_scan": manifest_contract_full_scan,
+        "data_manifest_hash": fingerprint or tp.dataset_fingerprint(d, req),
+    }
+
+
+def test_require_quality_gate_custom_prebuilt_consumed(tp, tmp_path):
+    """§九.1: a custom prebuilt basename (not features/features_panel) is added
+    to ``consumed`` and must be covered by the gate's required datasets — the
+    old fixed-basename whitelist silently skipped it."""
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel_v2"
+    report_path = tmp_path / "gate.json"
+    report = _gate_report(tp, data_dir, ["daily", "features_panel_v2"],
+                          dataset_paths={
+                              "daily": str((data_dir / "a_shares" / "daily").resolve()),
+                              "features_panel_v2": str(prebuilt.resolve()),
+                          })
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    out = tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+    assert out["required_datasets"] == ["daily", "features_panel_v2"]
+
+
+def test_require_quality_gate_refuses_missing_custom_dataset(tp, tmp_path):
+    """§九.1: a custom prebuilt that the gate did NOT validate is refused —
+    consumed must be a subset of required_datasets."""
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel_v2"
+    report_path = tmp_path / "gate.json"
+    report = _gate_report(tp, data_dir, ["daily"])
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+
+
+def test_require_quality_gate_refuses_path_mismatch(tp, tmp_path):
+    """§九.1: if the gate validated the prebuilt at a DIFFERENT absolute dir
+    than training reads, the run is refused instead of trusted."""
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel_v2"
+    report_path = tmp_path / "gate.json"
+    report = _gate_report(tp, data_dir, ["daily", "features_panel_v2"],
+                          dataset_paths={
+                              "daily": str((data_dir / "a_shares" / "daily").resolve()),
+                              "features_panel_v2": str(
+                                  (data_dir / "elsewhere").resolve()),
+                          })
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))

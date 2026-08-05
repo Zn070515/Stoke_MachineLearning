@@ -29,8 +29,12 @@ class TestNormalizeStockCode:
         ("SH600001", "600001"),
         ("sh600519", "600519"),
         ("600001.SH", "600001"),
-        ("600519.sz", "600519"),
+        ("600519.sh", "600519"),
         (" 600001 ", "600001"),      # stray whitespace
+        # §六: exchange prefix must be stripped BEFORE the integer-.0 cleanup
+        # so "sh600001.0" resolves instead of failing the isdigit() gate.
+        ("sh600001.0", "600001"),
+        ("600001.0.SH", "600001"),   # suffix stripped, then the float .0
     ])
     def test_valid_codes(self, raw, expected):
         assert normalize_stock_code(raw) == expected
@@ -48,12 +52,20 @@ class TestNormalizeStockCode:
         1.5,
         True,                        # bool is not a code
         "nan",
-        "60000",                     # 5 digits → padded is legal actually
+        # §六 strict range / market-contradiction rejections:
+        -1,                          # negative
+        0,                           # zero → "000000"
+        1000000,                     # > 999999
+        "1000000",                   # 7 digits
+        "000000",                    # the reserved all-zero code
+        "0",                         # zero → "000000"
+        "SZ600519",                  # SZ prefix contradicts Shanghai 600519
+        "600519.sz",                 # SZ suffix contradicts Shanghai 600519
+        "SH000001",                  # SH prefix contradicts Shenzhen 000001
+        "600001.BJ",                 # BJ suffix contradicts Shanghai 600001
+        "BJ600001",                  # BJ prefix contradicts Shanghai 600001
     ])
     def test_invalid_codes(self, bad):
-        # 5-digit numeric strings DO normalize (zero-padded) — that's intended.
-        if isinstance(bad, str) and bad.strip().isdigit():
-            return
         assert normalize_stock_code(bad) is None
 
     def test_five_digit_pads(self):

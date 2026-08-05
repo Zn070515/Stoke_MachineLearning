@@ -34,33 +34,46 @@ def _frame(dates, closes=None, code="000001"):
     n = len(dates)
     if closes is None:
         closes = [10.0 + 0.1 * i for i in range(n)]
-    return pd.DataFrame({
+    closes = [float(c) for c in closes]
+    df = pd.DataFrame({
         "date": dates,
-        "open": [float(c) for c in closes],
-        "high": [float(c) + 0.5 for c in closes],
-        "low": [float(c) - 0.5 for c in closes],
-        "close": [float(c) for c in closes],
+        "open": closes,
+        "high": [c + 0.5 for c in closes],
+        "low": [c - 0.5 for c in closes],
+        "close": closes,
         "volume": [1e6] * n,
         "amount": [1e8] * n,
         "stock_code": code,
     })
+    # §八-1: save_daily now enforces the RESEARCH_QFQ_DAILY contract, so the
+    # fixture must carry pct_change (NaN on the first row) + provenance attrs.
+    pct = pd.Series([float("nan")] * n)
+    if n > 1:
+        pct.iloc[1:] = 100.0 * pd.Series(closes).pct_change().iloc[1:].to_numpy()
+    df["pct_change"] = pct
+    df.attrs["source"] = "test"
+    df.attrs["adjustment_mode"] = "qfq"
+    return df
 
 
 def _write_flat(tmp_path, code, dates, closes):
     base = os.path.join(str(tmp_path), "a_shares", "daily")
     os.makedirs(base, exist_ok=True)
     path = os.path.join(base, f"{code}.parquet")
-    _frame(dates, closes=closes, code=code).to_parquet(path, index=False)
+    # Simulates a pre-provenance legacy parquet: attrs stripped, no manifest.
+    df = _frame(dates, closes=closes, code=code)
+    df.attrs.clear()
+    df.to_parquet(path, index=False)
 
 
 class TestSaveDaily:
     def test_incremental_merge_no_overwrite(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06", "2024-01-07"]))
-        store.save_daily(_frame(["2024-01-07", "2024-01-08"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08", "2024-01-09"]))
+        store.save_daily(_frame(["2024-01-09", "2024-01-10"]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["date"].tolist() == pd.to_datetime(
-            ["2024-01-05", "2024-01-06", "2024-01-07", "2024-01-08"]
+            ["2024-01-05", "2024-01-08", "2024-01-09", "2024-01-10"]
         ).tolist()
 
     def test_same_date_keeps_last_write(self, tmp_path):
@@ -73,8 +86,8 @@ class TestSaveDaily:
 
     def test_no_tmp_residue(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
-        store.save_daily(_frame(["2024-01-06", "2024-01-07"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
+        store.save_daily(_frame(["2024-01-08", "2024-01-09"]))
         residue = []
         for root, _, files in os.walk(str(tmp_path)):
             residue += [f for f in files if ".tmp" in f]
@@ -83,7 +96,7 @@ class TestSaveDaily:
     def test_multi_stock_multi_month(self, tmp_path):
         store = DataStorage(str(tmp_path))
         df = pd.concat([
-            _frame(["2023-12-29", "2023-12-30"], code="000001"),
+            _frame(["2023-12-28", "2023-12-29"], code="000001"),
             _frame(["2024-01-02"], code="000001"),
             _frame(["2024-01-02"], code="600519"),
         ])
@@ -96,75 +109,78 @@ class TestSaveDaily:
 
 class TestPriceBasisMismatch:
     """v11 §四.1 / P0-2: save_daily must never silently splice price-basis
-    segments.  A concrete mismatch (qfq history + raw tail, or vice versa)
-    raises instead of merging; "unknown" legacy basis stays permissive."""
+    segments.  A concrete mismatch (qfq history + raw tail) raises instead of
+    merging, and v12 §八-2 closes the "unknown" seam: a concrete new batch
+    refuses to append onto a legacy history whose basis is unknown — only an
+    explicit migration may do so."""
 
     def test_rejects_qfq_then_raw(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        qfq = _frame(["2024-01-05", "2024-01-06"])
+        qfq = _frame(["2024-01-05", "2024-01-08"])
         qfq.attrs["source"] = "efinance"
         qfq.attrs["adjustment_mode"] = "qfq"
         store.save_daily(qfq)
-        raw = _frame(["2024-01-07"])
+        raw = _frame(["2024-01-09"])
         raw.attrs["source"] = "efinance"
         raw.attrs["adjustment_mode"] = "raw"
         with pytest.raises(ValueError, match="price-basis"):
             store.save_daily(raw)
 
-    def test_rejects_raw_then_qfq(self, tmp_path):
+    def test_rejects_raw_even_on_fresh_stock(self, tmp_path):
+        """The §八 contract pins adjustment_mode=qfq, so a raw declaration is
+        refused at the contract gate — before any basis merge is reached."""
         store = DataStorage(str(tmp_path))
-        raw = _frame(["2024-01-05", "2024-01-06"])
+        raw = _frame(["2024-01-05", "2024-01-08"])
         raw.attrs["source"] = "efinance"
         raw.attrs["adjustment_mode"] = "raw"
-        store.save_daily(raw)
-        qfq = _frame(["2024-01-07"])
-        qfq.attrs["source"] = "efinance"
-        qfq.attrs["adjustment_mode"] = "qfq"
-        with pytest.raises(ValueError, match="price-basis"):
-            store.save_daily(qfq)
+        with pytest.raises(ValueError, match="refusing to persist"):
+            store.save_daily(raw)
 
     def test_same_basis_merges(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        a = _frame(["2024-01-05", "2024-01-06"])
+        a = _frame(["2024-01-05", "2024-01-08"])
         a.attrs["adjustment_mode"] = "qfq"
         store.save_daily(a)
-        b = _frame(["2024-01-07", "2024-01-08"])
+        b = _frame(["2024-01-09", "2024-01-10"])
         b.attrs["adjustment_mode"] = "qfq"
         store.save_daily(b)
         m = store.manifest("000001")
         assert m["adjust"] == "qfq" and m["rows"] == 4
 
-    def test_unknown_old_with_concrete_new_merges(self, tmp_path):
-        """Legacy files carry adjust=unknown; a concrete new batch upgrades the
-        manifest without proving a mismatch."""
+    def test_unknown_legacy_then_concrete_new_refuses(self, tmp_path):
+        """§八-2: a concrete qfq batch must NOT splice onto a legacy history
+        whose basis is unknown — the mixed basis would be undetectable.  Only
+        an explicit save_daily_repair migration may touch such a file."""
         store = DataStorage(str(tmp_path))
-        legacy = _frame(["2024-01-05", "2024-01-06"])  # no attrs → unknown
+        legacy = _frame(["2024-01-05", "2024-01-08"])
+        legacy.attrs["adjustment_mode"] = "unknown"
         store.save_daily(legacy)
-        fresh = _frame(["2024-01-07"])
+        assert store.manifest("000001")["adjust"] == "unknown"
+        fresh = _frame(["2024-01-09"])
         fresh.attrs["adjustment_mode"] = "qfq"
-        store.save_daily(fresh)
-        assert store.manifest("000001")["adjust"] == "qfq"
+        with pytest.raises(ValueError, match="refusing to append"):
+            store.save_daily(fresh)
 
 
 class TestLoadDaily:
     def test_reads_flat_file(self, tmp_path):
-        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])
+        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-08"], closes=[10.0, 11.0])
         out = DataStorage(str(tmp_path)).load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["close"].tolist() == pytest.approx([10.0, 11.0])
 
     def test_merge_appends_to_existing_flat(self, tmp_path):
-        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-07"], closes=[12.0]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0]))
+        store.save_daily(_frame(["2024-01-09"], closes=[12.0]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["close"].tolist() == pytest.approx([10.0, 11.0, 12.0])
 
     def test_date_range_filter(self, tmp_path):
-        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06", "2024-01-07"],
+        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-08", "2024-01-09"],
                     closes=[10.0, 11.0, 12.0])
-        out = DataStorage(str(tmp_path)).load_daily("000001", "2024-01-06", "2024-01-06")
+        out = DataStorage(str(tmp_path)).load_daily("000001", "2024-01-08", "2024-01-08")
         assert len(out) == 1
-        assert out["date"].iloc[0] == pd.Timestamp("2024-01-06")
+        assert out["date"].iloc[0] == pd.Timestamp("2024-01-08")
 
     def test_empty_when_nothing_present(self, tmp_path):
         out = DataStorage(str(tmp_path)).load_daily("000001", "2024-01-01", "2024-01-31")
@@ -172,9 +188,9 @@ class TestLoadDaily:
 
     def test_save_load_roundtrip(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
-        assert out["date"].tolist() == pd.to_datetime(["2024-01-05", "2024-01-06"]).tolist()
+        assert out["date"].tolist() == pd.to_datetime(["2024-01-05", "2024-01-08"]).tolist()
 
     def test_stale_partition_dirs_ignored(self, tmp_path):
         # Legacy year/month partition dirs must never be read or shadow the flat file
@@ -185,7 +201,7 @@ class TestLoadDaily:
         )
         store = DataStorage(str(tmp_path))
         assert store.load_daily("000001", "2024-01-01", "2024-01-31").empty
-        store.save_daily(_frame(["2024-01-06"], closes=[11.0]))
+        store.save_daily(_frame(["2024-01-08"], closes=[11.0]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["close"].tolist() == pytest.approx([11.0])
 
@@ -223,7 +239,7 @@ class TestSaveDailyRepair:
     def _saved_with_provenance(self, tmp_path, code="000001", source="efinance",
                                adjust="qfq"):
         store = DataStorage(str(tmp_path))
-        df = _frame(["2024-01-05", "2024-01-06"], code=code)
+        df = _frame(["2024-01-05", "2024-01-08"], code=code)
         df.attrs["source"] = source
         df.attrs["adjustment_mode"] = adjust
         store.save_daily(df)
@@ -231,7 +247,7 @@ class TestSaveDailyRepair:
 
     def test_repair_preserves_existing_provenance(self, tmp_path):
         store = self._saved_with_provenance(tmp_path)
-        store.save_daily_repair(_frame(["2024-01-06", "2024-01-07"], closes=[9.9, 9.8]))
+        store.save_daily_repair(_frame(["2024-01-08", "2024-01-09"], closes=[9.9, 9.8]))
         m = store.manifest("000001")
         assert m["source"] == "efinance"
         assert m["adjust"] == "qfq"
@@ -243,8 +259,8 @@ class TestSaveDailyRepair:
         """Control: a plain save_daily with no attrs would flatten the manifest
         source to "unknown" — which is exactly what save_daily_repair prevents."""
         store = self._saved_with_provenance(tmp_path)
-        df = _frame(["2024-01-07"], closes=[9.9])
-        assert "source" not in df.attrs
+        df = _frame(["2024-01-09"], closes=[9.9])
+        df.attrs.clear()
         store.save_daily(df)
         m = store.manifest("000001")
         assert m["source"] == "unknown"
@@ -257,8 +273,8 @@ class TestSaveDailyRepair:
         df2.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df2)
         repaired = pd.concat([
-            _frame(["2024-01-07"], code="000001"),
-            _frame(["2024-01-06", "2024-01-07"], code="600519"),
+            _frame(["2024-01-09"], code="000001"),
+            _frame(["2024-01-08", "2024-01-09"], code="600519"),
         ])
         store.save_daily_repair(repaired)
         assert store.manifest("000001")["source"] == "efinance"
@@ -278,7 +294,7 @@ class TestManifest:
 
     def test_save_writes_full_manifest(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        df = _frame(["2024-01-05", "2024-01-06"])
+        df = _frame(["2024-01-05", "2024-01-08"])
         df.attrs["source"] = "efinance"
         df.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df)
@@ -286,7 +302,7 @@ class TestManifest:
         assert m is not None
         assert m["stock"] == "000001"
         assert m["start"] == "2024-01-05"
-        assert m["end"] == "2024-01-06"
+        assert m["end"] == "2024-01-08"
         assert m["rows"] == 2
         assert m["source"] == "efinance"
         assert m["adjust"] == "qfq"
@@ -295,15 +311,15 @@ class TestManifest:
 
     def test_incremental_merge_updates_manifest(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
-        store.save_daily(_frame(["2024-01-07", "2024-01-08"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
+        store.save_daily(_frame(["2024-01-09", "2024-01-10"]))
         m = store.manifest("000001")
         assert m["rows"] == 4
-        assert m["start"] == "2024-01-05" and m["end"] == "2024-01-08"
+        assert m["start"] == "2024-01-05" and m["end"] == "2024-01-10"
 
     def test_validate_ok_after_save(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         report = store.validate_manifest("000001")
         assert report["ok"], report
         assert report["exists"] and report["mismatches"] == []
@@ -328,7 +344,7 @@ class TestManifest:
 
     def test_validate_flags_row_drift(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         # Overwrite the parquet with fewer rows behind the manifest's back.
         path = os.path.join(str(tmp_path), "a_shares", "daily", "000001.parquet")
         _frame(["2024-01-05"], code="000001").to_parquet(path, index=False)
@@ -379,30 +395,30 @@ class TestManifestV9:
 
     def test_manifest_records_provenance_fields(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         m = store.manifest("000001")
         for key in ("units", "price_basis", "calendar_version", "dataset_version",
                     "source_segments", "run_id"):
             assert key in m, f"manifest missing {key}"
-        assert m["source_segments"][0]["source"] == "unknown"
+        assert m["source_segments"][0]["source"] == "test"
         assert m["source_segments"][0]["rows"] == 2
 
     def test_source_segments_split_by_source(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        df1 = _frame(["2024-01-05", "2024-01-06"])
+        df1 = _frame(["2024-01-05", "2024-01-08"])
         df1.attrs["source"] = "efinance"
         df1.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df1)
-        df2 = _frame(["2024-01-07", "2024-01-08"])
+        df2 = _frame(["2024-01-09", "2024-01-10"])
         df2.attrs["source"] = "baostock"
         df2.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df2)
         segs = store.manifest("000001")["source_segments"]
         assert segs == [
             {"source": "efinance", "adjust": "qfq",
-             "start": "2024-01-05", "end": "2024-01-06", "rows": 2},
+             "start": "2024-01-05", "end": "2024-01-08", "rows": 2},
             {"source": "baostock", "adjust": "qfq",
-             "start": "2024-01-07", "end": "2024-01-08", "rows": 2},
+             "start": "2024-01-09", "end": "2024-01-10", "rows": 2},
         ]
 
     def test_batch_segments_row_level_source(self, tmp_path):
@@ -410,7 +426,7 @@ class TestManifestV9:
         mixing a Baostock backfill + primary) survive into the manifest,
         instead of flattening every new date to the batch's flat source."""
         store = DataStorage(str(tmp_path))
-        df = _frame(["2000-01-03", "2000-01-04", "2024-01-05", "2024-01-06"])
+        df = _frame(["2000-01-03", "2000-01-04", "2024-01-05", "2024-01-08"])
         df.attrs["source"] = "efinance"
         df.attrs["adjustment_mode"] = "qfq"
         df.attrs["source_segments"] = [
@@ -425,26 +441,26 @@ class TestManifestV9:
             {"source": "baostock", "adjust": "qfq",
              "start": "2000-01-03", "end": "2000-01-04", "rows": 2},
             {"source": "efinance", "adjust": "qfq",
-             "start": "2024-01-05", "end": "2024-01-06", "rows": 2},
+             "start": "2024-01-05", "end": "2024-01-08", "rows": 2},
         ]
 
     def test_source_segments_overlap_flips_to_latest(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        df1 = _frame(["2024-01-05", "2024-01-06"], closes=[10.0, 11.0])
+        df1 = _frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0])
         df1.attrs["source"] = "efinance"
         store.save_daily(df1)
-        df2 = _frame(["2024-01-06", "2024-01-07"], closes=[99.0, 12.0])
+        df2 = _frame(["2024-01-08", "2024-01-09"], closes=[99.0, 12.0])
         df2.attrs["source"] = "baostock"
         store.save_daily(df2)
         segs = store.manifest("000001")["source_segments"]
-        assert segs[0] == {"source": "efinance", "adjust": "unknown",
+        assert segs[0] == {"source": "efinance", "adjust": "qfq",
                            "start": "2024-01-05", "end": "2024-01-05", "rows": 1}
-        assert segs[1] == {"source": "baostock", "adjust": "unknown",
-                           "start": "2024-01-06", "end": "2024-01-07", "rows": 2}
+        assert segs[1] == {"source": "baostock", "adjust": "qfq",
+                           "start": "2024-01-08", "end": "2024-01-09", "rows": 2}
 
     def test_schema_hash_detects_dtype_drift(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         path = self._parquet_path(tmp_path)
         df = pd.read_parquet(path)
         df["volume"] = df["volume"].astype("float32")
@@ -455,10 +471,10 @@ class TestManifestV9:
 
     def test_schema_hash_detects_value_drift(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"], closes=[10.0, 11.0]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0]))
         path = self._parquet_path(tmp_path)
         df = pd.read_parquet(path)
-        df.loc[df["date"] == pd.Timestamp("2024-01-06"), "close"] = 88.0
+        df.loc[df["date"] == pd.Timestamp("2024-01-08"), "close"] = 88.0
         df.to_parquet(path, index=False)
         report = store.validate_manifest("000001")
         assert not report["ok"]
@@ -466,7 +482,7 @@ class TestManifestV9:
 
     def test_schema_hash_detects_units_change(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         path = self._parquet_path(tmp_path)
         df = pd.read_parquet(path)
         df.attrs["units"] = "amount=wan;close=cny;high=cny;low=cny;open=cny;volume=shares"
@@ -477,7 +493,7 @@ class TestManifestV9:
 
     def test_schema_hash_detects_price_basis_change(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         path = self._parquet_path(tmp_path)
         df = pd.read_parquet(path)
         df.attrs["adjustment_mode"] = "raw"
@@ -488,7 +504,7 @@ class TestManifestV9:
 
     def test_rebuild_manifest_writes_valid_manifest(self, tmp_path):
         # Legacy parquet with NO manifest → rebuild → validate ok.
-        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-06"],
+        _write_flat(tmp_path, "000001", ["2024-01-05", "2024-01-08"],
                     closes=[10.0, 11.0])
         store = DataStorage(str(tmp_path))
         assert store.manifest("000001") is None
@@ -505,7 +521,7 @@ class TestRequireValidManifest:
 
     def test_ok_after_save(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31",
                                require_valid_manifest=True)
         assert len(out) == 2
@@ -519,10 +535,10 @@ class TestRequireValidManifest:
 
     def test_raises_on_value_drift(self, tmp_path):
         store = DataStorage(str(tmp_path))
-        store.save_daily(_frame(["2024-01-05", "2024-01-06"], closes=[10.0, 11.0]))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0]))
         path = os.path.join(str(tmp_path), "a_shares", "daily", "000001.parquet")
         df = pd.read_parquet(path)
-        df.loc[df["date"] == pd.Timestamp("2024-01-06"), "close"] = 88.0
+        df.loc[df["date"] == pd.Timestamp("2024-01-08"), "close"] = 88.0
         df.to_parquet(path, index=False)
         with pytest.raises(ValueError):
             store.load_daily("000001", "2024-01-01", "2024-01-31",

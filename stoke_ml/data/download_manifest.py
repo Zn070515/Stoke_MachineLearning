@@ -9,7 +9,7 @@ import datetime as dt
 import json
 import os
 
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
 
 
 def default_path(data_dir: str) -> str:
@@ -65,6 +65,10 @@ def write_manifest(
     market: str,
     start_date: str | None = None,
     end_date: str | None = None,
+    requested_end: str | None = None,
+    effective_end: str | None = None,
+    latest_available_end: str | None = None,
+    status: str | None = None,
     requested: list[str],
     failed: list[str],
     complete: set[str],
@@ -85,16 +89,31 @@ def write_manifest(
     persisted so "is the ENTIRE requested universe complete" is auditable after
     the fact — a run that skipped already-complete stocks still reports the
     full request (§P0-4).
+
+    §七-2 (bounded end): an explicit future ``requested_end`` (past the latest
+    available trading day) is recorded verbatim, while ``effective_end`` and
+    ``latest_available_end`` say what was actually achievable.  A request whose
+    end was bounded is reported as ``status="bounded_complete"`` and
+    ``all_complete=False`` — the run must NOT claim coverage of a date range no
+    source can serve (§七-2).
     """
     requested_sorted = sorted(set(requested))
     failed_sorted = sorted(set(failed))
     missing = sorted(set(requested_sorted) - set(complete))
+    bounded = bool(
+        requested_end and effective_end and requested_end > effective_end
+    )
+    status_field = status or ("bounded_complete" if bounded else "complete")
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "market": market,
         "start_date": start_date,
         "end_date": end_date,
+        "requested_end": requested_end,
+        "effective_end": effective_end,
+        "latest_available_end": latest_available_end,
+        "status": status_field,
         "requested_count": len(requested_sorted),
         "success_count": int(success_count),
         "failed_count": len(failed_sorted),
@@ -105,7 +124,9 @@ def write_manifest(
         "missing": missing,
         "requested": requested_sorted,
         "complete": sorted(complete),
-        "all_complete": len(missing) == 0,
+        "all_complete": (
+            len(missing) == 0 and status_field == "complete"
+        ),
     }
     parent = os.path.dirname(path)
     if parent:

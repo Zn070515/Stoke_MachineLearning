@@ -15,6 +15,7 @@ import contextlib
 import dataclasses
 import hashlib
 import io
+import re
 import json
 import logging
 import os
@@ -153,8 +154,18 @@ def _require_quality_gate(
     consumed = {"daily"}
     if prebuilt_dir:
         name = os.path.basename(os.path.normpath(prebuilt_dir))
-        if name in ("features", "features_panel"):
-            consumed.add(name)
+        consumed.add(name)
+        # §九.1: the gate must have validated the SAME absolute directory this
+        # run reads, not just a matching basename.  The gate records where it
+        # validated each dataset; a prebuilt at a different real path than the
+        # gate reviewed is refused instead of trusted.
+        bound = (report.get("dataset_paths") or {}).get(name)
+        if bound and os.path.realpath(bound) != os.path.realpath(prebuilt_dir):
+            problems.append(
+                f"quality gate validated {name} at {bound}, but training reads "
+                f"prebuilt from {os.path.realpath(prebuilt_dir)} — §九.1 path "
+                f"mismatch"
+            )
     gate_required = set(report.get("required_datasets") or [])
     if not consumed <= gate_required:
         problems.append(
@@ -1171,8 +1182,24 @@ def _experiment_signature(version: dict, config: PanelConfig,
         h.update(f"{key}={version.get(key) or 'unknown'};".encode("utf-8"))
     model_hash = model_key if model_key else version.get("model_hash")
     h.update(f"model_hash={model_hash or 'unknown'};".encode("utf-8"))
+    # §十二.5/§P1-8: the DSR multiplicity must treat different RESEARCH CHOICES
+    # as distinct trials — the review's canonical example is trying five random
+    # seeds and keeping the best, which the old signature (no seed) conflated
+    # into one trial.  Seed, horizon, sequence length, transaction cost, the
+    # evaluator identity and the frozen calendar all enter the signature, so a
+    # re-run that changes any research choice counts as a NEW experiment.
+    h.update(f"seed={version.get('random_seed', getattr(config, 'seed', None))};"
+             .encode("utf-8"))
     h.update(f"horizon={config.horizon};".encode("utf-8"))
+    h.update(f"seq_len={config.seq_len};".encode("utf-8"))
+    h.update(f"txn_cost={getattr(config, 'txn_cost', None)};".encode("utf-8"))
     h.update(f"objective={_objective_desc(config)};".encode("utf-8"))
+    h.update(f"evaluator_version={version.get('evaluator_version') or 'unknown'};"
+             .encode("utf-8"))
+    h.update(f"calendar_version={version.get('calendar_version') or 'unknown'};"
+             .encode("utf-8"))
+    h.update(f"calendar_artifact_hash={version.get('calendar_artifact_hash') or 'unknown'};"
+             .encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -1370,6 +1397,8 @@ def _replay_continuous_oos(
     oos_dir: str,
     n_trials: int | None = None,
     trial_sharpes: list[float] | None = None,
+    formal: bool = False,
+    model_name: str | None = None,
 ) -> dict | None:
     """§十四-4: replay ONE continuous long sleeve account across ALL fold tapes.
 
@@ -1405,18 +1434,39 @@ def _replay_continuous_oos(
     same data version) and that all tapes share the same data_version /
     universe_status_hash / membership_hash / calendar_hash — a silent
     overwrite, a delist-file/membership edit, or a calendar-content change
-    between runs fails the replay instead of passing.
+    between runs fails the replay instead of passing.  §十五-1 additionally
+    requires the strategy POLICY (horizon / cost / top_fraction /
+    evaluator_version / price_convention / exit_policy / strategy_mode) to be
+    identical across folds, so a mixed-policy directory is never explained by
+    the first tape's policy.
+
+    `formal=True` (§十五-2) is the production headline mode: it refuses ANY
+    tape that lacks required metadata (universe/delist/calendar/version/policy
+    keys) instead of replaying it under legacy semantics — the final continuous
+    account must never silently blend a legacy tape.  Non-formal replay keeps
+    the legacy tolerance for unit tests and migrations.
+
+    `model_name` (§十五-3) selects ONE baseline model's tapes
+    (`fold_000_lgbm.npz`, ...) for its own continuous account.  The default
+    scan matches only digit-stem tapes (`fold_000.npz`, the deep model), so a
+    baseline tape sharing an oos_dir is never blended into the deep replay.
 
     Returns the account dict (see `_run_sleeve_sim`), the global price dates,
     union stock codes, ledger, and headline metrics; None when no fold tapes
-    exist.
+    match.
     """
     if not os.path.isdir(oos_dir):
         return None
+    if model_name is not None:
+        pat = re.compile(rf"fold_\d+_{re.escape(model_name)}\.npz$")
+    else:
+        # Deep-model tapes are the bare `fold_000.npz` form; baseline tapes
+        # carry a `_modelname` suffix and must not join the deep replay.
+        pat = re.compile(r"fold_\d+\.npz$")
     tapes = sorted(
         os.path.join(oos_dir, f)
         for f in os.listdir(oos_dir)
-        if f.startswith("fold_") and f.endswith(".npz"))
+        if pat.match(f))
     if not tapes:
         return None
     recs = []
@@ -1449,6 +1499,16 @@ def _replay_continuous_oos(
                                 if "membership_hash" in z.files else None),
             "calendar_hash": (str(z["calendar_hash"])
                               if "calendar_hash" in z.files else None),
+            # §十五-1: policy + evaluator identity — `None` marks a legacy tape
+            # that predates these keys (tolerated by non-formal replay).
+            "evaluator_version": (str(z["evaluator_version"])
+                                  if "evaluator_version" in z.files else None),
+            "price_convention": (str(z["price_convention"])
+                                 if "price_convention" in z.files else None),
+            "exit_policy": (str(z["exit_policy"])
+                            if "exit_policy" in z.files else None),
+            "strategy_mode": (str(z["strategy_mode"])
+                              if "strategy_mode" in z.files else None),
         })
     # fold index grows as val_start walks BACKWARD, so chronological order is
     # the reverse of the lexicographic tape order.
@@ -1457,17 +1517,53 @@ def _replay_continuous_oos(
     # §十二.2: every fold tape must describe the SAME data + universe records —
     # a fold re-downloaded mid-run, or a delist-file/membership edit between
     # runs, would otherwise be silently blended into one continuous account.
-    def _consistent(name: str, values: list) -> None:
+    #
+    # §十五-1: the STRATEGY POLICY must be identical across folds too.  The
+    # replay explains the whole account with ONE policy (horizon, cost,
+    # top_fraction, ...); a horizon=5 fold mixed with a horizon=20 fold, or a
+    # 10bp fold with a 30bp fold, would otherwise be silently replayed with the
+    # first tape's policy.  A legacy tape that predates a key is `None` and
+    # only tolerated by NON-formal replay.
+    #
+    # §十五-2: FORMAL replay (the production headline account) refuses ANY
+    # missing required metadata — universe/delist/calendar/version keys that a
+    # legacy tape lacks.  The final continuous account must never silently
+    # blend a legacy tape, so `formal=True` upgrades every consistency check to
+    # require the key to be present.
+    def _consistent(name: str, values: list, *, required: bool = False) -> None:
+        if required and any(v is None for v in values):
+            raise ValueError(
+                f"formal continuous-OOS replay: tape missing required "
+                f"{name} — refusing to blend a legacy tape (§十五-2)")
         known = [v for v in values if v is not None]
         if len(set(known)) > 1:
             raise ValueError(
                 f"§十二.2: fold tapes disagree on {name}: {sorted(set(known))}")
 
-    _consistent("data_version", [r["data_version"] for r in recs])
+    _consistent("data_version", [r["data_version"] for r in recs],
+                required=formal)
     _consistent("universe_status_hash",
-                [r["universe_status_hash"] for r in recs])
-    _consistent("membership_hash", [r["membership_hash"] for r in recs])
-    _consistent("calendar_hash", [r["calendar_hash"] for r in recs])
+                [r["universe_status_hash"] for r in recs], required=formal)
+    _consistent("membership_hash", [r["membership_hash"] for r in recs],
+                required=formal)
+    _consistent("calendar_hash", [r["calendar_hash"] for r in recs],
+                required=formal)
+    _consistent("horizon", [r["horizon"] for r in recs], required=formal)
+    _consistent("cost", [r["cost"] for r in recs], required=formal)
+    _consistent("top_fraction", [r["top_fraction"] for r in recs],
+                required=formal)
+    _consistent("evaluator_version", [r["evaluator_version"] for r in recs],
+                required=formal)
+    _consistent("price_convention", [r["price_convention"] for r in recs],
+                required=formal)
+    _consistent("exit_policy", [r["exit_policy"] for r in recs],
+                required=formal)
+    _consistent("strategy_mode", [r["strategy_mode"] for r in recs],
+                required=formal)
+    if formal and any(r["delist_day"] is None for r in recs):
+        raise ValueError(
+            "formal continuous-OOS replay: tape missing required delist_day — "
+            "refusing to blend a legacy tape (§十五-2)")
 
     union_stocks: list[str] = []
     for r in recs:
@@ -1749,8 +1845,16 @@ def main():
         _report_path = args.quality_gate_report or str(
             get_project_root() / "reports" / "data_quality_gate.json"
         )
-        _require_quality_gate(data_dir, args.prebuilt, _report_path)
-        logger.info("Quality-gate report verified: %s", _report_path)
+        gate_report = _require_quality_gate(data_dir, args.prebuilt, _report_path)
+        logger.info(
+            "Quality-gate report verified: %s (scope=%s scanned=%s/%s "
+            "manifest_contract_full_scan=%s)",
+            _report_path,
+            gate_report.get("scope"),
+            gate_report.get("scanned_files"),
+            gate_report.get("total_files"),
+            gate_report.get("manifest_contract_full_scan"),
+        )
 
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
@@ -1815,10 +1919,6 @@ def main():
 
     panel = pd.concat(frames, ignore_index=True)
     logger.info("Panel shape: %s", panel.shape)
-    # Panel stock order is sorted-unique (build_panel_features sorts codes);
-    # derive the code list from the panel itself so OOS artifacts stay aligned
-    # with the panel arrays even if a stock's data was dropped as empty.
-    panel_stocks = sorted(panel["stock_code"].unique())
 
     # Load auxiliary data (unless --no-aux or --prebuilt)
     required_set = {c.strip() for c in (args.require_aux_channels or "").split(",") if c.strip()}
@@ -1851,6 +1951,18 @@ def main():
         panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
         require_feature_manifest=args.require_feature_manifest,
     )
+    # §v12-P0: panel row identity — stock_codes comes from the pipeline's
+    # valid_codes (only stocks whose features survived cleaning), NEVER
+    # re-derived from the raw panel: a stock whose features were cleaned out
+    # would otherwise shift every subsequent array row's stock label (board
+    # one-hot, universe/delist mask, OOS artifact codes) with no error raised.
+    panel_stocks = list(panel_data["stock_codes"])
+    assert len(panel_stocks) == panel_data["past_observed"].shape[0], (
+        "panel stock_codes length != past_observed rows (row identity broken)")
+    assert len(panel_stocks) == panel_data["static_features"].shape[0], (
+        "panel stock_codes length != static_features rows (row identity broken)")
+    assert len(set(panel_stocks)) == len(panel_stocks), (
+        "duplicate stock codes in panel (row identity broken)")
 
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the panel's
@@ -2350,6 +2462,15 @@ def main():
                 # to the exact weights in fold_XXX_model.pt (config+source
                 # model_hash is shared by all folds, this one is not).
                 weight_hash=weight_hash,
+                # §十五-1: the strategy policy + evaluator identity that produced
+                # this tape.  The continuous replay REJECTS a directory whose
+                # folds disagree on any of these — otherwise a horizon=5 fold
+                # mixed with a horizon=20 fold would be replayed with the first
+                # tape's policy explaining the whole account.
+                evaluator_version=version_info["evaluator_version"],
+                price_convention="open_to_open",
+                exit_policy="scheduled_horizon_delayed_delist_force_sell",
+                strategy_mode="long_top_fraction",
             )
             # Per-position ledger: the exact fills the long
             # sleeve account made — entry/exit price, exit status, gross/net
@@ -2518,7 +2639,8 @@ def main():
         if isinstance(e.get("oos_continuous_sharpe"), (int, float))
     ]
     cont = (_replay_continuous_oos(oos_dir, n_trials=n_trials,
-                                   trial_sharpes=historical_sharpes)
+                                   trial_sharpes=historical_sharpes,
+                                   formal=True)
             if oos_preds_all else None)
     if cont is not None:
         daily = np.asarray(cont["account"]["daily"], dtype=np.float64)

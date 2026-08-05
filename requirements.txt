@@ -4,7 +4,7 @@
 #   PYTHONPATH=. ./.venv/Scripts/python scripts/maintenance/current/gen_requirements.py
 
 # Core
-pandas>=2.0
+pandas>=3.0
 numpy>=1.24
 polars>=0.20
 pyarrow>=14.0

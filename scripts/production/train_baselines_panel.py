@@ -19,6 +19,7 @@ Usage:
       --models ridge,lgbm,mlp,momentum --outdir reports/experiments/baselines
 """
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -68,6 +69,7 @@ from train_panel import (  # noqa: E402  (same-module fold logic)
     _objective_desc,
     _prebuilt_channel_coverage,
     _predict_outer,
+    _replay_continuous_oos,
     _require_quality_gate,
     _resolve_universe,
     _slice_panel,
@@ -78,6 +80,15 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _file_sha1(path: str) -> str:
+    """Content sha1 of a file's bytes — the baseline tape's weight fingerprint."""
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class _LGBMWrapper:
@@ -245,7 +256,6 @@ def main():
         sys.exit(1)
 
     panel = pd.concat(frames, ignore_index=True)
-    panel_stocks = sorted(panel["stock_code"].unique())
 
     seq_len = args.seq_len or 60
     fp = FeaturePipeline(
@@ -262,6 +272,16 @@ def main():
     panel_data = fp.build_panel_features(
         panel, aux_data=None, horizon=args.horizon, prebuilt_dir=args.prebuilt,
     )
+    # §v12-P0: same row-identity invariant as train_panel.py — stock_codes
+    # comes from the pipeline's valid_codes, never re-derived from the raw
+    # panel (a cleaned-out stock would shift every subsequent row's label).
+    panel_stocks = list(panel_data["stock_codes"])
+    assert len(panel_stocks) == panel_data["past_observed"].shape[0], (
+        "panel stock_codes length != past_observed rows (row identity broken)")
+    assert len(panel_stocks) == panel_data["static_features"].shape[0], (
+        "panel stock_codes length != static_features rows (row identity broken)")
+    assert len(set(panel_stocks)) == len(panel_stocks), (
+        "duplicate stock codes in panel (row identity broken)")
     channel_manifest = _prebuilt_channel_coverage(panel_data)
 
     global_dates = panel_data.get("global_dates")
@@ -509,15 +529,28 @@ def main():
             elapsed = time.time() - t0
             # §P0-5: persist the fitted baseline (ridge/lgbm/mlp) alongside the
             # tape so fold_XXX_<model>.npz maps to exact fitted weights — the
-            # analogue of the deep model's fold_XXX_model.pt.  A pickle is best
-            # effort: a score tape without weights is still replayable from the
-            # saved preds grid, so a serialization hiccup must not kill a fold.
+            # analogue of the deep model's fold_XXX_model.pt.  §P1-3: the tape's
+            # model_hash is the REAL content hash of this artifact (not a static
+            # "baseline-<name>" string), so a re-fit that changes the weights is
+            # detectable.  A pickle is best effort in non-formal mode: a score
+            # tape without weights is still replayable from the saved preds grid,
+            # so a serialization hiccup must not kill a fold — but in formal
+            # mode an unhashable tape aborts the run instead of silently saving
+            # a weight whose provenance is unverifiable.
+            weight_hash = None
             try:
                 model_path = os.path.join(
                     oos_dir, f"fold_{fold:03d}_{model_name}.pkl")
                 with open(model_path, "wb") as f:
                     pickle.dump(adapter, f)
-            except Exception as exc:  # noqa: BLE001 — best-effort artifact
+                weight_hash = _file_sha1(model_path)
+            except Exception as exc:  # noqa: BLE001
+                if not args.no_formal:
+                    logger.error(
+                        "  Fold %d %s: model pickle FAILED (%s) — formal mode "
+                        "aborts rather than save a tape whose weight hash is "
+                        "unverifiable", fold, model_name, exc)
+                    raise
                 logger.warning("  Fold %d %s: model pickle failed (%s) — "
                                "tape saved without weights", fold, model_name, exc)
             # §P0-5: per-fold OOS prediction tape, same layout/contract as the
@@ -564,9 +597,20 @@ def main():
                     universe_status_hash=universe_hashes["universe_status_hash"],
                     membership_hash=universe_hashes["membership_hash"],
                     data_version=version_info["data_manifest_hash"],
-                    model_hash="baseline-" + model_name,
+                    # §P1-3: real content hash of the fitted pickle (not a
+                    # static "baseline-<name>" string); falls back to the
+                    # legacy string only when the non-formal pickle failed.
+                    model_hash=weight_hash or ("baseline-" + model_name),
                     seed=args.seed,
                     evaluator_version=EVALUATOR_VERSION,
+                    weight_hash=weight_hash,
+                    calendar_hash=version_info["calendar_artifact_hash"],
+                    # §十五-3: identical policy metadata as the deep tapes, so a
+                    # mixed oos_dir (deep + baseline, or two baselines) is
+                    # rejected by the continuous replay instead of blended.
+                    price_convention="open_to_open",
+                    exit_policy="scheduled_horizon_delayed_delist_force_sell",
+                    strategy_mode="long_top_fraction",
                 )
                 # Per-position ledger, same contract as train_panel.py — the
                 # tape is self-contained, so each realized number is traceable.
@@ -616,6 +660,9 @@ def main():
                 "entry_end": _fmt_date(global_dates, val_start + val_len - 1),
                 "seconds": round(elapsed, 1),
                 "dsr_n_trials": outer_m.get("dsr_n_trials", 0),
+                # §P1-3: real content hash of the persisted pickle — re-fit
+                # changes it, so the registry can aggregate a real fingerprint.
+                "weight_hash": weight_hash,
             }
             fold_records.append(rec)
             logger.info(
@@ -674,6 +721,79 @@ def main():
             "selected_universe_ew_sharpe": _agg("selected_universe_ew_sharpe"),
         }
 
+    # §十五-3: baseline continuous long-only OOS account — the SAME replay the
+    # deep model produces.  Each baseline model's fold tapes
+    # (fold_000_<model>.npz) are replayed as ONE account through
+    # _run_sleeve_sim, so its headline Sharpe is comparable to the deep
+    # model's oos_continuous_sharpe on the same LONG basis (§十二.3).  The
+    # account's daily NAV + ledger are persisted next to the summary so the
+    # number is traceable to positions, not just a scalar.  Formal replay is
+    # used here too: a baseline tape missing required metadata must not be
+    # silently blended into the account.
+    cont_dir = os.path.join(outdir, "continuous")
+    os.makedirs(cont_dir, exist_ok=True)
+    for model_name in models:
+        sub = rows[rows["model"] == model_name]
+        if sub.empty:
+            continue
+        trial_sharpes = [float(v) for v in sub["long_sharpe"].dropna().astype(float)]
+        try:
+            cont = _replay_continuous_oos(
+                oos_dir,
+                model_name=model_name,
+                formal=True,
+                n_trials=n_trials,
+                trial_sharpes=trial_sharpes,
+            )
+        except ValueError as exc:
+            if not args.no_formal:
+                raise
+            logger.warning("  %s continuous OOS failed (%s) — skipped",
+                           model_name, exc)
+            cont = None
+        if cont is None:
+            logger.warning("  %s: no continuous OOS tapes found", model_name)
+            continue
+        daily = np.asarray(cont["account"]["daily"], dtype=np.float64)
+        # Same NAV identity as the deep side: account starts at 1.0 on the
+        # close before day 0, so NAV after day c = cumulative product of daily
+        # returns through c (final row == final_nav).
+        nav = (1.0 + daily).cumprod()
+        pd.DataFrame({
+            "price_date": cont["price_dates"],
+            "nav": nav,
+            "daily_return": daily,
+        }).to_parquet(
+            os.path.join(cont_dir, f"oos_continuous_{model_name}.parquet"),
+            index=False)
+        if cont["ledger"] is not None:
+            cont["ledger"].to_parquet(
+                os.path.join(cont_dir, f"oos_continuous_{model_name}_ledger.parquet"))
+        mets = cont["metrics"]
+        summary["models_result"][model_name]["oos_continuous"] = {
+            "sharpe": mets["sharpe"],
+            "maxdd": mets["maxdd"],
+            "cagr": mets["cagr"],
+            "final_nav": mets["final_nav"],
+            "n_days": mets["n_days"],
+            "n_stocks": mets["n_stocks"],
+            "n_eff": mets.get("n_eff"),
+            "psr": mets.get("psr"),
+            "dsr": mets.get("dsr"),
+            "dsr_trial_sharpes_n": mets.get("dsr_trial_sharpes_n"),
+            "dsr_trial_variance_source": mets.get("dsr_trial_variance_source"),
+            "file": f"continuous/oos_continuous_{model_name}.parquet",
+            "ledger": (f"continuous/oos_continuous_{model_name}_ledger.parquet"
+                       if cont["ledger"] is not None else None),
+        }
+        logger.info(
+            "  %-8s continuous OOS: Sharpe=%.2f MaxDD=%.2f CAGR=%.4f "
+            "final_nav=%.3f (%d days, %d stocks)",
+            model_name, mets["sharpe"], mets["maxdd"],
+            mets["cagr"] if mets["cagr"] is not None else float("nan"),
+            mets["final_nav"] if mets["final_nav"] is not None else float("nan"),
+            mets["n_days"], mets["n_stocks"])
+
     with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     with open(os.path.join(outdir, "universe_resolved.txt"), "w", encoding="utf-8") as f:
@@ -683,20 +803,23 @@ def main():
 
     logger.info("=== Baseline Summary (%d folds, disjoint OOS windows) ===",
                 summary["n_folds"])
-    header = f"{'model':<10} {'LS_sharpe':>10} {'IC':>8} {'long_sharpe':>12} {'q5mq1(bp)':>10} {'elgEW':>8} {'selUniEW':>8}"
+    header = (f"{'model':<10} {'LS_sharpe':>10} {'IC':>8} {'long_sharpe':>12} "
+              f"{'q5mq1(bp)':>10} {'OOS_cont':>10}")
     logger.info(header)
     for model_name in models:
         r = summary["models_result"].get(model_name)
         if not r:
             continue
-        logger.info("%-10s %10.2f %8.4f %12.2f %10.1f %8.2f %8.2f",
+        cont = r.get("oos_continuous")
+        cont_s = (f"{cont['sharpe']:.2f}"
+                  if cont and cont.get("sharpe") is not None else "-")
+        logger.info("%-10s %10.2f %8.4f %12.2f %10.1f %10s",
                     model_name,
                     r["ls_sharpe"]["mean"] or 0.0,
                     r["ic_mean"]["mean"] or 0.0,
                     r["long_sharpe"]["mean"] or 0.0,
                     (r["q5mq1_ret"]["mean"] or 0.0) * 10000,
-                    r["eligible_ew_sharpe"]["mean"] or 0.0,
-                    r["selected_universe_ew_sharpe"]["mean"] or 0.0)
+                    cont_s)
     logger.info("Artifacts saved to %s", outdir)
 
     # §十二.6: register each baseline model as a distinct research trial in the
@@ -712,7 +835,25 @@ def main():
         # §十二.3: trial Sharpe on the LONG sleeve basis — the deep model's
         # oos_continuous_sharpe is a long account, so baseline trials use the
         # same basis to keep the historical DSR variance pool comparable.
-        sharpe = float(long_vals.mean()) if len(long_vals) else None
+        # §十五-3: when the continuous replay produced a REAL account, its
+        # Sharpe is the headline (mirrors the deep model exactly); only fall
+        # back to the mean fold long-Sharpe when no continuous account exists.
+        cont_res = summary["models_result"].get(model_name, {}).get("oos_continuous")
+        if cont_res and cont_res.get("sharpe") is not None:
+            sharpe = float(cont_res["sharpe"])
+        else:
+            sharpe = float(long_vals.mean()) if len(long_vals) else None
+        # §P1-3: the registry fingerprint is a REAL content hash over the fold
+        # weight artifacts (sha1 of the sorted per-fold weight hashes), not a
+        # static "baseline-<name>" label — a re-fit that changes any fold's
+        # weights changes the fingerprint.  Falls back to the label only when
+        # no fold produced a hashable pickle (non-formal failure path).
+        weight_hashes = [str(v) for v in sub["weight_hash"].dropna()]
+        if weight_hashes:
+            model_hash = hashlib.sha1(
+                "|".join(sorted(weight_hashes)).encode("utf-8")).hexdigest()
+        else:
+            model_hash = f"baseline-{model_name}"
         baseline_entry = {
             "experiment_signature": _experiment_signature(
                 version_info, config, model_key=f"baseline-{model_name}"),
@@ -721,7 +862,7 @@ def main():
             "git_commit": version_info.get("git_commit"),
             "data_manifest_hash": version_info.get("data_manifest_hash"),
             "feature_schema_hash": version_info.get("feature_schema_hash"),
-            "model_hash": f"baseline-{model_name}",
+            "model_hash": model_hash,
             "universe_hash": version_info.get("universe_hash"),
             "horizon": config.horizon,
             "objective": _objective_desc(config),

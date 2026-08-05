@@ -89,9 +89,80 @@ MARKET_ENV_COLS = [
     "investor_new_num", "investor_new_z", "market_adv_ratio", "market_turnover_z",
 ]
 
+# §P1-7: per state-channel maximum acceptable staleness in CALENDAR days.
+# A forward-filled state value older than this is flagged `{prefix}_is_stale`
+# (and `{prefix}_staleness_days` records the exact age) so a balance last
+# updated 60 days ago is never silently consumed as the "latest true state".
+# Defaults follow each channel's disclosure cadence: daily (margin / northbound
+# / valuation / macro / market_env / industry), quarterly (fundamental /
+# shareholder), monthly (pledge), and per-disclosure forecast bands (earnings).
+# Overridable per call via ``max_staleness=`` on the merge.
+STATE_MAX_STALENESS: dict[str, int] = {
+    "margin": 5,
+    "northbound": 5,
+    "valuation": 5,
+    "fundamental": 120,
+    "earnings": 120,
+    "shareholder": 120,
+    "pledge": 40,
+    "macro": 5,
+    "market_env": 5,
+    "industry": 5,
+}
+
+
+def _append_state_staleness(df: pd.DataFrame, value_cols: list[str],
+                            prefix: str, max_staleness: int) -> list[str]:
+    """Record a state channel's observation pattern as staleness features.
+
+    Must run BEFORE the ffill destroys the NaN pattern.  A row is an
+    "observation" when ANY value column is non-NaN.  Four columns are appended:
+
+    * ``{prefix}_staleness_days`` — calendar days since the last observation
+      (the ``age`` feature, §8.2); 0 before the first observation.
+    * ``{prefix}_has_ever_observed`` — True from the first observation onward;
+      distinguishes pre-history "unknown" from a real zero (§8.3).
+    * ``{prefix}_days_since_first_available`` — calendar days since the first
+      observation (§8.3); 0 before it.
+    * ``{prefix}_is_stale`` — ``has_ever_observed`` AND age > max_staleness.
+
+    Returns the new column names so the caller can PIT-shift them with the
+    value columns (the feature at t reflects the state as of t-1).
+    """
+    dates = pd.to_datetime(df["date"]).reset_index(drop=True)
+    obs = df[value_cols].notna().any(axis=1).reset_index(drop=True)
+    n = len(df)
+    has_ever = obs.cummax().astype(bool).to_numpy()
+    staleness = np.zeros(n, dtype="int32")
+    days_since_first = np.zeros(n, dtype="int32")
+    is_stale = np.zeros(n, dtype=bool)
+    if bool(obs.any()):
+        obs_dates = dates.where(obs)
+        last_obs = obs_dates.ffill()
+        first_obs = dates[obs].iloc[0]
+        age = (dates - last_obs).dt.days.fillna(0).to_numpy()
+        staleness = np.where(has_ever, age, 0).astype("int32")
+        days_since_first = np.where(
+            has_ever, (dates - first_obs).dt.days.fillna(0).to_numpy(), 0
+        ).astype("int32")
+        is_stale = has_ever & (staleness > max_staleness)
+    cols = [
+        f"{prefix}_staleness_days",
+        f"{prefix}_has_ever_observed",
+        f"{prefix}_days_since_first_available",
+        f"{prefix}_is_stale",
+    ]
+    df[cols[0]] = staleness
+    df[cols[1]] = has_ever
+    df[cols[2]] = days_since_first
+    df[cols[3]] = is_stale
+    return cols
+
 
 def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
-                      lag: bool = True, policy: str = "zero") -> None:
+                      lag: bool = True, policy: str = "zero",
+                      prefix: str | None = None,
+                      max_staleness: int | None = None) -> None:
     """Vectorized fill → shift → fill for merged aux columns.
 
     Groups columns by dtype and does each operation in a single block
@@ -134,6 +205,15 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
                 and not c.startswith("has_")]
     bool_cols = [c for c in available if c.startswith("has_")]
 
+    # §P1-7: state channels record their observation pattern BEFORE the fill
+    # destroys it — staleness / has_ever_observed / days-since-first / is_stale
+    # (only when the caller supplied a channel prefix + max_staleness).
+    staleness_cols: list[str] = []
+    if (policy == "ffill" and prefix and max_staleness is not None
+            and "date" in df.columns and float_cols):
+        staleness_cols = _append_state_staleness(df, float_cols, prefix,
+                                                 max_staleness)
+
     # Pre-lag fill
     if float_cols:
         if policy == "ffill":
@@ -148,6 +228,8 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
     # PIT lag: feature[t-1] paired with price[t]
     if lag:
         df[available] = df[available].shift(1)
+        if staleness_cols:
+            df[staleness_cols] = df[staleness_cols].shift(1)
 
     # Post-lag fill (first row becomes NaN after shift)
     if float_cols:
@@ -156,16 +238,27 @@ def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
         df[int_cols] = df[int_cols].fillna(0).astype("int16")
     if bool_cols:
         df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
+    if staleness_cols:
+        int_s = [c for c in staleness_cols
+                 if c.endswith(("_days", "_since_first_available"))]
+        bool_s = [c for c in staleness_cols if c not in int_s]
+        if int_s:
+            df[int_s] = df[int_s].fillna(0).astype("int32")
+        if bool_s:
+            df[bool_s] = df[bool_s].fillna(False).astype(bool)
 
 
 def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame,
-                     policy: str = "zero") -> pd.DataFrame:
+                     policy: str = "zero", prefix: str | None = None,
+                     max_staleness: int | None = None) -> pd.DataFrame:
     """Merge a preprocessed auxiliary DataFrame on date with fill + PIT lag.
 
     Any column that exists in *aux* (except date, stock_code, has_* flags and
     K-line derived columns) is merged and lagged by 1 trading day.  ``policy``
     selects the channel's aux missingness policy (§九-4): "zero" for event-type
     channels, "ffill" for state-type channels (see :func:`_batch_fill_shift`).
+    ``prefix`` + ``max_staleness`` enable §P1-7 state-staleness tracking for
+    state channels (forwarded to :func:`_batch_fill_shift`).
     """
     a = aux.copy()
     a["date"] = pd.to_datetime(a["date"])
@@ -195,7 +288,8 @@ def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame,
         return df
 
     df = df.merge(a[["date"] + available], on="date", how="left")
-    _batch_fill_shift(df, available, policy=policy)
+    _batch_fill_shift(df, available, policy=policy,
+                      prefix=prefix, max_staleness=max_staleness)
     return df
 
 
@@ -402,7 +496,8 @@ class AuxAligner:
             return df
         df = df.merge(m[["date"] + available], on="date", how="left")
         # Margin balance is a state: a missing day means "unchanged", never 0.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="margin",
+                          max_staleness=STATE_MAX_STALENESS["margin"])
         return df
 
     def _merge_northbound(self, df: pd.DataFrame,
@@ -421,7 +516,8 @@ class AuxAligner:
             return df
         df = df.merge(nb[["date"] + available], on="date", how="left")
         # Holdings are a state snapshot — forward-fill gaps, never zero.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="northbound",
+                          max_staleness=STATE_MAX_STALENESS["northbound"])
         return df
 
     def _merge_dragon_tiger(self, df: pd.DataFrame,
@@ -497,7 +593,8 @@ class AuxAligner:
 
         df = df.merge(fd[["date"] + available], on="date", how="left")
         # Fundamentals are a state snapshot — forward-fill any residual gap.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="fundamental",
+                          max_staleness=STATE_MAX_STALENESS["fundamental"])
         return df
 
     def _merge_earnings(self, df: pd.DataFrame,
@@ -524,7 +621,9 @@ class AuxAligner:
         df = df.merge(ed[["date"] + available], on="date", how="left")
         # date is the storage-mapped effective_trade_date → no extra shift.
         # A forecast band is a state that persists until superseded → ffill.
-        _batch_fill_shift(df, available, lag=False, policy="ffill")
+        _batch_fill_shift(df, available, lag=False, policy="ffill",
+                          prefix="earnings",
+                          max_staleness=STATE_MAX_STALENESS["earnings"])
         return df
 
     def _merge_valuation(self, df: pd.DataFrame,
@@ -542,7 +641,8 @@ class AuxAligner:
             return df
         df = df.merge(vd[["date"] + available], on="date", how="left")
         # Valuation ratios are a state snapshot — forward-fill, never zero.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="valuation",
+                          max_staleness=STATE_MAX_STALENESS["valuation"])
         return df
 
     def _merge_etf_flow(self, df: pd.DataFrame,
@@ -636,7 +736,8 @@ class AuxAligner:
             self._warn_if_missing("shareholder")
             return df
         # Shareholder count is a state snapshot between disclosures.
-        return _merge_daily_aux(df, sh_df, policy="ffill")
+        return _merge_daily_aux(df, sh_df, policy="ffill", prefix="shareholder",
+                                max_staleness=STATE_MAX_STALENESS["shareholder"])
 
     def _merge_lockup(self, df: pd.DataFrame,
                       lu_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -704,7 +805,8 @@ class AuxAligner:
             self._warn_if_missing("pledge")
             return df
         # Pledge ratio is outstanding state — forward-fill between records.
-        return _merge_daily_aux(df, pledge_df, policy="ffill")
+        return _merge_daily_aux(df, pledge_df, policy="ffill", prefix="pledge",
+                                max_staleness=STATE_MAX_STALENESS["pledge"])
 
     def _merge_index_membership(self, df: pd.DataFrame,
                                 im_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -746,7 +848,8 @@ class AuxAligner:
             return df
         df = df.merge(macro[["date"] + available], on="date", how="left")
         # Macro rates/levels are state — forward-fill gaps, never zero.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="macro",
+                          max_staleness=STATE_MAX_STALENESS["macro"])
         return df
 
     def _merge_market_env(self, df: pd.DataFrame,
@@ -784,7 +887,8 @@ class AuxAligner:
             return df
         df = df.merge(me[["date"] + available], on="date", how="left")
         # Market-breadth stats are state — forward-fill gaps, never zero.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="market_env",
+                          max_staleness=STATE_MAX_STALENESS["market_env"])
         return df
 
     def _merge_industry(self, df: pd.DataFrame,
@@ -840,5 +944,6 @@ class AuxAligner:
 
         df = df.merge(ind[["date"] + available], on="date", how="left")
         # Industry cross-sectional stats are state — forward-fill, never zero.
-        _batch_fill_shift(df, available, policy="ffill")
+        _batch_fill_shift(df, available, policy="ffill", prefix="industry",
+                          max_staleness=STATE_MAX_STALENESS["industry"])
         return df

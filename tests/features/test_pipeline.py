@@ -362,6 +362,53 @@ class TestCleanCalendarDates:
         assert fp._clean_calendar_dates(df, "000001") is None
 
 
+class TestPanelRowIdentity:
+    """§v12-P0 regression: build_panel_features row i MUST map to the
+    returned stock_codes[i] — never to the position of the original code in
+    the raw panel.  When a stock is cleaned out, every subsequent row would
+    otherwise be mislabelled (board one-hot, universe mask, OOS artifact
+    codes) without any error being raised."""
+
+    @staticmethod
+    def _make_panel():
+        base = pd.bdate_range("2020-01-01", "2020-08-31")
+        A = _make_panel_kl(list(base), seed=1)
+        A["stock_code"] = "000001"  # SZ main board (starts with "00")
+        # B: EVERY row is an off-calendar day (both Saturdays) →
+        # _clean_calendar_dates returns None → B drops out of the feature
+        # stack entirely.
+        B = _make_panel_kl(["2020-03-14", "2020-03-21"], seed=2)
+        B["stock_code"] = "000002"
+        C = _make_panel_kl(list(base), seed=3)
+        C["stock_code"] = "600519"  # SH main board (starts with "60")
+        return pd.concat([A, B, C], ignore_index=True)
+
+    def _build(self):
+        return FeaturePipeline(seq_len=60).build_panel_features(
+            self._make_panel(), aux_data={}, horizon=5)
+
+    def test_dropped_stock_excluded_from_stock_codes(self):
+        p = self._build()
+        assert p["stock_codes"] == ["000001", "600519"]
+        assert p["static_features"].shape[0] == 2
+        assert p["past_observed"].shape[0] == 2
+
+    def test_row_one_maps_to_original_third_stock(self):
+        # Regression: before the fix, row 1 carried B's (dropped) position, so
+        # its board one-hot came from code "000002" instead of "600519".
+        p = self._build()
+        cols = list(_PIT_STATIC_COLS)
+        j_sz = cols.index("board_sz_main")
+        j_sh = cols.index("board_sh_main")
+        sf = p["static_features"]
+        # Row 0 = 000001 (SZ main): sz_main fires, sh_main stays cold.
+        assert sf[0, :, j_sz].max() == 1.0
+        assert sf[0, :, j_sh].max() == 0.0
+        # Row 1 = 600519 (SH main): sh_main fires, sz_main stays cold.
+        assert sf[1, :, j_sh].max() == 1.0
+        assert sf[1, :, j_sz].max() == 0.0
+
+
 class TestPanelCalendarDateValidity:
     """build_panel_features keeps every stock's date axis on the
     official A-share calendar before the UNION date axis is built, so a wrong
@@ -446,6 +493,25 @@ class TestCrossSectionCleanup:
         assert np.isfinite(others).all()
         assert (others != 0).all(), \
             "an inf must not zero the other stocks' z-scores on that date"
+
+    def test_bool_state_column_survives_cross_section_norm(self):
+        """§P1-7: a bool state flag (has_ever_observed / is_stale) reaching the
+        cross-sectional path must not crash np.isfinite — numpy 2.x raises
+        TypeError on bool — and must be emitted as finite z-scores, not zeroed."""
+        frames = []
+        for i, code in enumerate(["000001", "000002", "000003", "000004"]):
+            df = _make_panel_kl(TestCrossSectionCleanup._dates(), seed=200 + i)
+            df["stock_code"] = code
+            df["state_known"] = np.array([i % 2 == 0] * len(df))
+            frames.append(df)
+        p = self._build(pd.concat(frames, ignore_index=True))
+        po_cols = list(p["past_observed_cols"])
+        assert "state_known" in po_cols
+        vals = p["past_observed"][:, :, po_cols.index("state_known")]
+        assert np.isfinite(vals).all()
+        # The bool survives z-scoring to ±1 (or 0 outside a stock's history) —
+        # a crashed/polluted cross-section would zero the whole channel.
+        assert np.unique(vals).size >= 2
 
     @staticmethod
     def _panel(with_inf=False, inf_date="2020-06-01"):
