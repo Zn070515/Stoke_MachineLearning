@@ -2361,6 +2361,34 @@ class TestContinuousOosReplay:
         with pytest.raises(ValueError, match="§十八-C1"):
             _replay_continuous_oos(str(tmp_path), model_name="lgbm", formal=True)
 
+    def test_baseline_without_weight_hash_clean_contract(self, tmp_path):
+        """# §十八-1: a baseline tape whose weight_hash key is ABSENT (a non-formal
+        fold whose model pickle failed — train_baselines_panel omits the key
+        rather than storing an object-dtype None array) must give the clean
+        contract: non-formal replay tolerates it (legacy tolerance), formal replay
+        REFUSES it with the §十八-1 ValueError — not a crash from the replay
+        reader's allow_pickle=False."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 4)]
+        close = np.arange(10, 13, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / "fold_000_lgbm.npz"),
+            stocks=["000001"], dates=dates[0:2], price_dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close[0:2]]), open=np.stack([close[0:2]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            **self._MODEL_META,
+            model_source_hash="src1", model_config_hash="cfg1",
+            feature_schema_hash="feat1", weight_hash=None)
+        # Non-formal: the missing weight_hash key is tolerated (legacy path).
+        assert _replay_continuous_oos(
+            str(tmp_path), model_name="lgbm") is not None
+        # Formal: missing weight_hash → clean §十八-1 refusal, not a reader crash.
+        with pytest.raises(ValueError, match="weight_hash"):
+            _replay_continuous_oos(str(tmp_path), model_name="lgbm", formal=True)
+
     def test_duplicate_signal_day_fails(self, tmp_path):
         """§十八-C2: two fold tapes predicting the SAME (stock, signal-day) cell
         must fail — the folds' signal windows are strictly disjoint (step ==

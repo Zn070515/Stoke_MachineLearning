@@ -738,7 +738,13 @@ def main():
                     model_hash=weight_hash or ("baseline-" + model_name),
                     seed=args.seed,
                     evaluator_version=EVALUATOR_VERSION,
-                    weight_hash=weight_hash,
+                    # §十八-1: omit the weight_hash key when the non-formal
+                    # pickle failed — a stored None becomes an object-dtype
+                    # array that crashes the replay reader (allow_pickle=False)
+                    # before the §十八-1 gate / legacy tolerance can give the
+                    # clean "unverifiable weights" handling.
+                    **({"weight_hash": weight_hash}
+                       if weight_hash is not None else {}),
                     calendar_hash=version_info["calendar_artifact_hash"],
                     # §十六: the split model-identity hashes the formal replay
                     # requires to be identical across a model's folds.  The
