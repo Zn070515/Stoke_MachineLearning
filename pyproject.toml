@@ -2,6 +2,12 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# Only stoke_ml is installable. Without an explicit find filter, setuptools
+# flat-layout discovery treats data/, config/, reports/ as top-level packages
+# and aborts the build (Multiple top-level packages discovered).
+[tool.setuptools.packages.find]
+include = ["stoke_ml*"]
+
 [project]
 name = "stoke-ml"
 version = "0.1.0"
