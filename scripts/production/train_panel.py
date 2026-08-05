@@ -521,8 +521,9 @@ def _enforce_universe_memory(
       * universe == "csi800": est > _UNIVERSE_MEMORY_HARD_GB → "refuse";
         est > _UNIVERSE_MEMORY_WARN_GB → "warn".
       * any other universe: "ok".
-      * if ``available_gb`` is known and est > available_gb → "refuse" (the
-        estimate alone already guarantees the panel will not fit on THIS host).
+      * universe in ("all", "csi800") and ``available_gb`` is known and
+        est > available_gb → "refuse" (the estimate alone already guarantees
+        the panel will not fit on THIS host).
 
     Side effect: when the verdict is "refuse" and ``allow_override`` is False,
     raises SystemExit with a message that names the estimate, the available
