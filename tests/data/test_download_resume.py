@@ -154,17 +154,25 @@ class TestMarkStockResult:
         assert m["status"] == STATUS_DEGRADED
         assert m["covers_request"] is False
 
-    def test_explicit_status_and_covers_override(self, tmp_path):
-        """A bounded provider with no pre-listing data is complete but cannot
-        reach requested_start: caller pins COMPLETE + covers_request=True."""
+    def test_effective_start_derives_complete(self, tmp_path):
+        """v14 §十一: a bounded provider with no pre-listing data cannot reach
+        the global requested_start, but the caller clips the ask to the stock's
+        own lifecycle (effective_start=listing_date) so the effective window is
+        genuinely covered -> status derives COMPLETE and
+        effective_range_covered is True.  No boolean override is involved."""
         mark_stock_result(
             str(tmp_path), "000001", _frame(["2024-01-01"]),
             dataset="news_raw", requested_start="2015-01-01",
-            pagination_exhausted=True, covers_request=True,
+            effective_start="2024-01-01", pagination_exhausted=True,
         )
         m = read_stock_manifest(str(tmp_path), "000001")
         assert m["status"] == STATUS_COMPLETE
+        assert m["effective_range_covered"] is True
+        assert m["effective_start"] == "2024-01-01"
+        # covers_request mirrors the effective-range conclusion; request_covered
+        # stays informational (the raw global request was never reached).
         assert m["covers_request"] is True
+        assert m["request_covered"] is False
 
 
 class TestSkipCompletedStocks:
@@ -195,27 +203,37 @@ class TestSkipCompletedStocks:
         assert pending == []
         assert skipped == 1
 
-    def test_covers_request_false_forces_redownload(self, tmp_path):
+    def test_effective_range_not_covered_forces_redownload(self, tmp_path):
+        """v14 §十一: no effective_start supplied -> the effective window
+        degenerates to the request, and actual dates that do NOT reach the
+        effective end mean the manifest is BOUNDED_COMPLETE
+        (effective_range_covered False) -> resume must re-download."""
         mark_stock_result(
             str(tmp_path), "000001", _frame(["2024-01-01"]),
             dataset="news_raw", requested_start="2024-01-01",
-            pagination_exhausted=True, covers_request=False,
+            requested_end="2024-12-31", pagination_exhausted=True,
         )
+        m = read_stock_manifest(str(tmp_path), "000001")
+        assert m["status"] == STATUS_BOUNDED_COMPLETE
+        assert m["effective_range_covered"] is False
         pending, skipped = skip_completed_stocks(
-            str(tmp_path), ["000001"], start_date="2024-01-01"
+            str(tmp_path), ["000001"],
+            start_date="2024-01-01", end_date="2024-12-31",
         )
         assert pending == ["000001"]
         assert skipped == 0
 
     def test_stored_covers_true_but_dates_lie_not_skipped(self, tmp_path):
-        """§五-2: a COMPLETE manifest that claims covers_request=True but whose
-        actual dates do NOT reach the request must be re-verified against the
-        request and re-downloaded — the stored boolean is never trusted."""
+        """§五-2/v14 §十一: a COMPLETE manifest whose derived covers_request is
+        True but whose actual dates do NOT reach the requested start is
+        re-verified against the effective range and re-downloaded — the date
+        facts, not any stored boolean, decide."""
         write_stock_manifest(
             str(tmp_path), "000001", status=STATUS_COMPLETE,
-            covers_request=True,
             actual_start="2024-01-01", actual_end="2024-12-31",
         )
+        m = read_stock_manifest(str(tmp_path), "000001")
+        assert m["covers_request"] is True  # derived, yet the dates still lie
         pending, skipped = skip_completed_stocks(
             str(tmp_path), ["000001"], start_date="2020-01-01"
         )
@@ -258,9 +276,7 @@ class TestSkipCompletedStocks:
 
     @staticmethod
     def _write_status(tmp_path, status):
-        write_stock_manifest(
-            str(tmp_path), "000001", status=status, covers_request=True,
-        )
+        write_stock_manifest(str(tmp_path), "000001", status=status)
 
     def test_non_complete_statuses_force_redownload(self, tmp_path):
         for status in (STATUS_PARTIAL, STATUS_FAILED, STATUS_DEGRADED):
@@ -301,9 +317,10 @@ class TestSkipCompletedStocks:
 
 class TestSkipCompletedYears:
     def _year_manifest(self, tmp_path, data_type, year, status=STATUS_COMPLETE):
-        write_year_manifest(
-            str(tmp_path), data_type, year, status=status, covers_request=True,
-        )
+        # v14 §十一: write_year_manifest derives coverage from dates — no
+        # covers_request override.  With no actual dates supplied the effective
+        # window degenerates to the request and status derives from it.
+        write_year_manifest(str(tmp_path), data_type, year, status=status)
 
     def test_no_manifest_means_pending(self, tmp_path):
         pending, skipped = skip_completed_years(

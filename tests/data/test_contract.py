@@ -31,18 +31,25 @@ from stoke_ml.data.contract import (
 
 
 def _daily(drop=(), **over):
+    closes = [10.2, 11.2, 12.2]
     df = pd.DataFrame({
         "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
         "stock_code": "600519",
         "open": [10.0, 11.0, 12.0],
         "high": [10.5, 11.5, 12.5],
         "low": [9.5, 10.5, 11.5],
-        "close": [10.2, 11.2, 12.2],
+        "close": closes,
         "volume": [1e6, 2e6, 3e6],
         "amount": [1e7, 2e7, 3e7],
         "turnover": [0.5, 0.6, 0.7],
-        "pct_change": [1.0, 2.0, 3.0],
     })
+    # pct_change is NaN on the first (listing) row and otherwise equals the qfq
+    # close return 100*(close[t]/close[t-1]-1) — the §十二/§十三 arithmetic
+    # identity the contract now enforces.
+    closes_s = pd.Series(closes, dtype="float64")
+    pct = pd.Series([float("nan"), 100.0 * closes_s.pct_change().iloc[1],
+                     100.0 * closes_s.pct_change().iloc[2]])
+    df["pct_change"] = pct
     df = df.drop(columns=[c for c in drop if c in df.columns])
     for k, v in over.items():
         df[k] = v
@@ -476,8 +483,21 @@ class TestPctChange:
     later row must be finite, and a mid-series NaN is a corruption."""
 
     def test_first_row_nan_allowed(self):
-        df = _daily(pct_change=[np.nan, 2.0, 3.0])
+        # close=[100, 102, 105.06] with the matching pct_change [nan, 2.0, 3.0]
+        # (100*(102/100-1)=2.0, 100*(105.06/102-1)=3.0) keeps the §十二/§十三
+        # arithmetic identity consistent while the first row stays NaN.  (The
+        # _daily helper derives pct_change from its default closes, so both
+        # columns must be passed together to stay arithmetically self-consistent.)
+        df = _daily(close=[100.0, 102.0, 105.06], pct_change=[np.nan, 2.0, 3.0])
         assert validate_pct_change(df, DAILY_EQUITY) == []
+
+    def test_arithmetically_inconsistent_pct_change_fails(self):
+        """v14 §十二/§十三: pct_change must equal 100*(close[t]/close[t-1]-1)
+        within PCT_CHANGE_TOLERANCE_PP — a close correction that left the
+        adjacent return stale is caught."""
+        # close implies [nan, 2.0, 3.0] but the frame claims 5.0 on the last row.
+        df = _daily(close=[100.0, 102.0, 105.06], pct_change=[np.nan, 2.0, 5.0])
+        assert validate_pct_change(df, DAILY_EQUITY) == ["pct_change_inconsistent:1"]
 
     def test_mid_series_nan_fails(self):
         df = _daily(pct_change=[1.0, np.nan, 3.0])
