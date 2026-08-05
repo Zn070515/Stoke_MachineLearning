@@ -3,10 +3,11 @@
 Integrates K-line, sentiment, market-wide (margin/northbound/dragon-tiger),
 ETF sector flow, and fundamental data into a unified feature set.
 """
-import json
 import logging
 import os
 import re
+from collections import Counter, defaultdict
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
@@ -52,8 +53,10 @@ _panel_calendar = None
 def _get_panel_calendar():
     global _panel_calendar
     if _panel_calendar is None:
-        from stoke_ml.data.calendar import TradingCalendar
-        _panel_calendar = TradingCalendar("a_shares")
+        from stoke_ml.data.calendar import get_research_calendar
+        # Formal research path: the frozen exchange_calendar artifact, strict so
+        # any date past verified_until fails loudly instead of guessing.
+        _panel_calendar = get_research_calendar(strict=True)
     return _panel_calendar
 
 # Sparse feature policy: drop structurally-dead columns — constant on every
@@ -264,6 +267,15 @@ class FeaturePipeline:
         use_temporal_stats: bool = True,
         drop_dead_features: bool = True,
         min_history: int = 50,
+        # §七: topic-model features (topic_* from the global_frozen topic model)
+        # are OFF by default.  The model is fit once on a pinned reference corpus
+        # and then TRANSFORMS ALL historical headlines, so a headline that enters
+        # the reference after an earlier day's decision leaks future vocabulary
+        # into that day's representation — an ablation-only dimension.  Explicitly
+        # enabling use_topic restores the columns for a controlled study of their
+        # marginal value; keeping the default OFF means the headline/Lockbox
+        # feature set never silently consumes them.
+        use_topic: bool = False,
     ):
         self.seq_len = seq_len
         self.min_history = min_history
@@ -322,6 +334,24 @@ class FeaturePipeline:
         self._fundamental_refiner = FundamentalRefiner() if use_fundamental_refine else None
         self._market_env_refiner = MarketEnvRefiner() if use_market_env_refine else None
         self.drop_dead_features = drop_dead_features
+        # §七: topic_* features OFF by default (global_frozen topic-model
+        # representation leakage) — see the __init__ docstring.
+        self.use_topic = use_topic
+
+    @staticmethod
+    def _drop_topic_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """Drop topic_* columns (topic_entropy / topic_dominant / topic_*_sent /
+        topic_*_ratio / topic_sent_dispersion) from a feature frame.
+
+        The global_frozen topic model (preprocessing.text.topics) is fit on a
+        pinned reference corpus and then transforms every historical headline,
+        so its outputs are not point-in-time and must not feed the default
+        feature set (§七).  ``use_topic=True`` (ablation) skips this drop.
+        """
+        cols = [c for c in df.columns if c.startswith("topic_")]
+        if cols:
+            df = df.drop(columns=cols)
+        return df
 
     # ------------------------------------------------------------------
     # Preprocessing integration
@@ -710,6 +740,14 @@ class FeaturePipeline:
             index_membership=index_membership_df,
         )
 
+        # §七: topic_* columns ride in as "extra" merge columns on the
+        # sentiment/guba/announcement channels.  OFF by default — drop them
+        # immediately after the merge so no downstream step (interaction,
+        # emotion refinement, temporal/lag assembly) consumes the
+        # future-corpus-contaminated representation.
+        if not self.use_topic:
+            df = self._drop_topic_columns(df)
+
         # Interaction features require merged sentiment columns — must run
         # after the aux merges (was previously a silent no-op).
         if self.use_interaction:
@@ -1089,6 +1127,7 @@ class FeaturePipeline:
         prebuilt_dir: str | None = None,
         min_history: int | None = None,
         require_feature_manifest: bool = False,
+        data_dir: str | None = None,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -1120,6 +1159,12 @@ class FeaturePipeline:
                       training passes the CLI's ``--require-feature-manifest``
                       (default on); legacy prebuilt dirs / unit tests pass False
                       to keep warn-only behavior.
+            data_dir: data root used to fingerprint the source lineage when
+                      validating sidecar manifests (``manifest_matches_detailed``
+                      hashes the shared inputs + per-stock source files under it).
+                      Defaults to the active config's ``project.data_dir``; pass
+                      an explicit path in tests so the fake source files and the
+                      manifest both resolve under the same temp root.
 
         Returns:
             dict with numpy arrays: static_features, past_known, past_observed,
@@ -1129,6 +1174,11 @@ class FeaturePipeline:
         aux_data = aux_data or {}
         if min_history is None:
             min_history = self.min_history
+        # §十四-1: count WHY stocks drop out so an all-cleaned panel raises a
+        # clear error instead of the misleading "Max timesteps (0)".
+        input_stocks = len(codes)
+        drop_reasons: Counter = Counter()
+        drop_examples: dict[str, list[str]] = defaultdict(list)
 
         if prebuilt_dir:
             # A missing prebuilt parquet would otherwise surface as a bare
@@ -1144,6 +1194,8 @@ class FeaturePipeline:
                     f"No prebuilt feature parquets found in {prebuilt_dir}"
                 )
             if missing:
+                drop_reasons["prebuilt_missing_parquet"] += len(missing)
+                drop_examples["prebuilt_missing_parquet"].extend(missing[:8])
                 if require_feature_manifest:
                     raise FileNotFoundError(
                         f"prebuilt_dir {prebuilt_dir}: {len(missing)}/{len(codes)} "
@@ -1167,6 +1219,7 @@ class FeaturePipeline:
             manifest_dir = os.path.join(prebuilt_dir, ".manifests")
             missing_manifest: list[str] = []
             stale_manifest: list[str] = []
+            stale_reasons: dict[str, list[str]] = {}
             if os.path.isdir(manifest_dir) and os.listdir(manifest_dir):
                 commit = cache_manifest.git_head()
                 # §十一-3: config.yaml can change under the SAME git commit
@@ -1174,52 +1227,50 @@ class FeaturePipeline:
                 # against the current config snapshot too.  None when config
                 # cannot load → comparison skipped.
                 cfg_hash = cache_manifest.current_config_hash()
+                # §六: the full lineage check (cache_manifest.manifest_matches_detailed)
+                # — code tree + config + schema + daily range + every shared
+                # input + every per-stock source channel — replaces the old
+                # hand-rolled 4-field probe.  It is STRICTER than the manual
+                # version (the code-tree hash is compared unconditionally, even
+                # inside a repo where git_commit matches), which is the point:
+                # an uncommitted source edit or a shared-data change must not
+                # let a stale feature survive a formal run.
+                if data_dir is None:
+                    try:
+                        from stoke_ml.config import load_config as _load_cfg
+                        data_dir = _load_cfg().project.data_dir
+                    except Exception:
+                        data_dir = None
+                mconfig = _manifest_check_config(self.seq_len, horizon)
                 for code in codes:
                     mp = os.path.join(manifest_dir, f"{code}.json")
                     if not os.path.isfile(mp):
                         missing_manifest.append(code)
                         continue
-                    try:
-                        with open(mp, encoding="utf-8") as f:
-                            m = json.load(f)
-                    except Exception as exc:
-                        from stoke_ml.utils.error_summary import classify_error
-                        logger.warning(
-                            "manifest %s unreadable (category=%s), marking stale",
-                            mp, classify_error(exc).value,
-                        )
+                    ok, reasons = cache_manifest.manifest_matches_detailed(
+                        mp, code, mconfig,
+                        os.path.join(prebuilt_dir, f"{code}.parquet"),
+                        data_dir or "", commit, cfg_hash,
+                    )
+                    if not ok:
                         stale_manifest.append(code)
-                        continue
-                    if (
-                        m.get("feature_schema_hash")
-                        != cache_manifest.schema_hash(
-                            os.path.join(prebuilt_dir, f"{code}.parquet")
-                        )
-                        or m.get("git_commit") != commit
-                        or (
-                            # §十-2: git_commit=unknown outside a repo — the
-                            # git check cannot see code drift; fall back to the
-                            # feature code-tree hash recorded at build time.
-                            m.get("git_commit") == "unknown"
-                            and m.get("feature_code_tree_hash")
-                            and m["feature_code_tree_hash"]
-                            != cache_manifest.feature_code_tree_hash()
-                        )
-                        or (cfg_hash is not None and m.get("config_hash") != cfg_hash)
-                    ):
-                        stale_manifest.append(code)
+                        stale_reasons[code] = reasons
             else:
                 # No .manifests/ at all: every stock is unverifiable, so both
                 # the warn path and the require path speak the same language.
                 missing_manifest = list(codes)
 
             if require_feature_manifest and (missing_manifest or stale_manifest):
+                reason_counts = Counter(
+                    r for rs in stale_reasons.values() for r in rs
+                )
                 raise RuntimeError(
                     f"prebuilt_dir {prebuilt_dir}: feature-manifest check FAILED "
                     f"({len(missing_manifest)} missing, {len(stale_manifest)} "
-                    f"stale — schema drift, built by a different git commit, or "
-                    f"built with a different config; first missing: "
-                    f"{missing_manifest[:5]}, first stale: {stale_manifest[:5]}). "
+                    f"stale — lineage mismatch; reason_counts="
+                    f"{dict(reason_counts)}; first stale (code → reasons): "
+                    f"{list(stale_reasons.items())[:5]}; first missing: "
+                    f"{missing_manifest[:5]}). "
                     f"Regenerate with build_features.py --panel-mode before a "
                     f"formal run (--no-require-feature-manifest to override)."
                 )
@@ -1232,13 +1283,15 @@ class FeaturePipeline:
                     missing_manifest[:10],
                 )
             if stale_manifest:
+                reason_counts = Counter(
+                    r for rs in stale_reasons.values() for r in rs
+                )
                 logger.warning(
                     "prebuilt_dir %s: %d/%d stocks have STALE manifests "
-                    "(schema drift, different git commit, or config drift; "
-                    "first 10: %s) — rebuild features before trusting "
-                    "training output",
+                    "(reason_counts=%s; first 10 codes: %s) — rebuild features "
+                    "before trusting training output",
                     prebuilt_dir, len(stale_manifest), len(codes),
-                    stale_manifest[:10],
+                    dict(reason_counts), stale_manifest[:10],
                 )
 
         # Engineer features per stock (reuses existing pipeline)
@@ -1262,10 +1315,19 @@ class FeaturePipeline:
                 lag_cols = [c for c in feats.columns if re.search(r"_lag\d+$", c)]
                 if lag_cols:
                     feats = feats.drop(columns=lag_cols)
+                # §七: topic_* columns (global_frozen topic model) are OFF by
+                # default — drop them on the PREBUILT path too, not just in
+                # _engineer_features, so a prebuilt parquet that carried them
+                # (built with use_topic=True, or a schema drift) cannot leak
+                # the non-PIT representation into a default training run.
+                if not self.use_topic:
+                    feats = self._drop_topic_columns(feats)
                 # A stale/hand-built parquet may carry a
                 # weekend/duplicate bar that would pollute the UNION date axis.
                 feats = self._clean_calendar_dates(feats, code)
                 if feats is None:
+                    drop_reasons["calendar_clean_dropped"] += 1
+                    drop_examples["calendar_clean_dropped"].append(code)
                     continue
                 # Calendar features are idempotent (overwrite in place); safe
                 # to re-apply even though save_features(panel_mode=True) already
@@ -1287,6 +1349,8 @@ class FeaturePipeline:
                 # date axis nor corrupts the rolling indicators around it.
                 df_stock = self._clean_calendar_dates(df_stock, code)
                 if df_stock is None:
+                    drop_reasons["calendar_clean_dropped"] += 1
+                    drop_examples["calendar_clean_dropped"].append(code)
                     continue
                 stock_aux = aux_data.get(code, {})
                 feats = self._engineer_features(
@@ -1361,6 +1425,11 @@ class FeaturePipeline:
         y_dir_arr = np.full((N_stocks, max_T), -100, dtype=np.int64)  # CE ignore_index
         y_ret_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
         y_vol_arr = np.zeros((N_stocks, max_T), dtype=np.float32)
+        # §十四-3: per-label metadata — count of VALID daily returns inside each
+        # forward vol window (t, t+h] (0 for the tail where no window exists).
+        # vol_tgt_arr requires this to reach _min_vol_nobs(horizon); callers use
+        # it to weight/augment the vol loss with the label's true sample size.
+        forward_vol_nobs = np.zeros((N_stocks, max_T), dtype=np.int32)
         stock_T = np.zeros(N_stocks, dtype=np.int32)
 
         # ── Per-task target masks ──
@@ -1370,7 +1439,9 @@ class FeaturePipeline:
         #   obs_arr        — real close at t (base observation / history count)
         #   entry_arr      — real open at t → can enter a position at open[t]
         #   ret_tgt_arr    — clean forward return open[t+h]/open[t]-1 available
-        #   vol_tgt_arr    — vol window (t, t+h] has >=2 valid daily returns
+        #   vol_tgt_arr    — vol window (t, t+h] holds >= _min_vol_nobs(horizon)
+        #                    valid daily returns (max(1, ceil(horizon/2)), hard
+        #                    floor >=2) — see forward_vol_nobs metadata below
         #   realized_arr   — evaluation P&L: clean open return, else carry to the
         #                    last real close in (t, t+h], else 0 (flat) — so a
         #                    stock that suspends/delists AFTER entry still counts
@@ -1462,6 +1533,25 @@ class FeaturePipeline:
             # Clean forward return (training label): open[t] and open[t+h] both
             # real.  Positions without one stay NaN → direction -100 / return 0
             # with ret_tgt_arr False so training ignores them.
+            # §十四-4 (ENTRY-FILL SELECTION BIAS — research design choice, not a
+            # bug): ``both`` requires open_valid[t] AND open_valid[t+h], i.e. a
+            # FUTURE entry open at t+h.  A stock that is decision-eligible at t
+            # but NOT fillable at the exit horizon (suspended/delisted before
+            # t+h) is EXCLUDED from the training label set.  So the learned
+            # function is "decision on stocks that will stay tradeable for h
+            # days", a subtly easier population than the full decision pool.
+            # Evaluation deliberately does NOT share this bias: evaluate.py
+            # ranks every decision-eligible stock then checks fill (a
+            # non-fillable pick is skipped/carried, never rewarded), so a model
+            # conditioned on future-fillability can look better than it plays.
+            # Mitigations (NOT applied here — leave for a controlled study):
+            #   1) decision-eligibility sampling — mask vol/ret labels by
+            #      decision_arr (no future open needed), imputing the missing
+            #      forward open via last-close carry for the return label;
+            #   2) a return mask returned alongside labels so the loss can
+            #      down-weight partial-window / carried exits;
+            #   3) an explicit entry-fill head predicting whether open[t+h]
+            #      will exist, and conditioning on it at inference.
             ret_fwd = np.full(max_T, np.nan, dtype=np.float32)
             if max_T > horizon:
                 both = open_valid[:-horizon] & open_valid[horizon:]
@@ -1502,9 +1592,11 @@ class FeaturePipeline:
             # must NOT z-score it.  Suspended days get a 0 return and the
             # resumption day records the accumulated close gap, so a "5-day vol"
             # label uses all 5 days instead of silently collapsing to however
-            # many days actually traded.  A window with <2
-            # valid closes sets vol_tgt_arr False so the vol loss never sees a
-            # degenerate single-price window.
+            # many days actually traded.  §十四-3: a window with fewer than
+            # _min_vol_nobs(horizon) valid closes (max(1, ceil(h/2)), hard floor
+            # >=2) sets vol_tgt_arr False so the vol loss never sees a
+            # degenerate / non-comparable partial-window label; the raw valid
+            # count is recorded in forward_vol_nobs for any window position.
             ret_daily = np.zeros(max_T, dtype=np.float32)
             last_valid = np.maximum.accumulate(
                 np.where(close_valid, np.arange(max_T), -1))
@@ -1514,9 +1606,12 @@ class FeaturePipeline:
             ret_daily[ok] = (
                 close_full[ok] / close_full[prev_close[ok]] - 1.0
             )
+            min_nobs = _min_vol_nobs(horizon)
             for t in range(max_T - horizon):
                 win = ret_daily[t + 1:t + 1 + horizon]
-                if close_valid[t + 1:t + 1 + horizon].sum() < 2:
+                nobs = int(close_valid[t + 1:t + 1 + horizon].sum())
+                forward_vol_nobs[i, t] = nobs
+                if nobs < 2 or nobs < min_nobs:
                     continue
                 y_vol_arr[i, t] = float(np.std(win))
                 vol_tgt_arr[i, t] = True
@@ -1637,6 +1732,20 @@ class FeaturePipeline:
                             else:
                                 df[col] = df[col].fillna(0.0).astype(np.float32)
                         all_feat_dfs[i] = df
+
+        # §十四-1: ALL input stocks cleaned out — raise with drop stats instead
+        # of the misleading "Max timesteps (0)" (max_T collapses to 0 when
+        # all_feat_dfs is empty).  seq_len validation still runs below for any
+        # non-empty panel.
+        if not all_feat_dfs:
+            raise ValueError(
+                f"build_panel_features: every input stock was dropped — "
+                f"{input_stocks} input stock(s), {len(valid_codes)} survived "
+                f"cleaning.  drop_reason_counts={dict(drop_reasons)}; drop "
+                f"examples (first reason → codes): "
+                f"{dict(list(drop_examples.items())[:6])}.  Check the prebuilt "
+                f"dir / panel data / calendar alignment before training."
+            )
 
         if max_T < self.seq_len + 5:
             raise ValueError(
@@ -1855,6 +1964,11 @@ class FeaturePipeline:
             "entry_eligible_mask": entry_arr,
             "return_target_mask": ret_tgt_arr,
             "vol_target_mask": vol_tgt_arr,
+            # §十四-3: per-entry-day count of valid daily returns in the forward
+            # vol window (t, t+h] — lets the vol loss weight labels by their
+            # true sample size (vol_tgt_mask is already gated on this reaching
+            # _min_vol_nobs(horizon)).
+            "forward_vol_nobs": forward_vol_nobs,
             "realized_return": realized_arr,
             "decision_eligible_mask": decision_arr,
             "history_eligible_mask": history_arr,
@@ -2043,4 +2157,43 @@ _CS_NORM_SKIP_COLS = frozenset({
 def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:
     """Return the subset of *candidates* that exist in *df*."""
     return [c for c in candidates if c in df.columns]
+
+
+def _manifest_check_config(seq_len: int, horizon: int) -> dict:
+    """Config view used to validate a panel-mode feature sidecar manifest.
+
+    Mirrors build_features.py's worker args so a same-day build → train
+    handoff sees a MATCHING ``config``.  start/end/horizon/seq_len/panel_mode
+    are compared directly inside ``manifest_matches_detailed`` (NOT via
+    config_hash — build and train resolve them differently, §十一-3).
+    ``start`` follows the config's research start date; ``end`` is "today",
+    matching build_features.py's ``date_end = datetime.now().strftime(...)``.
+    """
+    from stoke_ml.config import load_config as _load_cfg
+    try:
+        start = _load_cfg().markets.a_shares.start_date
+    except Exception:
+        # Unit tests / unconfigured context: fall back to the research default
+        # so a manifest written with the same fallback still matches.
+        start = "2000-01-01"
+    return {
+        "seq_len": seq_len,
+        "horizon": horizon,
+        "panel_mode": True,
+        "start": start,
+        "end": datetime.now().strftime("%Y-%m-%d"),
+    }
+
+
+def _min_vol_nobs(horizon: int) -> int:
+    """Minimum number of VALID daily returns a vol window must hold to label.
+
+    §十四-3: ``max(1, ceil(0.5 * horizon))`` — a label computed from fewer
+    valid returns than half the horizon is a partial-window estimate whose
+    magnitude is not comparable across stocks (a 1-day vol read is not a
+    5-day vol read).  Using the midpoint (not the full window) keeps the
+    realistic case of one or two suspension days inside (t, t+h] still
+    labelable while excluding degenerate <2-return windows.
+    """
+    return max(1, int(np.ceil(horizon / 2)))
 

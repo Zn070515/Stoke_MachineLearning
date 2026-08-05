@@ -8,7 +8,7 @@ import os
 
 import pandas as pd
 
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,8 @@ class AnnouncementStorage:
         self._root = root_dir
         self._base = os.path.join(root_dir, "a_shares", "announcements")
         os.makedirs(self._base, exist_ok=True)
-        self._calendar = TradingCalendar()
+        # Artifact-backed calendar from this storage's own data root.
+        self._calendar = get_research_calendar(data_dir=self._root)
 
     def save_raw(self, stock_code: str, df: pd.DataFrame) -> str:
         """Save raw announcements to {code}.parquet."""

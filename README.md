@@ -152,7 +152,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --
 
 ## 特征维度
 
-FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_up` 未接线；见表；全部左连接 + ZI填充 + PIT lag(1)；FE v2 新增 4 维标 ★）：
+FeaturePipeline 支持 **27个 `use_*` 数据维度**（25 默认开启 + `use_topic` 默认关闭（ablation-only，§七 PIT 泄漏）+ `use_limit_up` 未接线；见表；全部左连接 + ZI填充 + PIT lag(1)；FE v2 新增 4 维标 ★）：
 
 | 维度 | 开关 | 列数 | 密度 | 数据源 |
 |------|------|------|------|--------|
@@ -182,9 +182,11 @@ FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_u
 | market_env (市场环境) ★ | `use_market_env` | 7 | 高(全市场日频) | market_breadth (FE v2) |
 | macro regime (宏观制度) ★ | `use_market_env_refine` | 49 | 高(日频) | MarketEnvRefiner (FE v2) |
 | limit-up ecology (涨停生态) | `use_limit_up` | 20 | 低 | 数据中心 — **未接线** (DEFERRED) |
+| topic-model (主题模型, global_frozen, §七) | `use_topic` | topic_* (entropy/dominant/sent/ratio/dispersion) | 高(新闻) | 全局冻结主题模型 — **默认关闭** (ablation-only) |
 
 > FE v2 维度开关默认全开，由 `scripts/production/build_features.py` CLI 关闭（`--no-pledge` / `--no-market-env` / `--no-market-env-refine` / `--no-index-membership`），不读 config.yaml。
 > limit-up 生态（涨停/炸板/跌停，19 列）已定义但**未接线**（`use_limit_up=False`，待后续启用）。
+> topic 主题特征：global_frozen 主题模型在固定参考语料上拟合后转换全部历史标题，早期日期的标题会读到未来语料词汇（§七 PIT 泄漏），故默认关闭 `use_topic=False`，仅作 ablation 研究维度。
 
 **预构建特征**: 5530 只股票 × 3744 列/股（516 基础 + 3228 时序展开），共 109GB，存于 `data/features/{code}.parquet`。XGBoost flat 模式再按窗口展平，维度极易爆炸——建议按 IC 预筛 top-K 特征。
 
@@ -334,7 +336,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/compare_pipelines.py --st
 
 ## 测试
 
-~53 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
+~60 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q

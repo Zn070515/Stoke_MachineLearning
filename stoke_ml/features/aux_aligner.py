@@ -810,6 +810,16 @@ class AuxAligner:
 
     def _merge_index_membership(self, df: pd.DataFrame,
                                 im_df: pd.DataFrame | None) -> pd.DataFrame:
+        # §P1-9 (PIT caution): the index-membership source is a Baostock
+        # MONTHLY-SNAPSHOT rebuild — each stock's in_date/out_date are the
+        # boundaries of the monthly snapshot in which membership changed, NOT
+        # the exact trading day the index committee acted.  A stock whose
+        # membership flips mid-month therefore appears in/out only at the next
+        # snapshot boundary, so a daily feature using these columns is a
+        # MONTHLY approximation of true membership and can be late (or early)
+        # by up to a month.  Treat index_membership features as slow-moving
+        # state (like sector), not day-exact events; do not make decisions that
+        # hinge on a single day's membership flag.
         if not self.use_index_membership:
             return df
         if im_df is None or im_df.empty:

@@ -22,6 +22,12 @@ Checks:
                      source/adjustment_mode provenance
   manifest         : per-stock manifest must exist and match the parquet
                      (range/completeness/schema-hash/provenance, §四-4)
+  universe         : OPT-IN per-requested-stock reconciliation (§P1-7).  Given a
+                     requested universe (--requested-universe / --request-manifest
+                     / --universe-codes), every requested code is checked for a
+                     present parquet + valid manifest + not-degraded coverage,
+                     and the gate fails on any missing/degraded stock beyond the
+                     tolerated ratios.  Never runs unless a universe is supplied.
 
 Any read error or missing column FAILS its check — a problem recorded in the
 report must also flip the gate.
@@ -38,6 +44,10 @@ Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/data_quality_gate.py --data-dir <train-root> \
       --require daily,features --max-stale-days 10
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/data_quality_gate.py --allow-empty  # dev bootstrap
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/data_quality_gate.py \
+      --request-manifest data/a_shares/download_manifest.json   # §P1-7 reconcile the run's requested universe
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/data_quality_gate.py \
+      --requested-universe universe.txt --min-universe-rows 500
 """
 import argparse
 import glob
@@ -55,7 +65,9 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.codes import normalize_stock_code
 from stoke_ml.data.contract import get_contract, validate_contract
+from stoke_ml.data.download_manifest import load_manifest
 from stoke_ml.config import get_project_root
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.utils.error_summary import classify_error
@@ -130,6 +142,13 @@ FORMAL_PROFILE = {
     "stock_ratio": 0.98,
 }
 
+# §P1-7: per-requested-stock reconciliation state.  ``_UNIVERSE_REQUEST`` is set
+# by main() when a requested universe is supplied (--requested-universe /
+# --request-manifest / --universe-codes); ``check_universe`` no-ops when it is
+# None, so default runs are byte-for-byte unaffected.  The ``universe`` check is
+# deliberately NOT in ``CHECKS`` — it only joins the run when a universe is given.
+_UNIVERSE_REQUEST: dict | None = None
+
 
 @dataclass
 class CheckResult:
@@ -141,6 +160,7 @@ class CheckResult:
     scanned_files: int = 0  # files actually row-read (<= files_scanned under --quick, §九.2)
     unreadable_files: int = 0  # files that existed but failed to parse (§六-3)
     issues: list = field(default_factory=list)  # list of (file, detail)
+    details: dict | None = None  # optional structured report (universe §P1-7)
 
 
 # Union of columns every _load_daily caller needs; cached once per code so the
@@ -856,6 +876,256 @@ def check_manifest(sample: int) -> CheckResult:
     return res
 
 
+# ── §P1-7: per-requested-stock reconciliation ─────────────────────────────
+# The dataset checks above gate the POOL (files/stocks/rows/spans) but never
+# answer "did the run that requested 5530 stocks actually deliver every one of
+# them".  This layer reconciles a requested universe code-by-code: parquet
+# present, contract manifest valid, data not degraded.  It is a new, additive
+# layer — it only runs when a requested universe is passed; without one the
+# gate behaves exactly as before.
+
+
+def _tolerance_count(requested: int, ratio: float) -> int:
+    """Max tolerated failing stocks for a ratio (0.0 → strict zero tolerance)."""
+    if ratio <= 0.0:
+        return 0
+    return int(math.ceil(ratio * requested))
+
+
+def _requested_from_manifest(data: dict) -> dict:
+    """Extract codes + requested date range from a download run manifest dict.
+
+    ``requested`` is the full universe the run set out to fetch (§五-4).  The
+    requested interval is start_date → requested_end (the bounded request end,
+    recorded verbatim), falling back to effective_end then end_date (§七-2).
+    """
+    requested = data.get("requested")
+    if not isinstance(requested, list):
+        raise ValueError("download run manifest 'requested' must be a list")
+    codes = []
+    for tok in requested:
+        code = normalize_stock_code(tok)
+        if code:
+            codes.append(code)
+        else:
+            logger.warning("requested-universe: dropping unusable requested code %r", tok)
+    end = data.get("requested_end") or data.get("effective_end") or data.get("end_date")
+    return {
+        "codes": codes,
+        "requested_start": data.get("start_date"),
+        "requested_end": end,
+    }
+
+
+def _parse_requested_json(text: str) -> dict | None:
+    """Parse a requested-universe JSON source.
+
+    Recognizes (a) a download run manifest object with a ``requested`` list
+    (also carries the requested date range), or (b) a plain JSON list of codes.
+    Returns ``None`` when ``text`` is not JSON (caller falls back to line-per-
+    code).
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and "requested" in data:
+        return _requested_from_manifest(data)
+    if isinstance(data, list):
+        return {
+            "codes": [c for c in (normalize_stock_code(t) for t in data) if c],
+            "requested_start": None,
+            "requested_end": None,
+        }
+    return None
+
+
+def _read_requested_file(path: str, require_manifest: bool = False) -> dict:
+    """Read a requested-universe source file into codes + optional date range.
+
+    ``require_manifest`` (--request-manifest) reads the file through the
+    download-run manifest module's own loader and refuses anything without a
+    ``requested`` field.  Otherwise the format is auto-detected: (a) a download
+    run manifest JSON, (b) a plain JSON list of codes, or (c) a text/CSV file
+    with one code per line (blank lines and ``#`` comments ignored).  Codes
+    normalize through ``normalize_stock_code`` (shared with the downloader /
+    storage layers).
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"requested-universe file not found: {path}")
+    if require_manifest:
+        data = load_manifest(path)
+        if data is None:
+            raise ValueError(f"--request-manifest unreadable or empty: {path}")
+        if not isinstance(data, dict) or "requested" not in data:
+            raise ValueError("--request-manifest file has no 'requested' field")
+        info = _requested_from_manifest(data)
+    else:
+        text = p.read_text(encoding="utf-8")
+        info = _parse_requested_json(text)
+        if info is None:
+            info = {"codes": [], "requested_start": None, "requested_end": None}
+            for line in text.splitlines():
+                token = line.strip()
+                if not token or token.startswith("#"):
+                    continue
+                code = normalize_stock_code(token)
+                if code is None:
+                    logger.warning("requested-universe: dropping unusable code token %r", token)
+                    continue
+                info["codes"].append(code)
+    # Dedup (e.g. "000001" + "000001.0" collapse to one code) preserving order.
+    seen: set[str] = set()
+    info["codes"] = [c for c in info["codes"] if not (c in seen or seen.add(c))]
+    return info
+
+
+def _degradation_reason(
+    storage: DataStorage,
+    code: str,
+    market: str,
+    *,
+    req_days: frozenset | None,
+    min_rows: int,
+    min_coverage_ratio: float,
+) -> str | None:
+    """Why a PRESENT stock is degraded, or ``None`` if it is sound.
+
+    A present parquet is degraded when (1) its contract manifest is missing /
+    stale / mismatched — ``validate_manifest`` reuses the §四-4 authority
+    instead of re-implementing it; (2) its valid row count is below the
+    optional ``min_rows`` floor; or (3) its actual trading-day coverage of the
+    requested interval is below the optional ``min_coverage_ratio`` (a stock
+    whose history is a thin fragment of the request is not "complete").
+    """
+    report = storage.validate_manifest(code, market)
+    if not report["ok"]:
+        detail = report.get("reason")
+        if not detail:
+            detail = ";".join(report.get("mismatches", [])[:8])
+        return f"manifest_invalid: {detail}" if detail else "manifest_invalid"
+    actual = report.get("actual") or {}
+    rows = actual.get("rows")
+    if min_rows and rows is not None and rows < min_rows:
+        return f"rows={rows} < min={min_rows}"
+    if req_days is not None and min_coverage_ratio > 0.0:
+        a_lo = pd.Timestamp(actual["start"]).date() if actual.get("start") else None
+        a_hi = pd.Timestamp(actual["end"]).date() if actual.get("end") else None
+        if a_lo is not None and a_hi is not None and len(req_days):
+            covered = sum(1 for dd in req_days if a_lo <= dd <= a_hi)
+            ratio = covered / len(req_days)
+            if ratio < min_coverage_ratio:
+                return f"coverage_ratio={ratio:.3f} < min={min_coverage_ratio}"
+    return None
+
+
+def reconcile_requested_universe(
+    codes: list[str],
+    *,
+    daily_dir: Path | None = None,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    min_rows: int = 0,
+    min_coverage_ratio: float = 0.0,
+    max_missing_ratio: float = 0.0,
+    max_degraded_ratio: float = 0.0,
+) -> dict:
+    """Reconcile a requested stock universe against on-disk daily files (§P1-7).
+
+    For every requested code, in order: (1) the flat parquet must exist — an
+    absent parquet is a MISSING stock; (2) the contract manifest must be valid
+    — a present file whose sidecar is missing/stale/mismatched is DEGRADED
+    ("file exists" never stands in for "data complete", §四-4); (3) the data
+    must not be degraded per the optional ``min_rows`` / ``min_coverage_ratio``
+    floors (a request interval must be supplied for the coverage ratio).
+
+    Reuses ``DataStorage.validate_manifest`` (the same authority the
+    ``manifest`` check uses) rather than re-reading parquets by hand.
+
+    Returns a structured report: ``requested_count`` / ``present_count`` /
+    ``missing_codes`` / ``degraded_codes`` (each with a reason) / ``ok``.
+    ``ok`` honours the tolerance ratios ``max_missing_ratio`` /
+    ``max_degraded_ratio`` (default 0.0 = any gap fails, matching the gate's
+    "a problem recorded must flip the gate" rule).
+    """
+    d = Path(daily_dir) if daily_dir is not None else DAILY_DIR
+    market = d.parent.name
+    storage = DataStorage(str(d.parents[1]))
+    requested = sorted({c for c in codes if c})
+    req_days: frozenset | None = None
+    if requested_start and requested_end:
+        try:
+            req_lo = pd.Timestamp(requested_start).date()
+            req_hi = pd.Timestamp(requested_end).date()
+            req_days = frozenset(_CALENDAR.get_trading_days(req_lo, req_hi))
+        except Exception:
+            req_days = None
+    missing: list[str] = []
+    degraded: list[dict] = []
+    present = 0
+    for code in requested:
+        if not (d / f"{code}.parquet").is_file():
+            missing.append(code)
+            continue
+        present += 1
+        reason = _degradation_reason(
+            storage, code, market,
+            req_days=req_days,
+            min_rows=min_rows,
+            min_coverage_ratio=min_coverage_ratio,
+        )
+        if reason:
+            degraded.append({"code": code, "reason": reason})
+    n = len(requested)
+    return {
+        "ok": (
+            len(missing) <= _tolerance_count(n, max_missing_ratio)
+            and len(degraded) <= _tolerance_count(n, max_degraded_ratio)
+        ),
+        "requested_count": n,
+        "present_count": present,
+        "missing_count": len(missing),
+        "degraded_count": len(degraded),
+        "missing_codes": missing,
+        "degraded_codes": degraded,
+    }
+
+
+def check_universe(sample: int) -> CheckResult:
+    """Per-requested-stock reconciliation against the requested universe (§P1-7).
+
+    ``sample`` is ignored — a requested universe is a complete accounting, never
+    a sample.  No-ops (PASS) when no requested universe was supplied.
+    """
+    res = CheckResult("universe", True, "")
+    req = _UNIVERSE_REQUEST
+    if req is None:
+        res.summary = "skipped (no requested universe)"
+        return res
+    report = reconcile_requested_universe(
+        req["codes"],
+        daily_dir=DAILY_DIR,
+        requested_start=req.get("requested_start"),
+        requested_end=req.get("requested_end"),
+        min_rows=req.get("min_rows", 0),
+        min_coverage_ratio=req.get("min_coverage_ratio", 0.0),
+        max_missing_ratio=req.get("max_missing_ratio", 0.0),
+        max_degraded_ratio=req.get("max_degraded_ratio", 0.0),
+    )
+    res.details = report
+    res.files_scanned = report["requested_count"]
+    res.issues = [(c, "missing") for c in report["missing_codes"]]
+    res.issues += [(item["code"], item["reason"]) for item in report["degraded_codes"]]
+    res.passed = report["ok"]
+    res.summary = (
+        f"{'FAIL' if not report['ok'] else 'OK'} "
+        f"requested={report['requested_count']} present={report['present_count']} "
+        f"missing={report['missing_count']} degraded={report['degraded_count']}"
+    )
+    return res
+
+
 CHECKS = {
     "datasets": check_datasets,
     "daily_internal": check_daily_internal,
@@ -868,6 +1138,60 @@ CHECKS = {
     "manifest": check_manifest,
 }
 
+# §P1-7: the universe check is deliberately NOT in ``CHECKS`` (a default run
+# must be unchanged) but IS runnable — via ``--check universe`` or when a
+# requested universe is supplied.  The run loop resolves through this combined
+# registry so a KeyError can never hide an opt-in check.
+RUN_CHECKS = dict(CHECKS)
+RUN_CHECKS["universe"] = check_universe
+
+
+def _build_universe_request(args) -> dict | None:
+    """Assemble the §P1-7 universe request from CLI args, or None if none given.
+
+    Sources may combine: ``--requested-universe <file>`` (auto-detected: a
+    download run manifest, a JSON code list, or a line-per-code file),
+    ``--request-manifest <file>`` (explicit download run manifest), and
+    ``--universe-codes a,b,c`` (inline).  Codes are unioned and de-duplicated;
+    the requested date range comes from a manifest source (start_date /
+    requested_end).  An unreadable / non-manifest --request-manifest raises.
+    """
+    codes: list[str] = []
+    requested_start = requested_end = None
+    sources: list[str] = []
+    if args.requested_universe:
+        info = _read_requested_file(args.requested_universe)
+        codes += info["codes"]
+        requested_start = requested_start or info["requested_start"]
+        requested_end = requested_end or info["requested_end"]
+        sources.append(args.requested_universe)
+    if args.request_manifest:
+        info = _read_requested_file(args.request_manifest, require_manifest=True)
+        codes += info["codes"]
+        requested_start = requested_start or info["requested_start"]
+        requested_end = requested_end or info["requested_end"]
+        sources.append(args.request_manifest)
+    if args.universe_codes:
+        codes += [
+            c for c in (normalize_stock_code(t) for t in args.universe_codes.split(","))
+            if c
+        ]
+        sources.append("inline")
+    if not sources:
+        return None
+    seen: set[str] = set()
+    uniq = [c for c in codes if not (c in seen or seen.add(c))]
+    return {
+        "codes": uniq,
+        "requested_start": requested_start,
+        "requested_end": requested_end,
+        "min_rows": args.min_universe_rows,
+        "min_coverage_ratio": args.min_universe_coverage,
+        "max_missing_ratio": args.max_universe_missing_ratio,
+        "max_degraded_ratio": args.max_universe_degraded_ratio,
+        "sources": sources,
+    }
+
 
 def main():
     logging.basicConfig(
@@ -876,7 +1200,7 @@ def main():
     global MIN_FILES, MIN_STOCKS, MIN_ROWS, MIN_SPAN_DAYS, MAX_STALE_DAYS
     global MAX_UNREADABLE_RATIO, FORMAL_STOCK_RATIO
     global ALLOW_EMPTY, A_SHARES, DAILY_DIR, FEAT_DIR
-    global ENFORCE_VERIFIED_UNTIL
+    global ENFORCE_VERIFIED_UNTIL, _UNIVERSE_REQUEST
     ap = argparse.ArgumentParser(description="Data quality gate")
     ap.add_argument("--check", default=None,
                     help="comma-separated checks (default: all)")
@@ -916,6 +1240,31 @@ def main():
                          "bootstrap (default, dev) or formal — a 5530-stock "
                          "research run must clear: span >= 5y, stale <= 4d, "
                          "unreadable = 0, readable stocks >= 98%")
+    # §P1-7: per-requested-stock reconciliation — OPT-IN; without one of these
+    # the gate runs exactly as before (the universe check never joins the run).
+    ap.add_argument("--requested-universe", default=None,
+                    help="requested-universe file: a download run manifest JSON "
+                         "(data/a_shares/download_manifest.json, 'requested' "
+                         "field), a JSON code list, or a line-per-code text/CSV")
+    ap.add_argument("--request-manifest", default=None,
+                    help="explicit download run manifest JSON (must carry "
+                         "'requested'); also supplies the requested date range")
+    ap.add_argument("--universe-codes", default=None,
+                    help="comma-separated inline requested code list")
+    ap.add_argument("--min-universe-rows", type=int, default=0,
+                    help="§P1-7 degraded floor: a requested stock whose valid "
+                         "rows fall below this is DEGRADED (0 = disabled)")
+    ap.add_argument("--min-universe-coverage", type=float, default=0.0,
+                    help="§P1-7 degraded floor: a requested stock whose "
+                         "trading-day coverage of the requested interval is "
+                         "below this ratio is DEGRADED (0 = disabled; needs a "
+                         "manifest source for the requested interval)")
+    ap.add_argument("--max-universe-missing-ratio", type=float, default=0.0,
+                    help="max tolerated missing-stock share of the requested "
+                         "universe before FAIL (0.0 = any missing fails)")
+    ap.add_argument("--max-universe-degraded-ratio", type=float, default=0.0,
+                    help="max tolerated degraded-stock share of the requested "
+                         "universe before FAIL (0.0 = any degraded fails)")
     args = ap.parse_args()
 
     # §六-4 frozen formal profile: research-run floors override loose dev
@@ -947,17 +1296,25 @@ def main():
         DAILY_DIR = A_SHARES / "daily"
         FEAT_DIR = root / "features"
 
+    # §P1-7: build the optional requested-universe reconciliation.  The check
+    # only joins the run when a universe source is supplied (additive); without
+    # one, the run is identical to before.
+    _UNIVERSE_REQUEST = _build_universe_request(args)
+
     names = (args.check.split(",") if args.check else list(CHECKS))
-    unknown = [n for n in names if n not in CHECKS]
+    if _UNIVERSE_REQUEST is not None and "universe" not in names:
+        names.append("universe")
+    available = set(CHECKS) | {"universe"}
+    unknown = [n for n in names if n not in available]
     if unknown:
-        print(f"unknown checks: {unknown}; available: {list(CHECKS)}")
+        print(f"unknown checks: {unknown}; available: {sorted(available)}")
         return 2
     sample = args.sample or (300 if args.quick else 0)
 
     results = []
     for name in names:
         t0 = time.time()
-        r = CHECKS[name](sample)
+        r = RUN_CHECKS[name](sample)
         dt = time.time() - t0
         results.append(r)
         status = "PASS" if r.passed else "FAIL"
@@ -1025,6 +1382,11 @@ def main():
             for r in results
         ],
     }
+    # §P1-7: attach the structured universe reconciliation only when it ran —
+    # a default run's report keeps its previous shape exactly.
+    universe_res = next((r for r in results if r.name == "universe"), None)
+    if universe_res is not None and universe_res.details is not None:
+        report["universe_reconciliation"] = universe_res.details
     out_path = os.path.join(args.output, "data_quality_gate.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)

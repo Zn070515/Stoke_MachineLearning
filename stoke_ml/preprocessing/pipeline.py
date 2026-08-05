@@ -96,7 +96,8 @@ class PreprocessingPipeline:
         self._chains[name] = chain
 
     def run(self, chain_name: str, df: pd.DataFrame, *, strict: bool = False,
-            formal: bool = False, **kwargs) -> pd.DataFrame:
+            formal: bool = False, allow_degraded: bool = False,
+            **kwargs) -> pd.DataFrame:
         """Run a named chain on *df*, returning transformed DataFrame.
 
         With ``strict=True``, error-level quality problems raise
@@ -108,6 +109,13 @@ class PreprocessingPipeline:
         :class:`PreprocessingScopeError` (§十-1).  Such steps must be fit per
         fold on train-only rows via :meth:`PreprocessingChain.fold_fitted_chain`,
         not over the whole window.
+
+        §十二: formal mode is STRICT by default — error-level quality problems
+        block (raise) rather than silently writing a degraded artifact.  Pass
+        ``allow_degraded=True`` to opt out explicitly and let the caller persist
+        degraded output (the caller still carries the full report).  ``strict``
+        remains the independent "always block" switch, effective even in the
+        non-formal dev path.
         """
         chain = self._chains.get(chain_name)
         if chain is None:
@@ -139,7 +147,7 @@ class PreprocessingPipeline:
                 logger.warning(
                     "QualityMonitor[%s] errors: %s", chain_name, errors[:3]
                 )
-            if strict and errors:
+            if errors and (strict or (formal and not allow_degraded)):
                 raise PreprocessingQualityError(chain_name, report, out)
         return out
 

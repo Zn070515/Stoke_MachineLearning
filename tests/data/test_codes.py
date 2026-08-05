@@ -9,6 +9,8 @@ import pandas as pd
 import pytest
 
 from stoke_ml.data.codes import (
+    a_share_equity_segment,
+    is_a_share_equity_code,
     is_valid_stock_code,
     normalize_stock_code,
     normalize_stock_code_series,
@@ -98,3 +100,58 @@ class TestIsValidStockCode:
     def test_invalid(self):
         assert is_valid_stock_code(None) is False
         assert is_valid_stock_code("junk") is False
+
+    def test_format_layer_accepts_non_equity(self):
+        """is_valid_stock_code is the FORMAT layer only — indices/B-shares/funds
+        are format-legal six-digit codes, so they pass here (§十 two layers)."""
+        for c in ("100000", "200000", "500000", "700000", "900000"):
+            assert is_valid_stock_code(c) is True, c
+
+
+class TestAShareEquitySegment:
+    def test_sh_main_and_star(self):
+        for c in ("600519", "601318", "603288", "605499", "688981", "689009"):
+            assert a_share_equity_segment(c) == "SH", c
+
+    def test_sz_main_and_chinext(self):
+        for c in ("000001", "001979", "002594", "003816", "300750", "301269"):
+            assert a_share_equity_segment(c) == "SZ", c
+
+    def test_bj(self):
+        for c in ("430001", "830799", "871981", "889988", "920001"):
+            assert a_share_equity_segment(c) == "BJ", c
+
+    def test_non_equity_returns_none(self):
+        for c in ("100000", "200000", "500000", "700000", "900000"):
+            assert a_share_equity_segment(c) is None, c
+
+
+class TestIsAShareEquityCode:
+    """v13 §十: the canonical daily store only holds A-share common equity, so
+    format-legal but non-equity codes (indices/B-shares/funds) must be False."""
+
+    @pytest.mark.parametrize("code", [
+        "600519", "000001", "688981", "300750", "430001",
+        "002594", "301269", "689009", "601318", "920001",
+    ])
+    def test_equity_true(self, code):
+        assert is_a_share_equity_code(code) is True
+
+    @pytest.mark.parametrize("code", [
+        "100000", "200000", "500000", "700000", "900000",
+    ])
+    def test_non_equity_false(self, code):
+        assert is_a_share_equity_code(code) is False
+
+    def test_normalizes_first(self):
+        # float / exchange-prefixed inputs are normalized before the segment
+        # filter — a format-legal code via any spelling is classified.
+        assert is_a_share_equity_code(600519.0) is True
+        assert is_a_share_equity_code("SH600519") is True
+        assert is_a_share_equity_code(900001) is False  # SH B-share
+        assert is_a_share_equity_code(100001) is False  # index
+
+    def test_garbage_false(self):
+        assert is_a_share_equity_code(None) is False
+        assert is_a_share_equity_code("junk") is False
+        assert is_a_share_equity_code(0) is False

@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 
 import numpy as np
 import pandas as pd
@@ -20,6 +21,41 @@ from stoke_ml.preprocessing.base import PreprocessingStep
 from stoke_ml.utils.error_summary import classify_error
 
 logger = logging.getLogger(__name__)
+
+
+def dependency_versions() -> dict[str, str]:
+    """Runtime + dependency versions for the topic stack (§十三).
+
+    Best-effort ``importlib.metadata`` lookups; a distribution that is not
+    installed (or an import that fails) is reported as ``"unknown"`` so a fit
+    manifest is always complete.  The ``"python"`` entry is the interpreter
+    version.
+    """
+    from importlib import metadata
+
+    out = {}
+    for dist in ("bertopic", "sentence-transformers", "umap", "hdbscan"):
+        try:
+            out[dist] = metadata.version(dist)
+        except Exception:
+            out[dist] = "unknown"
+    out["python"] = platform.python_version()
+    return out
+
+
+def _sha256_file(path: str) -> str:
+    """Full SHA-256 hex digest of a file, or ``"unknown"`` when unreadable.
+
+    Used for the persisted model pickle (``model_pickle_sha256``) so a cached
+    artifact can be verified byte-for-byte and a corrupt pickle surfaces
+    (§十三).  Returns ``"unknown"`` for a missing/unreadable file rather than
+    raising, so metadata writing never crashes the fit.
+    """
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return "unknown"
 
 
 def _truncate_to_cutoff(df, corpus_cutoff=None):
@@ -57,6 +93,9 @@ class TopicModeler(PreprocessingStep):
         Directory for cached BERTopic models and metadata JSON.
     embedding_model:
         ``"finbert"`` for sentence-transformers, ``"tfidf"`` for jieba+CountVectorizer.
+    seed:
+        Random seed for UMAP (deterministic reproducibility).  Also recorded in
+        the cache metadata / fit manifest (§十三).
     """
 
     # Fit ONCE on a pinned corpus (see corpus_cutoff) and frozen to disk; a
@@ -72,12 +111,14 @@ class TopicModeler(PreprocessingStep):
         model_cache_dir: str = "models/bertopic",
         embedding_model: str = "finbert",
         corpus_cutoff: str | None = None,
+        seed: int = 42,
     ):
         self.enabled = enabled
         self.n_topics = n_topics
         self.min_topic_size = min_topic_size
         self.model_cache_dir = model_cache_dir
         self.embedding_model = embedding_model
+        self.seed = int(seed)
         # Pinned production corpus cutoff (TRAIN_END).  When set, transform()
         # auto-loads the cached model fit on this corpus instead of running
         # unfitted, and never silently drops the topic features (§十-2).
@@ -85,6 +126,9 @@ class TopicModeler(PreprocessingStep):
         # SHA-1 (first 16 hex) of the training corpus text, recorded in cache
         # metadata so a model is only reused when the corpus CONTENT matches.
         self.corpus_hash_ = None
+        # Stock codes that contributed to the training corpus, recorded in cache
+        # metadata + the fit manifest for reproducibility (§十三).
+        self._stock_codes: list[str] | None = None
 
         self._model = None
         self._finbert_model = None
@@ -119,6 +163,9 @@ class TopicModeler(PreprocessingStep):
         source = kwargs.get("source", "default")
         force_retrain = kwargs.get("force_retrain", False)
         corpus_cutoff = kwargs.get("corpus_cutoff", self.corpus_cutoff)
+        seed = int(kwargs.get("seed", self.seed))
+        self.seed = seed
+        self._stock_codes = kwargs.get("stock_codes")
 
         fit_df = _truncate_to_cutoff(df, corpus_cutoff)
         self._record_fit_range(fit_df)
@@ -187,7 +234,7 @@ class TopicModeler(PreprocessingStep):
                 n_components=5,
                 min_dist=0.0,
                 metric="cosine",
-                random_state=42,
+                random_state=self.seed,
             )
             hdbscan_model = HDBSCAN(
                 min_cluster_size=self.min_topic_size,
@@ -464,7 +511,11 @@ class TopicModeler(PreprocessingStep):
         meta_path = os.path.join(
             self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}_meta.json"
         )
+        cache_path = os.path.join(
+            self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}.pkl"
+        )
         used_embedding = "finbert" if self._finbert_model is not None else "tfidf"
+        versions = dependency_versions()
         meta = {
             "source": source,
             "corpus_cutoff": corpus_key,
@@ -476,7 +527,14 @@ class TopicModeler(PreprocessingStep):
             "corpus_date_max": (self.fit_end.strftime("%Y-%m-%d")
                                 if self.fit_end is not None else None),
             "min_topic_size": self.min_topic_size,
+            "seed": self.seed,
             "embedding_model": used_embedding,
+            "embedding_model_config": self.embedding_model,
+            "bertopic_version": versions["bertopic"],
+            "sentence_transformers_version": versions["sentence-transformers"],
+            "python_version": versions["python"],
+            "stock_codes": list(self._stock_codes) if self._stock_codes else None,
+            "model_pickle_sha256": _sha256_file(cache_path),
             "training_date": pd.Timestamp.now().isoformat(),
         }
         with open(meta_path, "w", encoding="utf-8") as f:

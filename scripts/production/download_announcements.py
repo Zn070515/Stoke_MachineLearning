@@ -17,6 +17,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.announcement_storage import AnnouncementStorage
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.download_resume import (
     evidence_says_complete,
     mark_stock_result,
@@ -62,7 +63,7 @@ def main():
     storage = AnnouncementStorage(cfg.project.data_dir)
     source = AnnouncementSource()
 
-    codes = (args.stocks.split(",") if args.stocks
+    codes = (parse_stock_codes_arg(args.stocks) if args.stocks
              else available_stocks(cfg.project.data_dir))
 
     if not codes:

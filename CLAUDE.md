@@ -56,7 +56,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/check_docs_consistency.py
 
 ### Testing
 
-~53 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
+~60 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q                    # fast smoke (default, excludes slow/network)
@@ -125,7 +125,7 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
                 use_guba=False, use_comment=False)
 ```
 
-**26 `use_*` data dimensions** (25 active + `use_limit_up` deferred; all lagged 1 day to prevent leakage, merged via left-join ZI):
+**27 `use_*` data dimensions** (25 default-on + `use_topic` ablation-only, OFF by default + `use_limit_up` deferred; all lagged 1 day to prevent leakage, merged via left-join ZI):
 | Dimension | switch | Columns | Data density |
 |---|---|---|---|
 | sentiment (news) | `use_sentiment` | 6 | medium |
@@ -154,8 +154,11 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
 | market env | `use_market_env` | 7 | high (all-market) |
 | macro regime refine | `use_market_env_refine` | 49 | high (daily) |
 | limit-up ecology | `use_limit_up` | 20 | low — **DEFERRED** |
+| topic-model (global_frozen, §七) | `use_topic` | topic_* (entropy/dominant/sent/ratio/dispersion) | high (news) | — **OFF by default (ablation-only)** |
 
 (Plus pipeline-switch flags that toggle processing rather than data: `use_technical`, `use_scoring`, `use_temporal`, `use_interaction`, `use_feature_selection`, `use_new_preprocessing`, `use_emotion_refine`, `use_fundamental_refine`, `use_temporal_stats`.)
+
+> `use_topic` 默认关闭：global_frozen 主题模型在固定参考语料上拟合后转换全部历史标题，早期日期的标题会读到未来语料词汇（§七 PIT 泄漏），故仅作 ablation 研究维度。
 
 Pipeline steps:
 1. Merge all auxiliary DataFrames (ZI fill for missing days/lags)

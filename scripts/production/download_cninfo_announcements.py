@@ -23,6 +23,7 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.cninfo_source import CninfoSource
 from stoke_ml.data.sources.a_shares.announcement_source import AnnouncementSource
 from stoke_ml.data.download_manifest import write_run_manifest
@@ -170,7 +171,7 @@ def main():
     raw_dir = os.path.join(data_dir, "a_shares", "announcements")
     os.makedirs(raw_dir, exist_ok=True)
 
-    codes = (args.stocks.split(",") if args.stocks
+    codes = (parse_stock_codes_arg(args.stocks) if args.stocks
              else available_stocks(data_dir))
 
     if not codes:

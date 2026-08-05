@@ -93,5 +93,54 @@ def normalize_stock_code_series(s) -> pd.Series:
 
 
 def is_valid_stock_code(value) -> bool:
-    """True iff ``value`` normalizes to a legal code."""
+    """True iff ``value`` normalizes to a legal code.
+
+    This is the FORMAT layer only (§十): any plausible six-digit code in the
+    A-share range passes, including non-equity instruments (100xxx indices,
+    200xxx/900xxx B-shares, 500xxx funds, ...).  Use
+    :func:`is_a_share_equity_code` when the canonical daily K-line store needs
+    the A-share common-equity layer on top — a format-legal code is not
+    automatically a stock.
+    """
     return normalize_stock_code(value) is not None
+
+
+def a_share_equity_segment(code6: str) -> str | None:
+    """Return the A-share common-equity segment of a normalized 6-digit code,
+    or ``None`` if it is not an A-share common stock.
+
+    Prefix-based classification (§十), the practical filter for a daily K-line
+    store:
+      * SH 主板 / 科创板: ``600 / 601 / 603 / 605 / 688 / 689``
+      * SZ 主板 / 创业板: ``000 / 001 / 002 / 003 / 300 / 301``
+      * BJ 北交所:        ``43 / 83 / 87 / 88 / 920``
+    Everything else — 100xxx indices, 200xxx (SZ B股), 500xxx funds,
+    900xxx (SH B股), the 000300/399xxx index ranges that fall outside the
+    equity prefixes, etc. — returns ``None``.
+
+    ``code6`` must already be a normalized 6-digit code (see
+    :func:`normalize_stock_code`); callers normalize first.
+    """
+    if code6.startswith(("600", "601", "603", "605", "688", "689")):
+        return "SH"
+    if code6.startswith(("000", "001", "002", "003", "300", "301")):
+        return "SZ"
+    if code6.startswith(("43", "83", "87", "88", "920")):
+        return "BJ"
+    return None
+
+
+def is_a_share_equity_code(value) -> bool:
+    """True iff ``value`` is an A-share common-stock code (two-layer test).
+
+    Layer 1 — format: :func:`normalize_stock_code` accepts any legal six-digit
+    code in the plausible A-share range.  Layer 2 — equity filter:
+    :func:`a_share_equity_segment` must classify the code as SH/SZ/BJ common
+    equity.  Use this gate on the canonical daily K-line store, which only ever
+    holds common-equity series (100xxx indices, 200xxx/900xxx B-shares,
+    500xxx funds are format-legal but not stocks and are rejected here).
+    """
+    code = normalize_stock_code(value)
+    if code is None:
+        return False
+    return a_share_equity_segment(code) is not None

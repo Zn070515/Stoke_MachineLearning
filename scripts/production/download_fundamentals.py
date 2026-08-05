@@ -15,6 +15,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.fundamental_source import FundamentalSource
 from stoke_ml.data.fundamental_storage import FundamentalStorage
 from stoke_ml.data.download_manifest import write_run_manifest
@@ -57,7 +58,7 @@ def main():
     data_dir = cfg.project.data_dir
 
     if args.stocks:
-        codes = [c.strip() for c in args.stocks.split(",")]
+        codes = parse_stock_codes_arg(args.stocks)
     else:
         codes = get_stocks_from_disk(data_dir)
 

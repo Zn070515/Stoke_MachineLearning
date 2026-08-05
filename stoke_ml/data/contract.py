@@ -12,6 +12,12 @@ The contracts harden the schemas from documentation into real constraints:
   a minimum valid row count, so an all-NaN OHLC file is corrupt, not "valid".
   Suspension days are represented by ABSENT rows, never NaN OHLC rows.
 * ``validate_ohlc`` — ``low <= open/close <= high`` on every bar.
+* ``validate_pct_change`` — ``pct_change`` must be finite except on the first
+  (listing) row; a mid-series NaN means the returns column was repaired or
+  derived inconsistently.
+* ``validate_price_volume_amount_consistency`` — a weak economic check that
+  ``amount / volume`` (the day's VWAP) stays within a 100× band of ``close``,
+  catching a volume/amount unit corruption (手 vs 股, 千元 vs 元).
 * ``validate_source_metadata`` — a ``source`` column, when present, must be
   non-empty, and an ``adjustment_mode`` column must hold a legal value.
 * ``validate_required_metadata`` — contracts may declare ``required_metadata``
@@ -217,6 +223,67 @@ def validate_ohlc(df: pd.DataFrame, contract: DataContract) -> list[str]:
     return out
 
 
+def validate_pct_change(df: pd.DataFrame, contract: DataContract) -> list[str]:
+    """``pct_change`` must be finite except on the first (listing) row.
+
+    A-share ``pct_change`` is undefined for the first trading day of a stock,
+    so row 0 may be NaN; every later row must be finite.  A mid-series NaN
+    means the column was repaired/derived inconsistently (e.g. a gap filled
+    with NaN instead of the real cross-gap return), which would corrupt the
+    returns a model trains on.  A fully missing column is reported by
+    ``validate_schema``; an all-NaN column is caught here by the tail check
+    (every non-first row NaN), so ``pct_change`` needs no entry in
+    ``required_finite_ratio`` (which would reject a legit 2-row listing file).
+    """
+    if "pct_change" not in contract.required_columns:
+        return []
+    if "pct_change" not in df.columns:
+        return []  # validate_schema reports the missing column
+    values = pd.to_numeric(df["pct_change"], errors="coerce").to_numpy(dtype="float64")
+    n = len(values)
+    if n <= 1:
+        return []  # a lone listing-day row may legitimately be NaN
+    n_nan_after = int((~np.isfinite(values[1:])).sum())
+    if n_nan_after:
+        return [f"pct_change_nan_after_first_row:{n_nan_after}"]
+    return []
+
+
+def validate_price_volume_amount_consistency(
+    df: pd.DataFrame,
+    contract: DataContract,
+) -> list[str]:
+    """Weak economic check: ``amount / volume`` ≈ ``close`` within a 100× band.
+
+    ``implied_price = amount / volume`` equals the day's VWAP, which must sit
+    in the same order of magnitude as ``close``.  A unit corruption (volume in
+    手 vs 股, amount in 千元 vs 元) or a mis-scaled amount pushes ``implied_price``
+    orders of magnitude away from ``close``.  The 100× band is deliberately
+    loose — this flags unit-level anomalies, not normal intraday noise — and
+    only rows where OHLC/volume/amount are all finite AND volume > 0 count
+    (a zero-volume suspension row carries no trade, so no VWAP).
+    """
+    cols = ("open", "high", "low", "close", "volume", "amount")
+    if not set(cols).issubset(contract.required_columns):
+        return []
+    if not set(cols).issubset(df.columns):
+        return []  # validate_schema reports the missing columns
+    num = {
+        c: pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
+        for c in cols
+    }
+    ok = np.ones(len(df), dtype=bool)
+    for c in cols:
+        ok &= np.isfinite(num[c])
+    ok &= num["volume"] > 0
+    if not ok.any():
+        return []
+    implied = num["amount"][ok] / num["volume"][ok]
+    close = num["close"][ok]
+    n = int(((implied < close / 100.0) | (implied > close * 100.0)).sum())
+    return [f"amount_volume_unit_mismatch:{n}"] if n else []
+
+
 VALID_ADJUSTMENT_MODES = {"raw", "none", "qfq", "hfq", "n/a"}
 
 
@@ -282,6 +349,7 @@ def validate_adjustment_mode(
     contract: DataContract,
     *,
     manifest: dict | None = None,
+    formal: bool = False,
 ) -> list[str]:
     """The declared adjustment basis must actually match the contract's mode.
 
@@ -291,11 +359,20 @@ def validate_adjustment_mode(
     ``unknown`` is the honest legacy declaration for pre-provenance files and is
     not treated as a concrete mismatch — the economic-semantics check only fires
     on an explicit declaration of the WRONG basis (§四.1 / P0-2).
+
+    ``formal=True`` (v13 §五-1, canonical write/read paths) closes the legacy
+    seam: when the contract pins a concrete basis, ANY declared
+    ``unknown``/``n/a``/``""`` is itself a violation
+    (``adjustment_mode_unknown_in_formal``) — a formal QFQ store must never
+    accept files whose basis cannot be proven.  ``formal=False`` (default)
+    keeps the legacy exemption for migration / audit / exploration.
     """
     if contract.adjustment_mode in ("", "n/a"):
         return []
     actual: set[str] = set()
-    if df.attrs.get("adjustment_mode"):
+    # Use "in attrs" (not truthiness) so an empty-string declaration is still
+    # collected — formal mode must reject a declared "" basis, not skip it.
+    if df.attrs.get("adjustment_mode") is not None:
         actual.add(str(df.attrs["adjustment_mode"]))
     if "adjustment_mode" in df.columns:
         actual.update(str(m) for m in df["adjustment_mode"].dropna().unique())
@@ -304,7 +381,12 @@ def validate_adjustment_mode(
     concrete = {m for m in actual if m not in ("unknown", "n/a", "")}
     bad = sorted(f"{m}!={contract.adjustment_mode}" for m in concrete
                  if m != contract.adjustment_mode)
-    return [f"adjustment_mode_mismatch:{b}" for b in bad]
+    out = [f"adjustment_mode_mismatch:{b}" for b in bad]
+    if formal:
+        unknown = {m for m in actual if m in ("unknown", "n/a", "")}
+        if unknown:
+            out.append("adjustment_mode_unknown_in_formal")
+    return out
 
 
 def validate_contract(
@@ -314,6 +396,7 @@ def validate_contract(
     code: str | None = None,
     trading_days: set | None = None,
     manifest: dict | None = None,
+    formal: bool = False,
 ) -> list[str]:
     """Run every validator; return a flat list of violation strings.
 
@@ -321,6 +404,11 @@ def validate_contract(
     per-stock sidecar) it satisfies ``required_metadata`` declarations, so a
     legacy daily file whose parquet carries no provenance still passes as long
     as its manifest records source/adjust.
+
+    ``formal=True`` enforces the strict provenance rule for the canonical
+    write/read paths (v13 §五-1): an unknown adjustment basis is refused
+    instead of treated as an honest legacy declaration.  ``formal=False``
+    (default) keeps the legacy exemption for migration / audit.
     """
     out = []
     out += validate_schema(df, contract)
@@ -328,10 +416,12 @@ def validate_contract(
     out += validate_dates(df, contract, trading_days=trading_days)
     out += validate_units(df, contract)
     out += validate_finite(df, contract)
+    out += validate_pct_change(df, contract)
     out += validate_ohlc(df, contract)
+    out += validate_price_volume_amount_consistency(df, contract)
     out += validate_source_metadata(df, contract)
     out += validate_required_metadata(df, contract, manifest=manifest)
-    out += validate_adjustment_mode(df, contract, manifest=manifest)
+    out += validate_adjustment_mode(df, contract, manifest=manifest, formal=formal)
     return [f"{code}:{v}" if code else v for v in out]
 
 
@@ -342,7 +432,13 @@ def validate_contract(
 # ``daily_equity`` aliases ``research_qfq_daily`` rather than pretending the
 # same schema covers unadjusted data too.
 DAILY_PRICE_COLUMNS = ("open", "high", "low", "close")
-DAILY_REQUIRED_FINITE = {"open": 0.99, "high": 0.99, "low": 0.99, "close": 0.99}
+# §五-2 (v13): volume/amount joined the finite set so an all-NaN volume/amount
+# column (previously let through by validate_units' all-NaN skip) is now a
+# contract violation — a trading file without trade size/value is corrupt.
+DAILY_REQUIRED_FINITE = {
+    "open": 0.99, "high": 0.99, "low": 0.99, "close": 0.99,
+    "volume": 0.99, "amount": 0.99,
+}
 
 RESEARCH_QFQ_DAILY = DataContract(
     dataset_name="research_qfq_daily",

@@ -35,6 +35,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.download_manifest import write_run_manifest
 from stoke_ml.data.sources.a_shares.capital_flow_source import CapitalFlowSource
@@ -135,7 +136,7 @@ def main():
 
     # Resolve stock list
     if args.stocks:
-        stock_list = [c.strip() for c in args.stocks.split(",")]
+        stock_list = parse_stock_codes_arg(args.stocks)
     else:
         stock_list = get_stocks_from_disk(data_dir)
         if not stock_list:

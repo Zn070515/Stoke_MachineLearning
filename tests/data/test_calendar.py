@@ -8,11 +8,13 @@ import datetime as dt
 
 import pandas as pd
 import pytest
+from omegaconf import OmegaConf
 
 from stoke_ml.data.calendar import (
     VERIFIED_UNTIL,
     TradingCalendar,
     build_calendar_frame,
+    get_research_calendar,
     load_calendar,
     save_calendar,
     validate_calendar,
@@ -345,3 +347,47 @@ class TestExternalCalendar:
         report = validate_calendar(tmp_path, "a_shares")
         assert not report["ok"]
         assert report["problems"]["verified_until_mismatch"] is True, report
+
+
+class TestResearchCalendarFactory:
+    """get_research_calendar unifies every formal consumer on the frozen
+    exchange_calendar artifact — no module silently builds a hardcoded default
+    calendar.  The factory attaches the artifact when present, inherits strict
+    mode, and resolves data_dir lazily from the project config when omitted."""
+
+    def test_factory_with_artifact_uses_external_calendar(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        cal = get_research_calendar(data_dir=tmp_path)
+        assert cal._external is not None
+        assert cal.verified_until == VERIFIED_UNTIL["a_shares"]
+        # Queries flow through the artifact, not the code fallback.
+        assert cal.is_trading_day(dt.date(2026, 6, 19)) is False  # 端午 2026
+        assert cal.is_trading_day(dt.date(2026, 7, 15)) is True
+
+    def test_factory_strict_fails_beyond_verified_until(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        cal = get_research_calendar(strict=True, data_dir=tmp_path)
+        assert cal.verified_until == VERIFIED_UNTIL["a_shares"]
+        with pytest.raises(ValueError, match="verified_until"):
+            cal.is_trading_day(dt.date(2027, 1, 4))
+        with pytest.raises(ValueError, match="verified_until"):
+            cal.get_trading_days("2026-12-30", "2027-01-02")
+        # Non-strict (aux PIT mapping) keeps answering forward estimates.
+        loose = get_research_calendar(data_dir=tmp_path)
+        assert loose.is_trading_day(dt.date(2027, 1, 4)) is True
+
+    def test_factory_absent_artifact_falls_back_to_code(self, tmp_path):
+        cal = get_research_calendar(data_dir=tmp_path)
+        assert cal._external is None
+        # Semantics identical to the artifact-free calendar (fallback).
+        assert cal.is_trading_day(dt.date(2026, 6, 19)) is False
+
+    def test_factory_default_data_dir_from_config(self, tmp_path, monkeypatch):
+        # data_dir omitted → resolved lazily from project config; the calendar
+        # still reads the artifact that lives under that data root.
+        save_calendar(tmp_path, "a_shares")
+        cfg = OmegaConf.create({"project": {"data_dir": str(tmp_path)}})
+        monkeypatch.setattr("stoke_ml.config.load_config", lambda **k: cfg)
+        cal = get_research_calendar()
+        assert cal._external is not None
+        assert cal.verified_until == VERIFIED_UNTIL["a_shares"]

@@ -293,3 +293,74 @@ def test_transform_auto_loads_pinned_cache(
     assert "topic_id" in out.columns
     assert "topic_probability" in out.columns
     assert tm._model is not None
+
+
+# ---------------------------------------------------------------------------
+# §十三: reproducibility provenance in the cache metadata
+# ---------------------------------------------------------------------------
+
+def test_meta_records_reproducibility_fields(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """fit() with seed + stock_codes writes them (plus dependency/Python
+    versions and the model-pickle SHA-256) into the cache meta (§十三)."""
+    import json
+    monkeypatch.setattr(joblib, "dump", lambda model, path: None)
+    tm = _make_topic_modeler(tmp_path, monkeypatch, seed=7)
+    tm.fit(
+        posts.copy(),
+        source="news",
+        corpus_cutoff="2024-01-31",
+        seed=7,
+        stock_codes=["000001", "000002"],
+    )
+
+    meta_path = tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    for key in (
+        "seed", "bertopic_version", "sentence_transformers_version",
+        "python_version", "stock_codes", "model_pickle_sha256",
+        "embedding_model_config", "min_topic_size",
+    ):
+        assert key in meta, f"meta missing {key}"
+    assert meta["seed"] == 7
+    assert meta["stock_codes"] == ["000001", "000002"]
+    # joblib.dump is stubbed → no pickle on disk → hash recorded as unknown.
+    assert meta["model_pickle_sha256"] == "unknown"
+
+
+def test_meta_model_pickle_sha256_of_real_pickle(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """When the pickle is written, its SHA-256 is recorded (§十三)."""
+    import json
+    from stoke_ml.preprocessing.text.topics import _sha256_file
+
+    def fake_dump(model, path):
+        with open(path, "wb") as f:
+            f.write(b"pickle-bytes")
+
+    monkeypatch.setattr(joblib, "dump", fake_dump)
+    tm = _make_topic_modeler(tmp_path, monkeypatch)
+    tm.fit(posts.copy(), source="news", corpus_cutoff="2024-01-31")
+
+    meta_path = tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    cache_path = tmp_path / "bertopic_news_cutoff_2024-01-31.pkl"
+    assert meta["model_pickle_sha256"] == _sha256_file(str(cache_path))
+    assert len(meta["model_pickle_sha256"]) == 64
+
+
+def test_dependency_versions_returns_unknown_for_missing_dists(monkeypatch):
+    """Uninstalled dists are reported as 'unknown', never raising (§十三)."""
+    from importlib import metadata as md
+    from stoke_ml.preprocessing.text.topics import dependency_versions
+
+    def _raise(name):
+        raise Exception("no dist")
+
+    monkeypatch.setattr(md, "version", _raise)
+    versions = dependency_versions()
+    assert versions["bertopic"] == "unknown"
+    assert "python" in versions
+    assert versions["python"]  # non-empty interpreter version

@@ -15,9 +15,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from stoke_ml.data.storage import _provenance_from_attrs, _schema_hash
 from scripts.production.data_quality_gate import (
+    CHECKS,
+    _read_requested_file,
     _sample_files,
     check_contract_schema,
     check_daily_internal,
@@ -26,8 +29,10 @@ from scripts.production.data_quality_gate import (
     check_manifest,
     check_ohlc_sanity,
     check_sparsity,
+    check_universe,
     contract_version,
     dataset_fingerprint,
+    reconcile_requested_universe,
 )
 
 
@@ -715,3 +720,151 @@ class TestFingerprints:
         h2 = dataset_fingerprint(tmp_path, ["daily", "features_panel"])
         assert h1 == h2
         assert len(h1) == 16
+
+
+class TestUniverseReconciliation:
+    """§P1-7: per-requested-stock reconciliation against a requested universe.
+
+    The gate must account for every requested code individually: an absent
+    parquet is MISSING, a present file with an invalid manifest is DEGRADED
+    ("file exists" ≠ "data complete"), and the report must list them precisely.
+    The whole check is OPT-IN — without a requested universe the gate's default
+    behavior is unchanged (``universe`` not in ``CHECKS``, ``check_universe``
+    no-ops to PASS).
+    """
+
+    def _daily_dir(self, tmp_path):
+        daily_dir = tmp_path / "a_shares" / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        return daily_dir
+
+    def test_all_requested_present_ok(self, tmp_path):
+        daily_dir = self._daily_dir(tmp_path)
+        for c in ("000001", "600519"):
+            _write_daily_full(daily_dir, c, _daily(TRADE_DATES, [10.0] * 5))
+        rep = reconcile_requested_universe(["000001", "600519"], daily_dir=daily_dir)
+        assert rep["ok"] is True
+        assert rep["requested_count"] == 2
+        assert rep["present_count"] == 2
+        assert rep["missing_codes"] == []
+        assert rep["degraded_codes"] == []
+
+    def test_missing_codes_listed_precisely(self, tmp_path):
+        daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        rep = reconcile_requested_universe(
+            ["000001", "600519", "300750"], daily_dir=daily_dir
+        )
+        assert rep["ok"] is False
+        assert rep["requested_count"] == 3
+        assert rep["present_count"] == 1
+        assert rep["missing_codes"] == ["300750", "600519"]  # sorted
+        assert rep["degraded_codes"] == []
+
+    def test_present_but_invalid_manifest_is_degraded(self, tmp_path):
+        """A parquet on disk with NO valid manifest is degraded, not "present"."""
+        daily_dir = self._daily_dir(tmp_path)
+        _daily(TRADE_DATES, [10.0] * 5).to_parquet(
+            daily_dir / "000001.parquet", index=False  # no sidecar
+        )
+        _write_daily_full(daily_dir, "600519", _daily(TRADE_DATES, [10.0] * 5))
+        rep = reconcile_requested_universe(["000001", "600519"], daily_dir=daily_dir)
+        assert rep["ok"] is False
+        assert rep["present_count"] == 2
+        assert rep["missing_codes"] == []
+        assert len(rep["degraded_codes"]) == 1
+        assert rep["degraded_codes"][0]["code"] == "000001"
+        assert "manifest_invalid" in rep["degraded_codes"][0]["reason"]
+
+    def test_stale_manifest_is_degraded(self, tmp_path):
+        daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5), rows=999)
+        rep = reconcile_requested_universe(["000001"], daily_dir=daily_dir)
+        assert rep["ok"] is False
+        assert rep["degraded_codes"][0]["code"] == "000001"
+        assert "manifest_invalid" in rep["degraded_codes"][0]["reason"]
+
+    def test_min_rows_flags_thin_history_degraded(self, tmp_path):
+        daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        rep = reconcile_requested_universe(["000001"], daily_dir=daily_dir, min_rows=100)
+        assert rep["ok"] is False
+        assert rep["degraded_codes"][0]["code"] == "000001"
+        assert "rows=5 < min=100" in rep["degraded_codes"][0]["reason"]
+        # At/below the actual row count the same file is sound.
+        rep2 = reconcile_requested_universe(["000001"], daily_dir=daily_dir, min_rows=5)
+        assert rep2["ok"] is True
+        assert rep2["degraded_codes"] == []
+
+    def test_missing_within_tolerance_passes_but_is_listed(self, tmp_path):
+        """A tolerated gap does not fail the gate, but is still reported."""
+        daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        _write_daily_full(daily_dir, "600519", _daily(TRADE_DATES, [10.0] * 5))
+        rep = reconcile_requested_universe(
+            ["000001", "600519", "300750", "000002"], daily_dir=daily_dir,
+            max_missing_ratio=0.5,  # 2 of 4 missing tolerated
+        )
+        assert rep["ok"] is True
+        assert rep["missing_codes"] == ["000002", "300750"]
+
+    def test_no_requested_universe_skips(self, monkeypatch):
+        """Default behavior is unchanged: no universe -> check no-ops to PASS,
+        and the universe check is not part of the default CHECKS set."""
+        monkeypatch.setattr("scripts.production.data_quality_gate._UNIVERSE_REQUEST", None)
+        res = check_universe(0)
+        assert res.passed is True
+        assert "skipped" in res.summary
+        assert "universe" not in CHECKS
+
+    def test_check_universe_wrapper_reports_and_fails(self, tmp_path, monkeypatch):
+        """The gate wrapper surfaces the report + flips passed on a gap."""
+        daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily_dir)
+        monkeypatch.setattr("scripts.production.data_quality_gate._UNIVERSE_REQUEST", {
+            "codes": ["000001", "600519"],
+            "requested_start": None, "requested_end": None,
+            "min_rows": 0, "min_coverage_ratio": 0.0,
+            "max_missing_ratio": 0.0, "max_degraded_ratio": 0.0,
+        })
+        res = check_universe(0)
+        assert res.passed is False
+        assert res.details is not None
+        assert res.details["missing_codes"] == ["600519"]
+        assert ("600519", "missing") in res.issues
+
+    # ── universe-source loaders ──────────────────────────────────────────
+    def test_read_download_run_manifest(self, tmp_path):
+        p = tmp_path / "download_manifest.json"
+        p.write_text(json.dumps({
+            "schema_version": "1.3", "market": "a_shares",
+            "start_date": "2020-01-02", "requested_end": "2026-07-31",
+            "requested": ["000001", "600519", "000001.0", "SH600519"],
+        }), encoding="utf-8")
+        info = _read_requested_file(str(p), require_manifest=True)
+        assert info["codes"] == ["000001", "600519"]  # dedup + normalize
+        assert info["requested_start"] == "2020-01-02"
+        assert info["requested_end"] == "2026-07-31"
+
+    def test_read_line_per_code_text_file(self, tmp_path):
+        p = tmp_path / "universe.txt"
+        p.write_text("# comment\n000001\n\n600519\n300750\n", encoding="utf-8")
+        info = _read_requested_file(str(p))
+        assert info["codes"] == ["000001", "600519", "300750"]
+
+    def test_read_json_code_list(self, tmp_path):
+        p = tmp_path / "codes.json"
+        p.write_text('["000001", "600519"]', encoding="utf-8")
+        info = _read_requested_file(str(p))
+        assert info["codes"] == ["000001", "600519"]
+
+    def test_read_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            _read_requested_file(str(tmp_path / "nope.json"))
+
+    def test_request_manifest_requires_requested_field(self, tmp_path):
+        p = tmp_path / "not_a_manifest.json"
+        p.write_text('{"foo": 1}', encoding="utf-8")
+        with pytest.raises(ValueError):
+            _read_requested_file(str(p), require_manifest=True)

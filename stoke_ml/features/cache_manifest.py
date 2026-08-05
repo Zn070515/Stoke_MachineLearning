@@ -61,7 +61,13 @@ SNAPSHOT_FILES = {
 # (train_panel FoldResearchContext), not the per-stock feature manifest.
 SHARED_FILES = {
     "macro": ("a_shares", "macro", "macro_daily.parquet"),
-    "market_env": ("a_shares", "market_env_daily.parquet"),
+    # P1-10: the market-env lineage path must match where the channel is actually
+    # READ/WRITTEN — aux_aligner._merge_market_env reads
+    # a_shares/market_breadth/market_env_daily.parquet (written by
+    # _preprocess_market_env.py).  A path here that misses `market_breadth` would
+    # fingerprint None forever, so a market-env change never invalidated a stale
+    # feature cache.
+    "market_env": ("a_shares", "market_breadth", "market_env_daily.parquet"),
     "industry": ("a_shares", "industry", "industry_returns.parquet"),
     "sector_mapper": ("a_shares", "stock_sector_cache.csv"),
     "calendar": ("exchange_calendar", "a_shares.parquet"),
@@ -92,6 +98,12 @@ _CONFIG_KEYS = [
     "use_new_preprocessing", "use_emotion_refine", "use_fundamental_refine",
     "use_temporal_stats", "drop_dead_features", "min_history",
     "panel_mode", "start", "end",
+    # §七: topic_* features are OFF by default (headline representation
+    # leakage from the global_frozen topic model); flipping use_topic changes
+    # the feature COLUMN set, so the flat-dict config hash must track it too
+    # (production config_hash already covers topic enablement via the
+    # preprocessing section; schema_hash catches the column-set change).
+    "use_topic",
 ]
 
 # config.yaml sections that change prebuilt feature VALUES.  Hashed verbatim
@@ -433,9 +445,52 @@ def manifest_matches(
     manifest_path: str, code: str, config: dict, output_path: str,
     data_dir: str, commit: str, cfg_hash: str,
 ) -> bool:
-    """Cache hit iff every recorded hash still matches the current inputs."""
+    """Cache hit iff every recorded hash still matches the current inputs.
+
+    Thin bool wrapper over :func:`manifest_matches_detailed` for callers that
+    only need a yes/no (e.g. ``build_features.py`` cache-hit probe); the
+    detailed variant additionally reports WHICH lineage entry went stale.
+    """
+    return manifest_matches_detailed(
+        manifest_path, code, config, output_path, data_dir, commit, cfg_hash,
+    )[0]
+
+
+def manifest_matches_detailed(
+    manifest_path: str, code: str, config: dict, output_path: str,
+    data_dir: str, commit: str, cfg_hash: str,
+) -> tuple[bool, list[str]]:
+    """Cache-hit check returning ``(matches, failure_reasons)``.
+
+    Identical semantics to :func:`manifest_matches` but does NOT short-circuit:
+    every recorded check is evaluated so the caller can report the structured
+    reason each stale feature failed.  ``matches`` is True iff ``reasons`` is
+    empty.  Reason vocabulary (stable identifiers for triage / dashboards):
+
+      * ``code_changed``            — git commit, feature code-tree hash, or
+                                      stock_code disagree (the code-tree hash is
+                                      ALWAYS compared, git or not, §十二.2).
+      * ``config_changed``          — recorded config_hash / horizon / seq_len
+                                      disagree with the current config.
+      * ``schema_changed``          — the feature parquet's column set drifted
+                                      from what the manifest recorded.
+      * ``source_changed``          — a per-stock source channel (daily,
+                                      sentiment, margin, ...) fingerprint changed.
+      * ``shared_input_changed``    — a market-wide shared input (macro,
+                                      industry, sector_mapper, etf_flow dir, or
+                                      the shared-inputs aggregate) changed, or a
+                                      manifest predates shared-input lineage.
+      * ``calendar_changed``        — the exchange-calendar artifact changed.
+      * ``range_changed``           — the recorded daily source date-window no
+                                      longer matches the requested start/end.
+      * ``manifest_missing`` / ``manifest_unreadable`` — no usable sidecar.
+
+    ``cfg_hash`` may be None (config could not load); the config_hash comparison
+    is then skipped, mirroring the pre-existing warn path.
+    """
+    reasons: list[str] = []
     if not os.path.isfile(manifest_path):
-        return False
+        return False, ["manifest_missing"]
     try:
         with open(manifest_path, encoding="utf-8") as f:
             m = json.load(f)
@@ -444,22 +499,26 @@ def manifest_matches(
             "manifest %s unreadable (category=%s), treating as stale",
             manifest_path, classify_error(exc).value,
         )
-        return False
-    if not all([
-        m.get("stock_code") == code,
-        m.get("config_hash") == cfg_hash,
-        m.get("git_commit") == commit,
-        m.get("feature_schema_hash") == schema_hash(output_path),
-        m.get("horizon") == config.get("horizon"),
-        m.get("seq_len") == config.get("seq_len"),
-    ]):
-        return False
+        return False, ["manifest_unreadable"]
+
+    if m.get("stock_code") != code:
+        reasons.append("code_changed")
+    if cfg_hash is not None and m.get("config_hash") != cfg_hash:
+        reasons.append("config_changed")
+    if m.get("git_commit") != commit:
+        reasons.append("code_changed")
+    if m.get("feature_schema_hash") != schema_hash(output_path):
+        reasons.append("schema_changed")
+    if m.get("horizon") != config.get("horizon"):
+        reasons.append("config_changed")
+    if m.get("seq_len") != config.get("seq_len"):
+        reasons.append("config_changed")
     # §十-1: a manifest written before shared inputs were fingerprinted cannot
     # vouch for them — rebuild to record complete lineage.  Without this, a
     # macro / calendar / ETF-flow change would silently keep old features valid.
     missing_shared = _SHARED_NAMES - set((m.get("source_files") or {}).keys())
     if missing_shared:
-        return False
+        reasons.append("shared_input_changed")
     # §十二.2: the feature code-tree hash is ALWAYS compared, git or not.  In a
     # repo, git_commit can match while uncommitted source edits change the
     # feature code — trusting the commit alone would let a stale cache survive;
@@ -468,22 +527,27 @@ def manifest_matches(
     # for reuse; a manifest that cannot vouch for its code provenance (missing /
     # None field) is treated as stale rather than trusted.
     if m.get("feature_code_tree_hash") != feature_code_tree_hash():
-        return False
+        reasons.append("code_changed")
     # §十二.3/§P1-1: the shared-inputs aggregate must match too.  A manifest
     # written before a shared input existed (or before this field was recorded)
     # cannot vouch for it — rebuild to record complete lineage.
     if m.get("shared_inputs_hash") != shared_inputs_hash(data_dir):
-        return False
+        reasons.append("shared_input_changed")
     # start/end are NOT part of config_hash (build and training resolve them
     # differently) — they are recorded as the daily source range and compared
     # here so a date-window change still invalidates the cache (§十一-3).
     rng = (m.get("source_files") or {}).get("daily", {}).get("range")
     if rng != [config.get("start"), config.get("end")]:
-        return False
+        reasons.append("range_changed")
     for name, rec in (m.get("source_files") or {}).items():
         path = source_paths(data_dir, code).get(name)
         if path is None:
             continue
         if rec.get("hash") != _input_fingerprint(name, path):
-            return False
-    return True
+            if name == "calendar":
+                reasons.append("calendar_changed")
+            elif name in _SHARED_NAMES:
+                reasons.append("shared_input_changed")
+            else:
+                reasons.append("source_changed")
+    return not reasons, reasons

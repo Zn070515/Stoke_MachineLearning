@@ -9,6 +9,8 @@ requested range — never a mere "file exists" scan (§五-4).
 import json
 import os
 
+import pytest
+
 from stoke_ml.data.download_manifest import (
     default_path, load_manifest, run_manifest_path, write_manifest, write_run_manifest,
 )
@@ -30,7 +32,9 @@ def test_write_manifest_full_report(tmp_path):
     assert manifest["missing_count"] == 2
     assert manifest["missing"] == ["000002", "000003"]
     assert manifest["all_complete"] is False
-    assert manifest["status"] == "complete"
+    # §九-1: un-reconciled missing units with some complete → "partial", never
+    # the old buggy "complete" that let a partially-failed run claim success.
+    assert manifest["status"] == "partial"
     assert manifest["requested_end"] is None
     assert manifest["effective_end"] is None
     assert manifest["latest_available_end"] is None
@@ -138,3 +142,116 @@ def test_write_run_manifest_success_count_and_skipped(tmp_path):
     assert manifest["missing"] == ["000905/2026-02-01"]
     assert manifest["all_complete"] is False
     assert manifest["skipped_existing_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# §九-1 status derivation: when the caller passes status=None, write_manifest
+# derives it from missing/failed/complete instead of looking ONLY at `bounded`.
+# The old logic reported "complete" for a run that silently dropped failed
+# stocks (status="complete" with missing≠0).  Every derived combination must be
+# self-consistent: status="complete" implies all_complete AND empty missing.
+# ---------------------------------------------------------------------------
+
+def _status_manifest(tmp_path, *, codes, complete, failed=(), **kw):
+    return write_manifest(
+        str(tmp_path / "m.json"), market="a_shares",
+        requested=codes, failed=list(failed), complete=set(complete),
+        success_count=len(complete), **kw,
+    )
+
+
+def test_derive_complete_when_all_landed(tmp_path):
+    codes = [f"{i:06d}" for i in range(3)]
+    m = _status_manifest(tmp_path, codes=codes, complete=codes)
+    assert m["status"] == "complete"
+    assert m["all_complete"] is True
+    assert m["missing"] == []
+
+
+def test_derive_partial_when_some_missing(tmp_path):
+    codes = [f"{i:06d}" for i in range(4)]
+    m = _status_manifest(tmp_path, codes=codes, complete=codes[:3],
+                         failed=[codes[3]])
+    assert m["status"] == "partial"
+    assert m["all_complete"] is False
+    assert m["missing"] == [codes[3]]
+
+
+def test_derive_failed_when_nothing_complete(tmp_path):
+    codes = [f"{i:06d}" for i in range(2)]
+    m = _status_manifest(tmp_path, codes=codes, complete=[], failed=codes)
+    assert m["status"] == "failed"
+    assert m["all_complete"] is False
+    assert m["missing"] == codes
+
+
+def test_derive_bounded_complete_still_not_all_complete(tmp_path):
+    codes = [f"{i:06d}" for i in range(3)]
+    m = _status_manifest(
+        tmp_path, codes=codes, complete=codes,
+        requested_end="2026-12-31", effective_end="2026-08-04",
+        latest_available_end="2026-08-04",
+    )
+    assert m["status"] == "bounded_complete"
+    assert m["all_complete"] is False
+    assert m["missing"] == []
+
+
+def test_derive_bounded_plus_missing_is_partial(tmp_path):
+    codes = [f"{i:06d}" for i in range(3)]
+    m = _status_manifest(
+        tmp_path, codes=codes, complete=codes[:2], failed=[codes[2]],
+        requested_end="2026-12-31", effective_end="2026-08-04",
+        latest_available_end="2026-08-04",
+    )
+    # A bounded request that ALSO dropped a stock is partial, not bounded_complete
+    # — bounded_complete is reserved for "every requested unit landed, only the
+    # date ceiling is short".
+    assert m["status"] == "partial"
+    assert m["all_complete"] is False
+
+
+def test_explicit_status_wins_over_derivation(tmp_path):
+    """A caller-supplied status (e.g. "in_progress" checkpoint) is preserved."""
+    codes = [f"{i:06d}" for i in range(3)]
+    m = _status_manifest(tmp_path, codes=codes, complete=codes[:1],
+                         failed=codes[1:], status="in_progress")
+    assert m["status"] == "in_progress"
+    assert m["all_complete"] is False
+
+
+@pytest.mark.parametrize("complete_idx,expected", [
+    ([0, 1, 2], "complete"),      # every requested unit complete
+    ([0, 1], "partial"),          # one missing
+    ([], "failed"),               # nothing landed
+])
+def test_derived_status_all_complete_self_consistent(tmp_path, complete_idx, expected):
+    """status=="complete" is the ONLY value allowed to carry all_complete==True,
+    and it must imply zero missing (the §九-1 invariant the old bug violated)."""
+    codes = [f"{i:06d}" for i in range(3)]
+    m = _status_manifest(tmp_path, codes=codes, complete=[codes[i] for i in complete_idx])
+    assert m["status"] == expected
+    if m["status"] == "complete":
+        assert m["all_complete"] is True
+        assert m["missing"] == []
+    else:
+        assert m["all_complete"] is False
+
+
+def test_manifest_records_universe_status_absent(tmp_path):
+    """§九-3: when the PIT listing/delisting artifact is absent the run manifest
+    records universe_status=absent + bounded_reason=no_ipo_delist_artifact so it
+    never pretends to cover a pre-IPO window."""
+    codes = [f"{i:06d}" for i in range(3)]
+    m = _status_manifest(
+        tmp_path, codes=codes, complete=codes,
+        universe_status="absent",
+        bounded_reason="no_ipo_delist_artifact",
+    )
+    assert m["universe_status"] == "absent"
+    assert m["bounded_reason"] == "no_ipo_delist_artifact"
+    # The extra keys are additive — absent by default so existing manifests are
+    # byte-stable.
+    m2 = _status_manifest(tmp_path, codes=codes, complete=codes)
+    assert "universe_status" not in m2
+    assert "bounded_reason" not in m2

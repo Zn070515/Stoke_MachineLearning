@@ -32,6 +32,7 @@ from stoke_ml.config import get_project_root, load_config
 from stoke_ml.data.calendar import (
     TradingCalendar,
     build_calendar_frame,
+    get_research_calendar,
     load_calendar,
 )
 from stoke_ml.data.universe import (
@@ -196,7 +197,7 @@ def _check_verified_until_scope(global_dates, enforce: bool) -> str | None:
     """
     if not enforce or global_dates is None or not len(global_dates):
         return None
-    strict_cal = TradingCalendar("a_shares", strict=True)
+    strict_cal = get_research_calendar(strict=True)
     lo = pd.Timestamp(global_dates[0]).date()
     hi = pd.Timestamp(global_dates[-1]).date()
     try:
@@ -1073,18 +1074,39 @@ def _experiment_version(
                 src.update(str(source_files[name].get("hash")).encode())
                 src.update(b";")
 
-    # Model hash: content-addressed over the architecture
-    # source + the PanelConfig hyper-parameters, so an OOS tape row records
-    # exactly which model produced it — config change or arch edit flips it.
+    # §十六: model identity is split into THREE content hashes so a continuous-OOS
+    # replay can tell a config change from a source change from a schema change,
+    # and reject a "first two folds VSN+xLSTM, last three plain LSTM" switch
+    # instead of silently blending it.
+    #   * model_source_hash — architecture + training code source files only
+    #     (hyper-parameter VALUES do not enter it);
+    #   * model_config_hash — the PanelConfig hyper-parameters only;
+    #   * model_hash        — LEGACY combined digest (config + architecture
+    #     source), kept byte-for-byte stable so old readers / registry
+    #     signatures that consume `model_hash` keep working.
+    _root = str(get_project_root())
+    _model_source_files = (
+        "stoke_ml/models/panel/model.py",
+        "stoke_ml/models/panel/vsn.py",
+        "stoke_ml/models/panel/xlstm.py",
+        "stoke_ml/models/panel/heads.py",
+        "stoke_ml/models/panel/config.py",
+        "stoke_ml/models/panel/loss.py",
+    )
+    model_source_h = hashlib.sha1()
+    for rel in (*_model_source_files,
+                "stoke_ml/models/panel/train.py",
+                "scripts/production/train_panel.py"):
+        fp = cache_manifest.file_fingerprint(os.path.join(_root, rel)) or "absent"
+        model_source_h.update(rel.encode("utf-8"))
+        model_source_h.update(b"=")
+        model_source_h.update(fp.encode("utf-8"))
+        model_source_h.update(b";")
+    model_config_h = hashlib.sha1()
+    model_config_h.update(repr(config).encode("utf-8"))
     model_h = hashlib.sha1()
     model_h.update(repr(config).encode("utf-8"))
-    _root = str(get_project_root())
-    for rel in ("stoke_ml/models/panel/model.py",
-                "stoke_ml/models/panel/vsn.py",
-                "stoke_ml/models/panel/xlstm.py",
-                "stoke_ml/models/panel/heads.py",
-                "stoke_ml/models/panel/config.py",
-                "stoke_ml/models/panel/loss.py"):
+    for rel in _model_source_files:
         fp = cache_manifest.file_fingerprint(os.path.join(_root, rel)) or "absent"
         model_h.update(rel.encode("utf-8"))
         model_h.update(b"=")
@@ -1102,6 +1124,8 @@ def _experiment_version(
         "feature_schema_hash": feat.hexdigest()[:16],
         "universe_hash": _sha1("\n".join(sorted(universe_used))),
         "model_hash": model_h.hexdigest()[:16],
+        "model_source_hash": model_source_h.hexdigest()[:16],
+        "model_config_hash": model_config_h.hexdigest()[:16],
         "evaluator_version": EVALUATOR_VERSION,
         "cost_model": f"sleeve per-side txn_cost={config.txn_cost}, top_fraction=0.1",
         "random_seed": seed,
@@ -1171,12 +1195,25 @@ def _objective_desc(config: PanelConfig) -> str:
 
 
 def _experiment_signature(version: dict, config: PanelConfig,
-                          model_key: str | None = None) -> str:
+                          model_key: str | None = None,
+                          *,
+                          augmentation: bool | None = None,
+                          seq_features: bool | None = None) -> str:
     """Content signature of a research trial: the keys the DSR multiplicity must
     NOT conflate.  Two runs sharing a signature ARE the same experiment (a
     re-run); differing on any key is a NEW trial (§十二.6).  `model_key` lets a
     caller override the model identity (e.g. baselines, whose version's
-    model_hash is computed for the deep architecture)."""
+    model_hash is computed for the deep architecture).
+
+    §十八-2 best-effort: the signature covers at least — random seed, model
+    architecture (model_hash) + loss weights (objective), features
+    (feature_schema_hash), horizon, top fraction, universe, cost (txn_cost),
+    data version, augmentation, baseline sequence features, and a code-tree
+    proxy (git commit; the model source-file fingerprints already enter
+    model_hash).  `augmentation`/`seq_features` are the caller's flags (the
+    deep run's --augment, the baselines' --with-seq-features); each defaults to
+    'none' so the signature stays meaningful for callers that lack the switch.
+    """
     h = hashlib.sha1()
     for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
         h.update(f"{key}={version.get(key) or 'unknown'};".encode("utf-8"))
@@ -1200,6 +1237,16 @@ def _experiment_signature(version: dict, config: PanelConfig,
              .encode("utf-8"))
     h.update(f"calendar_artifact_hash={version.get('calendar_artifact_hash') or 'unknown'};"
              .encode("utf-8"))
+    # §十八-2: the remaining research levers the review wants pinned — top
+    # fraction (constant 0.1 across deep + baseline runs), the augmentation
+    # flag, the baseline sequence-feature flag, and a code-tree hash proxy
+    # (git commit; model source-file fingerprints already enter model_hash).
+    h.update("top_fraction=0.1;".encode("utf-8"))
+    h.update(f"augmentation={augmentation if augmentation is not None else 'none'};"
+             .encode("utf-8"))
+    h.update(f"seq_features={seq_features if seq_features is not None else 'none'};"
+             .encode("utf-8"))
+    h.update(f"code_tree={version.get('git_commit') or 'unknown'};".encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -1438,7 +1485,12 @@ def _replay_continuous_oos(
     requires the strategy POLICY (horizon / cost / top_fraction /
     evaluator_version / price_convention / exit_policy / strategy_mode) to be
     identical across folds, so a mixed-policy directory is never explained by
-    the first tape's policy.
+    the first tape's policy.  §十六 further requires the MODEL IDENTITY
+    (model_source_hash / model_config_hash / feature_schema_hash) to be
+    identical across folds in formal mode, so a mid-run architecture switch
+    (e.g. "first two folds VSN+xLSTM, last three plain LSTM") or a config /
+    feature-schema edit is refused instead of silently blended; only
+    `weight_hash` (the trained parameters) is allowed to differ per fold.
 
     `formal=True` (§十五-2) is the production headline mode: it refuses ANY
     tape that lacks required metadata (universe/delist/calendar/version/policy
@@ -1509,6 +1561,14 @@ def _replay_continuous_oos(
                             if "exit_policy" in z.files else None),
             "strategy_mode": (str(z["strategy_mode"])
                               if "strategy_mode" in z.files else None),
+            # §十六: split model-identity hashes — `None` marks a legacy tape
+            # that predates these keys (tolerated by non-formal replay).
+            "model_source_hash": (str(z["model_source_hash"])
+                                  if "model_source_hash" in z.files else None),
+            "model_config_hash": (str(z["model_config_hash"])
+                                  if "model_config_hash" in z.files else None),
+            "feature_schema_hash": (str(z["feature_schema_hash"])
+                                    if "feature_schema_hash" in z.files else None),
         })
     # fold index grows as val_start walks BACKWARD, so chronological order is
     # the reverse of the lexicographic tape order.
@@ -1534,11 +1594,20 @@ def _replay_continuous_oos(
         if required and any(v is None for v in values):
             raise ValueError(
                 f"formal continuous-OOS replay: tape missing required "
-                f"{name} — refusing to blend a legacy tape (§十五-2)")
+                f"{name} — refusing to blend a legacy tape (§十五-2/§十六)")
         known = [v for v in values if v is not None]
         if len(set(known)) > 1:
+            # Name the exact folds carrying each value so a model switch is
+            # traceable (e.g. "folds [0,1] -> arch A; folds [2,3,4] -> arch B").
+            by_val: dict[str, list[int]] = {}
+            for i, v in enumerate(values):
+                if v is not None:
+                    by_val.setdefault(v, []).append(i)
+            detail = "; ".join(
+                f"folds {sorted(idxs)} -> {v!r}"
+                for v, idxs in sorted(by_val.items()))
             raise ValueError(
-                f"§十二.2: fold tapes disagree on {name}: {sorted(set(known))}")
+                f"§十二.2/§十六: fold tapes disagree on {name} — {detail}")
 
     _consistent("data_version", [r["data_version"] for r in recs],
                 required=formal)
@@ -1559,6 +1628,19 @@ def _replay_continuous_oos(
     _consistent("exit_policy", [r["exit_policy"] for r in recs],
                 required=formal)
     _consistent("strategy_mode", [r["strategy_mode"] for r in recs],
+                required=formal)
+    # §十六: the MODEL identity must be identical across folds too — a "first
+    # two folds VSN+xLSTM, last three plain LSTM" switch (or a config / feature
+    # schema edit between runs) is a model switch the continuous account must
+    # never silently blend.  Architecture / config / schema hashes are required
+    # to be present AND equal in formal mode; `weight_hash` (the actual trained
+    # parameters) is deliberately allowed to differ per fold, so it is checked
+    # nowhere here.
+    _consistent("model_source_hash", [r["model_source_hash"] for r in recs],
+                required=formal)
+    _consistent("model_config_hash", [r["model_config_hash"] for r in recs],
+                required=formal)
+    _consistent("feature_schema_hash", [r["feature_schema_hash"] for r in recs],
                 required=formal)
     if formal and any(r["delist_day"] is None for r in recs):
         raise ValueError(
@@ -2127,7 +2209,8 @@ def main():
     # prior row with this run's experiment_signature is the SAME experiment
     # re-run, so it is replaced and N does not grow.
     experiment_registry = _load_experiment_registry(_EXPERIMENT_REGISTRY_PATH)
-    experiment_signature = _experiment_signature(version_info, config)
+    experiment_signature = _experiment_signature(
+        version_info, config, augmentation=bool(args.augment))
     n_trials = _distinct_trial_count(experiment_registry, experiment_signature)
     oos_dates_all: list[str] = []
     oos_stocks_all: list[str] = []
@@ -2357,7 +2440,8 @@ def main():
                 "test_end": _fmt_date(global_dates, val_end - 1),
             },
             "weight_hash": weight_hash,
-            "model_source_hash": version_info["model_hash"],
+            "model_source_hash": version_info["model_source_hash"],
+            "model_config_hash": version_info["model_config_hash"],
             "best_epoch": history.get("best_epoch_idx", 0) + 1,
             "data_version": version_info["data_manifest_hash"],
             "feature_schema_hash": version_info["feature_schema_hash"],
@@ -2458,6 +2542,13 @@ def main():
                 # that produced it, so every return number is traceable.
                 data_version=version_info["data_manifest_hash"],
                 model_hash=version_info["model_hash"],
+                # §十六: the split model-identity hashes the formal continuous
+                # replay REQUIRES to be identical across folds (architecture /
+                # config / feature-schema).  weight_hash below — the actual
+                # trained parameters — is allowed to differ per fold.
+                model_source_hash=version_info["model_source_hash"],
+                model_config_hash=version_info["model_config_hash"],
+                feature_schema_hash=version_info["feature_schema_hash"],
                 # Trained-parameter hash — the fold's tape maps
                 # to the exact weights in fold_XXX_model.pt (config+source
                 # model_hash is shared by all folds, this one is not).

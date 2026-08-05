@@ -16,7 +16,22 @@ from stoke_ml.data.universe import (
     index_membership_mask,
     load_universe_status,
     not_delisted_mask,
+    universe_status_available,
 )
+
+
+def test_universe_status_available(tmp_path):
+    """§九-3: availability tracks the on-disk ipo/delisted artifact — absent
+    when neither exists, present when either one lands."""
+    assert universe_status_available(str(tmp_path)) is False
+    uni = tmp_path / "a_shares" / "universe"
+    uni.mkdir(parents=True)
+    assert universe_status_available(str(tmp_path)) is False
+    (uni / "ipo.parquet").write_bytes(b"")
+    assert universe_status_available(str(tmp_path)) is True
+    (uni / "ipo.parquet").unlink()
+    (uni / "delisted.parquet").write_bytes(b"")
+    assert universe_status_available(str(tmp_path)) is True
 
 
 def _write_universe(data_dir: str) -> None:

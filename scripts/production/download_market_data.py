@@ -15,6 +15,7 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.download_resume import (
     mark_stock_result,
     skip_completed_stocks,
@@ -140,7 +141,7 @@ def main():
             df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
         elif label == "dragon_tiger":
             if args.stocks:
-                stock_list = [c.strip() for c in args.stocks.split(",")]
+                stock_list = parse_stock_codes_arg(args.stocks)
                 if args.concurrent:
                     from stoke_ml.crawler.rate_limiter import RateLimiter
                     from stoke_ml.crawler.concurrent import ConcurrentDownloader
@@ -170,7 +171,7 @@ def main():
         elif label == "northbound":
             stock_codes = None
             if args.stocks:
-                stock_codes = [c.strip() for c in args.stocks.split(",")]
+                stock_codes = parse_stock_codes_arg(args.stocks)
             else:
                 stock_codes = get_stocks_from_disk(data_dir)
                 if not stock_codes:

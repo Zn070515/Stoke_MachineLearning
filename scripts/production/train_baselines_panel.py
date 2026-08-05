@@ -82,13 +82,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _file_sha1(path: str) -> str:
-    """Content sha1 of a file's bytes — the baseline tape's weight fingerprint."""
-    h = hashlib.sha1()
+def _file_sha256(path: str) -> str:
+    """Content SHA-256 of a file's bytes — the baseline tape's weight fingerprint.
+
+    §十七: the pickle's real content hash, so a re-fit that changes the weights
+    is detectable.  Full-length digest (not truncated) so two pickles collide
+    only by cryptographic accident.
+    """
+    h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _baseline_source_hash() -> str:
+    """§十六: SHA-256 over the baseline implementation + training-script source
+    files — the model_source_hash a baseline tape carries (its analogue of the
+    deep model's architecture-source hash).  Shared by every baseline model and
+    fold of a run, so a baseline's folds only ever blend under the same source.
+    """
+    h = hashlib.sha256()
+    root = str(get_project_root())
+    for rel in ("stoke_ml/models/baseline/panel_baselines.py",
+                "scripts/production/train_baselines_panel.py"):
+        p = os.path.join(root, rel)
+        fp = _file_sha256(p) if os.path.isfile(p) else "absent"
+        h.update(rel.encode("utf-8"))
+        h.update(b"=")
+        h.update(fp.encode("utf-8"))
+        h.update(b";")
+    return h.hexdigest()[:16]
 
 
 class _LGBMWrapper:
@@ -341,6 +365,11 @@ def main():
                 version_info["universe_hash"],
                 version_info["calendar_version"])
 
+    # §十六: baseline model-identity hashes for the OOS tape — the source hash
+    # fingerprints the baseline implementation files (shared by every model and
+    # fold), while the per-model config hash below binds a tape to its family.
+    baseline_source_hash = _baseline_source_hash()
+
     val_len = 126
     step = val_len
     purge = config.seq_len
@@ -543,7 +572,7 @@ def main():
                     oos_dir, f"fold_{fold:03d}_{model_name}.pkl")
                 with open(model_path, "wb") as f:
                     pickle.dump(adapter, f)
-                weight_hash = _file_sha1(model_path)
+                weight_hash = _file_sha256(model_path)
             except Exception as exc:  # noqa: BLE001
                 if not args.no_formal:
                     logger.error(
@@ -605,6 +634,16 @@ def main():
                     evaluator_version=EVALUATOR_VERSION,
                     weight_hash=weight_hash,
                     calendar_hash=version_info["calendar_artifact_hash"],
+                    # §十六: the split model-identity hashes the formal replay
+                    # requires to be identical across a model's folds.  The
+                    # config hash binds the tape to (model family, hyperparams,
+                    # panel config); feature_schema_hash comes from the shared
+                    # version freeze.  Only `weight_hash` may differ per fold.
+                    model_source_hash=baseline_source_hash,
+                    model_config_hash=hashlib.sha256(
+                        f"baseline:{model_name}:{repr(config)}".encode("utf-8")
+                    ).hexdigest()[:16],
+                    feature_schema_hash=version_info["feature_schema_hash"],
                     # §十五-3: identical policy metadata as the deep tapes, so a
                     # mixed oos_dir (deep + baseline, or two baselines) is
                     # rejected by the continuous replay instead of blended.
@@ -626,7 +665,10 @@ def main():
                     ldf["entry_eligible"] = elig[si, di]
                     ldf["fold"] = fold
                     ldf["data_version"] = version_info["data_manifest_hash"]
-                    ldf["model_hash"] = "baseline-" + model_name
+                    # §十七: per-fold REAL file hash (matches the tape's
+                    # weight_hash / model_hash), falling back to the legacy
+                    # label only when the non-formal pickle produced no hash.
+                    ldf["model_hash"] = weight_hash or ("baseline-" + model_name)
                     ldf = ldf[["fold", "entry_day", "entry_date", "stock",
                                "stock_code", "mode", "prediction",
                                "candidate_eligible", "entry_eligible",
@@ -844,19 +886,20 @@ def main():
         else:
             sharpe = float(long_vals.mean()) if len(long_vals) else None
         # §P1-3: the registry fingerprint is a REAL content hash over the fold
-        # weight artifacts (sha1 of the sorted per-fold weight hashes), not a
+        # weight artifacts (SHA-256 of the sorted per-fold weight hashes), not a
         # static "baseline-<name>" label — a re-fit that changes any fold's
         # weights changes the fingerprint.  Falls back to the label only when
         # no fold produced a hashable pickle (non-formal failure path).
         weight_hashes = [str(v) for v in sub["weight_hash"].dropna()]
         if weight_hashes:
-            model_hash = hashlib.sha1(
+            model_hash = hashlib.sha256(
                 "|".join(sorted(weight_hashes)).encode("utf-8")).hexdigest()
         else:
             model_hash = f"baseline-{model_name}"
         baseline_entry = {
             "experiment_signature": _experiment_signature(
-                version_info, config, model_key=f"baseline-{model_name}"),
+                version_info, config, model_key=f"baseline-{model_name}",
+                seq_features=args.with_seq_features),
             "outdir": outdir,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "git_commit": version_info.get("git_commit"),

@@ -11,7 +11,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,10 @@ class NewsStorage:
 
     def __init__(self, data_dir: str, calendar: TradingCalendar | None = None):
         self._root = data_dir
-        self._calendar = calendar or TradingCalendar("a_shares")
+        # Each storage instance uses its own data root so the calendar artifact
+        # it reads is the one that lives alongside its own data (PIT mapping
+        # walks the same frozen exchange_calendar the rest of the repo uses).
+        self._calendar = calendar or get_research_calendar(data_dir=self._root)
         os.makedirs(data_dir, exist_ok=True)
 
     # ── paths ──────────────────────────────────────────────────────

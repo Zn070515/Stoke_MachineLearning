@@ -29,7 +29,16 @@ from stoke_ml.data.storage import (
 )
 
 
-def _frame(dates, closes=None, code="000001"):
+def _frame(dates, closes=None, code="000001", prev_close=None):
+    """A well-formed qfq daily batch.
+
+    ``prev_close`` models a CONTINUATION batch: the first row's pct_change is
+    derived against the previous batch's last close instead of being NaN.  A
+    fresh batch (``prev_close=None``) leaves row 0 NaN — the honest first-listing
+    value.  save_daily (v13 §五-2) rejects a mid-series NaN pct_change, so any
+    fixture that appends onto existing history must pass ``prev_close`` to
+    mirror what a correct downloader produces.
+    """
     dates = list(pd.to_datetime(dates))
     n = len(dates)
     if closes is None:
@@ -47,9 +56,12 @@ def _frame(dates, closes=None, code="000001"):
     })
     # §八-1: save_daily now enforces the RESEARCH_QFQ_DAILY contract, so the
     # fixture must carry pct_change (NaN on the first row) + provenance attrs.
+    closes_s = pd.Series(closes, dtype="float64")
     pct = pd.Series([float("nan")] * n)
     if n > 1:
-        pct.iloc[1:] = 100.0 * pd.Series(closes).pct_change().iloc[1:].to_numpy()
+        pct.iloc[1:] = 100.0 * closes_s.pct_change().iloc[1:].to_numpy()
+    if prev_close is not None:
+        pct.iloc[0] = 100.0 * (closes[0] / prev_close - 1.0)
     df["pct_change"] = pct
     df.attrs["source"] = "test"
     df.attrs["adjustment_mode"] = "qfq"
@@ -70,7 +82,7 @@ class TestSaveDaily:
     def test_incremental_merge_no_overwrite(self, tmp_path):
         store = DataStorage(str(tmp_path))
         store.save_daily(_frame(["2024-01-05", "2024-01-08", "2024-01-09"]))
-        store.save_daily(_frame(["2024-01-09", "2024-01-10"]))
+        store.save_daily(_frame(["2024-01-09", "2024-01-10"], prev_close=10.2))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["date"].tolist() == pd.to_datetime(
             ["2024-01-05", "2024-01-08", "2024-01-09", "2024-01-10"]
@@ -87,7 +99,7 @@ class TestSaveDaily:
     def test_no_tmp_residue(self, tmp_path):
         store = DataStorage(str(tmp_path))
         store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
-        store.save_daily(_frame(["2024-01-08", "2024-01-09"]))
+        store.save_daily(_frame(["2024-01-08", "2024-01-09"], prev_close=10.1))
         residue = []
         for root, _, files in os.walk(str(tmp_path)):
             residue += [f for f in files if ".tmp" in f]
@@ -97,7 +109,7 @@ class TestSaveDaily:
         store = DataStorage(str(tmp_path))
         df = pd.concat([
             _frame(["2023-12-28", "2023-12-29"], code="000001"),
-            _frame(["2024-01-02"], code="000001"),
+            _frame(["2024-01-02"], code="000001", prev_close=10.1),
             _frame(["2024-01-02"], code="600519"),
         ])
         store.save_daily(df)
@@ -141,7 +153,7 @@ class TestPriceBasisMismatch:
         a = _frame(["2024-01-05", "2024-01-08"])
         a.attrs["adjustment_mode"] = "qfq"
         store.save_daily(a)
-        b = _frame(["2024-01-09", "2024-01-10"])
+        b = _frame(["2024-01-09", "2024-01-10"], prev_close=10.1)
         b.attrs["adjustment_mode"] = "qfq"
         store.save_daily(b)
         m = store.manifest("000001")
@@ -150,16 +162,81 @@ class TestPriceBasisMismatch:
     def test_unknown_legacy_then_concrete_new_refuses(self, tmp_path):
         """§八-2: a concrete qfq batch must NOT splice onto a legacy history
         whose basis is unknown — the mixed basis would be undetectable.  Only
-        an explicit save_daily_repair migration may touch such a file."""
+        an explicit save_daily_repair migration may touch such a file (v13
+        §五-1: a direct formal save_daily now refuses an unknown basis, so the
+        legacy file is written through the migration seam instead)."""
         store = DataStorage(str(tmp_path))
         legacy = _frame(["2024-01-05", "2024-01-08"])
         legacy.attrs["adjustment_mode"] = "unknown"
-        store.save_daily(legacy)
+        store.save_daily_repair(legacy)
         assert store.manifest("000001")["adjust"] == "unknown"
         fresh = _frame(["2024-01-09"])
         fresh.attrs["adjustment_mode"] = "qfq"
         with pytest.raises(ValueError, match="refusing to append"):
             store.save_daily(fresh)
+
+
+class TestAShareEquityGate:
+    """v13 §十: the canonical daily store only holds A-share common equity.
+    A format-legal but non-equity code (index / B-share / fund) is refused at
+    the formal write path and at the formal read path."""
+
+    def test_save_daily_rejects_non_equity(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df = _frame(["2024-01-05", "2024-01-08"], code="900001")  # SH B-share
+        with pytest.raises(ValueError, match="non-A-share-equity"):
+            store.save_daily(df)
+
+    def test_save_daily_rejects_index_code(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df = _frame(["2024-01-05"], code="100000")
+        with pytest.raises(ValueError, match="non-A-share-equity"):
+            store.save_daily(df)
+
+    def test_save_daily_mixed_equity_and_non_equity_rejects(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df = pd.concat([
+            _frame(["2024-01-05"], code="000001"),
+            _frame(["2024-01-05"], code="500000"),  # fund
+        ])
+        with pytest.raises(ValueError, match="non-A-share-equity"):
+            store.save_daily(df)
+
+    def test_save_daily_accepts_equity_codes(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05"], code="000001"))
+        store.save_daily(_frame(["2024-01-05"], code="600519"))
+        store.save_daily(_frame(["2024-01-05"], code="430001"))
+        assert store.list_stocks() == ["000001", "430001", "600519"]
+
+    def test_formal_read_rejects_non_equity(self, tmp_path):
+        """save_daily blocks non-equity writes, so plant a B-share parquet
+        directly (as a legacy/hand-planted file) and confirm the formal read
+        refuses it — the gate fires once the file exists, before any manifest
+        check."""
+        base = os.path.join(str(tmp_path), "a_shares", "daily")
+        os.makedirs(base, exist_ok=True)
+        _frame(["2024-01-05"], code="900001").to_parquet(
+            os.path.join(base, "900001.parquet"), index=False
+        )
+        store = DataStorage(str(tmp_path))
+        with pytest.raises(ValueError, match="not an A-share common-equity"):
+            store.load_daily("900001", "2024-01-01", "2024-01-31",
+                             require_valid_manifest=True)
+
+
+class TestFormalWriteRejectsUnknown:
+    """v13 §五-1: the formal save_daily path refuses an unknown adjustment
+    basis on a fresh write — the canonical store can no longer be seeded with
+    an unprovable basis."""
+
+    def test_fresh_unknown_attrs_refused(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        df = _frame(["2024-01-05", "2024-01-08"])
+        df.attrs["adjustment_mode"] = "unknown"
+        with pytest.raises(ValueError, match="adjustment_mode_unknown_in_formal"):
+            store.save_daily(df)
+        assert not store.list_stocks()
 
 
 class TestLoadDaily:
@@ -171,7 +248,7 @@ class TestLoadDaily:
     def test_merge_appends_to_existing_flat(self, tmp_path):
         store = DataStorage(str(tmp_path))
         store.save_daily(_frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0]))
-        store.save_daily(_frame(["2024-01-09"], closes=[12.0]))
+        store.save_daily(_frame(["2024-01-09"], closes=[12.0], prev_close=11.0))
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["close"].tolist() == pytest.approx([10.0, 11.0, 12.0])
 
@@ -247,7 +324,7 @@ class TestSaveDailyRepair:
 
     def test_repair_preserves_existing_provenance(self, tmp_path):
         store = self._saved_with_provenance(tmp_path)
-        store.save_daily_repair(_frame(["2024-01-08", "2024-01-09"], closes=[9.9, 9.8]))
+        store.save_daily_repair(_frame(["2024-01-08", "2024-01-09"], closes=[9.9, 9.8], prev_close=10.0))
         m = store.manifest("000001")
         assert m["source"] == "efinance"
         assert m["adjust"] == "qfq"
@@ -255,15 +332,19 @@ class TestSaveDailyRepair:
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert out["close"].tolist() == pytest.approx([10.0, 9.9, 9.8])
 
-    def test_raw_save_daily_without_attrs_degrades_provenance(self, tmp_path):
-        """Control: a plain save_daily with no attrs would flatten the manifest
-        source to "unknown" — which is exactly what save_daily_repair prevents."""
+    def test_raw_save_daily_without_attrs_refuses_unknown(self, tmp_path):
+        """v13 §五-1: a plain (formal) save_daily with no provenance REFUSES
+        to persist an unknown-adjustment frame instead of degrading the
+        manifest to "unknown" — only save_daily_repair (the migration seam)
+        may carry unknown forward."""
         store = self._saved_with_provenance(tmp_path)
         df = _frame(["2024-01-09"], closes=[9.9])
         df.attrs.clear()
-        store.save_daily(df)
-        m = store.manifest("000001")
-        assert m["source"] == "unknown"
+        with pytest.raises(ValueError, match="adjustment_mode_unknown_in_formal"):
+            store.save_daily(df)
+        # Nothing landed: the file still holds only the original two rows.
+        out = store.load_daily("000001", "2024-01-01", "2024-01-31")
+        assert len(out) == 2
 
     def test_repair_multi_stock_preserves_each(self, tmp_path):
         store = self._saved_with_provenance(tmp_path, code="000001",
@@ -273,8 +354,8 @@ class TestSaveDailyRepair:
         df2.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df2)
         repaired = pd.concat([
-            _frame(["2024-01-09"], code="000001"),
-            _frame(["2024-01-08", "2024-01-09"], code="600519"),
+            _frame(["2024-01-09"], code="000001", prev_close=10.1),
+            _frame(["2024-01-08", "2024-01-09"], code="600519", prev_close=10.0),
         ])
         store.save_daily_repair(repaired)
         assert store.manifest("000001")["source"] == "efinance"
@@ -312,7 +393,7 @@ class TestManifest:
     def test_incremental_merge_updates_manifest(self, tmp_path):
         store = DataStorage(str(tmp_path))
         store.save_daily(_frame(["2024-01-05", "2024-01-08"]))
-        store.save_daily(_frame(["2024-01-09", "2024-01-10"]))
+        store.save_daily(_frame(["2024-01-09", "2024-01-10"], prev_close=10.1))
         m = store.manifest("000001")
         assert m["rows"] == 4
         assert m["start"] == "2024-01-05" and m["end"] == "2024-01-10"
@@ -409,7 +490,7 @@ class TestManifestV9:
         df1.attrs["source"] = "efinance"
         df1.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df1)
-        df2 = _frame(["2024-01-09", "2024-01-10"])
+        df2 = _frame(["2024-01-09", "2024-01-10"], prev_close=10.1)
         df2.attrs["source"] = "baostock"
         df2.attrs["adjustment_mode"] = "qfq"
         store.save_daily(df2)
@@ -449,7 +530,7 @@ class TestManifestV9:
         df1 = _frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0])
         df1.attrs["source"] = "efinance"
         store.save_daily(df1)
-        df2 = _frame(["2024-01-08", "2024-01-09"], closes=[99.0, 12.0])
+        df2 = _frame(["2024-01-08", "2024-01-09"], closes=[99.0, 12.0], prev_close=10.0)
         df2.attrs["source"] = "baostock"
         store.save_daily(df2)
         segs = store.manifest("000001")["source_segments"]
@@ -548,6 +629,19 @@ class TestRequireValidManifest:
         out = DataStorage(str(tmp_path)).load_daily(
             "000001", "2024-01-01", "2024-01-31", require_valid_manifest=True)
         assert out.empty
+
+    def test_raises_on_unknown_basis_even_with_valid_manifest(self, tmp_path):
+        """v13 §五-1: a file whose manifest is valid but whose adjustment basis
+        is unknown passes the manifest cross-check yet is refused by the formal
+        contract validation — a formal read must not trust an unprovable basis."""
+        store = DataStorage(str(tmp_path))
+        legacy = _frame(["2024-01-05", "2024-01-08"])
+        legacy.attrs["adjustment_mode"] = "unknown"
+        store.save_daily_repair(legacy)  # migration seam: valid manifest, unknown basis
+        assert store.validate_manifest("000001")["ok"]
+        with pytest.raises(ValueError, match="adjustment_mode_unknown_in_formal"):
+            store.load_daily("000001", "2024-01-01", "2024-01-31",
+                             require_valid_manifest=True)
 
 
 class TestLockV9:

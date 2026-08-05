@@ -20,6 +20,8 @@ from stoke_ml.data.contract import (
     validate_dates,
     validate_finite,
     validate_ohlc,
+    validate_pct_change,
+    validate_price_volume_amount_consistency,
     validate_primary_key,
     validate_required_metadata,
     validate_schema,
@@ -199,6 +201,27 @@ class TestFinite:
         out = validate_contract(df, DAILY_EQUITY)
         assert len(out) >= 4  # open/high/low/close each below the finite ratio
         assert any("open_finite_ratio" in v for v in out)
+
+    # §五-2 (v13): volume/amount joined DAILY_REQUIRED_FINITE so an all-NaN
+    # volume/amount column is a contract violation, not a validate_units skip.
+    def test_all_nan_volume_fails(self):
+        df = _daily(volume=[np.nan, np.nan, np.nan])
+        out = validate_finite(df, DAILY_EQUITY)
+        assert any("volume_finite_ratio" in v for v in out)
+
+    def test_all_nan_amount_fails(self):
+        df = _daily(amount=[np.nan, np.nan, np.nan])
+        out = validate_finite(df, DAILY_EQUITY)
+        assert any("amount_finite_ratio" in v for v in out)
+
+    def test_all_nan_volume_fails_contract(self):
+        df = _daily(volume=[np.nan, np.nan, np.nan])
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("volume_finite_ratio" in v for v in out)
+
+    def test_partial_nan_volume_above_threshold_fails(self):
+        df = _daily(volume=[1e6, np.nan, 3e6])  # 2/3 finite = 0.667 < 0.99
+        assert any("volume_finite_ratio" in v for v in validate_finite(df, DAILY_EQUITY))
 
 
 class TestOhlc:
@@ -386,6 +409,163 @@ class TestAdjustmentMode:
         )
         out = validate_contract(df, c)
         assert not any("adjustment_mode_mismatch" in v for v in out)
+
+
+class TestFormalAdjustmentMode:
+    """v13 §五-1: the formal contract (canonical write/read paths) closes the
+    legacy seam — a contract that pins a concrete basis must REJECT an
+    ``unknown``/``n/a``/``""`` declaration, while ``formal=False`` (the
+    default) keeps the honest-legacy exemption for migration / audit."""
+
+    def test_formal_rejects_unknown_attrs(self):
+        df = _daily()
+        df.attrs["adjustment_mode"] = "unknown"
+        out = validate_contract(df, DAILY_EQUITY, formal=True)
+        assert "adjustment_mode_unknown_in_formal" in out
+
+    def test_formal_rejects_unknown_manifest(self):
+        df = _daily()
+        df.attrs = {}
+        manifest = {"source": "unknown", "adjust": "unknown"}
+        out = validate_contract(df, DAILY_EQUITY, manifest=manifest, formal=True)
+        assert "adjustment_mode_unknown_in_formal" in out
+
+    def test_formal_rejects_empty_attr(self):
+        df = _daily()
+        df.attrs = {"source": "efinance", "adjustment_mode": ""}
+        out = validate_contract(df, DAILY_EQUITY, formal=True)
+        assert "adjustment_mode_unknown_in_formal" in out
+
+    def test_formal_rejects_unknown_column(self):
+        df = _daily(adjustment_mode=["unknown"] * 3)
+        out = validate_contract(df, DAILY_EQUITY, formal=True)
+        assert "adjustment_mode_unknown_in_formal" in out
+
+    def test_formal_passes_concrete_qfq(self):
+        assert validate_contract(_daily(), DAILY_EQUITY, formal=True) == []
+
+    def test_formal_still_rejects_wrong_concrete(self):
+        df = _daily()
+        df.attrs["adjustment_mode"] = "raw"
+        out = validate_contract(df, DAILY_EQUITY, formal=True)
+        assert any("adjustment_mode_mismatch:raw!=qfq" in v for v in out)
+
+    def test_non_formal_keeps_unknown_exemption(self):
+        """formal=False (default) still treats unknown as honest legacy."""
+        df = _daily()
+        df.attrs["adjustment_mode"] = "unknown"
+        assert validate_contract(df, DAILY_EQUITY) == []
+        assert "adjustment_mode_unknown_in_formal" not in validate_contract(
+            df, DAILY_EQUITY, formal=False)
+
+    def test_formal_n_a_contract_skips(self):
+        """A contract with no concrete adjustment_mode has nothing to enforce."""
+        df = _daily()
+        df.attrs["adjustment_mode"] = "unknown"
+        c = DataContract(
+            dataset_name="custom", primary_key=("id", "ts"),
+            required_columns=("id", "ts", "v"), units={}, price_basis="n/a",
+            timezone="Asia/Shanghai", calendar="x",
+        )
+        out = validate_contract(df, c, formal=True)
+        assert "adjustment_mode_unknown_in_formal" not in out
+
+
+class TestPctChange:
+    """v13 §五-2: pct_change may be NaN only on the first (listing) row; every
+    later row must be finite, and a mid-series NaN is a corruption."""
+
+    def test_first_row_nan_allowed(self):
+        df = _daily(pct_change=[np.nan, 2.0, 3.0])
+        assert validate_pct_change(df, DAILY_EQUITY) == []
+
+    def test_mid_series_nan_fails(self):
+        df = _daily(pct_change=[1.0, np.nan, 3.0])
+        assert validate_pct_change(df, DAILY_EQUITY) == ["pct_change_nan_after_first_row:1"]
+
+    def test_multiple_tail_nan_fails(self):
+        df = _daily(pct_change=[1.0, 2.0, np.nan])
+        assert validate_pct_change(df, DAILY_EQUITY) == ["pct_change_nan_after_first_row:1"]
+
+    def test_all_nan_fails(self):
+        df = _daily(pct_change=[np.nan, np.nan, np.nan])
+        assert validate_pct_change(df, DAILY_EQUITY) == ["pct_change_nan_after_first_row:2"]
+
+    def test_single_row_nan_allowed(self):
+        df = _daily().iloc[0:1]
+        assert validate_pct_change(df, DAILY_EQUITY) == []
+
+    def test_missing_column_reported_by_schema_not_here(self):
+        df = _daily(drop=("pct_change",))
+        assert validate_pct_change(df, DAILY_EQUITY) == []
+        assert any("missing_column:pct_change" in v
+                   for v in validate_contract(df, DAILY_EQUITY))
+
+    def test_contract_wires_pct_change(self):
+        df = _daily(pct_change=[1.0, np.nan, 3.0])
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("pct_change_nan_after_first_row" in v for v in out)
+
+    def test_non_daily_contract_skips(self):
+        c = DataContract(
+            dataset_name="custom", primary_key=("id", "ts"),
+            required_columns=("id", "ts", "v"), units={}, price_basis="n/a",
+            timezone="Asia/Shanghai", calendar="x",
+        )
+        df = pd.DataFrame({"id": [1], "ts": ["a"], "v": [1.0], "pct_change": [np.nan]})
+        assert validate_pct_change(df, c) == []
+
+
+class TestPriceVolumeAmount:
+    """v13 §五-3: weak economic check — amount/volume (VWAP) must sit within a
+    100× band of close.  Flags unit corruption, not intraday noise."""
+
+    def test_clean_passes(self):
+        # amount = 1e7, volume = 1e6 → implied 10 ≈ close ~10.
+        assert validate_price_volume_amount_consistency(_daily(), DAILY_EQUITY) == []
+
+    def test_amount_scaled_wrong_fails(self):
+        # amount 1e4 instead of 1e7 → implied 0.01, 1000× below close.
+        df = _daily(amount=[1e4, 2e4, 3e4])
+        out = validate_price_volume_amount_consistency(df, DAILY_EQUITY)
+        assert any("amount_volume_unit_mismatch" in v for v in out)
+
+    def test_volume_scaled_wrong_fails(self):
+        # volume in 手 (÷100) instead of 股 → implied = amount/volume = 100 ×
+        # true VWAP ≈ 1000, but close ≈ 10 so implied ~2000 is 200× above close
+        # (strictly beyond the 100× band) → flagged as a unit mismatch.
+        df = _daily(volume=[5e3, 1e4, 1.5e4])  # 200× smaller volume than 股
+        out = validate_price_volume_amount_consistency(df, DAILY_EQUITY)
+        assert any("amount_volume_unit_mismatch" in v for v in out)
+
+    def test_zero_volume_rows_skipped(self):
+        df = _daily(volume=[0.0, 2e6, 3e6], amount=[0.0, 2e7, 3e7])
+        assert validate_price_volume_amount_consistency(df, DAILY_EQUITY) == []
+
+    def test_nan_rows_skipped(self):
+        df = _daily(amount=[np.nan, 2e7, 3e7])
+        assert validate_price_volume_amount_consistency(df, DAILY_EQUITY) == []
+
+    def test_contract_wires_consistency(self):
+        df = _daily(amount=[1e4, 2e7, 3e7])
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("amount_volume_unit_mismatch" in v for v in out)
+
+    def test_missing_columns_deferred_to_schema(self):
+        df = _daily(drop=("amount",))
+        assert validate_price_volume_amount_consistency(df, DAILY_EQUITY) == []
+        assert any("missing_column:amount" in v
+                   for v in validate_contract(df, DAILY_EQUITY))
+
+    def test_non_daily_contract_skips(self):
+        c = DataContract(
+            dataset_name="custom", primary_key=("id", "ts"),
+            required_columns=("id", "ts", "v"), units={}, price_basis="n/a",
+            timezone="Asia/Shanghai", calendar="x",
+        )
+        df = pd.DataFrame({"id": [1], "ts": ["a"], "v": [1.0],
+                           "close": [10.0], "volume": [1e6], "amount": [1e4]})
+        assert validate_price_volume_amount_consistency(df, c) == []
 
 
 class TestCalendarMembership:

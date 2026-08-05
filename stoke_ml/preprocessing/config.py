@@ -7,6 +7,7 @@ PreprocessingChains for each text/numeric source.
 from __future__ import annotations
 
 import logging
+import os
 
 from stoke_ml.preprocessing.base import PreprocessingChain
 from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
@@ -29,6 +30,22 @@ from stoke_ml.preprocessing.monitor import QualityMonitor, DriftMonitor
 from stoke_ml.preprocessing.registry import FeatureRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _anchor_to_root(path: str) -> str:
+    """Anchor a relative config path to the project root (§十一).
+
+    ``load_config()`` already resolves config.yaml path keys to absolute paths;
+    this catches the code-level defaults (registry / topic cache dir) so a
+    config dict that omits them is still CWD-independent.  Absolute, ``$VAR``
+    env-expanded, and ``~`` home-expanded paths pass through unchanged.
+    """
+    s = os.path.expandvars(os.path.expanduser(path))
+    if os.path.isabs(s):
+        return s
+    from stoke_ml.config import get_project_root
+    return str(get_project_root() / s)
+
 
 _STEP_REGISTRY = {
     "BipolarClassifier": BipolarClassifier,
@@ -133,7 +150,9 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
             enabled=True,
             n_topics=topic_cfg.get("n_topics", "auto"),
             min_topic_size=topic_cfg.get("min_topic_size", 50),
-            model_cache_dir=topic_cfg.get("model_cache_dir", "models/bertopic"),
+            model_cache_dir=_anchor_to_root(
+                topic_cfg.get("model_cache_dir", "models/bertopic")
+            ),
             embedding_model=topic_cfg.get("embedding_model", "finbert"),
             corpus_cutoff=topic_cfg.get("corpus_cutoff"),
         )
@@ -258,7 +277,9 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
         )
     reg_cfg = pp_cfg.get("registry", {})
     if reg_cfg.get("enabled", False):
-        reg_path = pp_cfg.get("registry_path", "models/features/feature_registry.json")
+        reg_path = _anchor_to_root(
+            pp_cfg.get("registry_path", "models/features/feature_registry.json")
+        )
         pp._registry = FeatureRegistry.load(reg_path)
 
     return pp

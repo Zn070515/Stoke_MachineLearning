@@ -52,6 +52,21 @@ def _read_universe_parquet(data_dir: str, name: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def universe_status_available(data_dir: str) -> bool:
+    """True iff the PIT listing/delisting artifact exists on disk.
+
+    ``load_universe_status`` needs at least one of ``ipo.parquet`` /
+    ``delisted.parquet`` under ``{data_dir}/a_shares/universe/`` to answer
+    per-stock lifecycle windows (§P0-3).  When neither exists a long-history
+    request cannot be clipped to a stock's own list/delist dates, so download
+    must not pretend it covers a pre-IPO range (§九-3).
+    """
+    base = os.path.join(data_dir, "a_shares", "universe")
+    return os.path.isfile(os.path.join(base, "ipo.parquet")) or os.path.isfile(
+        os.path.join(base, "delisted.parquet")
+    )
+
+
 def _delisted_codes(delisted: pd.DataFrame) -> pd.Series:
     """Canonical codes from the new-format ``stock_code`` column, else the legacy
     Chinese ``公司代码`` (SSE rows have no stock_code)."""

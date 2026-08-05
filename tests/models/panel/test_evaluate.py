@@ -1681,7 +1681,9 @@ class TestContinuousOosReplay:
                     universe_status_hash="u", membership_hash="m",
                     calendar_hash=None, evaluator_version=None,
                     price_convention=None, exit_policy=None,
-                    strategy_mode=None):
+                    strategy_mode=None,
+                    model_source_hash=None, model_config_hash=None,
+                    feature_schema_hash=None, weight_hash="test"):
         kw = dict(decision_eligible=pool, history_eligible=pool, pool=pool,
                   entry_eligible=np.ones_like(pool),
                   return_target_mask=np.ones_like(pool),
@@ -1693,15 +1695,19 @@ class TestContinuousOosReplay:
                   data_version=data_version,
                   universe_status_hash=universe_status_hash,
                   membership_hash=membership_hash,
-                  model_hash="test", weight_hash="test")
-        # §十五-1/§十五-2: the policy + full metadata keys a FORMAL replay
-        # requires.  Omitted by default so legacy-behaviour tests (missing
-        # keys → tolerated in non-formal mode) keep exercising that path.
+                  model_hash="test", weight_hash=weight_hash)
+        # §十五-1/§十五-2/§十六: the policy + full metadata + model-identity
+        # keys a FORMAL replay requires.  Omitted by default so legacy-behaviour
+        # tests (missing keys → tolerated in non-formal mode) keep exercising
+        # that path.
         for k, v in [("calendar_hash", calendar_hash),
                      ("evaluator_version", evaluator_version),
                      ("price_convention", price_convention),
                      ("exit_policy", exit_policy),
-                     ("strategy_mode", strategy_mode)]:
+                     ("strategy_mode", strategy_mode),
+                     ("model_source_hash", model_source_hash),
+                     ("model_config_hash", model_config_hash),
+                     ("feature_schema_hash", feature_schema_hash)]:
             if v is not None:
                 kw[k] = v
         if delist_day is not None:
@@ -2033,7 +2039,9 @@ class TestContinuousOosReplay:
                 evaluator_version="ev1", price_convention="open_to_open",
                 exit_policy="scheduled_horizon_delayed_delist_force_sell",
                 strategy_mode="long_top_fraction",
-                delist_day=np.array([-1], dtype=int))
+                delist_day=np.array([-1], dtype=int),
+                model_source_hash="src1", model_config_hash="cfg1",
+                feature_schema_hash="feat1")
 
         cont = _replay_continuous_oos(str(tmp_path), formal=True)
         assert cont is not None
@@ -2109,10 +2117,126 @@ class TestContinuousOosReplay:
                 evaluator_version="ev1", price_convention="open_to_open",
                 exit_policy="scheduled_horizon_delayed_delist_force_sell",
                 strategy_mode="long_top_fraction",
-                delist_day=np.array([-1], dtype=int))
+                delist_day=np.array([-1], dtype=int),
+                model_source_hash="src1", model_config_hash="cfg1",
+                feature_schema_hash="feat1")
         cont = _replay_continuous_oos(
             str(tmp_path), model_name="lgbm", formal=True)
         assert cont is not None
         assert cont["account"]["final_nav"] > 0
         # Without the filter the default scan must NOT pick up these tapes.
         assert _replay_continuous_oos(str(tmp_path), formal=True) is None
+
+    # §十六: the MODEL identity (source / config / feature-schema hashes) must
+    # be identical across folds in formal replay; only `weight_hash` (the actual
+    # trained parameters) is allowed to differ.  A "first two folds VSN+xLSTM,
+    # last three plain LSTM" switch must be refused, not silently blended.
+
+    _MODEL_META = dict(
+        data_version="test", universe_status_hash="u", membership_hash="m",
+        calendar_hash="c1", evaluator_version="ev1",
+        price_convention="open_to_open",
+        exit_policy="scheduled_horizon_delayed_delist_force_sell",
+        strategy_mode="long_top_fraction",
+        delist_day=np.array([-1], dtype=int),
+    )
+
+    def _model_meta_tape(self, tmp_path, sl, meta, **overrides):
+        """One fold tape over dates[sl] with full formal metadata + model hashes."""
+        dates = [f"2025-01-{d:02d}" for d in range(1, 5)]
+        close = np.arange(10, 14, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / sl[0]),
+            stocks=["000001"], dates=dates[sl[1]:sl[2]],
+            price_dates=dates[sl[1]:sl[2]],
+            preds=np.ones((1, sl[2] - sl[1]), dtype=np.float32),
+            pool=np.ones((1, sl[2] - sl[1]), dtype=bool),
+            close=np.stack([close[sl[1]:sl[2]]]),
+            open=np.stack([close[sl[1]:sl[2]]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            **meta, **overrides)
+
+    def test_mixed_model_config_hash_fails(self, tmp_path):
+        """§十六: folds trained under DIFFERENT hyper-parameter configs (e.g.
+        backbone VSN+xLSTM vs plain LSTM) must be refused in formal replay."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg-vsn",
+                              feature_schema_hash="feat1")
+        self._model_meta_tape(tmp_path, ("fold_001.npz", 2, 4),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg-lstm",
+                              feature_schema_hash="feat1")
+        with pytest.raises(ValueError, match="model_config_hash"):
+            _replay_continuous_oos(str(tmp_path), formal=True)
+
+    def test_mixed_model_source_hash_fails(self, tmp_path):
+        """§十六: folds produced by DIFFERENT architecture/training code must be
+        refused in formal replay (a mid-run code edit is a model switch)."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src-a", model_config_hash="cfg1",
+                              feature_schema_hash="feat1")
+        self._model_meta_tape(tmp_path, ("fold_001.npz", 2, 4),
+                              dict(self._MODEL_META),
+                              model_source_hash="src-b", model_config_hash="cfg1",
+                              feature_schema_hash="feat1")
+        with pytest.raises(ValueError, match="model_source_hash"):
+            _replay_continuous_oos(str(tmp_path), formal=True)
+
+    def test_mixed_feature_schema_hash_fails(self, tmp_path):
+        """§十六: folds built on DIFFERENT feature schemas must be refused in
+        formal replay (a feature-column edit between runs changes the input)."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat-a")
+        self._model_meta_tape(tmp_path, ("fold_001.npz", 2, 4),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat-b")
+        with pytest.raises(ValueError, match="feature_schema_hash"):
+            _replay_continuous_oos(str(tmp_path), formal=True)
+
+    def test_formal_replay_refuses_missing_model_identity_field(self, tmp_path):
+        """§十六: a tape missing ANY model-identity key fails FORMAL replay (a
+        legacy tape must never be silently blended), while non-formal keeps the
+        legacy tolerance."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat1")
+        self._model_meta_tape(tmp_path, ("fold_001.npz", 2, 4),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", feature_schema_hash="feat1")
+        # Non-formal: the missing model_config_hash key is tolerated.
+        assert _replay_continuous_oos(str(tmp_path)) is not None
+        # Formal: missing required model_config_hash → hard failure.
+        with pytest.raises(ValueError, match="model_config_hash"):
+            _replay_continuous_oos(str(tmp_path), formal=True)
+
+    def test_weight_hash_may_differ_across_folds(self, tmp_path):
+        """§十六: `weight_hash` (the actual trained parameters) is ALLOWED to
+        differ per fold — every fold's tape maps to its own fold_XXX_model.pt —
+        so a formal replay accepts folds with distinct weight hashes."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat1", weight_hash="w-a")
+        self._model_meta_tape(tmp_path, ("fold_001.npz", 2, 4),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat1", weight_hash="w-b")
+        cont = _replay_continuous_oos(str(tmp_path), formal=True)
+        assert cont is not None
+        assert cont["account"]["final_nav"] > 0

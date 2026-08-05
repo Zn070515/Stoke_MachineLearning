@@ -345,6 +345,40 @@ class TradingCalendar:
         return candidate
 
 
+def get_research_calendar(
+    market: str = "a_shares",
+    strict: bool = False,
+    data_dir: str | pathlib.Path | None = None,
+) -> TradingCalendar:
+    """Construct a TradingCalendar backed by the external calendar artifact.
+
+    Single source of truth for research flows (§八): every formal consumer —
+    feature date cleaning, preprocessing, topic cutoff mapping, OOS train —
+    goes through this factory so one frozen ``exchange_calendar`` artifact is
+    used repo-wide instead of each module silently building a hardcoded
+    default calendar.  ``data_dir`` is the project data root containing
+    ``exchange_calendar/{market}.parquet``; when omitted it is resolved lazily
+    from ``stoke_ml.config.load_config()["project"]["data_dir"]`` (imported
+    inside the function to avoid module-level circular imports and import cost
+    at calendar-import time).
+
+    ``strict=True`` makes the calendar FAIL on any query past the artifact's
+    ``verified_until`` (forward estimates are not verified exchange fact) —
+    use for formal research/OOS paths.  Non-strict (default) preserves
+    downloader/scheduling behaviour and lets PIT mapping walk into the future.
+
+    When the artifact is absent the calendar transparently falls back to the
+    code-derived holiday set (the artifact is generated from that same code,
+    so semantics are identical) — the factory does not raise.  ``TradingCalendar``
+    itself remains directly constructible for tests/downloaders that want the
+    artifact-free calendar.
+    """
+    if data_dir is None:
+        from stoke_ml.config import load_config  # lazy: avoid circular import
+        data_dir = load_config()["project"]["data_dir"]
+    return TradingCalendar(market, calendar_dir=data_dir, strict=strict)
+
+
 # ── External calendar artifact ───────────────────────────────────────────────
 # The calendar is published as a self-describing parquet so consumers never
 # parse holiday rules themselves.  `build_calendar_frame` materializes it from

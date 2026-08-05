@@ -74,6 +74,8 @@ def write_manifest(
     complete: set[str],
     success_count: int,
     skipped_existing_count: int = 0,
+    universe_status: str | None = None,
+    bounded_reason: str | None = None,
 ) -> dict:
     """Persist a download-run manifest and return it.
 
@@ -103,7 +105,20 @@ def write_manifest(
     bounded = bool(
         requested_end and effective_end and requested_end > effective_end
     )
-    status_field = status or ("bounded_complete" if bounded else "complete")
+    if status is not None:
+        # Explicit caller status wins — kept for migration / in-progress use.
+        status_field = status
+    elif len(missing) == 0 and len(failed) == 0:
+        # Every requested unit is complete (and none failed) → the only honest
+        # status is a full-completion one.  §九-1: a bounded end never claims a
+        # date range no source can serve (§七-2).
+        status_field = "bounded_complete" if bounded else "complete"
+    else:
+        # Un-reconciled missing/failed units: nothing landed → "failed", else
+        # the run only partially covered its request → "partial".  §九-1: this
+        # replaces the old derivation that read ONLY `bounded` and so reported
+        # "complete" for a run that silently dropped failed stocks.
+        status_field = "failed" if len(complete) == 0 else "partial"
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -128,6 +143,13 @@ def write_manifest(
             len(missing) == 0 and status_field == "complete"
         ),
     }
+    # §九-3: honesty about universe coverage.  When the PIT listing/delisting
+    # artifact is absent the run cannot claim to cover a stock's pre-IPO
+    # window, so it records the fact rather than pretending full coverage.
+    if universe_status is not None:
+        manifest["universe_status"] = universe_status
+    if bounded_reason is not None:
+        manifest["bounded_reason"] = bounded_reason
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)

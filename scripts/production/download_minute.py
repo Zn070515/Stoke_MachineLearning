@@ -23,6 +23,7 @@ from datetime import datetime
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.minute_source import MinuteSource
 from stoke_ml.data.sources.a_shares.minute_source_sina_direct import SinaDirectMinuteSource
 from stoke_ml.data.sources.a_shares.minute_source_tencent import TencentMinuteSource
@@ -162,7 +163,7 @@ def main():
     _LOG_FILE = open(log_path, "w", encoding="utf-8", buffering=1)
 
     if args.stock_list:
-        codes = [c.strip() for c in args.stock_list.split(",")]
+        codes = parse_stock_codes_arg(args.stock_list)
     else:
         limit = None if args.all else (args.stocks or 500)
         codes = discover_stocks(data_dir, limit)

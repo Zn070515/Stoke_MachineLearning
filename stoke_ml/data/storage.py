@@ -51,7 +51,7 @@ import uuid
 import pandas as pd
 
 from stoke_ml.data.calendar import VERIFIED_UNTIL, TradingCalendar
-from stoke_ml.data.codes import normalize_stock_code_series
+from stoke_ml.data.codes import is_a_share_equity_code, normalize_stock_code_series
 from stoke_ml.data.contract import RESEARCH_QFQ_DAILY, validate_contract
 
 _LOCK_TIMEOUT = 30.0  # seconds to wait for a concurrent writer
@@ -355,7 +355,7 @@ class DataStorage:
         return os.path.join(self._root, market, "daily")
 
     def save_daily(self, df: pd.DataFrame, market: str = "a_shares",
-                   run_id: str | None = None):
+                   run_id: str | None = None, *, formal: bool = True):
         """Non-destructively merge ``df`` into ``daily/{code}.parquet``.
 
         Existing rows (by ``date``) are kept on last-write-wins, new rows are
@@ -371,6 +371,13 @@ class DataStorage:
         so a frame that violates the contract (or a basis that would splice
         onto a legacy ``unknown`` history) is refused instead of persisted: a
         manifest that matches a corrupt file is still corrupt.
+
+        ``formal=True`` (v13 §五-1/§十) — the default for the canonical write
+        path — enforces the strict contract: an ``unknown`` adjustment basis is
+        refused, and only A-share common-equity codes (``is_a_share_equity_code``)
+        may become canonical daily files.  ``formal=False`` keeps the legacy
+        ``unknown`` exemption and is used only by the explicit migration seam
+        :meth:`save_daily_repair`.
         """
         if "stock_code" not in df.columns:
             raise ValueError("save_daily: frame has no stock_code column")
@@ -390,6 +397,17 @@ class DataStorage:
                 f"{offenders} — refusing to write a corrupted canonical key"
             )
         df = df.assign(stock_code=norm)
+        # §十 (v13): the canonical daily store only holds A-share common equity.
+        # A format-legal but non-equity code (100xxx index, 200xxx/900xxx B-share,
+        # 500xxx fund) must not become a canonical daily file.
+        non_equity = norm.map(lambda c: not is_a_share_equity_code(c))
+        if non_equity.any():
+            offenders = sorted({str(c) for c in norm[non_equity].tolist()})[:5]
+            raise ValueError(
+                f"save_daily: {int(non_equity.sum())} non-A-share-equity "
+                f"stock_code value(s) {offenders} — the canonical daily store "
+                f"only accepts A-share common stocks"
+            )
         drop_cols = [c for c in ("year", "month") if c in df.columns]
         base = self._daily_dir(market)
         os.makedirs(base, exist_ok=True)
@@ -469,6 +487,7 @@ class DataStorage:
                 violations = validate_contract(
                     combined, RESEARCH_QFQ_DAILY, code=code,
                     trading_days=trading_days, manifest=old_manifest,
+                    formal=formal,
                 )
                 if violations:
                     raise ValueError(
@@ -485,6 +504,7 @@ class DataStorage:
                 rt_violations = validate_contract(
                     back, RESEARCH_QFQ_DAILY, code=code,
                     trading_days=trading_days, manifest=old_manifest,
+                    formal=formal,
                 )
                 if rt_violations:
                     raise ValueError(
@@ -531,12 +551,17 @@ class DataStorage:
         so a raw :meth:`save_daily` would degrade the manifest provenance to the
         ``attrs`` default.  This preserves the current attribution for every
         stock in ``df`` before routing through :meth:`save_daily`.
+
+        Repair is the explicit legacy-migration seam, so it routes with
+        ``formal=False`` (v13 §五-1): a file whose honest provenance is
+        ``unknown`` may still be repaired / re-persisted, while a fresh
+        canonical write (the default ``formal=True`` path) refuses it.
         """
         for code, group in df.groupby("stock_code"):
             m = self.manifest(code, market)
             group.attrs["source"] = (m or {}).get("source", "unknown")
             group.attrs["adjustment_mode"] = (m or {}).get("adjust", "unknown")
-            self.save_daily(group, market=market, run_id=run_id)
+            self.save_daily(group, market=market, run_id=run_id, formal=False)
 
     def load_daily(
         self, stock_code: str, start_date: str, end_date: str,
@@ -547,11 +572,21 @@ class DataStorage:
         ``require_valid_manifest=True`` (formal reads) raises if the
         file exists but its contract manifest is missing, stale or mismatched,
         instead of silently reading a possibly-corrupt parquet.
+
+        Formal reads are also the second enforcement point of the strict
+        contract (v13 §五-1/§十): the code must be an A-share common-equity
+        code and the frame must survive ``validate_contract(..., formal=True)``
+        — an ``unknown`` adjustment basis on disk is refused, not read.
         """
         flat_path = os.path.join(self._daily_dir(market), f"{stock_code}.parquet")
         if not os.path.isfile(flat_path):
             return pd.DataFrame()
         if require_valid_manifest:
+            if not is_a_share_equity_code(stock_code):
+                raise ValueError(
+                    f"refusing to read {stock_code} with require_valid_manifest=True: "
+                    f"not an A-share common-equity code"
+                )
             report = self.validate_manifest(stock_code, market)
             if not report["ok"]:
                 raise ValueError(
@@ -560,6 +595,15 @@ class DataStorage:
                 )
         result = pd.read_parquet(flat_path)
         result["date"] = pd.to_datetime(result["date"])
+        if require_valid_manifest:
+            violations = validate_contract(
+                result, RESEARCH_QFQ_DAILY, code=stock_code, formal=True,
+            )
+            if violations:
+                raise ValueError(
+                    f"refusing to read {stock_code} with require_valid_manifest=True: "
+                    f"{'; '.join(violations[:8])}"
+                )
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
         mask = (result["date"] >= start) & (result["date"] <= end)

@@ -49,10 +49,11 @@ class EarningsStorage:
     """Per-stock daily view over accumulated earnings announcement snapshots."""
 
     def __init__(self, data_dir: str):
-        from stoke_ml.data.calendar import TradingCalendar
+        from stoke_ml.data.calendar import get_research_calendar
 
         self._dir = os.path.join(data_dir, "a_shares", "earnings")
-        self._calendar = TradingCalendar()
+        # Artifact-backed calendar from this storage's own data root.
+        self._calendar = get_research_calendar(data_dir=data_dir)
         self._snap: pd.DataFrame | None = None
 
     # ── snapshot loading / normalization ────────────────────────────────

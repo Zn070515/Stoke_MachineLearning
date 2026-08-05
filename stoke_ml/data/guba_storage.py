@@ -11,7 +11,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,8 @@ class GubaStorage:
 
     def __init__(self, data_dir: str, calendar: TradingCalendar | None = None):
         self._root = data_dir
-        self._calendar = calendar or TradingCalendar("a_shares")
+        # Artifact-backed calendar from this storage's own data root.
+        self._calendar = calendar or get_research_calendar(data_dir=self._root)
         os.makedirs(data_dir, exist_ok=True)
 
     # ── paths ──────────────────────────────────────────────────────

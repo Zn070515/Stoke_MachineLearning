@@ -200,6 +200,68 @@ class TestStrictMode:
         assert isinstance(result, pd.DataFrame)
 
 
+class TestFormalStrictDefault:
+    """§十二: formal mode is STRICT by default — error-level quality problems
+    raise (block) unless the caller explicitly opts out with
+    allow_degraded=True.  `strict` remains the independent always-block switch
+    that wins even when allow_degraded is set.  The non-formal path keeps its
+    legacy degrade-silently semantics."""
+
+    def _pipeline_with_monitor(self, **qm_kwargs):
+        pp = PreprocessingPipeline()
+        pp.register_chain("numeric", PreprocessingChain([], name="numeric"))
+        pp._quality_monitor = QualityMonitor(**qm_kwargs)
+        return pp
+
+    @staticmethod
+    def _bad_df():
+        return pd.DataFrame({"x": [1.0] + [np.inf] * 9})
+
+    @staticmethod
+    def _clean_df():
+        return pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+
+    def test_formal_default_raises_on_error(self):
+        """formal=True with no allow_degraded blocks degraded output."""
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        with pytest.raises(PreprocessingQualityError):
+            pp.run("numeric", self._bad_df(), formal=True)
+
+    def test_formal_allow_degraded_returns_staged_output(self):
+        """formal=True + allow_degraded=True writes the degraded artifact."""
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        result = pp.run("numeric", self._bad_df(),
+                        formal=True, allow_degraded=True)
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == len(self._bad_df())
+
+    def test_formal_clean_data_no_raise(self):
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        result = pp.run("numeric", self._clean_df(), formal=True)
+        assert len(result) == 5
+
+    def test_explicit_strict_wins_over_allow_degraded(self):
+        """--strict is the explicit always-block switch even when
+        --allow-degraded is also given."""
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        with pytest.raises(PreprocessingQualityError):
+            pp.run("numeric", self._bad_df(),
+                   formal=True, allow_degraded=True, strict=True)
+
+    def test_non_formal_preserves_legacy_semantics(self):
+        """No formal, no strict → errors log but do not block (old behaviour)."""
+        pp = self._pipeline_with_monitor(missing_error_threshold=0.5)
+        result = pp.run("numeric", self._bad_df())
+        assert isinstance(result, pd.DataFrame)
+
+    def test_formal_no_monitor_is_noop(self):
+        """formal without a monitor attached cannot detect issues — returns."""
+        pp = PreprocessingPipeline()
+        pp.register_chain("numeric", PreprocessingChain([], name="numeric"))
+        result = pp.run("numeric", self._bad_df(), formal=True)
+        assert isinstance(result, pd.DataFrame)
+
+
 class TestFormalScope:
     """§十-1: formal full-history preprocessing refuses fold_train_only steps.
 

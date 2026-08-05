@@ -19,6 +19,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.download_resume import (
     evidence_says_complete,
     mark_stock_result,
@@ -91,7 +92,7 @@ def main():
         args.sleep = float(cfg.crawler.rate_limit.base_delay_sec)
 
     if args.stocks:
-        codes = [c.strip() for c in args.stocks.split(",")]
+        codes = parse_stock_codes_arg(args.stocks)
     else:
         codes = get_stocks_from_disk(data_dir)
 

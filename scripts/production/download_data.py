@@ -13,6 +13,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data import universe
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.codes import normalize_stock_code_series
+from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.download_manifest import default_path, write_manifest
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.sources.a_shares.failover import AShareDownloader
@@ -200,6 +201,9 @@ def main():
                         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--stocks", type=str, default=None,
                         help="Comma-separated stock codes (default: from config universe)")
+    parser.add_argument("--require-universe-status", action="store_true",
+                        help="Fail the run when the PIT listing/delisting artifact "
+                             "is absent (recommended for long-history downloads)")
     parser.add_argument("--sleep", type=float, default=0.0,
                         help="Seconds between stocks (default: 0)")
     parser.add_argument("--indices", type=str, default=None,
@@ -225,7 +229,10 @@ def main():
     end_date = args.end or _last_fully_closed_trading_day(_cal).strftime("%Y-%m-%d")
 
     if args.stocks:
-        codes = [c.strip() for c in args.stocks.split(",")]
+        # §九-2: every --stocks entry is normalized to its canonical six-digit
+        # code (SH600001 / 600001.SH / 600001 all collapse to "600001") so the
+        # requested universe, filters and manifest share one key space.
+        codes = parse_stock_codes_arg(args.stocks)
     elif args.all_stocks:
         codes = get_all_a_share_codes(cfg.project.data_dir)
     elif args.indices:
@@ -236,6 +243,33 @@ def main():
     if not codes:
         logger.error("No stock codes to download.")
         sys.exit(1)
+
+    # §九-3: without the PIT listing/delisting artifact, a long-history request
+    # cannot be clipped to each stock's own lifecycle (a 2018 IPO is not
+    # fetchable from 2000), so the run either refuses (--require-universe-status)
+    # or records the fact honestly instead of pretending pre-IPO coverage.
+    universe_status_ok = universe.universe_status_available(cfg.project.data_dir)
+    if not universe_status_ok:
+        if args.require_universe_status:
+            logger.error(
+                "UNIVERSE STATUS ARTIFACT MISSING: no ipo.parquet/delisted.parquet "
+                "under %s — cannot clip requests to listing/delisting dates; "
+                "refusing the long-history download (--require-universe-status). "
+                "Run download_ipo_st.py first.",
+                os.path.join(cfg.project.data_dir, "a_shares", "universe"),
+            )
+            sys.exit(1)
+        logger.warning(
+            "!!! UNIVERSE STATUS ARTIFACT MISSING !!!\n"
+            "No ipo.parquet/delisted.parquet under %s — the run CANNOT clip each "
+            "stock's history to its own listing/delisting dates, so a requested "
+            "range may include pre-IPO / post-delist days that will never be "
+            "covered. The run manifest records universe_status=absent and "
+            "bounded_reason=no_ipo_delist_artifact. For long-history downloads "
+            "re-run with --require-universe-status once download_ipo_st.py has "
+            "produced the artifact.",
+            os.path.join(cfg.project.data_dir, "a_shares", "universe"),
+        )
 
     # §P0-4: the run manifest must answer "is the ENTIRE requested universe
     # complete?", so the original request is captured before --skip-existing
@@ -307,6 +341,12 @@ def main():
             complete=complete_all,
             success_count=success,
             skipped_existing_count=n_skipped,
+            universe_status=(
+                None if universe_status_ok else "absent"
+            ),
+            bounded_reason=(
+                None if universe_status_ok else "no_ipo_delist_artifact"
+            ),
         )
 
     # §七-1: per-code try/except/finally — one bad stock (provider crash, disk

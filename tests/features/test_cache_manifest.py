@@ -409,6 +409,101 @@ class TestPaths:
             str(tmp_path), "a_shares", "etf_flow"
         )
 
+    def test_market_env_lineage_path_matches_aux_aligner(self, tmp_path):
+        """§P1-10 regression: the market_env shared-input path must be the
+        SAME file aux_aligner._merge_market_env actually reads — previously it
+        missed the ``market_breadth`` subdir, so the lineage fingerprint was
+        None forever and a market-env change never invalidated a stale cache.
+
+        Asserting the constant here pins it to the real read path, AND the
+        fingerprint of a real file written at that path must be non-None (a
+        lineage path that cannot resolve its own file is a silent no-op)."""
+        assert cache_manifest.SHARED_FILES["market_env"] == \
+            ("a_shares", "market_breadth", "market_env_daily.parquet")
+        data_dir = str(tmp_path / "data")
+        paths = cache_manifest.source_paths(data_dir, "600519")
+        assert paths["market_env"] == os.path.join(
+            data_dir, "a_shares", "market_breadth", "market_env_daily.parquet"
+        )
+        # Fingerprint None (absent) → write the real file → non-None.
+        assert cache_manifest._input_fingerprint(
+            "market_env", paths["market_env"]) is None
+        _write_parquet(paths["market_env"], rows=9)
+        cache_manifest._shared_fingerprint.cache_clear()
+        assert cache_manifest._input_fingerprint(
+            "market_env", paths["market_env"]) is not None
+
+
+class TestManifestDetailed:
+    """§六: manifest_matches_detailed returns structured failure reasons — one
+    stable identifier per lineage entry that went stale, for triage/dashboards."""
+
+    @staticmethod
+    def _setup(tmp_path):
+        return TestManifest()._setup(tmp_path)
+
+    def test_valid_returns_no_reasons(self, tmp_path):
+        data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
+        assert cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash,
+        ) == (True, [])
+
+    def test_commit_change_reports_code_changed(self, tmp_path):
+        data_dir, feature, mpath, cfg, cfg_hash, _commit = self._setup(tmp_path)
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, "other-commit", cfg_hash,
+        )
+        assert not ok
+        assert "code_changed" in reasons
+
+    def test_config_change_reports_config_changed(self, tmp_path):
+        data_dir, feature, mpath, cfg, _cfg_hash, commit = self._setup(tmp_path)
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, commit, "deadbeef",
+        )
+        assert not ok
+        assert "config_changed" in reasons
+
+    def test_schema_change_reports_schema_changed(self, tmp_path):
+        data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
+        _write_parquet(feature, cols=("date", "f1", "f2", "f3"))
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        assert not ok
+        assert "schema_changed" in reasons
+
+    def test_shared_input_change_reports_shared_input_changed(self, tmp_path):
+        data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
+        macro = os.path.join(data_dir, "a_shares", "macro", "macro_daily.parquet")
+        _write_parquet(macro)
+        cache_manifest._shared_fingerprint.cache_clear()
+        # Manifest recorded macro as None (absent); now it exists → mismatch.
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        assert not ok
+        assert "shared_input_changed" in reasons
+
+    def test_range_change_reports_range_changed(self, tmp_path):
+        data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
+        cfg = _base_config(start="1999-01-01", end="2026-01-01")
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        assert not ok
+        assert "range_changed" in reasons
+
+    def test_missing_manifest_reports_manifest_missing(self, tmp_path):
+        data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
+        gone = os.path.join(str(tmp_path / "out"), ".manifests", "000001.json")
+        os.unlink(gone)
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            gone, "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        assert not ok
+        assert "manifest_missing" in reasons
+
 
 class TestSharedInputs:
     """§十-1: market-wide shared inputs (macro / market-env / industry /

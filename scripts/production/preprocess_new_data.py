@@ -102,7 +102,8 @@ def get_stocks_from_daily(data_dir: str) -> list[str]:
     return sorted(codes)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI parser (exposed for tests)."""
     parser = argparse.ArgumentParser(
         description="Preprocess new data types through multi-shape pipeline",
     )
@@ -126,6 +127,11 @@ def main():
                         help="Block stocks whose output fails error-level quality "
                              "checks or whose daily K-line context cannot be loaded; "
                              "never persist degraded output")
+    parser.add_argument("--allow-degraded", action="store_true",
+                        help="§十二: explicit opt-out from the formal-mode default "
+                             "strictness — quality problems are logged and degraded "
+                             "output is written instead of blocking.  Only meaningful "
+                             "in formal mode; --strict still wins when both are given.")
     parser.add_argument("--no-formal", action="store_true",
                         help="§九-1: allow fold_train_only chains on the offline "
                              "full-history path (dev smoke only; production runs "
@@ -142,10 +148,24 @@ def main():
              "onto history.  Defaults to the snapshot file's mtime.  Ignored "
              "when sector_membership.parquet (genuine PIT) exists (§十-4).",
     )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.end is None:
         args.end = datetime.now().strftime("%Y-%m-%d")
+
+    # §十二: formal full-history preprocessing is STRICT by default — error-level
+    # quality problems BLOCK and nothing is persisted (no degraded artifact).
+    # --allow-degraded explicitly opts out so the caller may write degraded
+    # output; --strict remains the explicit "always block" switch (also effective
+    # in the --no-formal dev path).  The effective flag is passed down as the
+    # daily-K-line-load block decision; pp.run() additionally receives
+    # formal/allow_degraded so the quality gate is enforced at the pipeline layer.
+    strict = args.strict or (not args.no_formal and not args.allow_degraded)
 
     cfg = load_config()
     data_dir = cfg.project.data_dir
@@ -186,18 +206,20 @@ def main():
             continue
 
         if dtype == "board":
-            _process_board(pp, chain_name, stock_list, data_dir, args, provenance)
+            _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
+                           strict=strict)
         elif dtype == "sector":
-            _process_sector(pp, chain_name, stock_list, data_dir, args, provenance)
+            _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
+                            strict=strict)
         elif storage_key:
             _process_standard(
                 dtype, storage_key, pp, chain_name, stock_list, data_dir,
-                args, provenance,
+                args, provenance, strict=strict,
             )
 
 
 def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
-                      args, provenance):
+                      args, provenance, strict):
     """Process standard per-stock data: load → transform → save.
 
     Passes K-line data as ``close_prices`` + ``trading_dates`` so that
@@ -206,10 +228,13 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
     ``daily_data`` is also passed for block_trade amount_ratio which
     accesses it separately via **kwargs.
 
-    Under ``--strict`` a stock whose daily K-line context fails to load, or
-    whose transformed output trips error-level quality checks, is BLOCKED —
-    nothing is persisted and the failure is counted (禁止 commit,
-    保留 staging 输出, 记录失败 manifest).
+    Under ``strict`` (explicit ``--strict``, or formal mode by default §十二) a
+    stock whose daily K-line context fails to load, or whose transformed output
+    trips error-level quality checks, is BLOCKED — nothing is persisted and the
+    failure is counted (禁止 commit, 保留 staging 输出, 记录失败 manifest).
+    ``--allow-degraded`` (formal mode only) relaxes both: the quality gate is
+    lifted at the pipeline layer and the daily-load failure no longer blocks,
+    so degraded output is written instead.
 
     Every replace_range write carries ``provenance`` and is guarded by the
     degradation check in MarketWideStorage.save().
@@ -225,10 +250,10 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
         "source_snapshot": f"raw:{storage_key}:{len(stock_list)}stocks",
     }
 
-    from stoke_ml.data.calendar import TradingCalendar
+    from stoke_ml.data.calendar import get_research_calendar
     from stoke_ml.data.storage import DataStorage
     ds = DataStorage(data_dir)
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(strict=True)
     trading_dates = pd.DatetimeIndex(
         calendar.get_trading_days(args.start, args.end)
     )
@@ -254,10 +279,10 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
                 if not daily_data.empty and "stock_code" not in daily_data.columns:
                     daily_data["stock_code"] = code
             except Exception as exc:
-                if args.strict:
+                if strict:
                     logger.error(
-                        "%s: daily K-line load failed for %s — blocking under "
-                        "--strict (%s)", dtype, code, exc,
+                        "%s: daily K-line load failed for %s — blocking "
+                        "(strict mode, §十二) (%s)", dtype, code, exc,
                     )
                     blocked += 1
                     continue
@@ -266,7 +291,8 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
                     "features degraded (%s)", dtype, code, exc,
                 )
             processed = pp.run(
-                chain_name, raw, strict=args.strict, formal=not args.no_formal,
+                chain_name, raw, strict=strict, formal=not args.no_formal,
+                allow_degraded=args.allow_degraded,
                 daily_data=daily_data,
                 close_prices=daily_data,
                 trading_dates=trading_dates,
@@ -301,7 +327,8 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
     logger.info("  %s: %d rows saved (%.1fs)", dtype, total, time.time() - t0)
 
 
-def _process_board(pp, chain_name, stock_list, data_dir, args, provenance):
+def _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
+                   strict):
     """Process board data: load limit_up pools → broadcast to stocks."""
     logger.info("=== board: %d stocks ===", len(stock_list))
     t0 = time.time()
@@ -378,7 +405,8 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance):
             if base.empty:
                 continue
             processed = pp.run(
-                chain_name, base, strict=args.strict, formal=not args.no_formal,
+                chain_name, base, strict=strict, formal=not args.no_formal,
+                allow_degraded=args.allow_degraded,
                 pools=pools, sentiment=sentiment,
                 concept_map=concept_map if concept_map else None,
             )
@@ -410,7 +438,8 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance):
     logger.info("  board: %d rows saved (%.1fs)", total, time.time() - t0)
 
 
-def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance):
+def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
+                    strict):
     """Process sector data: load industry ranking + sector map → broadcast to stocks."""
     logger.info("=== sector: %d stocks ===", len(stock_list))
     t0 = time.time()
@@ -563,7 +592,8 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance):
                         on="date", direction="backward",
                     )
             processed = pp.run(
-                chain_name, base, strict=args.strict, formal=not args.no_formal,
+                chain_name, base, strict=strict, formal=not args.no_formal,
+                allow_degraded=args.allow_degraded,
                 industry_ranking=industry_ranking,
                 sector_map=None if membership is not None else sector_map,
                 sector_features=sector_features,

@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 from stoke_ml.config import load_config as _real_load_config
 from stoke_ml.features.pipeline import (
     FeaturePipeline, SENTIMENT_COLS, GUBA_COLS, _PIT_STATIC_COLS,
-    _not_long_suspended, fold_dead_feature_columns,
+    _min_vol_nobs, _not_long_suspended, fold_dead_feature_columns,
 )
 
 
@@ -731,6 +731,54 @@ class TestPanelTruncationInvariance:
         )
 
 
+def _vol_panel(closes, drop_idxs, code):
+    """One stock's panel frame with rows *drop_idxs* removed (suspension)."""
+    from stoke_ml.data.calendar import TradingCalendar
+    base = pd.to_datetime(
+        TradingCalendar().get_trading_days("2024-01-01", "2024-03-01")[:30]
+    )
+    keep = np.array([i for i in range(30) if i not in set(drop_idxs)])
+    c = np.asarray(closes, dtype=np.float64)
+    return pd.DataFrame({
+        "date": base[keep], "open": c[keep], "high": c[keep] + 0.5,
+        "low": c[keep] - 0.5, "close": c[keep], "volume": 1e6,
+        "amount": c[keep] * 1e6, "stock_code": code,
+    })
+
+
+def test_min_vol_nobs_threshold():
+    """§十四-3: min valid returns for a vol label = max(1, ceil(horizon/2))."""
+    assert _min_vol_nobs(1) == 1
+    assert _min_vol_nobs(5) == 3
+    assert _min_vol_nobs(20) == 10
+
+
+def test_forward_vol_nobs_three_tiers():
+    """§十四-3: forward_vol_nobs records the per-label count of valid daily
+    returns in each forward window; vol_target_mask requires >=
+    _min_vol_nobs(horizon) (hard floor 2).  Full-h window vs partial-window vs
+    <2-value: only the first is labelable for horizon=5."""
+    closes = 100.0 + np.arange(30, dtype=np.float64)
+    a = _vol_panel(closes, [], "000001")                 # full 5/5 valid
+    b = _vol_panel(closes, [10, 11, 12], "000002")       # 2/5 valid (partial)
+    c = _vol_panel(closes, [10, 11, 12, 13], "000003")   # 1/5 valid (<2 floor)
+    panel = pd.concat([a, b, c], ignore_index=True)
+    p = FeaturePipeline(seq_len=10).build_panel_features(
+        panel, aux_data={}, horizon=5)
+    # Column 8 → forward window [9, 10, 11, 12, 13].
+    # Tier 1: full window, all 5 closes valid → label.
+    assert p["forward_vol_nobs"][0, 8] == 5
+    assert p["vol_target_mask"][0, 8]
+    # Tier 2: 2 valid closes < ceil(5/2)=3 → no label, count still recorded.
+    assert p["forward_vol_nobs"][1, 8] == 2
+    assert not p["vol_target_mask"][1, 8]
+    # Tier 3: 1 valid close < hard floor 2 → no label.
+    assert p["forward_vol_nobs"][2, 8] == 1
+    assert not p["vol_target_mask"][2, 8]
+    # Tail: no full forward window → nobs stays 0.
+    assert p["forward_vol_nobs"][0, 29] == 0
+
+
 def test_volatility_target_spans_full_horizon_with_suspension():
     """A '5-day vol' label must span the FULL horizon —
     suspended days get a 0 return and the resumption day records the close
@@ -748,9 +796,12 @@ def test_volatility_target_spans_full_horizon_with_suspension():
         "low": closes - 0.5, "close": closes, "volume": 1e6,
         "amount": closes * 1e6, "stock_code": "000001",
     })
-    b_idx = np.array([i for i in range(30) if i not in (10, 11, 12)])
+    # ONE suspended day (index 11) so the forward window [9..13] still holds 4
+    # valid closes (>= _min_vol_nobs(5)=3) and stays labelable — the §十四-3
+    # threshold would reject a 3-day suspension here (2/5 valid).
+    b_idx = np.array([i for i in range(30) if i != 11])
     b_close = closes.copy()
-    b_close[13] = b_close[9] * 1.10  # +10% gap over the 3-day suspension
+    b_close[12] = b_close[10] * 1.10  # +10% gap over the 1-day suspension
     b = pd.DataFrame({
         "date": base[b_idx], "open": b_close[b_idx],
         "high": b_close[b_idx] + 0.5, "low": b_close[b_idx] - 0.5,
@@ -762,18 +813,27 @@ def test_volatility_target_spans_full_horizon_with_suspension():
         panel, aux_data={}, horizon=5)
 
     # Column 8 → forward window [9, 10, 11, 12, 13] for stock B (row 1):
-    # days 10-12 suspended → 0 returns; day 13 resumption → the +10% gap.
+    # day 11 suspended → 0 return; day 12 resumption → the +10% gap.
     win = np.array([
         b_close[9] / b_close[8] - 1.0,   # day 9: normal daily return
-        0.0, 0.0, 0.0,                     # days 10-12: suspended (zero return)
-        b_close[13] / b_close[9] - 1.0,   # day 13: resumption gap
+        b_close[10] / b_close[9] - 1.0,  # day 10: normal daily return
+        0.0,                             # day 11: suspended (zero return)
+        b_close[12] / b_close[10] - 1.0, # day 12: resumption gap
+        b_close[13] / b_close[12] - 1.0, # day 13: normal daily return
     ])
     expected = float(np.std(win))
     assert p["vol_target_mask"][1, 8]
+    assert p["forward_vol_nobs"][1, 8] == 4  # 4 valid closes in the window
     assert np.isclose(p["y_volatility"][1, 8], expected)
-    # Guard: a skip-NaN / <2-finite collapse (pre-fix behavior) would either
-    # drop the label entirely or return a 2-value std — both must fail here.
-    assert not np.isclose(expected, float(np.std(win[np.array([0, 4])])))
+    # Guard: skipping the suspended day (0 return) and the resumption gap would
+    # give a different, biased std — the label must span the FULL horizon.
+    skip_zero = np.array([
+        b_close[9] / b_close[8] - 1.0,
+        b_close[10] / b_close[9] - 1.0,
+        b_close[12] / b_close[10] - 1.0,
+        b_close[13] / b_close[12] - 1.0,
+    ])
+    assert not np.isclose(expected, float(np.std(skip_zero)))
 
 
 class TestNotLongSuspended:
