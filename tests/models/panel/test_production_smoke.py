@@ -112,9 +112,10 @@ class TestBuildPanelFeatures:
         assert T == N_DAYS
         for key in ("static_features", "past_known", "past_observed"):
             assert data[key].dtype == np.float32
-        # 9 PIT-static cols: price_60d_q / amt_60d_q / listing_days
-        # + 6 board one-hot.  industry_code excluded — no PIT
-        # industry-membership source exists, only a present-snapshot map.
+        # 8 PIT-static cols: amt_60d_q / listing_days + 6 board one-hot.
+        # price_60d_q removed (§五 P0 — qfq absolute price tier leaks future
+        # corporate actions); industry_code excluded — no PIT industry-membership
+        # source exists, only a present-snapshot map.
         assert data["static_features"].shape == (N, T, len(_PIT_STATIC_COLS))
         for key in ("y_direction", "y_return", "y_volatility"):
             assert data[key].shape == (N, T)

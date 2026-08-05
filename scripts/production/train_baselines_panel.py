@@ -64,6 +64,7 @@ from train_panel import (  # noqa: E402  (same-module fold logic)
     _fold_delist_day,
     _fold_eligible_stocks,
     _fold_universe_gates,
+    _gate_enforced,
     _load_experiment_registry,
     _mask_stocks,
     _objective_desc,
@@ -115,6 +116,72 @@ def _baseline_source_hash() -> str:
     return h.hexdigest()[:16]
 
 
+def _baseline_hyperparameter_dict(name: str) -> dict:
+    """The exact hyperparameters ``make_model`` constructs for ``name`` (§十七).
+
+    Kept in sync with ``make_model`` — a hyperparameter edit that changes what a
+    baseline trains with must change this digest (and thus the tape / ledger /
+    experiment signature).  The random seed is deliberately excluded: it is a
+    separate research lever that already enters the experiment signature via the
+    version's ``random_seed``.
+    """
+    if name == "ridge":
+        return {"alpha": 10.0, "solver": "lsqr"}
+    if name == "lgbm":
+        return dict(_LGBMWrapper._PARAMS)
+    if name == "mlp":
+        return {
+            "hidden_layer_sizes": (64, 32),
+            "activation": "relu",
+            "solver": "adam",
+            "alpha": 1e-3,
+            "batch_size": 256,
+            "max_iter": 25,
+            "early_stopping": False,
+        }
+    raise ValueError(f"unknown baseline model: {name}")
+
+
+def _baseline_hyperparameter_hash(name: str) -> str:
+    """Stable SHA-256 of a baseline family's hyperparameters (§十七)."""
+    h = hashlib.sha256()
+    h.update(json.dumps(_baseline_hyperparameter_dict(name),
+                        sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+# §十七: version tag of the baseline INPUT construction (build_flat_samples /
+# entry_column_features / sequence_summary).  Bump when the feature vector a
+# baseline is fit on changes shape or meaning.
+_BASELINE_INPUT_RECIPE_VERSION = "flat-decision-cols+v1"
+
+
+def _baseline_input_recipe_hash(with_seq_features: bool, seq_len: int) -> str:
+    """SHA-256 over what defines a baseline's input vector (§十七): the
+    --with-seq-features flag, the sequence-window length, and the construction
+    version of the flat sample builder."""
+    h = hashlib.sha256()
+    h.update(f"recipe={_BASELINE_INPUT_RECIPE_VERSION};"
+             f"with_seq={bool(with_seq_features)};seq_len={int(seq_len)};"
+             .encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+# §十七: version tag of the baseline TRAINING-SAMPLE policy (date-stratified
+# quota sampling inside build_flat_samples).  Bump when the sampling strategy
+# changes.
+_TRAINING_SAMPLE_POLICY_VERSION = "date-stratified-quotas+v1"
+
+
+def _training_sample_policy_hash(max_train_rows: int) -> str:
+    """SHA-256 over the training-sample policy (§十七): the --max-train-rows cap
+    and the sampling strategy that turns the budget into a per-date sample."""
+    h = hashlib.sha256()
+    h.update(f"policy={_TRAINING_SAMPLE_POLICY_VERSION};"
+             f"max_train_rows={int(max_train_rows)};".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
 class _LGBMWrapper:
     """LightGBM regression booster with a sklearn-like fit/predict surface."""
 
@@ -163,22 +230,19 @@ class _LGBMWrapper:
 
 
 def make_model(name: str, seed: int):
-    """Construct the sklearn-style regressor for a baseline name."""
+    """Construct the sklearn-style regressor for a baseline name.
+
+    Built from ``_baseline_hyperparameter_dict`` so the actual model and its
+    §十七 hyperparameter fingerprint cannot drift apart (the seed is added
+    separately and stays out of the hyperparameter hash).
+    """
+    params = _baseline_hyperparameter_dict(name)
     if name == "ridge":
-        return Ridge(alpha=10.0, solver="lsqr")
+        return Ridge(**params)
     if name == "lgbm":
         return _LGBMWrapper(seed)
     if name == "mlp":
-        return MLPRegressor(
-            hidden_layer_sizes=(64, 32),
-            activation="relu",
-            solver="adam",
-            alpha=1e-3,
-            batch_size=256,
-            max_iter=25,
-            random_state=seed,
-            early_stopping=False,
-        )
+        return MLPRegressor(**params, random_state=seed)
     raise ValueError(f"unknown baseline model: {name}")
 
 
@@ -249,12 +313,31 @@ def main():
         _report_path = args.quality_gate_report or str(
             get_project_root() / "reports" / "data_quality_gate.json"
         )
-        _require_quality_gate(data_dir, args.prebuilt, _report_path)
+        _require_quality_gate(
+            data_dir, args.prebuilt, _report_path,
+            universe_name=args.universe, requested=False,
+        )
         logger.info("Quality-gate report verified: %s", _report_path)
+
+    # §七-P0: same full-market guard as train_panel.py — `--universe all` must
+    # consume prebuilt panel features, never live-engineer the whole market.
+    if args.universe == "all" and not args.prebuilt:
+        raise SystemExit(
+            "--universe all requires --prebuilt: the full market cannot be "
+            "feature-engineered in memory (§七-P0).  Run "
+            "scripts/production/build_features.py --panel-mode first, then "
+            "re-run with --prebuilt data/features_panel."
+        )
 
     all_stocks = _discover_stocks(data_dir, None)
     stock_list, universe_desc = _resolve_universe(
         all_stocks, args.universe, args.stocks, args.seed, data_dir,
+        # §八-2: _resolve_universe's `formal` is the gate-ENFORCEMENT predicate
+        # (_gate_enforced = not --no-require-quality-gate), NOT --no-formal — so
+        # baselines' csi* missing-member refusal matches train_panel.  --no-formal
+        # still governs the §P0-7 universe-artifact degradation via
+        # _fold_universe_gates below, not this §八-2 drop refusal.
+        formal=_gate_enforced(args),
     )
     if not stock_list:
         logger.error("No stocks found")
@@ -644,6 +727,16 @@ def main():
                         f"baseline:{model_name}:{repr(config)}".encode("utf-8")
                     ).hexdigest()[:16],
                     feature_schema_hash=version_info["feature_schema_hash"],
+                    # §十七: baseline identity hashes — input recipe (with_seq +
+                    # seq_len + construction version), model hyperparameters, and
+                    # the training-sample policy — so the tape is bound to
+                    # exactly what produced it, not just the model family.
+                    baseline_input_recipe_hash=_baseline_input_recipe_hash(
+                        args.with_seq_features, config.seq_len),
+                    baseline_hyperparameter_hash=_baseline_hyperparameter_hash(
+                        model_name),
+                    training_sample_policy_hash=_training_sample_policy_hash(
+                        args.max_train_rows),
                     # §十五-3: identical policy metadata as the deep tapes, so a
                     # mixed oos_dir (deep + baseline, or two baselines) is
                     # rejected by the continuous replay instead of blended.
@@ -669,6 +762,13 @@ def main():
                     # weight_hash / model_hash), falling back to the legacy
                     # label only when the non-formal pickle produced no hash.
                     ldf["model_hash"] = weight_hash or ("baseline-" + model_name)
+                    # §十七: baseline identity hashes on every ledger row.
+                    ldf["baseline_input_recipe_hash"] = _baseline_input_recipe_hash(
+                        args.with_seq_features, config.seq_len)
+                    ldf["baseline_hyperparameter_hash"] = _baseline_hyperparameter_hash(
+                        model_name)
+                    ldf["training_sample_policy_hash"] = _training_sample_policy_hash(
+                        args.max_train_rows)
                     ldf = ldf[["fold", "entry_day", "entry_date", "stock",
                                "stock_code", "mode", "prediction",
                                "candidate_eligible", "entry_eligible",
@@ -678,7 +778,10 @@ def main():
                                "exit_status", "exit_price", "realized_return",
                                "mark_day", "mark_price", "gross_pnl",
                                "entry_cost", "exit_cost", "net_pnl",
-                               "unrealized_pnl"]]
+                               "unrealized_pnl",
+                               "baseline_input_recipe_hash",
+                               "baseline_hyperparameter_hash",
+                               "training_sample_policy_hash"]]
                     ledger_path = os.path.join(
                         oos_dir, f"fold_{fold:03d}_{model_name}_ledger.parquet")
                     ldf.to_parquet(ledger_path)
@@ -705,6 +808,14 @@ def main():
                 # §P1-3: real content hash of the persisted pickle — re-fit
                 # changes it, so the registry can aggregate a real fingerprint.
                 "weight_hash": weight_hash,
+                # §十七: input-recipe / hyperparameter / sample-policy hashes
+                # bind each fold's tape + ledger to the exact configuration that
+                # produced it.
+                "baseline_hyperparameter_hash": _baseline_hyperparameter_hash(model_name),
+                "baseline_input_recipe_hash": _baseline_input_recipe_hash(
+                    args.with_seq_features, config.seq_len),
+                "training_sample_policy_hash": _training_sample_policy_hash(
+                    args.max_train_rows),
             }
             fold_records.append(rec)
             logger.info(
@@ -899,7 +1010,12 @@ def main():
         baseline_entry = {
             "experiment_signature": _experiment_signature(
                 version_info, config, model_key=f"baseline-{model_name}",
-                seq_features=args.with_seq_features),
+                seq_features=args.with_seq_features,
+                baseline_hyperparameter_hash=_baseline_hyperparameter_hash(model_name),
+                baseline_input_recipe_hash=_baseline_input_recipe_hash(
+                    args.with_seq_features, config.seq_len),
+                training_sample_policy_hash=_training_sample_policy_hash(
+                    args.max_train_rows)),
             "outdir": outdir,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "git_commit": version_info.get("git_commit"),
