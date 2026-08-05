@@ -2362,7 +2362,7 @@ class TestContinuousOosReplay:
             _replay_continuous_oos(str(tmp_path), model_name="lgbm", formal=True)
 
     def test_baseline_without_weight_hash_clean_contract(self, tmp_path):
-        """# §十八-1: a baseline tape whose weight_hash key is ABSENT (a non-formal
+        """§十八-1: a baseline tape whose weight_hash key is ABSENT (a non-formal
         fold whose model pickle failed — train_baselines_panel omits the key
         rather than storing an object-dtype None array) must give the clean
         contract: non-formal replay tolerates it (legacy tolerance), formal replay
