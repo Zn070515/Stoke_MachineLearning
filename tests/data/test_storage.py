@@ -15,6 +15,7 @@ via ``require_valid_manifest``, and the file lock is a JSON heartbeat record
 that a live writer's lock is never stolen.
 """
 import json
+import math
 import os
 
 import numpy as np
@@ -95,6 +96,44 @@ class TestSaveDaily:
         out = store.load_daily("000001", "2024-01-01", "2024-01-31")
         assert len(out) == 1
         assert out["close"].iloc[0] == pytest.approx(99.0)
+
+    def test_same_date_close_correction_recomputes_adjacent_pct_change(self, tmp_path):
+        """v14 §十三-3: a same-date merge overwrite may CORRECT a close (t day),
+        which leaves the adjacent row's pct_change still based on the
+        pre-correction price unless save_daily recomputes the whole per-stock
+        series.  Correcting 01-05's close from 10.0 to 12.0 must re-derive
+        01-08's return from 12.0, not the stale 10.0."""
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(["2024-01-05", "2024-01-08"], closes=[10.0, 11.0]))
+        # Same-date correction of the earlier day's close (n=1, its own
+        # pct_change is NaN — the merge path recomputes the combined series).
+        store.save_daily(_frame(["2024-01-05"], closes=[12.0]))
+        out = store.load_daily("000001", "2024-01-01", "2024-01-31")
+        assert out["close"].tolist() == pytest.approx([12.0, 11.0])
+        assert math.isnan(out["pct_change"].iloc[0])
+        assert out["pct_change"].iloc[1] == pytest.approx(
+            100.0 * (11.0 / 12.0 - 1.0)
+        )
+
+    def test_mid_series_close_correction_recomputes_both_adjacent_returns(self, tmp_path):
+        """v14 §十三-3, stronger case: correcting the MIDDLE day's close must
+        recompute BOTH neighbouring returns — 01-08 against the corrected 01-05
+        close, and 01-09 against the corrected 01-08 close — while row 0 stays NaN."""
+        store = DataStorage(str(tmp_path))
+        store.save_daily(_frame(
+            ["2024-01-05", "2024-01-08", "2024-01-09"],
+            closes=[10.0, 11.0, 12.1],
+        ))
+        store.save_daily(_frame(["2024-01-08"], closes=[15.0]))
+        out = store.load_daily("000001", "2024-01-01", "2024-01-31")
+        assert out["close"].tolist() == pytest.approx([10.0, 15.0, 12.1])
+        assert math.isnan(out["pct_change"].iloc[0])
+        assert out["pct_change"].iloc[1] == pytest.approx(
+            100.0 * (15.0 / 10.0 - 1.0)
+        )
+        assert out["pct_change"].iloc[2] == pytest.approx(
+            100.0 * (12.1 / 15.0 - 1.0)
+        )
 
     def test_no_tmp_residue(self, tmp_path):
         store = DataStorage(str(tmp_path))
