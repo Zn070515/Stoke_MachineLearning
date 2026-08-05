@@ -31,6 +31,11 @@ class ConceptBlockEncoder(PreprocessingStep):
         momentum_months: windows (months) for concept momentum.
     """
 
+    # fit() builds the concept vocabulary from the data it is fit on; running
+    # over full history leaks validation/future board names into the encoding
+    # columns.  Must be fit on a train fold only (§十-1).
+    fit_scope = "fold_train_only"
+
     def __init__(
         self,
         top_n: int = 100,

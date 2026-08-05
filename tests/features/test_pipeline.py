@@ -2,8 +2,12 @@
 import numpy as np
 import pandas as pd
 import pytest
+from omegaconf import OmegaConf
+
+from stoke_ml.config import load_config as _real_load_config
 from stoke_ml.features.pipeline import (
     FeaturePipeline, SENTIMENT_COLS, GUBA_COLS, _PIT_STATIC_COLS,
+    _not_long_suspended, fold_dead_feature_columns,
 )
 
 
@@ -13,12 +17,14 @@ def _make_kl(n_days=200):
     dates = pd.date_range("2024-01-01", periods=n_days, freq="B")
     close = 100 + np.cumsum(rng.normal(0.05, 1.5, n_days))
     close = np.maximum(close, 1.0)
+    volume = rng.integers(1e6, 1e7, n_days).astype(float)
     return pd.DataFrame({
         "date": dates, "open": close - rng.normal(0, 0.5, n_days),
         "high": close + rng.uniform(0.1, 2.0, n_days),
         "low": close - rng.uniform(0.1, 2.0, n_days),
         "close": close,
-        "volume": rng.integers(1e6, 1e7, n_days).astype(float),
+        "volume": volume,
+        "amount": volume * close,
     })
 
 
@@ -152,7 +158,7 @@ class TestMergeHelpers:
             "has_guba_post": [True] * len(df),
         })
         # Just test merge doesn't crash
-        result = pipe._merge_guba(df.copy(), guba)
+        result = pipe._aux._merge_guba(df.copy(), guba)
         assert "guba_sentiment_mean" in result.columns
 
     def test_merge_sentiment_keeps_effective_date(self):
@@ -170,7 +176,7 @@ class TestMergeHelpers:
             "negative_ratio": [0.1] * 10,
             "has_news": [True] * 10,
         })
-        result = pipe._merge_sentiment(df.copy(), sentiment)
+        result = pipe._aux._merge_sentiment(df.copy(), sentiment)
         # No double lag: each row keeps its own effective-date value.
         assert result["sentiment_mean"].iloc[0] == 1.0
         assert result["sentiment_mean"].iloc[1] == 2.0
@@ -190,7 +196,7 @@ class TestMergeHelpers:
             "guba_negative_ratio": [0.2] * 10,
             "has_guba_post": [True] * 10,
         })
-        result = pipe._merge_guba(df.copy(), guba)
+        result = pipe._aux._merge_guba(df.copy(), guba)
         assert result["guba_sentiment_mean"].iloc[0] == 1.0
         assert result["guba_sentiment_mean"].iloc[1] == 2.0
 
@@ -213,7 +219,7 @@ class TestMergeHelpers:
             "ind_matched_return": [0.0] * 10,   # must be dropped
             "stock_vs_industry": [0.0] * 10,   # must be dropped
         })
-        result = pipe._merge_industry(df.copy(), ind)
+        result = pipe._aux._merge_industry(df.copy(), ind)
         assert "ind_matched_return" not in result.columns
         assert "stock_vs_industry" not in result.columns
         assert "ind_pct_up" in result.columns
@@ -233,7 +239,7 @@ class TestMergeHelpers:
             "net_profit_high": np.arange(4, 14, dtype=np.float32),
             "has_forecast": [True] * 10,
         })
-        result = pipe._merge_earnings(df.copy(), edf)
+        result = pipe._aux._merge_earnings(df.copy(), edf)
         assert result["net_profit_yoy_low"].iloc[0] == 1.0
         assert result["net_profit_yoy_low"].iloc[1] == 2.0
 
@@ -251,7 +257,19 @@ def _make_panel_kl(dates, seed):
     return pd.DataFrame({
         "date": dates, "open": open_, "high": high, "low": low,
         "close": close, "volume": vol,
+        "amount": vol.astype(np.float64) * close,
     })
+
+
+def test_amount_missing_raises():
+    """§十一-5: the formal daily contract REQUIRES `amount` — a panel without
+    it must fail loudly, never silently fall back to volume×close / price."""
+    df = _make_panel_kl(pd.bdate_range("2020-01-02", periods=20), seed=1)
+    df["stock_code"] = "000001"
+    df = df.drop(columns=["amount"])
+    with pytest.raises(ValueError, match="amount"):
+        FeaturePipeline(seq_len=5).build_panel_features(
+            df, aux_data={}, horizon=1)
 
 
 class TestPanelCalendarAlignment:
@@ -375,6 +393,24 @@ class TestPanelCalendarDateValidity:
         assert pd.Timestamp("2020-04-06") not in gd      # 清明 holiday excluded
         assert pd.Timestamp("2020-03-16") in gd          # valid trading day kept
 
+    def test_union_invariant_fires_when_cleaning_bypassed(self, monkeypatch):
+        """§九-1: if per-stock calendar cleaning were (regression) skipped, a
+        weekend bar that reaches the UNION must raise instead of silently
+        widening the global panel time axis."""
+        base = pd.bdate_range("2020-01-02", "2020-06-30")
+        A = _make_panel_kl(list(base), seed=1)
+        A["stock_code"] = "000001"
+        wk = _make_panel_kl([pd.Timestamp("2020-03-21")], seed=9)  # Saturday
+        wk["stock_code"] = "000001"
+        panel = pd.concat([A, wk], ignore_index=True)
+        fp = FeaturePipeline(seq_len=60)
+        # Simulate an upstream regression that bypasses the per-stock cleaner.
+        monkeypatch.setattr(
+            fp, "_clean_calendar_dates",
+            lambda df, code: df.sort_values("date").reset_index(drop=True))
+        with pytest.raises(ValueError, match="official a_shares"):
+            fp.build_panel_features(panel, aux_data={}, horizon=5)
+
 
 class TestCrossSectionCleanup:
     """Cross-sectional statistics must not be polluted by an
@@ -492,6 +528,7 @@ class TestPanelMasksAndCarry:
             "low": np.minimum(open_, close) - 0.2,
             "close": close,
             "volume": np.full(12, 1_000_000.0),
+            "amount": np.full(12, 1_000_000.0) * close,
         })
 
     def _build(self):
@@ -643,7 +680,7 @@ def test_volatility_target_spans_full_horizon_with_suspension():
     a = pd.DataFrame({
         "date": base, "open": closes, "high": closes + 0.5,
         "low": closes - 0.5, "close": closes, "volume": 1e6,
-        "stock_code": "000001",
+        "amount": closes * 1e6, "stock_code": "000001",
     })
     b_idx = np.array([i for i in range(30) if i not in (10, 11, 12)])
     b_close = closes.copy()
@@ -651,7 +688,8 @@ def test_volatility_target_spans_full_horizon_with_suspension():
     b = pd.DataFrame({
         "date": base[b_idx], "open": b_close[b_idx],
         "high": b_close[b_idx] + 0.5, "low": b_close[b_idx] - 0.5,
-        "close": b_close[b_idx], "volume": 1e6, "stock_code": "000002",
+        "close": b_close[b_idx], "volume": 1e6,
+        "amount": b_close[b_idx] * 1e6, "stock_code": "000002",
     })
     panel = pd.concat([a, b], ignore_index=True)
     p = FeaturePipeline(seq_len=10).build_panel_features(
@@ -670,3 +708,213 @@ def test_volatility_target_spans_full_horizon_with_suspension():
     # Guard: a skip-NaN / <2-finite collapse (pre-fix behavior) would either
     # drop the label entirely or return a 2-value std — both must fail here.
     assert not np.isclose(expected, float(np.std(win[np.array([0, 4])])))
+
+
+class TestNotLongSuspended:
+    """§七-3 long-suspension gate: disqualified from the first column whose
+    consecutive missing-close run reaches the threshold, through `lookback`
+    trading columns after the run resumes.  Pre-listing columns are never
+    "missing"."""
+
+    def test_never_suspended_all_eligible(self):
+        obs = np.ones((1, 10), dtype=bool)
+        mask = _not_long_suspended(obs, np.array([0]), 10, 3, 1)
+        assert mask.tolist() == [[True] * 10]
+
+    def test_trigger_and_lookback_window(self):
+        # cols 3-5 missing → run reaches 3 at col 5; resumes col 6; lookback=1
+        # → disqualified on the trigger day AND `lookback` trading columns after
+        # it: cols 5, 6.
+        obs = np.array([[1, 1, 1, 0, 0, 0, 1, 1, 1, 1]], dtype=bool)
+        mask = _not_long_suspended(obs, np.array([0]), 10, 3, 1)
+        assert mask.tolist() == [[1, 1, 1, 1, 1, 0, 0, 1, 1, 1]]
+
+    def test_pre_listing_missing_not_counted(self):
+        # Stock first lists at col 4; the F's before listing are not a halt.
+        obs = np.array([[0, 0, 0, 0, 1, 1, 1, 1, 1, 1]], dtype=bool)
+        mask = _not_long_suspended(obs, np.array([4]), 10, 3, 1)
+        assert mask.tolist() == [[True] * 10]
+
+    def test_run_below_threshold_never_triggers(self):
+        # Max run of 2 < threshold 3 → no disqualification.
+        obs = np.array([[1, 1, 0, 0, 1, 1, 1, 1, 1, 1]], dtype=bool)
+        mask = _not_long_suspended(obs, np.array([0]), 10, 3, 1)
+        assert mask.tolist() == [[True] * 10]
+
+    def test_multiple_disjoint_runs_each_trigger(self):
+        # threshold=2, lookback=0: cols 1-2 run reaches 2 at col 2; cols 5-6
+        # reaches 2 at col 6 → disqualified on cols 2 and 6.
+        obs = np.array([[1, 0, 0, 1, 1, 0, 0, 1, 1, 1]], dtype=bool)
+        mask = _not_long_suspended(obs, np.array([0]), 10, 2, 0)
+        assert mask.tolist() == [[1, 1, 0, 1, 1, 1, 0, 1, 1, 1]]
+
+    def test_never_listed_all_eligible(self):
+        obs = np.zeros((1, 10), dtype=bool)
+        mask = _not_long_suspended(obs, np.array([-1]), 10, 3, 1)
+        assert mask.tolist() == [[True] * 10]
+
+    def test_empty_returns_zero_width(self):
+        mask = _not_long_suspended(np.zeros((0, 10), dtype=bool),
+                                   np.array([], dtype=np.int32), 10, 3, 1)
+        assert mask.shape == (0, 10)
+
+
+class TestUniverseGateIntegration:
+    """§七-3 end-to-end: `universe_eligible_mask` is produced and merged into
+    `decision_eligible_mask`, so a long-suspended stock can never be ranked as a
+    fresh candidate."""
+
+    def test_suspension_excluded_from_decision_pool(self, monkeypatch):
+        def _patched_load_config():
+            cfg = _real_load_config()
+            # Small thresholds so a synthetic 3-day gap triggers the gate;
+            # min_amount=0 disables the turnover floor (synthetic panel has no
+            # canonical `amount` column anyway).
+            cfg.universe = OmegaConf.create({
+                "long_suspension_days": 3,
+                "suspension_lookback": 1,
+                "min_amount_60d": 0,
+            })
+            return cfg
+
+        monkeypatch.setattr("stoke_ml.config.load_config", _patched_load_config)
+        base = _make_kl(200)
+        gap_start, gap_len = 100, 3
+        a = base.copy()
+        a["stock_code"] = "000001"
+        b = base.drop(index=range(gap_start, gap_start + gap_len)).copy()
+        b["stock_code"] = "000002"
+        panel = pd.concat([a, b], ignore_index=True)
+
+        pipe = FeaturePipeline(seq_len=20, use_sentiment=False,
+                               use_announcements=False, use_guba=False,
+                               use_comment=False)
+        p = pipe.build_panel_features(panel, aux_data={}, horizon=1)
+        uni = p["universe_eligible_mask"]   # (2, T)
+        dec = p["decision_eligible_mask"]   # (2, T)
+        assert uni.shape == dec.shape
+        assert uni.shape[0] == 2
+        # decision ⊆ universe: nothing ranked tradable outside the gate.
+        assert not (dec & ~uni).any()
+        # The never-suspended stock is eligible everywhere.
+        assert uni[0].all()
+        # Stock 000002: exactly ONE suspension trigger → a contiguous
+        # disqualified window [trigger, trigger+1] (lookback=1).
+        false_cols = np.where(~uni[1])[0]
+        assert len(false_cols) == 2
+        assert np.all(np.diff(false_cols) == 1)
+        # The trigger column is the LAST missing column — the last gap date on
+        # the union calendar (calendar cleaning may shift raw indices).
+        gap_dates = [pd.Timestamp(d).date() for d in base["date"].iloc[gap_start:gap_start + gap_len]]
+        grid_dates = [pd.Timestamp(d).date() for d in p["global_dates"]]
+        assert grid_dates[false_cols[0]] == gap_dates[-1]
+
+
+class TestFoldDeadFeatureColumns:
+    """fold_dead_feature_columns must judge constancy only on observed rows of
+    the training window, ignore zero-padding, and return axis-2 index lists."""
+
+    def _train_data(self, pk: np.ndarray, po: np.ndarray, obs: np.ndarray) -> dict:
+        return {
+            "past_known": pk.astype(np.float32),
+            "past_observed": po.astype(np.float32),
+            "observation_mask": obs.astype(bool),
+        }
+
+    def test_drops_constant_columns_and_keeps_varying(self):
+        # 3 stocks × 4 days × 4 features, all rows observed, every stock identical.
+        pk = np.array([
+            [[1, 2, 5, 10], [1, 3, 5, 11], [1, 4, 5, 12], [1, 5, 5, 13]],
+            [[1, 2, 5, 10], [1, 3, 5, 11], [1, 4, 5, 12], [1, 5, 5, 13]],
+            [[1, 2, 5, 10], [1, 3, 5, 11], [1, 4, 5, 12], [1, 5, 5, 13]],
+        ], dtype=np.float32)  # features 0,2 constant; 1,3 vary
+        po = np.array([
+            [[9, 7, 1, 3], [9, 7, 2, 3], [9, 7, 3, 3], [9, 7, 4, 3]],
+            [[9, 7, 1, 3], [9, 7, 2, 3], [9, 7, 3, 3], [9, 7, 4, 3]],
+            [[9, 7, 1, 3], [9, 7, 2, 3], [9, 7, 3, 3], [9, 7, 4, 3]],
+        ], dtype=np.float32)  # features 0,1,3 constant; 2 varies
+        obs = np.ones((3, 4), dtype=bool)
+        cols = ["a", "b", "c", "d"]
+        pk_idx, po_idx = fold_dead_feature_columns(
+            self._train_data(pk, po, obs), cols, cols,
+        )
+        assert pk_idx == [0, 2]
+        assert po_idx == [0, 1, 3]
+
+    def test_zero_padding_is_not_evidence(self):
+        # Only stock 0 is listed; stocks 1-2 are all-padding (obs False).
+        # Padding must not count: feature 0 varies on the listed stock → kept,
+        # feature 2 is constant on the listed stock → dropped, even though its
+        # padded rows read 0 elsewhere (a varying feature isn't saved by fake
+        # padding values, and a constant one isn't killed by them either).
+        pk = np.array([
+            [[1, 2, 5], [2, 3, 5], [3, 4, 5], [4, 5, 5]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ], dtype=np.float32)
+        obs = np.array([
+            [True, True, True, True],
+            [False, False, False, False],
+            [False, False, False, False],
+        ])
+        cols = ["a", "b", "c"]
+        pk_idx, po_idx = fold_dead_feature_columns(
+            self._train_data(pk, pk.copy(), obs), cols, cols, ratio=0.9,
+        )
+        assert pk_idx == [2]
+        assert po_idx == [2]
+
+    def test_sparse_keep_prefix_families_are_exempt(self):
+        # A rare-event column (market_state_) constant on all stocks except one
+        # brief activation: 9/10 stocks time-constant → >= 0.9 would drop it,
+        # but the SPARSE_KEEP_PREFIXES exemption keeps it.  A same-shaped plain
+        # column without the prefix IS dropped.
+        rows = [[1, 0, 0], [2, 0, 0], [1, 0, 0], [2, 0, 0]]
+        pk = np.array([rows] * 10, dtype=np.float32)
+        # Stock 0 has one activation day (t=2) for features 1 and 2.
+        pk[0, 2, 1] = 1.0
+        pk[0, 2, 2] = 1.0
+        # feature 0 varies in time for every stock; feature 1 fires once for
+        # stock 0 (market_state family); feature 2 fires once for stock 0 (plain).
+        pk_cols = ["plain_a", "market_state_up", "plain_b"]
+        po_cols = pk_cols
+        obs = np.ones((10, 4), dtype=bool)
+        pk_idx, po_idx = fold_dead_feature_columns(
+            self._train_data(pk, pk.copy(), obs), pk_cols, po_cols,
+        )
+        # 9/10 stocks are time-constant on features 1 and 2 (0.9 threshold) —
+        # the prefixed one is exempt, the plain one is dropped.
+        assert pk_idx == [2]
+        assert po_idx == [2]
+
+    def test_ratio_threshold_governs_drop(self):
+        # 4 stocks; feature 0 varies on exactly one stock, constant on 3 → 0.75.
+        pk = np.array([
+            [[1, 9], [2, 9], [3, 9], [4, 9]],
+            [[5, 9], [5, 9], [5, 9], [5, 9]],
+            [[5, 9], [5, 9], [5, 9], [5, 9]],
+            [[5, 9], [5, 9], [5, 9], [5, 9]],
+        ], dtype=np.float32)  # feature 0 constant on 3/4, feature 1 on 4/4
+        po = np.ones_like(pk)
+        obs = np.ones((4, 4), dtype=bool)
+        cols = ["a", "b"]
+        lo = fold_dead_feature_columns(self._train_data(pk, po, obs), cols, cols, ratio=0.9)
+        hi = fold_dead_feature_columns(self._train_data(pk, po, obs), cols, cols, ratio=0.7)
+        # 0.75-constant feature dropped only under the looser ratio; the
+        # 1.0-constant feature is dropped under both.
+        assert lo == ([1], [0, 1])
+        assert hi == ([0, 1], [0, 1])
+
+    def test_all_zero_column_is_dead(self):
+        # Feature 1 is all-zero (a ZI-filled channel with no data anywhere) —
+        # constant for every observed stock → dropped; features 0, 2 vary.
+        pk = np.array([
+            [[1, 0, 3], [2, 0, 4], [3, 0, 5], [4, 0, 6]],
+            [[1, 0, 3], [2, 0, 4], [3, 0, 5], [4, 0, 6]],
+        ], dtype=np.float32)
+        po = np.ones_like(pk)
+        obs = np.ones((2, 4), dtype=bool)
+        cols = ["a", "b", "c"]
+        pk_idx, po_idx = fold_dead_feature_columns(self._train_data(pk, po, obs), cols, cols)
+        assert pk_idx == [1]
+        assert po_idx == [0, 1, 2]

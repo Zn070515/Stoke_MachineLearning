@@ -19,10 +19,10 @@ class PanelConfig:
     """
 
     # Input dimensions (overridden at runtime from actual data).  Defaults track
-    # the current prebuilt panel: S=4 PIT static,
+    # the current prebuilt panel: S=9 PIT static (3 continuous + 6 board one-hot),
     # PK=255, PO=1418 — the docs guard (check_docs_consistency.py) enforces
     # README / CONTEXT against these, so update all three together.
-    static_dim: int = 4
+    static_dim: int = 9
     past_known_dim: int = 255
     past_observed_dim: int = 1418
 
@@ -55,6 +55,12 @@ class PanelConfig:
 
     # Reproducibility
     seed: int | None = 42
+    # Strict bitwise CUDA determinism: torch.use_deterministic_algorithms(True).
+    # Opt-in because a single non-deterministic op (e.g. a CUDA atomic
+    # reduction) then RAISES mid-training instead of silently diverging.
+    # Default False = the safe knobs (cudnn deterministic, no TF32) + a
+    # declared "statistical-only" reproducibility guarantee.
+    deterministic_algorithms: bool = False
 
     # Sequence
     seq_len: int = 60

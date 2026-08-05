@@ -1,0 +1,640 @@
+"""Download EastMoney datacenter + capital flow + limit-up data.
+
+Covers 8 new data types added in the crawler improvement plan:
+
+  Capital flow (资金流向):
+    capital_flow    — per-stock daily main/super/large/mid/small net flow
+
+  Limit-up board (打板数据):
+    limit_up_zt     — daily limit-up pool (涨停池)
+    limit_up_zb     — daily busted pool (炸板池)
+    limit_up_dt     — daily limit-down pool (跌停池)
+    limit_up_yzt    — yesterday's ZT performance (昨日涨停池)
+    limit_up_sentiment — daily board sentiment summary
+
+  Datacenter (大宗/股东/解禁/分红):
+    block_trade     — per-stock block trade records (大宗交易)
+    shareholder     — per-stock shareholder count changes (股东户数)
+    lockup          — per-stock lockup expiry calendar (限售解禁)
+    dividend        — per-stock dividend history (分红送转)
+
+Usage:
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type all
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type capital_flow --stocks 600519,000001
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type block_trade --start 2024-01-01
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type limit_up --start 2026-06-01
+"""
+import argparse
+import logging
+import os
+import sys
+import time
+from datetime import datetime
+
+import pandas as pd
+
+from stoke_ml.config import load_config
+from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.market_wide_storage import MarketWideStorage
+from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.sources.a_shares.capital_flow_source import CapitalFlowSource
+from stoke_ml.data.sources.a_shares.limit_up_source import LimitUpSource, SENTIMENT_COLS
+from stoke_ml.data.sources.a_shares.datacenter_sources import (
+    BlockTradeSource, ShareholderSource, LockupExpirySource, DividendSource,
+)
+try:
+    from stoke_ml.data.sources.a_shares.sector_source import (
+        IndustryRankingSource, ConceptBlockSource,
+    )
+except ImportError:
+    IndustryRankingSource = None  # type: ignore[assignment]
+    ConceptBlockSource = None  # type: ignore[assignment]
+try:
+    from stoke_ml.data.sources.a_shares.backup_sources import SinaFundFlowSource
+except ImportError:
+    SinaFundFlowSource = None  # type: ignore[assignment]
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+LIMIT_UP_POOLS = ["zt", "zb", "dt", "yzt"]
+
+
+def _fetch_one(source_cls, method_name: str, min_interval: float, code: str):
+    """Create a fresh source instance, fetch, and close — safe for concurrent use."""
+    source = source_cls(min_interval=min_interval)
+    try:
+        return getattr(source, method_name)(code)
+    finally:
+        source.close()
+
+
+def _fetch_one_lockup(code: str, min_interval: float, trade_date: str):
+    """Fetch lockup data for one stock — safe for concurrent use."""
+    source = LockupExpirySource(min_interval=min_interval)
+    try:
+        data = source.fetch_all(code, trade_date=trade_date)
+        hist = data.get("history", pd.DataFrame())
+        upcoming = data.get("upcoming", pd.DataFrame()).copy()
+        if not upcoming.empty:
+            upcoming["is_upcoming"] = True
+        return (hist, upcoming)
+    finally:
+        source.close()
+
+
+def get_stocks_from_disk(data_dir: str) -> list[str]:
+    daily_dir = os.path.join(data_dir, "a_shares", "daily")
+    if not os.path.exists(daily_dir):
+        return []
+    codes = set()
+    for root, _dirs, files in os.walk(daily_dir):
+        for f in files:
+            if f.endswith(".parquet"):
+                codes.add(f.replace(".parquet", ""))
+    return sorted(codes)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download EastMoney datacenter + capital flow + limit-up data",
+    )
+    parser.add_argument(
+        "--type", type=str, default="all",
+        choices=[
+            "all", "capital_flow", "limit_up", "limit_up_zt", "limit_up_zb",
+            "limit_up_dt", "limit_up_yzt", "limit_up_sentiment",
+            "block_trade", "shareholder", "lockup", "dividend",
+            "industry_ranking", "concept_blocks",
+        ],
+        help="Data type to download (default: all)",
+    )
+    parser.add_argument("--start", type=str, default="2015-01-01",
+                        help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", type=str, default=None,
+                        help="End date YYYY-MM-DD (default: today)")
+    parser.add_argument("--stocks", type=str, default=None,
+                        help="Comma-separated stock codes (default: all from disk)")
+    parser.add_argument("--sleep", type=float, default=1.2,
+                        help="Seconds between API calls (default: 1.2)")
+    parser.add_argument("--concurrent", action="store_true",
+                        help="Use concurrent downloader")
+    parser.add_argument("--workers", type=int, default=2,
+                        help="Concurrent workers (default: 2, keep low for EastMoney)")
+    parser.add_argument("--shard", type=str, default=None,
+                        help="Shard spec k/N (e.g. 0/3 processes first third of stocks)")
+    args = parser.parse_args()
+
+    if args.end is None:
+        args.end = datetime.now().strftime("%Y-%m-%d")
+
+    cfg = load_config()
+    data_dir = cfg.project.data_dir
+
+    # Resolve stock list
+    if args.stocks:
+        stock_list = [c.strip() for c in args.stocks.split(",")]
+    else:
+        stock_list = get_stocks_from_disk(data_dir)
+        if not stock_list:
+            logger.error("No stock codes found. Run download_data.py first.")
+            sys.exit(1)
+
+    if args.shard:
+        k, n = args.shard.split("/")
+        k, n = int(k), int(n)
+        stock_list = [c for i, c in enumerate(stock_list) if i % n == k]
+
+    # Determine which types to download
+    if args.type == "all":
+        to_download = [
+            "capital_flow", "block_trade", "shareholder", "lockup", "dividend",
+            "limit_up_zt", "limit_up_zb", "limit_up_dt", "limit_up_yzt",
+            "limit_up_sentiment",
+            "industry_ranking", "concept_blocks",
+        ]
+    elif args.type == "limit_up":
+        to_download = [
+            "limit_up_zt", "limit_up_zb", "limit_up_dt", "limit_up_yzt",
+            "limit_up_sentiment",
+        ]
+    else:
+        to_download = [args.type]
+
+    # ── Per-stock sources (capital_flow, block_trade, shareholder, etc.) ──
+    per_stock_types = {
+        "capital_flow": ("capital_flow", CapitalFlowSource, "fetch_daily"),
+        "block_trade": ("block_trade", BlockTradeSource, "fetch"),
+        "shareholder": ("shareholder", ShareholderSource, "fetch"),
+        "dividend": ("dividend", DividendSource, "fetch"),
+    }
+    if SinaFundFlowSource is not None:
+        per_stock_types["sina_fund_flow"] = ("sina_fund_flow", SinaFundFlowSource, "fetch")
+
+    done_types: set[str] = set()
+    failed_types: list[str] = []
+
+    for dtype in to_download:
+        if dtype in per_stock_types:
+            storage_key, source_cls, method_name = per_stock_types[dtype]
+            try:
+                if _download_per_stock(
+                    dtype, storage_key, source_cls, method_name,
+                    stock_list, data_dir, args,
+                ):
+                    done_types.add(dtype)
+                else:
+                    failed_types.append(dtype)
+            except Exception as e:
+                failed_types.append(dtype)
+                logger.warning("  %s: download failed: %s", dtype, str(e)[:100])
+
+    # ── Lockup (special: history + upcoming) ──
+    if "lockup" in to_download:
+        try:
+            if _download_lockup(stock_list, data_dir, args):
+                done_types.add("lockup")
+            else:
+                failed_types.append("lockup")
+        except Exception as e:
+            failed_types.append("lockup")
+            logger.warning("  lockup: download failed: %s", str(e)[:100])
+
+    # ── Limit-up pools (market-wide, date-based) ──
+    for pool in LIMIT_UP_POOLS:
+        pool_key = f"limit_up_{pool}"
+        if pool_key in to_download:
+            try:
+                if _download_limit_up_pool(pool, pool_key, data_dir, args):
+                    done_types.add(pool_key)
+                else:
+                    failed_types.append(pool_key)
+            except Exception as e:
+                failed_types.append(pool_key)
+                logger.warning("  %s: download failed: %s", pool_key, str(e)[:100])
+
+    if "limit_up_sentiment" in to_download:
+        try:
+            if _download_limit_up_sentiment(data_dir, args):
+                done_types.add("limit_up_sentiment")
+            else:
+                failed_types.append("limit_up_sentiment")
+        except Exception as e:
+            failed_types.append("limit_up_sentiment")
+            logger.warning("  limit_up_sentiment: download failed: %s", str(e)[:100])
+
+    # ── Industry ranking (market-wide, date-based) ──
+    if "industry_ranking" in to_download:
+        if IndustryRankingSource is None:
+            failed_types.append("industry_ranking")
+            logger.error("industry_ranking requested but sector_source unavailable")
+        else:
+            try:
+                if _download_industry_ranking(data_dir, args):
+                    done_types.add("industry_ranking")
+                else:
+                    failed_types.append("industry_ranking")
+            except Exception as e:
+                failed_types.append("industry_ranking")
+                logger.warning("  industry_ranking: download failed: %s", str(e)[:100])
+
+    # ── Concept blocks (per-stock) ──
+    if "concept_blocks" in to_download:
+        if ConceptBlockSource is None:
+            failed_types.append("concept_blocks")
+            logger.error("concept_blocks requested but sector_source unavailable")
+        else:
+            try:
+                if _download_concept_blocks(stock_list, data_dir, args):
+                    done_types.add("concept_blocks")
+                else:
+                    failed_types.append("concept_blocks")
+            except Exception as e:
+                failed_types.append("concept_blocks")
+                logger.warning("  concept_blocks: download failed: %s", str(e)[:100])
+
+    # Unified run manifest (§五-5): a partial run can never pass for complete.
+    try:
+        write_run_manifest(
+            data_dir, "a_shares/datacenter",
+            start_date=args.start, end_date=args.end,
+            requested=to_download, failed=failed_types, complete=done_types,
+            success_count=len(done_types),
+        )
+    except Exception as exc:
+        logger.warning("run manifest write failed: %s", exc)
+
+    logger.info("Done.")
+
+
+# ── Per-stock download helpers ───────────────────────────────────────────
+
+def _download_per_stock(dtype, storage_key, source_cls, method_name,
+                        stock_list, data_dir, args) -> bool:
+    """Download per-stock data for one dtype. Returns True if any rows saved."""
+    logger.info("=== %s: %d stocks (%s to %s) ===",
+                dtype, len(stock_list), args.start, args.end)
+    t0 = time.time()
+
+    source = source_cls(min_interval=args.sleep)
+    storage = MarketWideStorage(data_dir, storage_key)
+    fetch_fn = getattr(source, method_name)
+    saved = False
+
+    if args.concurrent:
+        from stoke_ml.crawler.rate_limiter import RateLimiter
+        from stoke_ml.crawler.concurrent import ConcurrentDownloader
+
+        rl = RateLimiter(base_delay_sec=args.sleep, daily_quota=50000)
+        downloader = ConcurrentDownloader(rate_limiter=rl, max_workers=args.workers)
+        results = downloader.download_all(
+            stock_list,
+            lambda c: _fetch_one(source_cls, method_name, args.sleep, c),
+        )
+        frames = [d for d in results.values() if d is not None and not d.empty]
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        frames = []
+        for i, code in enumerate(stock_list):
+            try:
+                sdf = fetch_fn(code)
+                if not sdf.empty:
+                    frames.append(sdf)
+            except Exception:
+                logger.debug("%s fetch failed for %s", dtype, code)
+            if i > 0 and i % 100 == 0:
+                logger.info("  %s: %d/%d stocks done", dtype, i, len(stock_list))
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    if not df.empty:
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            mask = (df["date"] >= pd.Timestamp(args.start)) & \
+                   (df["date"] <= pd.Timestamp(args.end))
+            df = df[mask]
+        if not df.empty:
+            storage.save(df)
+            saved = True
+            logger.info("  %s: %d rows saved (%.1fs)", dtype, len(df), time.time() - t0)
+        else:
+            logger.warning("  %s: no data in date range (%s to %s)",
+                         dtype, args.start, args.end)
+    else:
+        logger.warning("  %s: no data returned", dtype)
+
+    source.close()
+    return saved
+
+
+def _download_lockup(stock_list, data_dir, args) -> bool:
+    """Download lockup history + upcoming. Returns True if any rows saved."""
+    logger.info("=== lockup: %d stocks ===", len(stock_list))
+    t0 = time.time()
+
+    hist_storage = MarketWideStorage(data_dir, "lockup")
+    upcoming_storage = MarketWideStorage(data_dir, "lockup_upcoming")
+
+    if args.concurrent:
+        from stoke_ml.crawler.rate_limiter import RateLimiter
+        from stoke_ml.crawler.concurrent import ConcurrentDownloader
+
+        rl = RateLimiter(base_delay_sec=args.sleep, daily_quota=50000)
+        downloader = ConcurrentDownloader(rate_limiter=rl, max_workers=args.workers)
+        results = downloader.download_all(
+            stock_list,
+            lambda c: _fetch_one_lockup(c, args.sleep, args.end),
+        )
+        hist_frames = []
+        upcoming_frames = []
+        for data in results.values():
+            if data is None:
+                continue
+            hist_df, upcoming_df = data
+            if not hist_df.empty:
+                hist_frames.append(hist_df)
+            if not upcoming_df.empty:
+                upcoming_frames.append(upcoming_df)
+    else:
+        source = LockupExpirySource(min_interval=args.sleep)
+        hist_frames = []
+        upcoming_frames = []
+        for i, code in enumerate(stock_list):
+            try:
+                data = source.fetch_all(code, trade_date=args.end)
+                if not data["history"].empty:
+                    hist_frames.append(data["history"])
+                if not data["upcoming"].empty:
+                    upcoming_stock = data["upcoming"].copy()
+                    upcoming_stock["is_upcoming"] = True
+                    upcoming_frames.append(upcoming_stock)
+            except Exception:
+                logger.debug("lockup fetch failed for %s", code)
+            if i > 0 and i % 100 == 0:
+                logger.info("  lockup: %d/%d stocks done", i, len(stock_list))
+        source.close()
+
+    if hist_frames:
+        hist_df = pd.concat(hist_frames, ignore_index=True)
+        hist_storage.save(hist_df)
+        logger.info("  lockup history: %d rows", len(hist_df))
+
+    if upcoming_frames:
+        upcoming_df = pd.concat(upcoming_frames, ignore_index=True)
+        upcoming_storage.save(upcoming_df)
+        logger.info("  lockup upcoming: %d rows", len(upcoming_df))
+
+    if not hist_frames and not upcoming_frames:
+        logger.warning("  lockup: no data returned")
+
+    logger.info("  lockup: done (%.1fs)", time.time() - t0)
+    return bool(hist_frames or upcoming_frames)
+
+
+def _download_limit_up_pool(pool, storage_key, data_dir, args) -> bool:
+    """Download one limit-up pool. Returns True if data saved or already cached."""
+    logger.info("=== limit_up_%s: %s to %s ===", pool, args.start, args.end)
+    t0 = time.time()
+
+    source = LimitUpSource(min_interval=args.sleep)
+    storage = MarketWideStorage(data_dir, storage_key)
+    fetch_fn = getattr(source, f"fetch_{pool}_pool")
+
+    # Build set of already-covered dates from existing parquet data
+    existing_dates = set()
+    base = os.path.join(data_dir, "a_shares", storage_key)
+    if os.path.isdir(base):
+        for root, _dirs, files in os.walk(base):
+            for f in files:
+                if f.endswith(".parquet"):
+                    try:
+                        df = pd.read_parquet(
+                            os.path.join(root, f), columns=["date"],
+                        )
+                        for d in pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"):
+                            existing_dates.add(d)
+                    except Exception:
+                        pass
+
+    calendar = TradingCalendar("a_shares")
+    all_dates = calendar.get_trading_days(args.start, args.end)
+    dates_to_fetch = [
+        d for d in all_dates
+        if d.strftime("%Y-%m-%d") not in existing_dates
+    ]
+
+    if not dates_to_fetch:
+        logger.info("  limit_up_%s: all %d days already cached, skipping",
+                    pool, len(all_dates))
+        source.close()
+        return True
+
+    n_cached = len(all_dates) - len(dates_to_fetch)
+    logger.info("  limit_up_%s: %d/%d days cached, %d to fetch",
+                pool, n_cached, len(all_dates), len(dates_to_fetch))
+
+    frames = []
+    for i, d in enumerate(dates_to_fetch):
+        date_str = d.strftime("%Y-%m-%d")
+        try:
+            df = fetch_fn(date_str)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            logger.debug("limit_up_%s failed for %s", pool, date_str)
+        if (i + 1) % 60 == 0:
+            pct = (i + 1) / len(dates_to_fetch) * 100
+            logger.info("  limit_up_%s: %d/%d days (%.0f%%)",
+                        pool, i + 1, len(dates_to_fetch), pct)
+
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        storage.save(df)
+        logger.info("  limit_up_%s: %d new rows saved (%.1fs)",
+                    pool, len(df), time.time() - t0)
+    else:
+        logger.info("  limit_up_%s: no new data in range", pool)
+
+    source.close()
+    return bool(frames)
+
+
+def _load_pool_flat(pool_dir: str) -> dict[str, pd.DataFrame]:
+    """Load all flat per-stock pool files and index by date.
+
+    Pool data is stored as flat files (e.g. limit_up_zt/000001.parquet),
+    not year/month partitions. Returns dict[date_str, DataFrame].
+    """
+    if not os.path.isdir(pool_dir):
+        return {}
+    frames = []
+    for f in os.listdir(pool_dir):
+        if not f.endswith(".parquet"):
+            continue
+        try:
+            df = pd.read_parquet(os.path.join(pool_dir, f))
+            if "date" in df.columns and not df.empty:
+                df["date"] = pd.to_datetime(df["date"])
+                frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return {}
+    all_data = pd.concat(frames, ignore_index=True)
+    return {
+        d.strftime("%Y-%m-%d"): grp.drop(columns=["date"])
+        for d, grp in all_data.groupby(all_data["date"].dt.date)
+    }
+
+
+def _download_limit_up_sentiment(data_dir, args) -> bool:
+    """Compute limit-up sentiment. Returns True if data saved or already cached."""
+    logger.info("=== limit_up_sentiment: %s to %s ===", args.start, args.end)
+    t0 = time.time()
+
+    # Load all pool flat files into memory, indexed by date.
+    pool_dirs = {
+        "zt": os.path.join(data_dir, "a_shares", "limit_up_zt"),
+        "zb": os.path.join(data_dir, "a_shares", "limit_up_zb"),
+        "dt": os.path.join(data_dir, "a_shares", "limit_up_dt"),
+        "yzt": os.path.join(data_dir, "a_shares", "limit_up_yzt"),
+    }
+    logger.info("  limit_up_sentiment: loading pool flat files...")
+    pool_by_date = {}
+    for key, pdir in pool_dirs.items():
+        pool_by_date[key] = _load_pool_flat(pdir)
+        logger.info("  limit_up_sentiment: loaded %s → %d dates", key,
+                    len(pool_by_date[key]))
+
+    # Determine which dates have all 4 pools with non-empty data.
+    all_pool_dates = set(pool_by_date["zt"].keys()) & \
+        set(pool_by_date["zb"].keys()) & \
+        set(pool_by_date["dt"].keys()) & \
+        set(pool_by_date["yzt"].keys())
+
+    # Check existing sentiment dates to avoid recomputing.
+    existing_dates: set[str] = set()
+    sentiment_base = os.path.join(data_dir, "a_shares", "limit_up_sentiment")
+    if os.path.isdir(sentiment_base):
+        for f in os.listdir(sentiment_base):
+            if f.endswith(".parquet"):
+                try:
+                    df = pd.read_parquet(
+                        os.path.join(sentiment_base, f), columns=["date"],
+                    )
+                    for d in pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"):
+                        existing_dates.add(d)
+                except Exception:
+                    pass
+
+    calendar = TradingCalendar("a_shares")
+    target_dates = {
+        d.strftime("%Y-%m-%d")
+        for d in calendar.get_trading_days(args.start, args.end)
+    }
+    dates_to_compute = sorted(
+        (target_dates & all_pool_dates) - existing_dates,
+    )
+
+    if not dates_to_compute:
+        logger.info("  limit_up_sentiment: all %d days cached or no pool data, skipping",
+                    len(target_dates & all_pool_dates))
+        return True
+
+    n_total = len(target_dates)
+    n_available = len(target_dates & all_pool_dates)
+    n_cached = n_available - len(dates_to_compute)
+    logger.info("  limit_up_sentiment: %d total dates, %d have pools, %d cached, %d to compute",
+                n_total, n_available, n_cached, len(dates_to_compute))
+
+    rows = []
+    for date_str in dates_to_compute:
+        zt_df = pool_by_date["zt"].get(date_str, pd.DataFrame())
+        zb_df = pool_by_date["zb"].get(date_str, pd.DataFrame())
+        dt_df = pool_by_date["dt"].get(date_str, pd.DataFrame())
+        yzt_df = pool_by_date["yzt"].get(date_str, pd.DataFrame())
+
+        rows.append(LimitUpSource.compute_sentiment(
+            date_str, zt_df, zb_df, dt_df, yzt_df,
+        ))
+
+    if rows:
+        df = pd.DataFrame(rows, columns=SENTIMENT_COLS)
+        df["date"] = pd.to_datetime(df["date"])
+        # Sentiment is a daily time-series (not per-stock), save as a single
+        # flat file.  MarketWideStorage expects a stock_code column for
+        # per-stock partitioning and would raise KeyError here.
+        os.makedirs(sentiment_base, exist_ok=True)
+        out_path = os.path.join(sentiment_base, "sentiment.parquet")
+        if os.path.isfile(out_path):
+            existing = pd.read_parquet(out_path)
+            existing["date"] = pd.to_datetime(existing["date"])
+            df = pd.concat([existing, df], ignore_index=True)
+            df = df.drop_duplicates(subset=["date"], keep="last")
+        df = df.sort_values("date")
+        df.to_parquet(out_path, index=False, compression="lz4")
+        logger.info("  limit_up_sentiment: %d rows saved (%.1fs)",
+                    len(df), time.time() - t0)
+    else:
+        logger.info("  limit_up_sentiment: no new data in range")
+
+    return bool(rows)
+
+
+def _download_industry_ranking(data_dir, args) -> bool:
+    logger.info("=== industry_ranking: %s to %s ===", args.start, args.end)
+    t0 = time.time()
+
+    source = IndustryRankingSource(min_interval=args.sleep)
+    df = source.fetch_batch(args.start, args.end)
+
+    saved = False
+    if not df.empty:
+        df = df.rename(columns={"code": "stock_code"})
+        storage = MarketWideStorage(data_dir, "industry_ranking")
+        storage.save(df)
+        saved = True
+        logger.info("  industry_ranking: %d rows saved (%.1fs)",
+                    len(df), time.time() - t0)
+    else:
+        logger.warning("  industry_ranking: no data returned")
+
+    source.close()
+    return saved
+
+
+def _download_concept_blocks(stock_list, data_dir, args) -> bool:
+    logger.info("=== concept_blocks: %d stocks ===", len(stock_list))
+    t0 = time.time()
+
+    source = ConceptBlockSource(min_interval=args.sleep)
+    storage = MarketWideStorage(data_dir, "concept_blocks")
+
+    frames = []
+    for i, code in enumerate(stock_list):
+        try:
+            df = source.fetch(code)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            logger.debug("concept_blocks fetch failed for %s", code)
+        if i > 0 and i % 100 == 0:
+            logger.info("  concept_blocks: %d/%d stocks done", i, len(stock_list))
+
+    saved = False
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        storage.save(df)
+        saved = True
+        logger.info("  concept_blocks: %d rows saved (%.1fs)",
+                    len(df), time.time() - t0)
+    else:
+        logger.warning("  concept_blocks: no data returned")
+
+    source.close()
+    return saved
+
+
+if __name__ == "__main__":
+    main()

@@ -47,18 +47,88 @@ SNAPSHOT_FILES = {
     "earnings_express": ("earnings", "express.parquet"),
 }
 
-# Build-time config keys whose values change the feature output.
+# Build-time config keys whose values change the feature output (flat form).
+# The production path hashes a full config snapshot instead (config_snapshot),
+# so this whitelist only backs the legacy flat-dict form (unit tests / callers
+# that carry just the pipeline flags).
 _CONFIG_KEYS = [
-    "seq_len", "horizon",
+    "seq_len", "flat_seq_len", "horizon",
     "use_technical", "use_scoring", "use_temporal",
-    "use_sentiment", "use_guba", "use_comment", "use_limit_up",
-    "use_pledge", "use_market_env", "use_market_env_refine",
-    "use_index_membership", "panel_mode", "start", "end",
+    "use_sentiment", "use_announcements", "use_guba", "use_comment",
+    "use_margin", "use_northbound", "use_dragon_tiger",
+    "use_fundamental", "use_earnings", "use_valuation", "use_etf_flow",
+    "use_capital_flow", "use_block_trade", "use_shareholder", "use_lockup",
+    "use_dividend", "use_board", "use_sector", "use_concept",
+    "use_macro", "use_industry", "use_limit_up", "use_pledge",
+    "use_market_env", "use_market_env_refine", "use_index_membership",
+    "use_interaction", "use_feature_selection", "feature_selection_k",
+    "use_new_preprocessing", "use_emotion_refine", "use_fundamental_refine",
+    "use_temporal_stats", "drop_dead_features", "min_history",
+    "panel_mode", "start", "end",
 ]
+
+# config.yaml sections that change prebuilt feature VALUES.  Hashed verbatim
+# by config_hash() so a same-commit config.yaml edit (technical windows,
+# missing-value handling, thresholds, cross-sectional normalization params,
+# source effective-date / persistence strategy, universe gates) invalidates
+# the feature cache — the git-commit field alone cannot see it (§十一-3).
+_CONFIG_SECTIONS = ["features", "preprocessing", "universe", "fundamental"]
 
 
 def _sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_dumps(obj) -> str:
+    """Deterministic JSON for hashing: sorted keys, compact separators."""
+    return json.dumps(
+        obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str,
+    )
+
+
+def _to_plain(value):
+    """Recursively normalize an OmegaConf node / container to plain Python."""
+    try:
+        from omegaconf import OmegaConf
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {k: _to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v) for v in value]
+    return value
+
+
+def config_snapshot(cfg) -> dict:
+    """Feature-affecting config sections, normalized to plain containers.
+
+    Covers technical-indicator switches, missing-value handling, thresholds,
+    cross-sectional normalization params and the source effective-date /
+    persistence strategy (§十一-3), plus the universe gates that
+    build_panel_features reads at runtime.  ``start``/``end`` and
+    ``panel_mode`` are deliberately excluded: they are resolved differently
+    by the build and training processes, so they are captured by the
+    manifest's source-file range and the feature schema hash instead.
+    """
+    snap = {}
+    for name in _CONFIG_SECTIONS:
+        raw = cfg.get(name) if isinstance(cfg, dict) else getattr(cfg, name, None)
+        snap[name] = _to_plain(raw) if raw is not None else {}
+    return snap
+
+
+def current_config_hash() -> str | None:
+    """config_hash of the active config.yaml's feature-affecting sections.
+
+    Returns None (callers then skip the comparison) if config cannot load.
+    """
+    try:
+        from stoke_ml.config import load_config
+        return config_hash(config_snapshot(load_config()))
+    except Exception:
+        return None
 
 
 def git_head() -> str:
@@ -74,18 +144,54 @@ def git_head() -> str:
         return "unknown"
 
 
-def file_fingerprint(path: str) -> str | None:
-    """Cheap content fingerprint (size + mtime_ns); None if the file is absent.
+def _upstream_manifest_hash(path: str) -> str | None:
+    """Content checksum recorded in an upstream storage sidecar manifest.
 
-    A make-style proxy for content hashing: re-downloading or appending to a
-    source parquet changes its size/mtime, so any stale feature built from it
-    is invalidated at the next build.
+    The daily K-line storage already writes ``daily/{code}.manifest.json`` whose
+    ``schema_hash`` is a value-level content checksum (storage.py ``_schema_hash``)
+    — re-reading that sidecar is cheaper and more robust than re-hashing the
+    parquet bytes.  Any channel that adds a content-checksummed sidecar at
+    ``{stem}.manifest.json`` is picked up the same way.
     """
+    sidecar = os.path.splitext(path)[0] + ".manifest.json"
+    if not os.path.isfile(sidecar):
+        return None
     try:
-        st = os.stat(path)
+        with open(sidecar, encoding="utf-8") as f:
+            m = json.load(f)
+    except Exception:
+        return None
+    sh = m.get("schema_hash")
+    return sh if isinstance(sh, str) and sh else None
+
+
+def _content_hash(path: str) -> str | None:
+    """Streaming SHA-256 of a file's bytes; None if unreadable."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
     except OSError:
         return None
-    return _sha1(f"{st.st_size}:{st.st_mtime_ns}")
+    return h.hexdigest()
+
+
+def file_fingerprint(path: str) -> str | None:
+    """Content-based fingerprint of a source file; None if the file is absent.
+
+    Prefers the upstream storage sidecar manifest's content checksum (daily
+    K-line), falling back to streaming the file bytes through SHA-256.  Either
+    way the fingerprint changes when the *content* changes — a same-size
+    replacement, a preserved-mtime copy, or a filesystem sync cannot slip
+    through the way the old size+mtime proxy could (§十一-2).
+    """
+    if not os.path.isfile(path):
+        return None
+    upstream = _upstream_manifest_hash(path)
+    if upstream is not None:
+        return _sha1(f"upstream:{upstream}")
+    return _content_hash(path)
 
 
 def schema_hash(path: str) -> str:
@@ -103,7 +209,17 @@ def schema_hash(path: str) -> str:
 
 
 def config_hash(config: dict) -> str:
-    """Signature of the build-time config a feature's values depend on."""
+    """Signature of the config a feature's values depend on.
+
+    A full config snapshot (see ``config_snapshot``) is hashed verbatim — the
+    production path — so every feature-affecting config.yaml value is covered.
+    A flat legacy dict (unit tests / callers that only carry pipeline flags)
+    is filtered through ``_CONFIG_KEYS`` instead.
+    """
+    if isinstance(config.get("features"), dict) and isinstance(
+        config.get("preprocessing"), dict
+    ):
+        return _sha1(_stable_dumps(config))
     sig = json.dumps({k: config.get(k) for k in _CONFIG_KEYS}, sort_keys=True)
     return _sha1(sig)
 
@@ -193,6 +309,12 @@ def manifest_matches(
         m.get("horizon") == config.get("horizon"),
         m.get("seq_len") == config.get("seq_len"),
     ]):
+        return False
+    # start/end are NOT part of config_hash (build and training resolve them
+    # differently) — they are recorded as the daily source range and compared
+    # here so a date-window change still invalidates the cache (§十一-3).
+    rng = (m.get("source_files") or {}).get("daily", {}).get("range")
+    if rng != [config.get("start"), config.get("end")]:
         return False
     for name, rec in (m.get("source_files") or {}).items():
         path = source_paths(data_dir, code).get(name)

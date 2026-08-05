@@ -54,11 +54,12 @@ def fake_topic_deps(monkeypatch):
         monkeypatch.setitem(sys.modules, name, stub)
 
 
-def _make_topic_modeler(tmp_path, monkeypatch):
+def _make_topic_modeler(tmp_path, monkeypatch, **kwargs):
     tm = TopicModeler(
         enabled=True,
         min_topic_size=2,
         model_cache_dir=str(tmp_path),
+        **kwargs,
     )
     monkeypatch.setattr(
         tm, "_get_embeddings", lambda texts: np.zeros((len(texts), 8))
@@ -203,3 +204,91 @@ def test_cached_fold_model_is_reused_for_same_cutoff(
     path = next(iter(dumped))
     assert path in loaded            # second fit reloaded from disk
     assert tm2._model is not None
+
+
+# ---------------------------------------------------------------------------
+# §十-2: corpus content hash — cache self-invalidation
+# ---------------------------------------------------------------------------
+
+def test_corpus_hash_recorded_in_meta(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """The persisted metadata carries the corpus content hash so transform()
+    and later fits can verify the cached model matches the corpus."""
+    monkeypatch.setattr(joblib, "dump", lambda model, path: None)
+    tm = _make_topic_modeler(tmp_path, monkeypatch)
+    tm.fit(posts.copy(), source="news", corpus_cutoff="2024-01-31")
+
+    assert tm.corpus_hash_ is not None and len(tm.corpus_hash_) == 16
+    meta_path = tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json"
+    import json
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["corpus_hash"] == tm.corpus_hash_
+
+
+def test_same_cutoff_edited_corpus_retrains(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """A same-cutoff corpus with different CONTENT must force a retrain —
+    never reuse the stale cached representation (§十-2)."""
+    dumped = []
+
+    def fake_dump(model, path):
+        dumped.append(path)
+        with open(path, "wb") as f:   # make the cache exist on disk
+            f.write(b"dummy")
+
+    monkeypatch.setattr(joblib, "dump", fake_dump)
+
+    tm1 = _make_topic_modeler(tmp_path, monkeypatch)
+    tm1.fit(posts.copy(), source="news", corpus_cutoff="2024-01-31")
+
+    # Same cutoff, same dates — but different post text.
+    edited = posts.copy()
+    edited["body"] = edited["body"] + "_EDITED"
+    tm2 = _make_topic_modeler(tmp_path, monkeypatch)
+    tm2.fit(edited, source="news", corpus_cutoff="2024-01-31")
+
+    assert len(dumped) == 2            # retrained despite same cutoff
+    assert tm2.corpus_hash_ != tm1.corpus_hash_
+
+
+def test_transform_raises_when_unfitted_no_cutoff(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """Production transform with no fitted model and no pinned cutoff must
+    raise instead of silently dropping the topic features (§十-2)."""
+    tm = _make_topic_modeler(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match="fit_topic_model"):
+        tm.transform(posts.copy(), source="news")
+
+
+def test_transform_raises_when_pinned_cache_missing(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """A pinned cutoff with no matching cached model still raises — the
+    operator must run fit_topic_model first (§十-2)."""
+    tm = _make_topic_modeler(
+        tmp_path, monkeypatch, corpus_cutoff="2024-01-31"
+    )
+    with pytest.raises(RuntimeError, match="fit_topic_model"):
+        tm.transform(posts.copy(), source="news")
+
+
+def test_transform_auto_loads_pinned_cache(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """With a pinned cutoff and its cached model on disk, transform()
+    auto-loads it and assigns topic columns (§十-2)."""
+    monkeypatch.setattr(joblib, "load", lambda path: _FakeBERTopic())
+    cache = tmp_path / "bertopic_news_cutoff_2024-01-31.pkl"
+    cache.write_bytes(b"dummy")
+
+    tm = _make_topic_modeler(
+        tmp_path, monkeypatch, corpus_cutoff="2024-01-31"
+    )
+    out = tm.transform(posts.copy(), source="news")
+
+    assert "topic_id" in out.columns
+    assert "topic_probability" in out.columns
+    assert tm._model is not None

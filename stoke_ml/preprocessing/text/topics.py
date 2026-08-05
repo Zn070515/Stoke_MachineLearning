@@ -8,6 +8,7 @@ Gracefully degrades to no-op when bertopic/umap/hdbscan are not installed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -58,6 +59,11 @@ class TopicModeler(PreprocessingStep):
         ``"finbert"`` for sentence-transformers, ``"tfidf"`` for jieba+CountVectorizer.
     """
 
+    # Fit ONCE on a pinned corpus (see corpus_cutoff) and frozen to disk; a
+    # formal offline pass must consume the pinned artifact, never re-fit on the
+    # full window (§十-1, §十-2).
+    fit_scope = "global_frozen"
+
     def __init__(
         self,
         enabled: bool = True,
@@ -65,12 +71,20 @@ class TopicModeler(PreprocessingStep):
         min_topic_size: int = 50,
         model_cache_dir: str = "models/bertopic",
         embedding_model: str = "finbert",
+        corpus_cutoff: str | None = None,
     ):
         self.enabled = enabled
         self.n_topics = n_topics
         self.min_topic_size = min_topic_size
         self.model_cache_dir = model_cache_dir
         self.embedding_model = embedding_model
+        # Pinned production corpus cutoff (TRAIN_END).  When set, transform()
+        # auto-loads the cached model fit on this corpus instead of running
+        # unfitted, and never silently drops the topic features (§十-2).
+        self.corpus_cutoff = corpus_cutoff
+        # SHA-1 (first 16 hex) of the training corpus text, recorded in cache
+        # metadata so a model is only reused when the corpus CONTENT matches.
+        self.corpus_hash_ = None
 
         self._model = None
         self._finbert_model = None
@@ -104,7 +118,7 @@ class TopicModeler(PreprocessingStep):
 
         source = kwargs.get("source", "default")
         force_retrain = kwargs.get("force_retrain", False)
-        corpus_cutoff = kwargs.get("corpus_cutoff", None)
+        corpus_cutoff = kwargs.get("corpus_cutoff", self.corpus_cutoff)
 
         fit_df = _truncate_to_cutoff(df, corpus_cutoff)
         self._record_fit_range(fit_df)
@@ -119,23 +133,35 @@ class TopicModeler(PreprocessingStep):
 
         # Corpus version key → cache identity.
         corpus_key = self._corpus_key(corpus_cutoff)
+        self.corpus_hash_ = self._corpus_hash(fit_df)
         cache_path = os.path.join(
             self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}.pkl"
         )
 
-        # Try loading from cache
+        # Try loading from cache — reuse ONLY when the cached model was fit on
+        # identical corpus CONTENT.  A same-cutoff corpus that changed (edited
+        # / re-downloaded posts) must force a retrain, never silently reuse the
+        # stale representation (§十-2).
         if not force_retrain and os.path.exists(cache_path):
-            try:
-                import joblib
-                self._model = joblib.load(cache_path)
-                self._restore_embedder(source, corpus_key)
-                logger.info("Loaded cached BERTopic model from %s", cache_path)
-                return self
-            except Exception as exc:
-                logger.warning(
-                    "Corrupted BERTopic cache at %s (category=%s), will retrain",
-                    cache_path, classify_error(exc).value,
+            cached_hash = self._read_meta(source, corpus_key).get("corpus_hash")
+            if cached_hash != self.corpus_hash_:
+                logger.info(
+                    "Cached model at %s was fit on different corpus content "
+                    "(cached=%s, current=%s), retraining",
+                    cache_path, cached_hash, self.corpus_hash_,
                 )
+            else:
+                try:
+                    import joblib
+                    self._model = joblib.load(cache_path)
+                    self._restore_embedder(source, corpus_key)
+                    logger.info("Loaded cached BERTopic model from %s", cache_path)
+                    return self
+                except Exception as exc:
+                    logger.warning(
+                        "Corrupted BERTopic cache at %s (category=%s), will retrain",
+                        cache_path, classify_error(exc).value,
+                    )
 
         texts = self._build_texts(fit_df)
         if len(texts) < self.min_topic_size:
@@ -186,7 +212,9 @@ class TopicModeler(PreprocessingStep):
             # Persist
             import joblib
             joblib.dump(self._model, cache_path)
-            self._save_metadata(source, corpus_key, n_found, len(texts))
+            self._save_metadata(
+                source, corpus_key, n_found, len(texts), self.corpus_hash_
+            )
 
         except Exception as e:
             logger.warning(
@@ -197,10 +225,29 @@ class TopicModeler(PreprocessingStep):
 
         return self
 
-    def transform(self, df, **kwargs):
-        """Assign topic_id and topic_probability columns."""
-        if df.empty or not self._enabled or self._model is None:
+    def transform(self, df, *, source="default", **kwargs):
+        """Assign topic_id and topic_probability columns.
+
+        Production transform needs a fitted model.  When none is loaded yet
+        and a pinned ``corpus_cutoff`` is configured, the matching cached
+        model is auto-loaded from disk.  When neither exists, the call RAISES
+        instead of silently dropping the topic features — the old behavior
+        meant the topic columns could be absent from production data with no
+        error at all (§十-2).
+        """
+        if df.empty or not self._enabled:
             return df
+        if self._model is None:
+            self._auto_load(source)
+        if self._model is None:
+            raise RuntimeError(
+                "TopicModeler.transform() has no fitted model to assign topics "
+                "(pinned corpus_cutoff=%s). Run "
+                "`python scripts/production/fit_topic_model.py --source %s --cutoff TRAIN_END` "
+                "and set preprocessing.text.topic_model.corpus_cutoff, or the "
+                "topic_* features are silently absent."
+                % (self.corpus_cutoff or "unset", source)
+            )
 
         df = df.copy()
         texts = self._build_texts(df)
@@ -264,6 +311,71 @@ class TopicModeler(PreprocessingStep):
             texts.append(" ".join(parts) if parts else "")
 
         return texts
+
+    def _corpus_hash(self, df: pd.DataFrame) -> str:
+        """Deterministic SHA-1 digest (first 16 hex) of the corpus text.
+
+        Recorded in cache metadata so a cached model is reused only when the
+        training corpus CONTENT is unchanged — an edited corpus with the same
+        cutoff date can no longer silently reuse a stale model (§十-2).
+        """
+        texts = self._build_texts(df)
+        digest = "\n".join(texts).encode("utf-8")
+        return hashlib.sha1(digest).hexdigest()[:16]
+
+    def _read_meta(self, source: str, corpus_key: str) -> dict:
+        """Read cached-model metadata, or an empty dict when unavailable."""
+        meta_path = os.path.join(
+            self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}_meta.json"
+        )
+        if not os.path.exists(meta_path):
+            return {}
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning(
+                "Cannot read BERTopic meta %s (category=%s)",
+                meta_path, classify_error(exc).value,
+            )
+            return {}
+
+    def _auto_load(self, source: str) -> None:
+        """Load the cached model pinned by ``corpus_cutoff``, if configured.
+
+        Called from transform() when no model is fitted.  With a pinned cutoff
+        this loads the production artifact fit on TRAIN_END; without one the
+        model stays unfitted and transform() raises so the missing topic
+        features are surfaced instead of silently dropped (§十-2).
+        """
+        if self.corpus_cutoff is None:
+            logger.error(
+                "TopicModeler has no fitted model and no pinned corpus_cutoff "
+                "(preprocessing.text.topic_model.corpus_cutoff); "
+                "topic features will not be generated."
+            )
+            return
+        corpus_key = self._corpus_key(self.corpus_cutoff)
+        cache_path = os.path.join(
+            self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}.pkl"
+        )
+        if not os.path.exists(cache_path):
+            logger.error(
+                "Pinned topic cache %s not found. Run "
+                "`python scripts/production/fit_topic_model.py --source %s --cutoff %s`.",
+                cache_path, source, self.corpus_cutoff,
+            )
+            return
+        try:
+            import joblib
+            self._model = joblib.load(cache_path)
+            self._restore_embedder(source, corpus_key)
+            logger.info("Auto-loaded pinned BERTopic model from %s", cache_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to auto-load pinned BERTopic cache %s (category=%s): %s",
+                cache_path, classify_error(exc).value, exc,
+            )
 
     def _get_embeddings(self, texts: list[str]):
         """Produce document embeddings for BERTopic.
@@ -346,7 +458,8 @@ class TopicModeler(PreprocessingStep):
             return None
 
     def _save_metadata(
-        self, source: str, corpus_key: str, n_topics: int, n_docs: int
+        self, source: str, corpus_key: str, n_topics: int, n_docs: int,
+        corpus_hash: str,
     ) -> None:
         meta_path = os.path.join(
             self.model_cache_dir, f"bertopic_{source}_cutoff_{corpus_key}_meta.json"
@@ -355,6 +468,7 @@ class TopicModeler(PreprocessingStep):
         meta = {
             "source": source,
             "corpus_cutoff": corpus_key,
+            "corpus_hash": corpus_hash,
             "n_topics_found": n_topics,
             "n_docs_trained": n_docs,
             "corpus_date_min": (self.fit_start.strftime("%Y-%m-%d")

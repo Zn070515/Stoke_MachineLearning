@@ -14,6 +14,12 @@ The contracts harden the schemas from documentation into real constraints:
 * ``validate_ohlc`` — ``low <= open/close <= high`` on every bar.
 * ``validate_source_metadata`` — a ``source`` column, when present, must be
   non-empty, and an ``adjustment_mode`` column must hold a legal value.
+* ``validate_required_metadata`` — contracts may declare ``required_metadata``
+  (e.g. daily K-line requires ``source`` + ``adjustment_mode``) that must be
+  declared somewhere: in ``df.attrs``, as a non-empty column, or in the
+  strongly-bound manifest.  Legacy files honestly record ``unknown`` — that IS
+  a declaration and passes; a file with no source/adjust anywhere is not
+  canonical daily.
 * ``validate_dates(..., trading_days=...)`` — optional membership in the
   official trading calendar.
 * Price basis is split across DISTINCT contracts (``raw_unadjusted_daily`` /
@@ -51,6 +57,10 @@ class DataContract:
     required_finite_ratio: dict[str, float] = field(default_factory=dict)
     minimum_valid_rows: int = 0
     adjustment_mode: str = "n/a"
+    # Provenance metadata that must be declared for this dataset — either in
+    # df.attrs, as a non-empty column, or in the strongly-bound manifest
+    # (e.g. daily K-line requires source + adjustment_mode).
+    required_metadata: tuple[str, ...] = ()
 
 
 # ── validators ────────────────────────────────────────────────────────────
@@ -137,10 +147,10 @@ def validate_units(df: pd.DataFrame, contract: DataContract) -> list[str]:
     for col, unit in contract.units.items():
         if col not in df.columns:
             continue
-        x = pd.to_numeric(df[col], errors="coerce").to_numpy()
-        finite = x[~pd.isna(x)]
+        x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype="float64")
+        finite = x[np.isfinite(x)]
         if finite.size == 0:
-            continue
+            continue  # all-non-finite is reported by validate_finite
         if unit == "price":
             n = int((finite <= 0).sum())
             if n:
@@ -155,10 +165,10 @@ def validate_units(df: pd.DataFrame, contract: DataContract) -> list[str]:
 def validate_finite(df: pd.DataFrame, contract: DataContract) -> list[str]:
     """Required finite ratios + minimum valid rows.
 
-    Previously an all-NaN OHLC file passed because schema only checked column
-    existence and units skipped zero-finite columns.  Suspension is represented
-    by absent rows, not NaN OHLC rows, so a frame below the finite threshold is
-    corrupt, not "suspended".
+    ``Inf``/``-Inf`` are NOT valid numbers: ``notna()`` counts them as present,
+    so the finite ratio must use ``np.isfinite`` after numeric coercion.
+    Suspension is represented by absent rows, not NaN/Inf OHLC rows, so a frame
+    below the finite threshold is corrupt, not "suspended".
     """
     out = []
     if contract.minimum_valid_rows and len(df) < contract.minimum_valid_rows:
@@ -169,14 +179,21 @@ def validate_finite(df: pd.DataFrame, contract: DataContract) -> list[str]:
         if len(df) == 0:
             out.append(f"{col}_finite_ratio:0.0<{min_ratio}")
             continue
-        ratio = float(df[col].notna().mean())
+        values = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype="float64")
+        finite = int(np.isfinite(values).sum())
+        ratio = finite / len(values)
         if ratio < min_ratio:
             out.append(f"{col}_finite_ratio:{ratio:.4f}<{min_ratio}")
     return out
 
 
 def validate_ohlc(df: pd.DataFrame, contract: DataContract) -> list[str]:
-    """low <= open/close <= high on every bar."""
+    """low <= open/close <= high on every bar.
+
+    ``Inf`` is not a legal price: bars carrying any non-finite price are
+    excluded from the ordering comparison and reported via ``validate_finite``
+    (which rejects an all-Inf OHLC file outright).
+    """
     if "low" not in contract.price_columns or "high" not in contract.price_columns:
         return []
     cols = [c for c in contract.price_columns if c in df.columns]
@@ -190,9 +207,9 @@ def validate_ohlc(df: pd.DataFrame, contract: DataContract) -> list[str]:
         if c in ("low", "high"):
             continue
         v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
-        nan = np.isnan(low) | np.isnan(high) | np.isnan(v)
-        n_low = int(((v < low - TOL) & ~nan).sum())
-        n_high = int(((v > high + TOL) & ~nan).sum())
+        finite = np.isfinite(low) & np.isfinite(high) & np.isfinite(v)
+        n_low = int(((v < low - TOL) & finite).sum())
+        n_high = int(((v > high + TOL) & finite).sum())
         if n_low:
             out.append(f"{c}<low:{n_low}")
         if n_high:
@@ -219,14 +236,62 @@ def validate_source_metadata(df: pd.DataFrame, contract: DataContract) -> list[s
     return out
 
 
+def validate_required_metadata(
+    df: pd.DataFrame,
+    contract: DataContract,
+    *,
+    manifest: dict | None = None,
+) -> list[str]:
+    """Each ``required_metadata`` key must be declared for the dataset.
+
+    ``required_metadata`` lives in the CONTRACT (this is the schema-level
+    statement of what provenance a canonical file must carry) while the value
+    lives in the manifest (for on-disk daily files) or in ``df.attrs`` (for
+    freshly-fetched frames).  A key counts as declared when it is present
+    non-empty in any of:
+
+    * ``df.attrs`` (the frame carries provenance, e.g. a downloader stamped it)
+    * a non-empty column of the same name (raw source frames)
+    * the strongly-bound ``manifest`` dict, when the caller has one
+
+    ``unknown`` counts as declared — legacy files honestly cannot recover their
+    real provenance, and the manifest records ``unknown`` truthfully.  The
+    point is to reject files with NO source/adjustment declaration anywhere,
+    not to demand a specific value.
+    """
+    # The storage manifest records the adjustment basis under "adjust"
+    # (mirroring _provenance_from_attrs), while the contract names the
+    # metadata column "adjustment_mode".
+    _MANIFEST_ALIASES = {"adjustment_mode": "adjust"}
+    declared: set[str] = set()
+    for key in contract.required_metadata:
+        if df.attrs.get(key):
+            declared.add(key)
+        elif key in df.columns and (df[key].astype("string").fillna("").str.strip() != "").any():
+            declared.add(key)
+        elif manifest:
+            mkey = _MANIFEST_ALIASES.get(key, key)
+            if manifest.get(mkey):
+                declared.add(key)
+    return [f"missing_metadata:{k}" for k in contract.required_metadata
+            if k not in declared]
+
+
 def validate_contract(
     df: pd.DataFrame,
     contract: DataContract,
     *,
     code: str | None = None,
     trading_days: set | None = None,
+    manifest: dict | None = None,
 ) -> list[str]:
-    """Run every validator; return a flat list of violation strings."""
+    """Run every validator; return a flat list of violation strings.
+
+    ``manifest`` is optional; when supplied (e.g. from the storage layer's
+    per-stock sidecar) it satisfies ``required_metadata`` declarations, so a
+    legacy daily file whose parquet carries no provenance still passes as long
+    as its manifest records source/adjust.
+    """
     out = []
     out += validate_schema(df, contract)
     out += validate_primary_key(df, contract)
@@ -235,6 +300,7 @@ def validate_contract(
     out += validate_finite(df, contract)
     out += validate_ohlc(df, contract)
     out += validate_source_metadata(df, contract)
+    out += validate_required_metadata(df, contract, manifest=manifest)
     return [f"{code}:{v}" if code else v for v in out]
 
 
@@ -273,6 +339,7 @@ RESEARCH_QFQ_DAILY = DataContract(
     price_columns=DAILY_PRICE_COLUMNS,
     required_finite_ratio=DAILY_REQUIRED_FINITE,
     minimum_valid_rows=1,
+    required_metadata=("source", "adjustment_mode"),
 )
 
 # daily_equity == the research qfq series (see contract docstring).
@@ -297,6 +364,7 @@ RAW_UNQUOTED_DAILY = DataContract(
     price_columns=DAILY_PRICE_COLUMNS,
     required_finite_ratio=DAILY_REQUIRED_FINITE,
     minimum_valid_rows=1,
+    required_metadata=("source", "adjustment_mode"),
 )
 
 ADJUSTMENT_FACTOR = DataContract(

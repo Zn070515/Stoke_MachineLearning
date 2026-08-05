@@ -285,7 +285,7 @@ class GubaStorage:
 
         tm = pp.topic_modeler
         if tm is not None and tm._enabled:
-            silver = tm.transform(silver)
+            silver = tm.transform(silver, source="guba")
 
         gold = pp.run("text_aggregate", silver)
         gold["stock_code"] = stock_code

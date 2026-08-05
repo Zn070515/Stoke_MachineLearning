@@ -67,6 +67,10 @@ pip install -r requirements.txt
 # GPU: pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
+依赖的唯一来源是 `pyproject.toml`；`requirements.txt` 由
+`scripts/maintenance/current/gen_requirements.py` 自动生成，不要手工编辑它。
+改依赖请改 `pyproject.toml` 后重新生成：`PYTHONPATH=. ./.venv/Scripts/python scripts/maintenance/current/gen_requirements.py`
+
 ## 数据管道
 
 **Always use venv Python:**
@@ -78,63 +82,63 @@ PYTHONPATH=. ./.venv/Scripts/python <script>
 ### K线数据 (5530只股票, 2000–2026)
 
 ```bash
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_data.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_data.py
 ```
 
 ### 新闻 + 情感 (3-source aggregation)
 
 ```bash
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --source all --max-pages 5
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_news.py --source all --max-pages 5
 ```
 
 ### 论坛情感 (Guba)
 
 ```bash
 # 股吧 (词典情感 fallback — body被WAF拦截)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_guba.py --max-pages 10
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_guba.py --max-pages 10
 ```
 
 ### 市场数据 (龙虎榜/融资融券/北向资金/ETF资金流)
 
 ```bash
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_market_data.py --type all
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_market_data.py --type all
 ```
 
 ### 基本面数据 (季度财报)
 
 ```bash
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_fundamentals.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_fundamentals.py
 ```
 
 ### 数据中心数据 (资金流向/大宗交易/股东户数/解禁/分红/打板/行业/概念)
 
 ```bash
 # 下载全部12种数据类型
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type all
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type all
 
 # 按类型下载
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type capital_flow
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type block_trade
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type limit_up     # 全部打板数据
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type industry_ranking
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type concept_blocks
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type capital_flow
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type block_trade
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type limit_up     # 全部打板数据
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type industry_ranking
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type concept_blocks
 
 # 指定日期范围 + 单只股票测试
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_datacenter.py --type block_trade --start 2024-01-01 --stocks 600519
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_datacenter.py --type block_trade --start 2024-01-01 --stocks 600519
 ```
 
 ### 数据预处理 (4种形态 → 统一日频特征)
 
 ```bash
 # 全部类型预处理
-PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type all
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type all
 
 # 按形态预处理
-PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type flow
-PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type event --event-type block_trade
-PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type board
-PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type sector
-PYTHONPATH=. ./.venv/Scripts/python scripts/preprocess_new_data.py --type concept --stocks 600519,000001
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type flow
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type event --event-type block_trade
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type board
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type sector
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type concept --stocks 600519,000001
 ```
 
 ### 四源故障切换
@@ -179,12 +183,12 @@ FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_u
 | macro regime (宏观制度) ★ | `use_market_env_refine` | 49 | 高(日频) | MarketEnvRefiner (FE v2) |
 | limit-up ecology (涨停生态) | `use_limit_up` | 20 | 低 | 数据中心 — **未接线** (DEFERRED) |
 
-> FE v2 维度开关默认全开，由 `scripts/build_features.py` CLI 关闭（`--no-pledge` / `--no-market-env` / `--no-market-env-refine` / `--no-index-membership`），不读 config.yaml。
+> FE v2 维度开关默认全开，由 `scripts/production/build_features.py` CLI 关闭（`--no-pledge` / `--no-market-env` / `--no-market-env-refine` / `--no-index-membership`），不读 config.yaml。
 > limit-up 生态（涨停/炸板/跌停，19 列）已定义但**未接线**（`use_limit_up=False`，待后续启用）。
 
 **预构建特征**: 5530 只股票 × 3744 列/股（516 基础 + 3228 时序展开），共 109GB，存于 `data/features/{code}.parquet`。XGBoost flat 模式再按窗口展平，维度极易爆炸——建议按 IC 预筛 top-K 特征。
 
-**Panel 格式**: 255 PastKnown + 1418 PastObserved + 4 Static = 1677 features × 60 seq_len. 跨股票截面归一化 (per-date z-score). 维度由当前预构建特征面板决定，训练时从数据自动推导。
+**Panel 格式**: 255 PastKnown + 1418 PastObserved + 9 Static = 1682 features × 60 seq_len. 跨股票截面归一化 (per-date z-score). 维度由当前预构建特征面板决定，训练时从数据自动推导。
 
 ### 预构建特征 (data/features/)
 
@@ -192,17 +196,17 @@ FeaturePipeline 支持 **26个 `use_*` 数据维度**（25 active + `use_limit_u
 
 ```bash
 # 全市场预构建 (5530 只)
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py
 
 # 单只 / 并行分片 (多进程或多机)
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --stock 000001
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --jobs 4 --shard 0/8
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py --stock 000001
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py --jobs 4 --shard 0/8
 
 # FE v2 维度开关 (默认全开)
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --no-pledge --no-market-env
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py --no-pledge --no-market-env
 
 # Panel 联合训练预构建 (跨股票截面 z-score, 输出到 features_panel/)
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --panel-mode
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py --panel-mode
 ```
 
 ## 模型训练
@@ -211,16 +215,16 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --panel-mode
 
 ```bash
 # 500只股票 Panel 联合训练 (多任务: 方向+涨跌幅+波动率) — 读预构建特征
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --prebuilt data/features_panel --horizon 5 --epochs 20 --max-folds 3
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --stocks 500 --prebuilt data/features_panel --horizon 5 --epochs 20 --max-folds 3
 
 # 少量股票快速测试
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 50 --epochs 5 --max-folds 1
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --stocks 50 --epochs 5 --max-folds 1
 
 # 指定股票训练
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stock-list 600519,000001,000858
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --stock-list 600519,000001,000858
 
 # 跳过辅助数据 (快速冒烟测试)
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --no-aux
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --no-aux
 ```
 
 Panel (VSN + xLSTM) 配置:
@@ -234,13 +238,13 @@ Panel (VSN + xLSTM) 配置:
 ### XGBoost 基线
 
 ```bash
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --stock 000001
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py  # 全量
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_baseline.py --stock 000001
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_baseline.py  # 全量
 ```
 
 ### Panel 基线
 
-Ridge / LightGBM / MLP / naive momentum 四组截面基线 (`models/baseline/panel_baselines.py`)，与主模型同一 inner_val 日历、同一评价口径下对照，证明 VSN+xLSTM 的真实增益。评估器版本 `evaluator_version 2026-08-04`。
+Ridge / LightGBM / MLP / naive momentum 四组截面基线 (`models/baseline/panel_baselines.py`)，与主模型同一 inner_val 日历、同一评价口径下对照，证明 VSN+xLSTM 的真实增益。评估器版本 `evaluator_version 2026-08-05`。
 
 ## 消融结果 (95 stocks, 1000 bootstrap)
 
@@ -276,7 +280,7 @@ Shape D (categorical):       ConceptBlockEncoder → 6层概念编码 (multi-hot
 
 ```bash
 # 对比新旧预处理的模型表现
-PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/compare_pipelines.py --stock 000001
 ```
 
 - 设计文档: `docs/superpowers/specs/2026-07-01-preprocessing-redesign-design.md`
@@ -288,7 +292,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 - **分类指标**：准确率、精确率、召回率、F1
 - **金融指标**：夏普比率、最大回撤、胜率、盈亏比
 - **验证方法**：Walk-Forward滚动验证 (2年训练/3月验证)，**严格时序拆分，无shuffle**
-- **特征评估 (FE v2)**：`scripts/feature_ic_report.py`（截面 Spearman RankIC / ICIR / 覆盖度）+ `scripts/feature_leakage_report.py`（PIT 泄露审计），报告输出到 `reports/`
+- **特征评估 (FE v2)**：`scripts/production/feature_ic_report.py`（截面 Spearman RankIC / ICIR / 覆盖度）+ `scripts/production/feature_leakage_report.py`（PIT 泄露审计），报告输出到 `reports/`
 
 ## 配置说明
 
@@ -310,7 +314,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 | `preprocessing.cross_sectional.board.consecutive_lookback` | 20 | 连板回看天数 |
 | `preprocessing.concept.top_n` | 100 | 概念板块编码数量 |
 
-> FE v2 维度开关（`use_pledge` / `use_market_env` / `use_market_env_refine` / `use_index_membership`）不在 config.yaml 中——由 `scripts/build_features.py` CLI 控制。
+> FE v2 维度开关（`use_pledge` / `use_market_env` / `use_market_env_refine` / `use_index_membership`）不在 config.yaml 中——由 `scripts/production/build_features.py` CLI 控制。
 
 ## 已知问题
 
@@ -330,13 +334,13 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/compare_pipelines.py --stock 000001
 
 ## 测试
 
-~46 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
+~53 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q
 ```
 
-文档漂移由 `scripts/check_docs_consistency.py` 守卫（检查股票数 / 测试数 / aux 维度数 / PanelConfig 常量是否与代码一致，不一致退出码 1）。
+文档漂移由 `scripts/production/check_docs_consistency.py` 守卫（检查股票数 / 测试数 / aux 维度数 / PanelConfig 常量是否与代码一致，不一致退出码 1）。
 
 ## 设计文档
 

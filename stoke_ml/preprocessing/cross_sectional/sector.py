@@ -43,6 +43,7 @@ class SectorBroadcaster(PreprocessingStep):
         industry_ranking: Optional[pd.DataFrame] = None,
         sector_map: Optional[dict[str, str]] = None,
         sector_features: Optional[pd.DataFrame] = None,
+        sector_map_valid_from: Optional[str] = None,
     ) -> pd.DataFrame:
         """Add sector features to the per-stock DataFrame.
 
@@ -57,6 +58,12 @@ class SectorBroadcaster(PreprocessingStep):
                 (momentum, RRG, breadth_z, relative_strength, alpha) are
                 broadcast straight from this panel instead of being
                 recomputed once per stock.
+            sector_map_valid_from: earliest date the static ``sector_map`` is
+                valid from (YYYY-MM-DD).  Rows before it get NaN sector_code so
+                their broadcast sector features read as unknown (zeroed) rather
+                than backfilling today's classification onto history (§十-4).
+                Ignored when ``df`` already carries a per-row ``sector_code``
+                (genuine PIT membership).
         """
         if df.empty:
             return df
@@ -75,9 +82,21 @@ class SectorBroadcaster(PreprocessingStep):
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-        # Map stocks to sectors
-        if sector_map:
-            df["sector_code"] = df["stock_code"].astype(str).map(sector_map)
+        # Map stocks to sectors (§十-4 — no present-backfill).
+        # A caller that already resolved a per-row sector_code (genuine PIT
+        # membership) keeps it: re-mapping would stamp today's classification
+        # onto the whole window.  Otherwise the static map is bounded to dates
+        # >= sector_map_valid_from; older rows stay NaN so the merged sector
+        # features read as unknown (zeroed) instead of being backfilled.
+        if "sector_code" in df.columns:
+            pass
+        elif sector_map:
+            assigned = df["stock_code"].astype(str).map(sector_map)
+            if sector_map_valid_from is not None:
+                assigned = assigned.where(
+                    df["date"] >= pd.Timestamp(sector_map_valid_from)
+                )
+            df["sector_code"] = assigned
         else:
             return df
 

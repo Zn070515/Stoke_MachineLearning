@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SCRIPT = os.path.join(ROOT, "scripts", "train_panel.py")
+SCRIPT = os.path.join(ROOT, "scripts", "production", "train_panel.py")
 
 
 @pytest.fixture(scope="module")

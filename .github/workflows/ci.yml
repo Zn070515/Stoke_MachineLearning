@@ -1,0 +1,38 @@
+name: ci
+
+# Minimal CI (§十八-4): compileall → docs consistency → fast pytest →
+# production smoke. Mirrors scripts/maintenance/current/ci.py so the local
+# pre-commit pass and the remote run cannot diverge.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (pyproject = single source of truth)
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[ml,nlp,online,analysis,dev]"
+
+      - name: compileall
+        run: python -m compileall -q stoke_ml scripts tests
+
+      - name: docs consistency
+        run: python scripts/production/check_docs_consistency.py
+
+      - name: fast pytest
+        run: python -m pytest tests/ -q
+
+      - name: production smoke
+        run: python -m pytest tests/models/panel/test_production_smoke.py -q

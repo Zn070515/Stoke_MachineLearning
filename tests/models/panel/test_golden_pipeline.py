@@ -27,7 +27,7 @@ import pandas as pd
 import pytest
 import torch
 
-from scripts import data_quality_gate as dqg
+from scripts.production import data_quality_gate as dqg
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 from stoke_ml.data.sources.a_shares.failover import AShareDownloader

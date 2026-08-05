@@ -21,6 +21,7 @@ from stoke_ml.data.contract import (
     validate_finite,
     validate_ohlc,
     validate_primary_key,
+    validate_required_metadata,
     validate_schema,
     validate_source_metadata,
     validate_units,
@@ -43,6 +44,10 @@ def _daily(drop=(), **over):
     df = df.drop(columns=[c for c in drop if c in df.columns])
     for k, v in over.items():
         df[k] = v
+    # Daily K-line requires source/adjustment_mode provenance (contract
+    # required_metadata); downloaders stamp these into attrs, so mirror that.
+    df.attrs["source"] = "efinance"
+    df.attrs["adjustment_mode"] = "qfq"
     return df
 
 
@@ -175,6 +180,26 @@ class TestFinite:
         df = _daily(close=[np.nan, np.nan, np.nan])
         assert any("close_finite_ratio" in v for v in validate_contract(df, DAILY_EQUITY))
 
+    def test_inf_close_fails(self):
+        """Inf is not a finite value — an all-Inf close must fail the ratio."""
+        df = _daily(close=[np.inf, np.inf, np.inf])
+        out = validate_finite(df, DAILY_EQUITY)
+        assert any("close_finite_ratio" in v for v in out)
+
+    def test_mixed_inf_lowers_ratio(self):
+        df = _daily(close=[10.0, np.inf, 12.0])  # 2/3 finite = 0.667 < 0.99
+        assert any("close_finite_ratio" in v for v in validate_finite(df, DAILY_EQUITY))
+
+    def test_all_inf_ohlc_fails_contract(self):
+        """v10 §四-1 dynamic repro: all-Inf OHLC previously returned []."""
+        df = _daily(
+            open=[np.inf] * 3, high=[np.inf] * 3,
+            low=[np.inf] * 3, close=[np.inf] * 3,
+        )
+        out = validate_contract(df, DAILY_EQUITY)
+        assert len(out) >= 4  # open/high/low/close each below the finite ratio
+        assert any("open_finite_ratio" in v for v in out)
+
 
 class TestOhlc:
     """Low <= open/close <= high on every bar."""
@@ -226,6 +251,73 @@ class TestSourceMetadata:
 
     def test_absent_columns_are_noop(self):
         assert validate_source_metadata(_daily(), DAILY_EQUITY) == []
+
+
+class TestRequiredMetadata:
+    """Daily contracts require source/adjustment_mode provenance (file or
+    strongly-bound manifest), so a file with no source/adjust anywhere fails."""
+
+    def test_attrs_satisfy_requirement(self):
+        # _daily() stamps attrs source/adjustment_mode, mirroring downloaders.
+        assert validate_required_metadata(_daily(), DAILY_EQUITY) == []
+
+    def test_column_satisfies_requirement(self):
+        df = _daily()
+        df.attrs = {}
+        df["source"] = "efinance"
+        df["adjustment_mode"] = "qfq"
+        assert validate_required_metadata(df, DAILY_EQUITY) == []
+
+    def test_manifest_satisfies_requirement(self):
+        df = _daily()
+        df.attrs = {}
+        manifest = {"source": "unknown", "adjust": "unknown"}
+        assert validate_required_metadata(df, DAILY_EQUITY, manifest=manifest) == []
+
+    def test_missing_metadata_fails(self):
+        df = _daily()
+        df.attrs = {}
+        out = validate_required_metadata(df, DAILY_EQUITY)
+        assert "missing_metadata:source" in out
+        assert "missing_metadata:adjustment_mode" in out
+
+    def test_partial_missing_fails(self):
+        df = _daily()
+        df.attrs = {"source": "efinance"}
+        out = validate_required_metadata(df, DAILY_EQUITY)
+        assert "missing_metadata:adjustment_mode" in out
+
+    def test_empty_attr_counts_as_missing(self):
+        df = _daily()
+        df.attrs = {"source": "", "adjustment_mode": "qfq"}
+        out = validate_required_metadata(df, DAILY_EQUITY)
+        assert "missing_metadata:source" in out
+
+    def test_contract_wires_required_metadata(self):
+        df = _daily()
+        df.attrs = {}
+        out = validate_contract(df, DAILY_EQUITY)
+        assert any("missing_metadata:source" in v for v in out)
+
+    def test_contract_manifest_satisfies_required_metadata(self):
+        df = _daily()
+        df.attrs = {}
+        manifest = {"source": "unknown", "adjust": "unknown"}
+        assert validate_contract(df, DAILY_EQUITY, manifest=manifest) == []
+
+    def test_contract_without_required_metadata_ignores(self):
+        # A contract that declares no required_metadata never flags missing keys.
+        c = DataContract(
+            dataset_name="custom",
+            primary_key=("id", "ts"),
+            required_columns=("id", "ts", "v"),
+            units={"v": "CNY"},
+            price_basis="n/a",
+            timezone="Asia/Shanghai",
+            calendar="x",
+        )
+        df = pd.DataFrame({"id": [1], "ts": ["a"], "v": [10.0]})
+        assert validate_contract(df, c) == []
 
 
 class TestCalendarMembership:

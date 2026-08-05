@@ -56,6 +56,43 @@ class TestFingerprints:
         fp2 = cache_manifest.file_fingerprint(p)
         assert fp1 != fp2
 
+    def test_preserved_mtime_same_size_detected(self, tmp_path):
+        """§十一-2: a same-size, same-mtime byte replacement must be caught.
+
+        The old size+mtime fingerprint was blind to this exact case; the
+        content hash must not be.
+        """
+        p = tmp_path / "blob.bin"
+        p.write_bytes(b"AAAA")
+        fp1 = cache_manifest.file_fingerprint(str(p))
+        st = p.stat()
+        p.write_bytes(b"BBBB")  # same 4 bytes, different content
+        os.utime(p, (st.st_atime, st.st_mtime))  # restore mtime -> old proxy blind
+        fp2 = cache_manifest.file_fingerprint(str(p))
+        assert fp1 != fp2
+
+    def test_daily_sidecar_manifest_fingerprint(self, tmp_path):
+        """daily K-line reuses the upstream storage content checksum."""
+        daily = tmp_path / "daily"
+        daily.mkdir()
+        p = daily / "000001.parquet"
+        _write_parquet(str(p))
+        (daily / "000001.manifest.json").write_text(
+            json.dumps({"schema_hash": "abc123"}), encoding="utf-8",
+        )
+        assert cache_manifest.file_fingerprint(str(p)) == \
+            cache_manifest._sha1("upstream:abc123")
+
+    def test_daily_sidecar_missing_falls_back_to_content(self, tmp_path):
+        """No upstream sidecar -> content-hash the parquet bytes."""
+        daily = tmp_path / "daily"
+        daily.mkdir()
+        p = daily / "000001.parquet"
+        _write_parquet(str(p))
+        fp = cache_manifest.file_fingerprint(str(p))
+        assert fp is not None
+        assert fp != cache_manifest._sha1("upstream:abc123")
+
     def test_config_hash_sensitive_to_build_inputs(self):
         a = cache_manifest.config_hash(_base_config())
         b = cache_manifest.config_hash(_base_config(horizon=5))
@@ -70,6 +107,77 @@ class TestFingerprints:
         _write_parquet(p1, cols=("close", "volume"))
         _write_parquet(p2, cols=("close", "volume", "extra"))
         assert cache_manifest.schema_hash(p1) != cache_manifest.schema_hash(p2)
+
+
+class TestConfigSnapshot:
+    """§十一-3: the manifest hash must cover the feature-affecting config."""
+
+    @staticmethod
+    def _snapshot():
+        return {
+            "features": {
+                "seq_len": 60, "target_horizon": 1, "technical_indicators": True,
+                "rule_based_scoring": True, "temporal_features": True,
+                "use_sentiment": True, "flat_seq_len": 5,
+            },
+            "preprocessing": {
+                "numeric": {
+                    "missing": {"short_gap_max": 2, "medium_gap_max": 10},
+                    "scaling": {"method": "robust", "window_days": 252,
+                                "winsorize_sigma": 3.0},
+                    "cross_section": {"enabled": True, "stages": ["sector"]},
+                },
+                "text": {"bipolar": {"threshold_positive": 0.2,
+                                     "threshold_negative": -0.2}},
+            },
+            "universe": {"min_amount_60d": 5_000_000,
+                         "long_suspension_days": 60},
+            "fundamental": {"max_stale_days": 30, "interpolate": True},
+        }
+
+    def test_snapshot_hash_sensitive_to_section_values(self):
+        base = cache_manifest.config_hash(self._snapshot())
+        assert base == cache_manifest.config_hash(self._snapshot())
+        # Technical-indicator switch
+        snap = self._snapshot()
+        snap["features"]["technical_indicators"] = False
+        assert cache_manifest.config_hash(snap) != base
+        # Missing-value handling
+        snap = self._snapshot()
+        snap["preprocessing"]["numeric"]["missing"]["short_gap_max"] = 5
+        assert cache_manifest.config_hash(snap) != base
+        # Bipolar threshold
+        snap = self._snapshot()
+        snap["preprocessing"]["text"]["bipolar"]["threshold_positive"] = 0.5
+        assert cache_manifest.config_hash(snap) != base
+        # Cross-sectional normalization param
+        snap = self._snapshot()
+        snap["preprocessing"]["numeric"]["scaling"]["winsorize_sigma"] = 2.0
+        assert cache_manifest.config_hash(snap) != base
+        # Universe gate
+        snap = self._snapshot()
+        snap["universe"]["min_amount_60d"] = 10_000_000
+        assert cache_manifest.config_hash(snap) != base
+        # Fundamental staleness policy
+        snap = self._snapshot()
+        snap["fundamental"]["max_stale_days"] = 60
+        assert cache_manifest.config_hash(snap) != base
+
+    def test_snapshot_and_flat_are_distinct_paths(self):
+        flat = cache_manifest.config_hash(_base_config())
+        snap = cache_manifest.config_hash(self._snapshot())
+        assert flat != snap
+
+    def test_current_config_hash_loads_from_real_config(self):
+        h = cache_manifest.current_config_hash()
+        assert h is not None and len(h) == 16
+        # Deterministic across calls.
+        assert h == cache_manifest.current_config_hash()
+
+    def test_config_snapshot_accepts_flat_and_nested(self):
+        snap = cache_manifest.config_snapshot({"features": {"seq_len": 60}})
+        assert snap["features"] == {"seq_len": 60}
+        assert snap["preprocessing"] == {}
 
 
 class TestManifest:

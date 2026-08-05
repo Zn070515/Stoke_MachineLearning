@@ -38,6 +38,110 @@ def _set_seed(seed: int | None) -> None:
             torch.cuda.manual_seed_all(seed)
 
 
+def _configure_reproducibility(config: PanelConfig) -> dict:
+    """Configure the CUDA determinism knobs §十二-5 lists; declare the level.
+
+    A random seed alone does NOT give CUDA bitwise reproducibility.  These
+    flags are set unconditionally and are cheap/safe on this model (no conv
+    layers, so cudnn.benchmark=False costs nothing): cudnn deterministic,
+    autotune off, TF32 disabled (its truncated mantissa makes reductions
+    order-dependent).  Strict `use_deterministic_algorithms(True)` is gated
+    behind config.deterministic_algorithms because one non-deterministic op
+    (e.g. a CUDA atomic reduction) then raises mid-training instead of
+    silently diverging.  torch.compile is a JIT and is NOT bitwise
+    reproducible, so a compiled run is declared statistical-only regardless.
+
+    Returns the declared reproducibility level for history / the log.
+    """
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    strict = bool(config.deterministic_algorithms)
+    if strict:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+
+    compile_enabled = bool(getattr(config, "compile_model", False))
+    bitwise = strict and not compile_enabled
+    report = {
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
+        "tf32_matmul": bool(torch.backends.cuda.matmul.allow_tf32),
+        "tf32_cudnn": bool(torch.backends.cudnn.allow_tf32),
+        "strict_deterministic_algorithms": strict,
+        "compile_enabled": compile_enabled,
+        "reproducibility_level": "bitwise" if bitwise else "statistical-only",
+    }
+    return report
+
+
+def _rank_pool_stats(ds: PanelDataset) -> tuple[list[int], int]:
+    """Per-date rank-eligible stock counts + total possible same-date pairs.
+
+    PairwiseRankingLoss can only form pairs between stocks that share a target
+    date AND both carry a valid return target.  When one date's eligible stock
+    count exceeds batch_size the DateGroupedSampler splits it across sub-batches
+    and pairs between sub-batches are never compared — so the true coverage is
+    the ratio of pairs actually formed to the C(n,2) theoretical total below.
+    """
+    if ds.ret_target is None:
+        pool = ds.valid_mask
+    else:
+        # valid_mask is (N, N_windows) over target windows; ret_target is
+        # (N, T) over absolute days.  Window w's target day is w + seq_len.
+        pool = ds.valid_mask & ds.ret_target[:, ds.seq_len:]
+    per_date = pool.sum(dim=0).tolist()
+    stocks_per_date = [n for n in per_date if n > 0]
+    possible_pairs = sum(n * (n - 1) // 2 for n in per_date)
+    return stocks_per_date, possible_pairs
+
+
+def _entry_bias_report(train_data: dict, val_data: dict, seq_len: int) -> dict:
+    """Train vs eval candidate-distribution gap (§十二-4).
+
+    Training samples require a REAL entry open (`entry_eligible`), so the model
+    never sees decision-selectable days where the NEXT day suspends / has no
+    open.  Evaluation selects on decision & history and THEN checks fill — those
+    unfilled candidates ARE in its pool.  `selectable` mirrors evaluate.py's
+    candidate pool (decision & history); `fill_rate` is the fraction of that
+    pool that also carries a next-day open, i.e. what training could see.
+    """
+    def _span(data: dict) -> dict:
+        entry_full = data.get("entry_eligible_mask")
+        if entry_full is None:
+            # No eligibility masks (legacy synthetic data) — nothing to compare.
+            return {
+                "selectable": 0, "with_entry_open": 0, "unfilled": 0,
+                "fill_rate": float("nan"), "n_dates": 0,
+            }
+        entry = entry_full[:, seq_len:]
+        dec = (data.get("decision_eligible_mask")[:, seq_len:]
+               if data.get("decision_eligible_mask") is not None
+               else np.ones_like(entry))
+        hist = (data.get("history_eligible_mask")[:, seq_len:]
+                if data.get("history_eligible_mask") is not None
+                else np.ones_like(entry))
+        selectable = dec & hist
+        n_selectable = int(selectable.sum())
+        if n_selectable == 0:
+            return {
+                "selectable": 0, "with_entry_open": 0, "unfilled": 0,
+                "fill_rate": float("nan"), "n_dates": 0,
+            }
+        with_entry = selectable & entry
+        n_entry = int(with_entry.sum())
+        return {
+            "selectable": n_selectable,
+            "with_entry_open": n_entry,
+            "unfilled": n_selectable - n_entry,
+            "fill_rate": n_entry / n_selectable,
+            "n_dates": int((selectable.sum(axis=0) > 0).sum()),
+        }
+
+    return {"train": _span(train_data), "val": _span(val_data)}
+
+
 def _compute_val_loss(
     model: nn.Module,
     val_loader: DataLoader,
@@ -237,6 +341,15 @@ def train_panel(
     raw_val_returns: np.ndarray | None = None,
 ) -> tuple[PanelModel, dict]:
     _set_seed(config.seed)
+    # §十二-5: a seed alone does not give CUDA bitwise reproducibility — set
+    # the determinism knobs explicitly and DECLARE the level achieved.
+    reproducibility = _configure_reproducibility(config)
+    # Worker processes re-seed from this generator, so multi-worker DataLoader
+    # order is reproducible for the same seed.
+    loader_generator = (
+        torch.Generator().manual_seed(config.seed)
+        if config.seed is not None else None
+    )
 
     model = PanelModel(config).to(device)
     if config.compile_model and device.type == "cuda":
@@ -273,6 +386,7 @@ def train_panel(
         sampler=train_sampler, collate_fn=panel_collate,
         num_workers=config.num_workers, pin_memory=True,
         drop_last=False, persistent_workers=config.num_workers > 0,
+        generator=loader_generator,
     )
 
     val_ds = PanelDataset(val_data, seq_len=config.seq_len,
@@ -282,6 +396,11 @@ def train_panel(
         shuffle=False, collate_fn=panel_collate,
         num_workers=0, pin_memory=False,
     )
+
+    # §十二-3: theoretical ranking pool — per-date eligible stock counts and
+    # the C(n,2) pair total they imply.  Fixed for the dataset, so computed
+    # once here and reused as the coverage denominator every epoch.
+    rank_pool_sizes, rank_possible_pairs = _rank_pool_stats(train_ds)
 
     warmup = LinearLR(
         optimizer,
@@ -323,6 +442,30 @@ def train_panel(
         "val_ls_sharpe": [], "val_ic": [],
         "val_eval_epochs": [],  # 1-based epoch of each val_metrics entry
     }
+    # §十二-4: entry-selection bias — training only ever sees candidates with a
+    # real next-day open, while evaluation also ranks selectable-but-unfillable
+    # days.  Record the train/eval candidate distribution difference once.
+    history["entry_bias"] = _entry_bias_report(train_data, val_data, config.seq_len)
+    for span, st in history["entry_bias"].items():
+        if st["selectable"] > 0:
+            logger.info(
+                "  Entry bias [%s]: selectable=%d fillable=%d (%.1f%%) "
+                "unfilled=%d dates=%d",
+                span, st["selectable"], st["with_entry_open"],
+                100 * st["fill_rate"], st["unfilled"], st["n_dates"])
+
+    # §十二-5: declared reproducibility level (bitwise vs statistical-only).
+    history["reproducibility"] = reproducibility
+    logger.info(
+        "  Reproducibility: %s (cudnn_deterministic=%s benchmark=%s "
+        "tf32_matmul=%s tf32_cudnn=%s strict=%s compile=%s)",
+        reproducibility["reproducibility_level"],
+        reproducibility["cudnn_deterministic"],
+        not reproducibility["cudnn_benchmark"],
+        reproducibility["tf32_matmul"],
+        reproducibility["tf32_cudnn"],
+        reproducibility["strict_deterministic_algorithms"],
+        reproducibility["compile_enabled"])
     use_amp = config.use_amp and device.type == "cuda"
     # The validation pool (candidate & return-target masks)
     # can be degenerate — too few eligible stocks per day, or near-total mask
@@ -338,6 +481,11 @@ def train_panel(
         epoch_rank_loss = 0.0
         epoch_rank_pairs = 0
         epoch_rank_batches = 0
+        # Batches that actually contributed a finite loss (passed both the
+        # no-active-task and the NaN/Inf guards) — the only correct denominator
+        # for the epoch average, since skipped batches add 0 loss but would
+        # otherwise inflate the divisor and understate avg_loss.
+        epoch_valid_batches = 0
         optimizer.zero_grad()
         accum_count = 0
 
@@ -410,6 +558,7 @@ def train_panel(
                 )
                 continue
 
+            epoch_valid_batches += 1
             total_loss = total_loss / config.grad_accum_steps
             scaler.scale(total_loss).backward()
             accum_count += 1
@@ -459,9 +608,31 @@ def train_panel(
                 _log_gradient_norms(model, epoch + 1)
             optimizer.zero_grad()
 
-        n_batches = max(len(train_loader), 1)
+        # §十二-2: average over the batches that actually produced a finite
+        # loss — skipped/NaN batches add 0 loss and must not inflate the
+        # divisor (the old len(train_loader) denominator understated avg_loss).
+        n_batches = max(epoch_valid_batches, 1)
         avg_loss = epoch_loss / n_batches
         history["train_loss"].append(avg_loss)
+        # Ranking loss is normalized by rank-ACTIVE batches only (a batch with
+        # no pairs contributes 0 and is not a fair divisor member either).
+        rank_divisor = max(epoch_rank_batches, 1)
+
+        # §十二-3: ranking-loss coverage for the epoch.  When a date's eligible
+        # stock count exceeds batch_size the sampler splits it across
+        # sub-batches and pairs are never formed across sub-batches — record how
+        # much of the theoretical C(n,2) pair space the epoch actually covered
+        # so a silently degraded ranking signal is visible in history.
+        rank_active_rate = epoch_rank_batches / max(len(train_loader), 1)
+        pair_coverage = epoch_rank_pairs / max(rank_possible_pairs, 1)
+        history.setdefault("rank_coverage", []).append({
+            "stocks_per_date": rank_pool_sizes,
+            "pair_coverage": pair_coverage,
+            "rank_active_rate": rank_active_rate,
+            "pairs_per_epoch": epoch_rank_pairs,
+            "possible_pairs": rank_possible_pairs,
+            "rank_active_batches": epoch_rank_batches,
+        })
 
         val_loss, v_ce, v_ret, v_vol, v_rankic = _compute_val_loss(
             model, val_loader, val_data, config, ret_loss, loss_fn, device,
@@ -515,7 +686,7 @@ def train_panel(
                 "LS_Sharpe=%.2f[%.1f,%.1f] Long_Sharpe=%.2f q5-q1=%.1fbp lr=%.2e",
                 epoch + 1, config.max_epochs, avg_loss, val_loss,
                 v_ce, v_ret, v_vol, v_rankic,
-                epoch_rank_loss / n_batches,
+                epoch_rank_loss / rank_divisor,
                 epoch_rank_pairs,
                 ic_mean, m["ic_ir"],
                 ls_sharpe, m["ls_sharpe_lo"], m["ls_sharpe_hi"],
@@ -527,9 +698,17 @@ def train_panel(
                 "RankIC=%.4f rank=%.6f pairs=%d lr=%.2e",
                 epoch + 1, config.max_epochs, avg_loss, val_loss,
                 v_ce, v_ret, v_vol, v_rankic,
-                epoch_rank_loss / n_batches,
+                epoch_rank_loss / rank_divisor,
                 epoch_rank_pairs,
                 optimizer.param_groups[0]["lr"])
+
+        if rank_pool_sizes:
+            logger.info(
+                "  Rank coverage: pairs=%d/%d (%.1f%%) active_batches=%d/%d "
+                "(%.1f%%) stocks/date max=%d mean=%.1f",
+                epoch_rank_pairs, rank_possible_pairs, 100 * pair_coverage,
+                epoch_rank_batches, len(train_loader), 100 * rank_active_rate,
+                max(rank_pool_sizes), float(np.mean(rank_pool_sizes)))
 
         if patience_counter >= config.early_stop_patience:
             logger.info("Early stopping at epoch %d (best val_rankic=%.4f)",

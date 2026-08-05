@@ -19,6 +19,11 @@ class RobustScaler(PreprocessingStep):
     for normally distributed data.
     """
 
+    # Scaling is a fold-level concern: the transform is rolling/PIT, but a
+    # full-history offline pass must never bake a single global scale into the
+    # feature store (§十-1).  Formal offline preprocessing refuses this step.
+    fit_scope = "fold_train_only"
+
     def __init__(
         self,
         window_days: int = 252,

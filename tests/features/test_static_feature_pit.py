@@ -19,7 +19,9 @@ import pandas as pd
 import pytest
 
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.features.pipeline import FeaturePipeline, _PIT_STATIC_COLS
+from stoke_ml.features.pipeline import (
+    FeaturePipeline, _BOARD_ONEHOT_COLS, _PIT_STATIC_COLS, _board_index,
+)
 
 SEQ_LEN = 20
 HORIZON = 5
@@ -70,8 +72,32 @@ class TestStaticColumns:
 
     def test_all_statics_pit_derivable(self):
         assert set(_PIT_STATIC_COLS) == {
-            "price_60d_q", "amt_60d_q", "listing_days", "board_code",
+            "price_60d_q", "amt_60d_q", "listing_days",
+            "board_unknown", "board_sh_main", "board_star",
+            "board_sz_main", "board_chinext", "board_bse",
         }
+
+    def test_board_onehot_mutually_exclusive(self):
+        """Exactly one board_* column is 1 per stock, matching _board_index —
+        a one-hot encoding, not a raw board id (§十一-5)."""
+        panel = _make_synthetic_panel()
+        data = _pipeline().build_panel_features(panel, horizon=HORIZON)
+        s = data["static_features"]
+        bcols = [k for k, c in enumerate(_PIT_STATIC_COLS) if c in _BOARD_ONEHOT_COLS]
+        assert len(bcols) == len(_BOARD_ONEHOT_COLS)
+        stacked = s[..., bcols]  # (N, T, n_boards)
+        assert np.allclose(stacked.sum(axis=-1), 1.0)
+        for i, code in enumerate(panel["stock_code"].unique()):
+            bid = _board_index(code)
+            assert np.allclose(stacked[i, :, bid], 1.0)
+
+    def test_board_index_mapping(self):
+        assert _board_index("600519") == 1  # SH main
+        assert _board_index("688981") == 2  # STAR
+        assert _board_index("000001") == 3  # SZ main (incl. SME)
+        assert _board_index("300750") == 4  # ChiNext
+        assert _board_index("830799") == 5  # BSE
+        assert _board_index("123456") == 0  # unknown
 
 
 class TestStaticTruncationInvariance:
@@ -129,7 +155,7 @@ class TestFundamentalPitLag:
             "roe": [15.0],
         })
 
-        out = _pipeline()._merge_fundamental(df, fd)
+        out = _pipeline()._aux._merge_fundamental(df, fd)
         roe = out["roe"].to_numpy()
 
         # Disclosed on day 0 → forward-filled, then shifted 1: day 0 holds 0
@@ -150,7 +176,7 @@ class TestFundamentalPitLag:
             "date": dates, "stock_code": ["000001"] * 4,
             "pe_ttm": [12.0, 12.5, 13.0, 13.5],
         })
-        out = _pipeline()._merge_valuation(df, vd)
+        out = _pipeline()._aux._merge_valuation(df, vd)
         pe = out["pe_ttm"].to_numpy()
         # Same-day value must NOT appear at its own row (would be a leak):
         # day t must carry the value known at t-1.

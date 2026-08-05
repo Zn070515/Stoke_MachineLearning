@@ -2,7 +2,11 @@
 import numpy as np
 import pandas as pd
 import pytest
-from stoke_ml.preprocessing.base import PreprocessingStep, PreprocessingChain
+from stoke_ml.preprocessing.base import (
+    PreprocessingStep,
+    PreprocessingChain,
+    FIT_SCOPES,
+)
 
 
 class _AddOne(PreprocessingStep):
@@ -41,6 +45,23 @@ class TestPreprocessingStep:
         step = _AddOne()
         result = step.fit(pd.DataFrame({"x": [1]}))
         assert result is step
+
+    def test_default_fit_scope_is_stateless_pit(self):
+        """§十-1: steps default to the offline-safe scope; stateful steps must
+        opt into fold_train_only / global_frozen explicitly."""
+        assert _AddOne().fit_scope == "stateless_pit"
+        assert FIT_SCOPES == ("stateless_pit", "fold_train_only", "global_frozen")
+
+    def test_scope_partition_of_stateful_steps(self):
+        """§十-1: the components named in the review are classified correctly."""
+        from stoke_ml.preprocessing.numeric.scaling import RobustScaler
+        from stoke_ml.preprocessing.categorical.encoder import ConceptBlockEncoder
+        from stoke_ml.preprocessing.monitor.drift import DriftMonitor
+        from stoke_ml.preprocessing.text.topics import TopicModeler
+        assert RobustScaler().fit_scope == "fold_train_only"
+        assert ConceptBlockEncoder().fit_scope == "fold_train_only"
+        assert DriftMonitor().fit_scope == "fold_train_only"
+        assert TopicModeler(enabled=False).fit_scope == "global_frozen"
 
     def test_transform_not_implemented(self):
         class _BadStep(PreprocessingStep):
@@ -116,6 +137,49 @@ class TestPreprocessingChain:
         assert cfg["name"] == "filter"
         assert cfg["steps"][0]["type"] == "_FilterMinLength"
         assert cfg["steps"][0]["params"]["min_length"] == 10
+
+    def test_to_config_records_fit_scope(self):
+        """§十-1: the serialized step record carries fit_scope for auditability."""
+        from stoke_ml.preprocessing.numeric.scaling import RobustScaler
+        chain = PreprocessingChain([RobustScaler()], name="num")
+        cfg = chain.to_config()
+        assert cfg["steps"][0]["fit_scope"] == "fold_train_only"
+
+    def test_offline_pit_chain_drops_fold_train_only(self):
+        """§十-1: offline_pit_chain keeps only steps safe for full-history
+        preprocessing; fold_fitted_chain keeps the fold_train_only complement."""
+        from stoke_ml.preprocessing.numeric.scaling import RobustScaler
+        from stoke_ml.preprocessing.numeric.missing import MissingImputer
+        chain = PreprocessingChain([MissingImputer(), RobustScaler()], name="num_full")
+        offline = chain.offline_pit_chain()
+        assert [type(s).__name__ for s in offline.steps] == ["MissingImputer"]
+        fitted = chain.fold_fitted_chain()
+        assert [type(s).__name__ for s in fitted.steps] == ["RobustScaler"]
+        # The two sub-chains partition the original (no step lost or doubled).
+        assert len(offline.steps) + len(fitted.steps) == len(chain.steps)
+        assert chain.fold_train_only_steps() == fitted.steps
+
+    def test_global_frozen_kept_in_offline_pit_chain(self):
+        """§十-1: a global_frozen step (fit once, pinned artifact) is allowed in
+        the offline pass — only fold_train_only steps are excluded."""
+        from stoke_ml.preprocessing.text.topics import TopicModeler
+        from stoke_ml.preprocessing.text.bipolar import BipolarClassifier
+        chain = PreprocessingChain(
+            [TopicModeler(enabled=False), BipolarClassifier()], name="topic"
+        )
+        offline = chain.offline_pit_chain()
+        assert [type(s).__name__ for s in offline.steps] == [
+            "TopicModeler", "BipolarClassifier",
+        ]
+        assert chain.fold_fitted_chain().steps == []
+
+    def test_add_rejects_unknown_fit_scope(self):
+        """§十-1: a typo in a future step's scope fails fast at assembly time."""
+        class _BadScope(_AddOne):
+            fit_scope = "leak_everything"
+        chain = PreprocessingChain()
+        with pytest.raises(ValueError, match="unknown fit_scope"):
+            chain.add(_BadScope())
 
     def test_chain_with_kwargs_passthrough(self):
         class _ContextStep(PreprocessingStep):

@@ -21,6 +21,24 @@ from stoke_ml.features.transform import TemporalTransformer
 from stoke_ml.features.emotion import EmotionRefiner
 from stoke_ml.features.fundamental import FundamentalRefiner
 from stoke_ml.features.market_env import MarketEnvRefiner
+from stoke_ml.features.aux_aligner import (
+    AuxAligner,
+    SENTIMENT_COLS,
+    MARGIN_COLS,
+    NORTHBOUND_COLS,
+    DRAGON_TIGER_COLS,
+    FUNDAMENTAL_COLS,
+    EARNINGS_COLS,
+    VALUATION_COLS,
+    ETF_FLOW_COLS,
+    GUBA_COLS,
+    COMMENT_COLS,
+    MACRO_COLS,
+    MARKET_ENV_COLS,
+    INDUSTRY_COLS,
+    _batch_fill_shift,
+    _merge_daily_aux,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,67 +55,82 @@ def _get_panel_calendar():
         _panel_calendar = TradingCalendar("a_shares")
     return _panel_calendar
 
-# Fix 3 (sparse feature policy): drop structurally-dead columns — constant on
-# >=90% of stocks per reports/feature_sparsity_report.csv — from training.  The
+# Sparse feature policy: drop structurally-dead columns — constant on every
+# observed day of a stock's series (flat path, _prep_feature_df) or of a fold's
+# training window (panel path, fold_dead_feature_columns) — from training.  The
 # SPARSE_KEEP_PREFIXES families are exempt: they are genuinely-rare events that
 # stay constant for most stocks but carry real signal on their activation days
 # (market-state regimes, dragon-tiger presence, dividend growth, pledge plan
-# stage, transfer ratio).  Data-driven: when a source gets fixed and features
-# are rebuilt, the column's constant_stock_ratio drops and it leaves the drop
-# set automatically.
+# stage, transfer ratio).  The judgment is per-stock / per-fold and uses only
+# data already available at the decision point, so a future period never picks
+# an earlier period's feature set (research-selection leakage).
 DEAD_FEATURE_RATIO = 0.9
 SPARSE_KEEP_PREFIXES = (
     "market_state_", "is_dt", "dividend_growth", "plan_stage_", "transfer_ratio",
 )
-SPARSITY_REPORT = "reports/feature_sparsity_report.csv"
 
-SENTIMENT_COLS = [
-    "sentiment_mean", "sentiment_std", "news_count",
-    "positive_ratio", "negative_ratio", "has_news",
-]
+
+def _constant_col_indices(arr: np.ndarray, obs: np.ndarray) -> np.ndarray:
+    """Per-stock dead-feature mask: (N, D) const[stock, feature].
+
+    const[i, f] is True when feature f's value is identical on every day of
+    stock i whose observation_mask is True, or stock i has no observed days in
+    the slice.  Zero-padded rows carry no evidence and are excluded from the
+    scan.
+    """
+    n_stocks, _n_dates, n_feat = arr.shape
+    listed = obs.sum(axis=1) > 0
+    hi = np.float32(1e30)
+    const = np.zeros((n_stocks, n_feat), dtype=bool)
+    # Chunk over stocks so the two where() temporaries stay bounded.
+    for s0 in range(0, n_stocks, 512):
+        s1 = min(s0 + 512, n_stocks)
+        m = obs[s0:s1, :, None]
+        vmin = np.where(m, arr[s0:s1], hi).min(axis=1)   # (chunk, D)
+        vmax = np.where(m, arr[s0:s1], -hi).max(axis=1)  # (chunk, D)
+        const[s0:s1] = vmin == vmax
+    const[~listed] = True
+    return const
+
+
+def fold_dead_feature_columns(
+    train_data: dict,
+    pk_cols: list[str],
+    po_cols: list[str],
+    ratio: float = DEAD_FEATURE_RATIO,
+) -> tuple[list[int], list[int]]:
+    """Axis-2 indices of dead columns in a fold's training window.
+
+    A column is dead when >= `ratio` of the fold's eligible stocks show it
+    time-constant over their observed days within the training period (the
+    same per-stock constant_stock_ratio measure the old report used), EXCEPT
+    the SPARSE_KEEP_PREFIXES rare-event families, which are kept — their
+    signal lives on sparse activation days.  The judgment uses ONLY the
+    training slice — never validation/test — so a future period can't decide
+    an earlier fold's feature set.  Returned index lists are safe to np.delete
+    from the past_known / past_observed grids of ALL fold slices (train/val/
+    test share the column layout).
+    """
+    obs = train_data["observation_mask"]
+    pk_const = _constant_col_indices(train_data["past_known"], obs)
+    po_const = _constant_col_indices(train_data["past_observed"], obs)
+    pk_dead = (pk_const.mean(axis=0) >= ratio) & ~_sparse_kept(pk_cols)
+    po_dead = (po_const.mean(axis=0) >= ratio) & ~_sparse_kept(po_cols)
+    pk_idx = [int(i) for i in np.where(pk_dead)[0]]
+    po_idx = [int(i) for i in np.where(po_dead)[0]]
+    return pk_idx, po_idx
+
+
+def _sparse_kept(cols: list[str]) -> np.ndarray:
+    """Per-column boolean: True for the exempt SPARSE_KEEP_PREFIXES families."""
+    return np.array(
+        [c.startswith(SPARSE_KEEP_PREFIXES) for c in cols], dtype=bool,
+    )
 
 ANNOUNCEMENT_COLS = [
     "ann_sentiment_mean", "ann_sentiment_std", "ann_count",
     "ann_positive_ratio", "ann_negative_ratio", "has_announce",
 ]
-
-MARGIN_COLS = [
-    "margin_balance", "margin_buy", "short_balance", "margin_net",
-]
-
-NORTHBOUND_COLS = [
-    "north_hold_pct", "north_net_buy",
-]
-
-DRAGON_TIGER_COLS = [
-    "lhb_net_amount", "lhb_buy_ratio", "lhb_present",
-]
-
-ETF_FLOW_COLS = [
-    "sector_etf_flow", "sector_etf_amount",
-]
-
-GUBA_COLS = [
-    "guba_sentiment_mean", "guba_sentiment_std", "guba_post_count",
-    "guba_positive_ratio", "guba_negative_ratio", "has_guba_post",
-]
-
-COMMENT_COLS = [
-    "comment_score", "comment_attention", "comment_institution",
-    "comment_trend", "has_comment",
-]
-
-FUNDAMENTAL_COLS = [
-    "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
-    "debt_ratio", "gross_margin", "net_margin",
-]
-
-EARNINGS_COLS = [
-    "has_forecast", "net_profit_yoy_low", "net_profit_yoy_high",
-    "net_profit_low", "net_profit_high", "forecast_age",
-]
-
-VALUATION_COLS = ["pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm"]
 
 TEMPORAL_BASE_COLS = [
     "open", "high", "low", "close", "volume",
@@ -154,28 +187,6 @@ CONCEPT_COLS = [
     "is_concept_leader", "board_overlap_score",
 ]
 
-# NOTE: ind_matched_return / stock_vs_industry were REMOVED:
-# they map a stock onto its industry via the current-snapshot sector_map.json,
-# backfilling today's classification onto historical rows (present-backfill
-# bias).  The industry-level columns below are PIT-safe — they are daily
-# cross-sectional stats over all industry indexes, with no per-stock membership.
-INDUSTRY_COLS = [
-    "ind_pct_up", "ind_return_mean", "ind_return_std",
-    "ind_return_max", "ind_return_min", "ind_return_skew",
-    "ind_dispersion_20d",
-]
-
-MACRO_COLS = [
-    "shibor_O_N", "shibor_1W", "shibor_2W", "shibor_1M",
-    "shibor_3M", "shibor_6M", "shibor_9M", "shibor_1Y",
-    "fx_usd_cny", "fx_eur_cny", "fx_jpy_cny", "fx_hkd_cny", "fx_gbp_cny",
-    "bond_cn_2y", "bond_cn_5y", "bond_cn_10y", "bond_cn_30y",
-    "bond_cn_10y2y_spread",
-    "bond_us_2y", "bond_us_5y", "bond_us_10y", "bond_us_30y",
-    "bond_us_10y2y_spread",
-    "gdp_cn_yoy", "m2_yoy", "m1_yoy", "sf_total", "cpi_yoy",
-]
-
 LIMIT_UP_COLS = [
     "zt_first_seal_hour", "zt_last_seal_hour", "zt_seal_fund_ratio",
     "zt_break_times", "zt_limit_days", "zt_pct",
@@ -193,13 +204,6 @@ PLEDGE_COLS = [
 INDEX_MEMBER_COLS = [
     "is_index_member", "n_indexes", "idx_change_30d",
 ]  # no index_weight — Baostock has no historical weights (A4a scope note)
-
-# Must match scripts/_preprocess_market_env.py output exactly (7 cols, no
-# limit-up temperature cols — that family is deferred).
-MARKET_ENV_COLS = [
-    "high_low_ratio", "mkt_cap_total_z", "avg_account_cap_z",
-    "investor_new_num", "investor_new_z", "market_adv_ratio", "market_turnover_z",
-]
 
 DRAGON_TIGER_SEAT_COLS = [
     "lhb_is_wave", "lhb_is_sustained", "lhb_is_drop", "lhb_count_5d",
@@ -295,7 +299,9 @@ class FeaturePipeline:
         self.use_market_env = use_market_env
         self.use_index_membership = use_index_membership
         self.use_market_env_refine = use_market_env_refine
-        self._market_env_cache: pd.DataFrame | None = None
+        self._aux = AuxAligner(
+            {k: getattr(self, f"use_{k}") for k in AuxAligner.AUX_KEYS}
+        )
         self.minute_mode = minute_mode
         self.feature_selection_k = feature_selection_k
         self.use_new_preprocessing = use_new_preprocessing
@@ -303,9 +309,6 @@ class FeaturePipeline:
         self._preprocessing = None
         if use_new_preprocessing and preprocessing_config:
             self._preprocessing = self._build_preprocessing()
-        self._warned_missing: set[str] = set()
-        self._macro_cache: pd.DataFrame | None = None
-        self._industry_cache: pd.DataFrame | None = None
         self._intraday = None
         self._ti = TechnicalIndicators()
         self._scorer = TrendScorer()
@@ -318,18 +321,6 @@ class FeaturePipeline:
         self._fundamental_refiner = FundamentalRefiner() if use_fundamental_refine else None
         self._market_env_refiner = MarketEnvRefiner() if use_market_env_refine else None
         self.drop_dead_features = drop_dead_features
-
-    def _warn_if_missing(self, key: str) -> None:
-        """Emit one-time debug log when use_*=True but no data was passed.
-
-        Many data types (lockup, shareholder, block_trade, etc.) are sparse
-        by nature — only a subset of stocks or dates have records.  This is
-        expected, not a problem, so we log at DEBUG instead of WARNING to
-        avoid noise during training runs.
-        """
-        if key not in self._warned_missing:
-            logger.debug("use_%s=True but no %s data for this stock", key, key)
-            self._warned_missing.add(key)
 
     # ------------------------------------------------------------------
     # Preprocessing integration
@@ -686,34 +677,37 @@ class FeaturePipeline:
                 self._intraday = MinuteIntradayFeatures()
             df = self._intraday.compute_all(df)
 
-        # 2. Merge aux DataFrames (expanded PO columns)
-        df = self._merge_sentiment(df, sentiment_df)
-        df = self._merge_announcements(df, announcement_df)
-        df = self._merge_margin(df, margin_df)
-        df = self._merge_northbound(df, northbound_df)
-        df = self._merge_dragon_tiger(df, dragon_tiger_df)
-        df = self._merge_fundamental(df, fundamental_df)
-        df = self._merge_earnings(df, earnings_df)
-        df = self._merge_valuation(df, valuation_df)
-        df = self._merge_etf_flow(df, etf_flow_df)
-        df = self._merge_guba(df, guba_df)
-        df = self._merge_comment(df, comment_df)
-        df = self._merge_capital_flow(df, capital_flow_df)
-        df = self._merge_block_trade(df, block_trade_df)
-        df = self._merge_shareholder(df, shareholder_df)
-        df = self._merge_lockup(df, lockup_df)
-        df = self._merge_dividend(df, dividend_df)
-        df = self._merge_board(df, board_df)
-        df = self._merge_sector(df, sector_df)
-        df = self._merge_concept(df, concept_df)
-        df = self._merge_macro(df, macro_df)
-        df = self._merge_industry(df, industry_df)
-
-        # _merge_limit_up is DEFERRED (limit-up ecology family, top scope note):
-        # the method exists (Step 1) but is intentionally NOT wired here.
-        df = self._merge_pledge(df, pledge_df)
-        df = self._merge_market_env(df, market_env_df)
-        df = self._merge_index_membership(df, index_membership_df)
+        # 2. Merge aux DataFrames (expanded PO columns).  The per-dimension
+        # merge family lives in AuxAligner (aux_aligner.py, §十七-1).
+        df = self._aux.merge_all(
+            df,
+            sentiment=sentiment_df,
+            announcements=announcement_df,
+            margin=margin_df,
+            northbound=northbound_df,
+            dragon_tiger=dragon_tiger_df,
+            fundamental=fundamental_df,
+            earnings=earnings_df,
+            valuation=valuation_df,
+            etf_flow=etf_flow_df,
+            guba=guba_df,
+            comment=comment_df,
+            capital_flow=capital_flow_df,
+            block_trade=block_trade_df,
+            shareholder=shareholder_df,
+            lockup=lockup_df,
+            dividend=dividend_df,
+            board=board_df,
+            sector=sector_df,
+            concept=concept_df,
+            macro=macro_df,
+            industry=industry_df,
+            # limit_up is DEFERRED (limit-up ecology family, top scope note) —
+            # the merge method exists but is intentionally NOT wired.
+            pledge=pledge_df,
+            market_env=market_env_df,
+            index_membership=index_membership_df,
+        )
 
         # Interaction features require merged sentiment columns — must run
         # after the aux merges (was previously a silent no-op).
@@ -815,515 +809,6 @@ class FeaturePipeline:
         return df
 
     # ------------------------------------------------------------------
-    # Merge helpers — each returns a (possibly enriched) DataFrame
-    # ------------------------------------------------------------------
-
-    def _merge_sentiment(self, df: pd.DataFrame,
-                         sentiment_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_sentiment:
-            return df
-        if sentiment_df is None or sentiment_df.empty:
-            self._warn_if_missing("sentiment")
-            return df
-        s = sentiment_df.copy()
-        s["date"] = pd.to_datetime(s["date"])
-        s = s.drop_duplicates(subset="date", keep="last")
-        available = [c for c in SENTIMENT_COLS if c in s.columns]
-        extra = [c for c in s.columns
-                 if c not in SENTIMENT_COLS and c not in ("date", "stock_code")
-                 and not c.startswith("has_")]
-        if not available and not extra:
-            return df
-        df = df.merge(s[["date"] + available + extra], on="date", how="left")
-        # NewsStorage maps post-close → next trading day; date is already the
-        # effective_trade_date, so no extra shift.
-        _batch_fill_shift(df, available + extra, lag=False)
-        return df
-
-    def _merge_announcements(self, df: pd.DataFrame,
-                             announcement_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_announcements:
-            return df
-        if announcement_df is None or announcement_df.empty:
-            self._warn_if_missing("announcements")
-            return df
-        a = announcement_df.copy()
-        a["date"] = pd.to_datetime(a["date"])
-        # Map storage column names to prefixed feature column names
-        col_map = {
-            "sentiment_mean": "ann_sentiment_mean",
-            "sentiment_std": "ann_sentiment_std",
-            "announce_count": "ann_count",
-            "positive_ratio": "ann_positive_ratio",
-            "negative_ratio": "ann_negative_ratio",
-            "has_announce": "has_announce",
-        }
-        mapped_cols = {k: v for k, v in col_map.items() if k in a.columns}
-        # Extra columns (e.g. ann_bipolar_sent from DailyAggregator) — merge directly
-        extra = [c for c in a.columns
-                 if c not in col_map and c not in ("date", "stock_code")
-                 and not c.startswith("has_")]
-        if not mapped_cols and not extra:
-            return df
-        rename = {k: v for k, v in mapped_cols.items()}
-        merged_cols = list(rename.values()) + extra
-        source_cols = list(rename.keys()) + extra
-        a_renamed = a[["date"] + source_cols].rename(columns=rename)
-        df = df.merge(a_renamed, on="date", how="left")
-        _batch_fill_shift(df, merged_cols)
-        return df
-
-    def _merge_margin(self, df: pd.DataFrame,
-                      margin_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_margin:
-            return df
-        if margin_df is None or margin_df.empty:
-            self._warn_if_missing("margin")
-            return df
-        m = margin_df.copy()
-        m["date"] = pd.to_datetime(m["date"])
-        m = m.drop(columns=["stock_code"], errors="ignore")
-        m = m.drop_duplicates(subset="date", keep="last")
-        available = [c for c in MARGIN_COLS if c in m.columns]
-        if not available:
-            return df
-        df = df.merge(m[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_northbound(self, df: pd.DataFrame,
-                          northbound_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_northbound:
-            return df
-        if northbound_df is None or northbound_df.empty:
-            self._warn_if_missing("northbound")
-            return df
-        nb = northbound_df.copy()
-        nb["date"] = pd.to_datetime(nb["date"])
-        nb = nb.drop(columns=["stock_code"], errors="ignore")
-        nb = nb.drop_duplicates(subset="date", keep="last")
-        available = [c for c in NORTHBOUND_COLS if c in nb.columns]
-        if not available:
-            return df
-        df = df.merge(nb[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_dragon_tiger(self, df: pd.DataFrame,
-                            dt_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_dragon_tiger:
-            return df
-        if dt_df is None or dt_df.empty:
-            self._warn_if_missing("dragon_tiger")
-            return df
-        dt = dt_df.copy()
-        dt["date"] = pd.to_datetime(dt["date"])
-        reason = dt.get("lhb_reason",
-                        pd.Series(index=dt.index, dtype=str)).fillna("").astype(str)
-        dt["lhb_is_wave"] = reason.str.contains("振幅|换手", regex=True)
-        dt["lhb_is_sustained"] = reason.str.contains("连续", regex=False)
-        dt["lhb_is_drop"] = reason.str.contains("跌幅|跌停|下跌", regex=True)
-        dt = dt.drop(columns=["stock_code", "stock_name", "lhb_reason"],
-                      errors="ignore")
-        # Aggregate multiple entries per date
-        agg = dt.groupby("date").agg(
-            lhb_net_amount=("net_amount", "sum"),
-            lhb_buy_ratio=(
-                "buy_amount",
-                lambda x: x.sum() / (x.sum()
-                                     + dt.loc[x.index, "sell_amount"].sum()
-                                     + 1),
-            ),
-            lhb_present=("net_amount", "count"),
-            lhb_is_wave=("lhb_is_wave", "any"),
-            lhb_is_sustained=("lhb_is_sustained", "any"),
-            lhb_is_drop=("lhb_is_drop", "any"),
-        ).reset_index()
-        agg["lhb_present"] = (agg["lhb_present"] > 0).astype(np.float32)
-        agg["lhb_buy_ratio"] = agg["lhb_buy_ratio"].fillna(0.5).astype(np.float32)
-        agg["lhb_net_amount"] = agg["lhb_net_amount"].fillna(0.0).astype(np.float32)
-        for c in ("lhb_is_wave", "lhb_is_sustained", "lhb_is_drop"):
-            agg[c] = agg[c].fillna(False).astype(np.float32)
-        df = df.merge(agg, on="date", how="left")
-        flag_cols = ["lhb_is_wave", "lhb_is_sustained", "lhb_is_drop"]
-        _batch_fill_shift(df, [c for c in DRAGON_TIGER_COLS if c in df.columns]
-                          + [c for c in flag_cols if c in df.columns])
-        # Past-5-trading-day LHB frequency (computed AFTER the PIT shift, so it
-        # never looks ahead; must NOT be shifted again).
-        if "lhb_present" in df.columns:
-            df["lhb_count_5d"] = df["lhb_present"].rolling(5, min_periods=1).sum().astype("int16")
-        return df
-
-    def _merge_fundamental(self, df: pd.DataFrame,
-                           fundamental_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_fundamental:
-            return df
-        if fundamental_df is None or fundamental_df.empty:
-            self._warn_if_missing("fundamental")
-            return df
-        fd = fundamental_df.copy()
-        # Drop metadata columns
-        fd = fd.drop(columns=["stock_code", "report_date"], errors="ignore")
-        available = [c for c in FUNDAMENTAL_COLS if c in fd.columns]
-        if not available:
-            return df
-
-        if "disclose_date" in fd.columns:
-            # Raw quarterly data — forward-fill to daily
-            fd["disclose_date"] = pd.to_datetime(fd["disclose_date"])
-            fd = fd.drop_duplicates(subset="disclose_date", keep="last")
-            fd = fd.sort_values("disclose_date").set_index("disclose_date")
-            full_idx = pd.date_range(fd.index.min(), df["date"].max(), freq="D")
-            fd = fd[available].reindex(full_idx).ffill().reset_index(names="date")
-        else:
-            # Already daily data — just ensure date column
-            fd["date"] = pd.to_datetime(fd["date"])
-            fd = fd.drop_duplicates(subset="date", keep="last")
-
-        df = df.merge(fd[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_earnings(self, df: pd.DataFrame,
-                        earnings_df: pd.DataFrame | None) -> pd.DataFrame:
-        """Merge the per-stock daily earnings-active frame (see EarningsStorage).
-
-        The storage already forward-fills the net-profit band across trading
-        days (a forecast stays active until superseded) and maps every
-        announce_date to its next-trading-day ``effective_trade_date``; this
-        method only merges on date and ZI-fills — no extra shift, so the signal
-        first appears exactly on its effective date.
-        """
-        if not self.use_earnings:
-            return df
-        if earnings_df is None or earnings_df.empty:
-            self._warn_if_missing("earnings")
-            return df
-        ed = earnings_df.copy()
-        ed["date"] = pd.to_datetime(ed["date"])
-        ed = ed.drop_duplicates(subset="date", keep="last")
-        available = [c for c in EARNINGS_COLS if c in ed.columns]
-        if not available:
-            return df
-        df = df.merge(ed[["date"] + available], on="date", how="left")
-        # date is the storage-mapped effective_trade_date → no extra shift.
-        _batch_fill_shift(df, available, lag=False)
-        return df
-
-    def _merge_valuation(self, df: pd.DataFrame,
-                         valuation_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_valuation:
-            return df
-        if valuation_df is None or valuation_df.empty:
-            self._warn_if_missing("valuation")
-            return df
-        vd = valuation_df.copy()
-        vd["date"] = pd.to_datetime(vd["date"])
-        vd = vd.drop_duplicates(subset="date", keep="last")
-        available = [c for c in VALUATION_COLS if c in vd.columns]
-        if not available:
-            return df
-        df = df.merge(vd[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_etf_flow(self, df: pd.DataFrame,
-                        etf_flow_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_etf_flow:
-            return df
-        if etf_flow_df is None or etf_flow_df.empty:
-            self._warn_if_missing("etf_flow")
-            return df
-        ef = etf_flow_df.copy()
-        ef["date"] = pd.to_datetime(ef["date"])
-        ef = ef.drop(columns=["sector_name", "etf_count"], errors="ignore")
-        ef = ef.drop_duplicates(subset="date", keep="last")
-        available = [c for c in ETF_FLOW_COLS if c in ef.columns]
-        if not available:
-            return df
-        df = df.merge(ef[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_guba(self, df: pd.DataFrame,
-                    guba_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_guba:
-            return df
-        if guba_df is None or guba_df.empty:
-            self._warn_if_missing("guba")
-            return df
-        g = guba_df.copy()
-        g["date"] = pd.to_datetime(g["date"])
-        g = g.drop_duplicates(subset="date", keep="last")
-        available = [c for c in GUBA_COLS if c in g.columns]
-        extra = [c for c in g.columns
-                 if c not in GUBA_COLS and c not in ("date", "stock_code")
-                 and not c.startswith("has_")]
-        if not available and not extra:
-            return df
-        df = df.merge(g[["date"] + available + extra], on="date", how="left")
-        # GubaStorage maps post-close → next trading day; date is already the
-        # effective_trade_date, so no extra shift.
-        _batch_fill_shift(df, available + extra, lag=False)
-        return df
-
-    def _merge_comment(self, df: pd.DataFrame,
-                       comment_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_comment:
-            return df
-        if comment_df is None or comment_df.empty:
-            self._warn_if_missing("comment")
-            return df
-        c = comment_df.copy()
-        c["date"] = pd.to_datetime(c["date"])
-        c = c.drop_duplicates(subset="date", keep="last")
-        available = [col for col in COMMENT_COLS if col in c.columns]
-        extra = [col for col in c.columns
-                 if col not in COMMENT_COLS and col not in ("date", "stock_code")
-                 and not col.startswith("has_")]
-        if not available and not extra:
-            return df
-        df = df.merge(c[["date"] + available + extra], on="date", how="left")
-        _batch_fill_shift(df, available + extra)
-        # Guard: ensure has_comment exists (may be absent in sparse comment data)
-        if "has_comment" not in df.columns:
-            df["has_comment"] = df.get("comment_score", pd.Series(dtype=float)).notna()
-        return df
-
-    # ── Multi-shape preprocessing merge methods ──────────────────────
-
-    def _merge_capital_flow(self, df: pd.DataFrame,
-                            flow_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_capital_flow:
-            return df
-        if flow_df is None or flow_df.empty:
-            self._warn_if_missing("capital_flow")
-            return df
-        return _merge_daily_aux(df, flow_df)
-
-    def _merge_block_trade(self, df: pd.DataFrame,
-                           bt_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_block_trade:
-            return df
-        if bt_df is None or bt_df.empty:
-            self._warn_if_missing("block_trade")
-            return df
-        return _merge_daily_aux(df, bt_df)
-
-    def _merge_shareholder(self, df: pd.DataFrame,
-                           sh_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_shareholder:
-            return df
-        if sh_df is None or sh_df.empty:
-            self._warn_if_missing("shareholder")
-            return df
-        return _merge_daily_aux(df, sh_df)
-
-    def _merge_lockup(self, df: pd.DataFrame,
-                      lu_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_lockup:
-            return df
-        if lu_df is None or lu_df.empty:
-            self._warn_if_missing("lockup")
-            return df
-        return _merge_daily_aux(df, lu_df)
-
-    def _merge_dividend(self, df: pd.DataFrame,
-                        dv_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_dividend:
-            return df
-        if dv_df is None or dv_df.empty:
-            self._warn_if_missing("dividend")
-            return df
-        return _merge_daily_aux(df, dv_df)
-
-    def _merge_board(self, df: pd.DataFrame,
-                     board_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_board:
-            return df
-        if board_df is None or board_df.empty:
-            self._warn_if_missing("board")
-            return df
-        return _merge_daily_aux(df, board_df)
-
-    def _merge_sector(self, df: pd.DataFrame,
-                      sector_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_sector:
-            return df
-        if sector_df is None or sector_df.empty:
-            self._warn_if_missing("sector")
-            return df
-        return _merge_daily_aux(df, sector_df)
-
-    def _merge_concept(self, df: pd.DataFrame,
-                       concept_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_concept:
-            return df
-        if concept_df is None or concept_df.empty:
-            self._warn_if_missing("concept")
-            return df
-        # Aggregate from long format (one row per stock-board-date) to wide
-        # (one row per stock-date) before merging.
-        if "board_name" in concept_df.columns:
-            concept_df = _aggregate_concept_long(concept_df)
-        return _merge_daily_aux(df, concept_df)
-
-    def _merge_limit_up(self, df: pd.DataFrame,
-                        limit_up_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_limit_up:
-            return df
-        if limit_up_df is None or limit_up_df.empty:
-            self._warn_if_missing("limit_up")
-            return df
-        return _merge_daily_aux(df, limit_up_df)
-
-    def _merge_pledge(self, df: pd.DataFrame,
-                      pledge_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_pledge:
-            return df
-        if pledge_df is None or pledge_df.empty:
-            self._warn_if_missing("pledge")
-            return df
-        return _merge_daily_aux(df, pledge_df)
-
-    def _merge_index_membership(self, df: pd.DataFrame,
-                                im_df: pd.DataFrame | None) -> pd.DataFrame:
-        if not self.use_index_membership:
-            return df
-        if im_df is None or im_df.empty:
-            self._warn_if_missing("index_membership")
-            return df
-        return _merge_daily_aux(df, im_df)
-
-    def _merge_macro(self, df: pd.DataFrame,
-                     macro_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        if not self.use_macro:
-            return df
-        if macro_df is None:
-            macro_df = getattr(self, '_macro_cache', None)
-            if macro_df is None:
-                import os
-                from stoke_ml.config import load_config
-                cfg = load_config()
-                path = os.path.join(cfg.project.data_dir, "a_shares", "macro", "macro_daily.parquet")
-                if not os.path.exists(path):
-                    self._warn_if_missing("macro")
-                    return df
-                macro_df = pd.read_parquet(path)
-                self._macro_cache = macro_df
-        if macro_df.empty:
-            return df
-        macro = macro_df.reset_index() if macro_df.index.name == "date" else macro_df.copy()
-        if "date" not in macro.columns:
-            if isinstance(macro.index, pd.DatetimeIndex):
-                macro = macro.reset_index()
-                macro = macro.rename(columns={"index": "date"})
-            else:
-                return df
-        macro["date"] = pd.to_datetime(macro["date"])
-        available = [c for c in MACRO_COLS if c in macro.columns]
-        if not available:
-            return df
-        df = df.merge(macro[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_market_env(self, df: pd.DataFrame,
-                          market_env_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        if not self.use_market_env:
-            return df
-        if market_env_df is None:
-            market_env_df = self._market_env_cache
-            if market_env_df is None:
-                import os
-                from stoke_ml.config import load_config
-                cfg = load_config()
-                path = os.path.join(cfg.project.data_dir, "a_shares", "market_breadth",
-                                    "market_env_daily.parquet")
-                if not os.path.exists(path):
-                    self._warn_if_missing("market_env")
-                    return df
-                market_env_df = pd.read_parquet(path)
-                self._market_env_cache = market_env_df
-        if market_env_df is None or market_env_df.empty:
-            return df
-        me = market_env_df.copy()
-        # Mirror _merge_macro's defensive date handling: named "date" index,
-        # unnamed DatetimeIndex, or date-as-column all resolve to a date col.
-        if "date" not in me.columns:
-            if isinstance(me.index, pd.DatetimeIndex):
-                me = me.reset_index()
-                me = me.rename(columns={"index": "date"})
-            else:
-                return df
-        me["date"] = pd.to_datetime(me["date"]).dt.normalize()
-        me = me.drop_duplicates(subset="date", keep="last")
-        available = [c for c in MARKET_ENV_COLS if c in me.columns]
-        if not available:
-            return df
-        df = df.merge(me[["date"] + available], on="date", how="left")
-        _batch_fill_shift(df, available)
-        return df
-
-    def _merge_industry(self, df: pd.DataFrame,
-                        industry_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        """Merge industry-level cross-sectional stats (NOT per-stock membership).
-
-        The industry-level columns (ind_pct_up / ind_return_* / ind_dispersion_20d)
-        are daily cross-sectional statistics over all industry indexes and are
-        PIT-safe.  The per-stock industry-relative columns (ind_matched_return /
-        stock_vs_industry) were removed: they mapped each
-        stock onto its industry through the current-snapshot sector_map.json,
-        backfilling today's classification onto historical rows.
-        """
-        if not self.use_industry:
-            return df
-        if industry_df is None:
-            industry_df = self._industry_cache
-            if industry_df is None:
-                import os
-                from stoke_ml.config import load_config
-                cfg = load_config()
-                ind_dir = os.path.join(cfg.project.data_dir, "a_shares", "industry")
-                path = os.path.join(ind_dir, "industry_returns.parquet")
-                if not os.path.exists(path):
-                    self._warn_if_missing("industry")
-                    return df
-                raw = pd.read_parquet(path)
-                # Compute cross-sectional stats from 90 industry returns
-                industry_df = pd.DataFrame({
-                    "date": pd.to_datetime(raw.index),
-                    "ind_pct_up": (raw > 0).sum(axis=1).values / raw.notna().sum(axis=1).values,
-                    "ind_return_mean": raw.mean(axis=1).values,
-                    "ind_return_std": raw.std(axis=1).values,
-                    "ind_return_max": raw.max(axis=1).values,
-                    "ind_return_min": raw.min(axis=1).values,
-                    "ind_return_skew": raw.skew(axis=1).values,
-                })
-                # Rolling dispersion: 20-day std of cross-sectional std
-                industry_df["ind_dispersion_20d"] = (
-                    industry_df["ind_return_std"].rolling(20).std().fillna(0.0)
-                )
-                ind_float_cols = [c for c in INDUSTRY_COLS if c in industry_df.columns]
-                if ind_float_cols:
-                    industry_df[ind_float_cols] = industry_df[ind_float_cols].astype(np.float32)
-                self._industry_cache = industry_df
-        if industry_df.empty:
-            return df
-        ind = industry_df.copy()
-        ind["date"] = pd.to_datetime(ind["date"])
-        available = [c for c in INDUSTRY_COLS if c in ind.columns]
-        if not available:
-            return df
-
-        df = df.merge(ind[["date"] + available], on="date", how="left")
-        # Batch fill → shift → fill (vectorized block assignment, no fragmentation)
-        df[available] = df[available].fillna(0.0).astype(np.float32)
-        df[available] = df[available].shift(1)
-        df[available] = df[available].fillna(0.0).astype(np.float32)
-        return df
-
-    # ------------------------------------------------------------------
     # Microstructure features
     # ------------------------------------------------------------------
 
@@ -1404,45 +889,22 @@ class FeaturePipeline:
     # Sequence creation
     # ------------------------------------------------------------------
 
-    _dead_feature_set: frozenset[str] = frozenset()
-    _dead_feature_checked: bool = False
-
-    @classmethod
-    def _dead_features(cls) -> frozenset[str]:
-        """Structurally-dead feature names to drop from training (cached once)."""
-        if cls._dead_feature_checked:
-            return cls._dead_feature_set
-        cls._dead_feature_checked = True
-        try:
-            from stoke_ml.config import get_project_root
-            rep = pd.read_csv(get_project_root() / SPARSITY_REPORT)
-        except Exception as e:
-            logger.warning("dead-feature drop disabled: %s", e)
-            return cls._dead_feature_set
-        if "feature" not in rep.columns or "constant_stock_ratio" not in rep.columns:
-            return cls._dead_feature_set
-        drop = {
-            name for name, const in zip(rep["feature"], rep["constant_stock_ratio"])
-            if const >= DEAD_FEATURE_RATIO
-            and not name.startswith(SPARSE_KEEP_PREFIXES)
-        }
-        cls._dead_feature_set = frozenset(drop)
-        logger.info(
-            "dead-feature drop: %d constant columns excluded from training",
-            len(drop),
-        )
-        return cls._dead_feature_set
-
     def _prep_feature_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Drop metadata/dead columns and rows with inf/NaN — shared by sequencing methods."""
         drop_cols = ["stock_code", "sector", "sector_code", "size_proxy"]
         feat_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
         if self.drop_dead_features:
-            dead = self._dead_features()
+            # Per-stock constancy: a column constant across the stock's whole
+            # series is constant in every walk-forward prefix, so dropping it
+            # here is leak-free — the full series never decides a column that
+            # varies (those are always kept).
+            nuniq = feat_df.nunique()
+            dead = [
+                c for c, u in nuniq.items()
+                if u <= 1 and not c.startswith(SPARSE_KEEP_PREFIXES)
+            ]
             if dead:
-                feat_df = feat_df.drop(
-                    columns=[c for c in dead if c in feat_df.columns]
-                )
+                feat_df = feat_df.drop(columns=dead)
         feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
         return feat_df.dropna()
 
@@ -1625,6 +1087,7 @@ class FeaturePipeline:
         horizon: int = 1,
         prebuilt_dir: str | None = None,
         min_history: int | None = None,
+        require_feature_manifest: bool = False,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -1649,6 +1112,13 @@ class FeaturePipeline:
                       column SETS may legitimately differ per stock (merge
                       methods skip columns a stock has no data for) — those gaps
                       are reconciled by the all_cols ZI-alignment block below.
+            require_feature_manifest: when True and prebuilt_dir is set, FAIL
+                      (raise) instead of warning if any sidecar manifest is
+                      missing/stale/schema-drifted or built by a different git
+                      commit (or no ``.manifests/`` exists at all).  Formal
+                      training passes the CLI's ``--require-feature-manifest``
+                      (default on); legacy prebuilt dirs / unit tests pass False
+                      to keep warn-only behavior.
 
         Returns:
             dict with numpy arrays: static_features, past_known, past_observed,
@@ -1673,6 +1143,13 @@ class FeaturePipeline:
                     f"No prebuilt feature parquets found in {prebuilt_dir}"
                 )
             if missing:
+                if require_feature_manifest:
+                    raise FileNotFoundError(
+                        f"prebuilt_dir {prebuilt_dir}: {len(missing)}/{len(codes)} "
+                        f"feature parquets missing (first 20: {missing[:20]}). "
+                        f"Regenerate with build_features.py before a formal run "
+                        f"(--no-require-feature-manifest to override)."
+                    )
                 logger.warning(
                     "prebuilt_dir missing %d/%d parquets (first 20: %s); "
                     "dropping those stocks from the panel",
@@ -1683,13 +1160,19 @@ class FeaturePipeline:
             # Lineage guard: surface prebuilt features that lack a
             # sidecar manifest, or whose manifest no longer matches the file
             # (schema drift) or the current code (built by another git commit).
-            # Warning-only — legacy un-manifested dirs still train — so stale
-            # features are flagged instead of silently reused.
+            # require_feature_manifest makes these FAIL — silently reusing
+            # unverified/stale features would corrupt a formal experiment —
+            # while warn-only keeps legacy un-manifested dirs trainable.
             manifest_dir = os.path.join(prebuilt_dir, ".manifests")
+            missing_manifest: list[str] = []
+            stale_manifest: list[str] = []
             if os.path.isdir(manifest_dir) and os.listdir(manifest_dir):
                 commit = cache_manifest.git_head()
-                missing_manifest = []
-                stale_manifest = []
+                # §十一-3: config.yaml can change under the SAME git commit
+                # (or outside git entirely) — compare the recorded config_hash
+                # against the current config snapshot too.  None when config
+                # cannot load → comparison skipped.
+                cfg_hash = cache_manifest.current_config_hash()
                 for code in codes:
                     mp = os.path.join(manifest_dir, f"{code}.json")
                     if not os.path.isfile(mp):
@@ -1712,31 +1195,40 @@ class FeaturePipeline:
                             os.path.join(prebuilt_dir, f"{code}.parquet")
                         )
                         or m.get("git_commit") != commit
+                        or (cfg_hash is not None and m.get("config_hash") != cfg_hash)
                     ):
                         stale_manifest.append(code)
-                if missing_manifest:
-                    logger.warning(
-                        "prebuilt_dir %s: %d/%d stocks lack sidecar manifests "
-                        "(first 10: %s) — regenerate with build_features.py for "
-                        "verifiable lineage",
-                        prebuilt_dir, len(missing_manifest), len(codes),
-                        missing_manifest[:10],
-                    )
-                if stale_manifest:
-                    logger.warning(
-                        "prebuilt_dir %s: %d/%d stocks have STALE manifests "
-                        "(schema drift or built by a different git commit; "
-                        "first 10: %s) — rebuild features before trusting "
-                        "training output",
-                        prebuilt_dir, len(stale_manifest), len(codes),
-                        stale_manifest[:10],
-                    )
             else:
+                # No .manifests/ at all: every stock is unverifiable, so both
+                # the warn path and the require path speak the same language.
+                missing_manifest = list(codes)
+
+            if require_feature_manifest and (missing_manifest or stale_manifest):
+                raise RuntimeError(
+                    f"prebuilt_dir {prebuilt_dir}: feature-manifest check FAILED "
+                    f"({len(missing_manifest)} missing, {len(stale_manifest)} "
+                    f"stale — schema drift, built by a different git commit, or "
+                    f"built with a different config; first missing: "
+                    f"{missing_manifest[:5]}, first stale: {stale_manifest[:5]}). "
+                    f"Regenerate with build_features.py --panel-mode before a "
+                    f"formal run (--no-require-feature-manifest to override)."
+                )
+            if missing_manifest:
                 logger.warning(
-                    "prebuilt_dir %s has no sidecar manifests — feature lineage "
-                    "cannot be verified; run build_features.py to regenerate "
-                    "with manifests",
-                    prebuilt_dir,
+                    "prebuilt_dir %s: %d/%d stocks lack sidecar manifests "
+                    "(first 10: %s) — regenerate with build_features.py for "
+                    "verifiable lineage",
+                    prebuilt_dir, len(missing_manifest), len(codes),
+                    missing_manifest[:10],
+                )
+            if stale_manifest:
+                logger.warning(
+                    "prebuilt_dir %s: %d/%d stocks have STALE manifests "
+                    "(schema drift, different git commit, or config drift; "
+                    "first 10: %s) — rebuild features before trusting "
+                    "training output",
+                    prebuilt_dir, len(stale_manifest), len(codes),
+                    stale_manifest[:10],
                 )
 
         N = len(codes)
@@ -1826,6 +1318,23 @@ class FeaturePipeline:
         # corrupting cross-sectional IC / Top-K / long-short evaluation (which
         # index by column) and walk-forward fold boundaries.
         all_dates = sorted({d for df in all_feat_dfs for d in pd.to_datetime(df["date"])})
+        # §九-1 defensive invariant: the panel time axis MUST be a subset of the
+        # official A-share trading calendar.  `_clean_calendar_dates` enforces
+        # this per stock on both entry paths and the merge methods only left-join
+        # aux data onto the K-line axis, so an off-calendar date surviving to the
+        # UNION signals an upstream regression — fail loudly instead of silently
+        # widening column t (the global calendar column) for every stock.
+        if all_dates:
+            _cal = _get_panel_calendar()
+            _official = set(_cal.get_trading_days(
+                all_dates[0].date(), all_dates[-1].date()))
+            _off = [d.strftime("%Y-%m-%d") for d in all_dates
+                    if d.date() not in _official]
+            if _off:
+                raise ValueError(
+                    "panel union axis contains dates that are not in the "
+                    f"official a_shares trading calendar: "
+                    f"{_off[:10]}{' ...' if len(_off) > 10 else ''}")
         max_T = len(all_dates)
         global_dates = np.array(all_dates, dtype="datetime64[ns]")
         # `all_dates` holds pandas Timestamps (which have .date()); iterating
@@ -1874,6 +1383,10 @@ class FeaturePipeline:
         price60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
         amt60_raw = np.zeros((N_stocks, max_T), dtype=np.float32)
         first_col = np.full(N_stocks, -1, dtype=np.int32)
+        # The canonical `amount` (real CNY turnover) is REQUIRED by the formal
+        # daily contract — a panel without it raises above (§十一-5).  Every
+        # stock here has it, so every stock qualifies for the liquidity floor.
+        has_amount_arr = np.ones(N_stocks, dtype=bool)
 
         # Direction noise threshold — scale by sqrt(horizon)
         # (0.003 per day, 1.0% / 5-day, 1.3% / 20-day)
@@ -1913,19 +1426,20 @@ class FeaturePipeline:
             # in each global-calendar window (NaNs from pre-listing/suspension
             # are skipped).  Computed here on the RAW df before z-scoring.
             price60_raw[i] = _trailing_mean(close_full, 60).astype(np.float32)
-            # Prefer the data layer's canonical CNY turnover
+            # The formal daily contract requires canonical CNY turnover
             # (`amount`, real 成交额).  volume×qfq-close misstates historical
             # nominal turnover because qfq prices are rescaled while volume is
-            # not; the stored amount is the actual traded value.
-            if "amount" in df_sorted.columns:
-                amt_full = np.full(max_T, np.nan, dtype=np.float64)
-                amt_full[pos] = df_sorted["amount"].to_numpy(dtype=np.float64)
-            elif "volume" in df_sorted.columns:
-                vol_full = np.full(max_T, np.nan, dtype=np.float64)
-                vol_full[pos] = df_sorted["volume"].to_numpy(dtype=np.float64)
-                amt_full = vol_full * close_full
-            else:
-                amt_full = close_full  # fallback: price as the size proxy
+            # not.  Fail loudly rather than silently substituting a proxy that
+            # is not a real turnover measure (§十一-5).
+            if "amount" not in df_sorted.columns:
+                raise ValueError(
+                    f"Stock {codes[i]}: daily K-line lacks canonical `amount` — "
+                    "the formal daily contract requires it (§十一-5); no "
+                    "volume×close / price fallback."
+                )
+            has_amount_arr[i] = True
+            amt_full = np.full(max_T, np.nan, dtype=np.float64)
+            amt_full[pos] = df_sorted["amount"].to_numpy(dtype=np.float64)
             amt60_raw[i] = _trailing_mean(amt_full, 60).astype(np.float32)
             first_col[i] = int(pos[0]) if len(pos) else -1
 
@@ -2014,6 +1528,33 @@ class FeaturePipeline:
             lo = np.maximum(t_idx - self.seq_len, 0)
             history_arr = (cum[:, t_idx] - cum[:, lo]) >= min_history
 
+        # ── Research-universe eligibility (§七-3) ──
+        # Data-derived PIT gates merged into the decision pool:
+        #   已上市  (first_col) + 当日未长期停牌 + 符合研究流动性规则.
+        # The 未退市 delist gate and the per-day index-membership gate need the
+        # EXTERNAL universe status / membership records, so they are applied
+        # per-fold in train_panel and ANDed into this same decision mask there.
+        from stoke_ml.config import load_config
+        uni_cfg = dict(load_config().get("universe", {}) or {})
+        long_susp_thr = int(uni_cfg.get("long_suspension_days", 60))
+        susp_lookback = int(uni_cfg.get("suspension_lookback", 60))
+        min_amount_60d = float(uni_cfg.get("min_amount_60d", 5_000_000))
+        universe_eligible_arr = _not_long_suspended(
+            obs_arr, first_col, max_T, long_susp_thr, susp_lookback,
+        )
+        if min_amount_60d > 0 and has_amount_arr.any():
+            # Causal trailing-60d turnover known at close[t-1] → entry day t:
+            # shift amt60_raw (mean over [t-59, t]) right by one column.  Only
+            # stocks with a canonical `amount` get the floor; the volume×close
+            # / price proxies are not a real turnover measure.
+            amt_causal = np.zeros_like(amt60_raw, dtype=np.float32)
+            if max_T > 1:
+                amt_causal[:, 1:] = amt60_raw[:, :-1]
+            liquid = np.ones((N_stocks, max_T), dtype=bool)
+            liquid[has_amount_arr] = amt_causal[has_amount_arr] >= min_amount_60d
+            universe_eligible_arr &= liquid
+        decision_arr &= universe_eligible_arr
+
         # Align columns across all stocks — sparse data types (dragon_tiger,
         # block_trade, lockup, etc.) may have data for some stocks but not
         # others, producing different column sets. Missing columns get ZI fill.
@@ -2092,16 +1633,13 @@ class FeaturePipeline:
         # + date + stock code — see _PIT_STATIC_COLS.
         static_cols_available = list(_PIT_STATIC_COLS)
         pk_cols_available = self._discover_pk_columns(first_df)
-        if self.drop_dead_features:
-            dead = self._dead_features()
-            if dead:
-                pk_cols_available = [c for c in pk_cols_available if c not in dead]
         pk_set = set(pk_cols_available)
         po_cols_available = self._discover_po_columns(first_df, pk_set)
-        if self.drop_dead_features:
-            dead = self._dead_features()
-            if dead:
-                po_cols_available = [c for c in po_cols_available if c not in dead]
+        # Dead-feature drop is deliberately NOT applied here: a column's
+        # constancy over the FULL history (including future periods) must never
+        # decide an earlier fold's feature set.  All engineered columns stay in
+        # the grids; train_panel drops dead columns per-fold using only its own
+        # training window (fold_dead_feature_columns).
 
         # ── Per-date cross-sectional z-score normalization ──
         # Normalize each feature across stocks within each date, so that
@@ -2213,8 +1751,10 @@ class FeaturePipeline:
                     if first_col[i] >= 0:
                         glob_col = np.maximum(glob_col - first_col[i], 0.0)
                     s[:, sidx["listing_days"]] = glob_col / 250.0
-                if "board_code" in sidx:
-                    s[:, sidx["board_code"]] = _board_code(codes[i])
+                bid = _board_index(codes[i])
+                bcol = _BOARD_ONEHOT_COLS[bid]
+                if bcol in sidx:
+                    s[:, sidx[bcol]] = 1.0
                 static_arr[i, pos] = s
 
             # Past known / observed — scattered onto global-calendar columns.
@@ -2295,12 +1835,15 @@ class FeaturePipeline:
             "realized_return": realized_arr,
             "decision_eligible_mask": decision_arr,
             "history_eligible_mask": history_arr,
+            # Data-derived research-universe gate (已上市 + 未长期停牌 +
+            # 流动性); the delist / index-membership halves are ANDed in per-fold
+            # by train_panel (§七-3).
+            "universe_eligible_mask": universe_eligible_arr,
             "close_price": close_price_arr,
             "open_price": open_price_arr,
             # Column order of the feature grids (axis 2) — lets consumers probe
-            # per-channel presence via the has_* flags.  Both are the post-union,
-            # post-dead-drop order actually
-            # used to build pk_arr / po_arr.
+            # per-channel presence via the has_* flags.  Full engineered order:
+            # per-fold dead-column removal happens in train_panel after slicing.
             "past_known_cols": list(pk_cols_available),
             "past_observed_cols": list(po_cols_available),
         }
@@ -2312,8 +1855,15 @@ class FeaturePipeline:
 # PIT-static features:
 #   price_60d_q / amt_60d_q  trailing 60d means → per-date cross-sectional rank
 #   listing_days             (global col − first listed col) / 250
-#   board_code               exchange board derived from the stock code
-# All four are computed purely from data known at the decision day.
+#   board_*                  exchange-board one-hot derived from the stock code
+# All nine are computed purely from data known at the decision day.
+# NOTE on size: a genuine PIT float market cap (real 流通市值) is NOT currently
+# derivable from canonical on-disk data — valuation data begins 2015 and is
+# PE/PB/PS/PCF only, the daily contract has no share counts, and fundamentals
+# are quarterly without share counts.  `amt_60d_q` (trailing 60d turnover rank)
+# is the size/liquidity axis; `price_60d_q` is a price tier, NOT a size proxy.
+# Replacing these with real PIT float market cap requires new data acquisition
+# (e.g. Sina backup `float_mcap_yi` or Baostock `turn`), not a derivation (§十一-5).
 # `industry_code` is deliberately EXCLUDED: the only available stock→industry
 # sources (sector_map.json / stock_sector_cache.csv) are current-snapshot maps
 # with no point-in-time membership history, so a static industry_code would
@@ -2322,11 +1872,14 @@ class FeaturePipeline:
 # The per-stock industry-relative features (ind_matched_return /
 # stock_vs_industry) are likewise removed from _merge_industry for the same
 # reason.
+_BOARD_NAMES = ("unknown", "sh_main", "star", "sz_main", "chinext", "bse")
+_BOARD_ONEHOT_COLS = [f"board_{n}" for n in _BOARD_NAMES]
+
 _PIT_STATIC_COLS = [
     "price_60d_q",     # trailing 60d mean close → cross-sectional price tier
     "amt_60d_q",       # trailing 60d mean turnover (canonical amount) → size/liquidity
     "listing_days",    # days since first bar (scaled by 250 → years)
-    "board_code",      # exchange board derived from stock code
+    *_BOARD_ONEHOT_COLS,  # exchange-board one-hot derived from the stock code
 ]
 
 
@@ -2351,20 +1904,62 @@ def _trailing_mean(values: np.ndarray, window: int) -> np.ndarray:
     return np.where(cnt >= 1.0, s / np.maximum(cnt, 1.0), 0.0)
 
 
-def _board_code(code) -> float:
-    """Map a 6-digit A-share code to an exchange-board id."""
+def _not_long_suspended(
+    obs_arr: np.ndarray,
+    first_col: np.ndarray,
+    max_T: int,
+    threshold: int,
+    lookback: int,
+) -> np.ndarray:
+    """Point-in-time long-suspension eligibility ``(n_stocks, T)`` (§七-3).
+
+    A stock is disqualified from the first column its consecutive missing-close
+    run reaches ``threshold``, through ``lookback`` trading columns after the
+    run resumes.  Pre-listing columns are never "missing" (the stock is not yet
+    listed, not suspended).  Fully vectorized: cumulative run lengths + a
+    difference array for the active-window intervals.
+    """
+    n = obs_arr.shape[0]
+    if n == 0 or max_T == 0:
+        return np.zeros((n, max_T), dtype=bool)
+    cols = np.arange(max_T)[None, :]
+    listed = (first_col[:, None] >= 0) & (cols >= first_col[:, None])
+    missing = (~obs_arr) & listed
+    # Consecutive missing-run length ending at t: last non-missing column up to
+    # t, so run[t] = t - last_ok[t] when missing, else 0.
+    last_ok = np.maximum.accumulate(np.where(missing, -1, cols), axis=1)
+    run = np.where(missing, cols - last_ok, 0)
+    trig = run >= threshold
+    if not trig.any():
+        return np.ones((n, max_T), dtype=bool)
+    trig_start = trig.copy()
+    trig_start[:, 1:] &= ~trig[:, :-1]
+    trig_end = trig.copy()
+    trig_end[:, :-1] &= ~trig[:, 1:]
+    rows_s, cols_s = np.where(trig_start)
+    rows_e, cols_e = np.where(trig_end)
+    diff = np.zeros((n, max_T + 1), dtype=np.int64)
+    np.add.at(diff, (rows_s, cols_s), 1)
+    end = np.minimum(cols_e + lookback + 1, max_T)
+    np.add.at(diff, (rows_e, end), -1)
+    active = np.cumsum(diff[:, :max_T], axis=1)
+    return active == 0
+
+
+def _board_index(code) -> int:
+    """Map a 6-digit A-share code to an index into _BOARD_ONEHOT_COLS."""
     s = str(code).zfill(6)
     if s.startswith("60"):
-        return 1.0   # SH main board
+        return 1   # SH main board
     if s.startswith("68"):
-        return 2.0   # STAR market
+        return 2   # STAR market
     if s.startswith("00"):
-        return 3.0   # SZ main board (incl. 002 SME)
+        return 3   # SZ main board (incl. 002 SME)
     if s.startswith("30"):
-        return 4.0   # ChiNext
+        return 4   # ChiNext
     if s[0] in ("8", "4"):
-        return 5.0   # Beijing Stock Exchange
-    return 0.0
+        return 5   # Beijing Stock Exchange
+    return 0
 
 
 
@@ -2420,137 +2015,3 @@ def _active_cols(df: pd.DataFrame, candidates: list[str]) -> list[str]:
     """Return the subset of *candidates* that exist in *df*."""
     return [c for c in candidates if c in df.columns]
 
-
-def _has_col_in_any_stock(all_feat_dfs: list[pd.DataFrame], col_name: str) -> str | None:
-    """Check whether a named feature column exists in any stock's DataFrame.
-
-    Returns the column name if found, None otherwise.
-    """
-    for df in all_feat_dfs:
-        if col_name in df.columns:
-            return col_name
-    return None
-
-
-def _batch_fill_shift(df: pd.DataFrame, cols: list[str],
-                      lag: bool = True) -> None:
-    """Vectorized fill → shift → fill for merged aux columns.
-
-    Groups columns by dtype and does each operation in a single block
-    assignment — zero DataFrame fragmentation (no PerformanceWarning).
-    Mutates *df* in-place.
-
-    ``lag=False`` skips the PIT shift for sources whose storage layer already
-    mapped events to their ``effective_trade_date`` (earnings/guba/news:
-    post-close → next trading day).  Their date column IS the PIT-effective
-    day, so an extra shift would double-lag the signal.
-    """
-    available = [c for c in cols if c in df.columns]
-    if not available:
-        return
-
-    # Partition by expected dtype
-    float_cols = [c for c in available
-                  if not c.startswith("has_")
-                  and not c.endswith("_count")
-                  and not c.endswith("_streak")
-                  and not c.endswith("_quadrant")]
-    int_cols = [c for c in available
-                if (c.endswith("_count") or c.endswith("_streak")
-                    or c.endswith("_quadrant"))
-                and not c.startswith("has_")]
-    bool_cols = [c for c in available if c.startswith("has_")]
-
-    # Pre-lag fill
-    if float_cols:
-        df[float_cols] = df[float_cols].fillna(0.0).astype(np.float32)
-    if int_cols:
-        df[int_cols] = df[int_cols].fillna(0).astype("int16")
-    if bool_cols:
-        df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
-
-    # PIT lag: feature[t-1] paired with price[t]
-    if lag:
-        df[available] = df[available].shift(1)
-
-    # Post-lag fill (first row becomes NaN after shift)
-    if float_cols:
-        df[float_cols] = df[float_cols].fillna(0.0).astype(np.float32)
-    if int_cols:
-        df[int_cols] = df[int_cols].fillna(0).astype("int16")
-    if bool_cols:
-        df[bool_cols] = df[bool_cols].fillna(False).astype(bool)
-
-
-def _merge_daily_aux(df: pd.DataFrame, aux: pd.DataFrame) -> pd.DataFrame:
-    """Merge a preprocessed auxiliary DataFrame on date with ZI fill + PIT lag.
-
-    Any column that exists in *aux* (except date, stock_code, has_* flags and
-    K-line derived columns) is merged and lagged by 1 trading day.
-    """
-    a = aux.copy()
-    a["date"] = pd.to_datetime(a["date"])
-    # Drop stock-level columns — we merge on date only
-    a = a.drop(columns=["stock_code"], errors="ignore")
-    a = a.drop_duplicates(subset="date", keep="last")
-
-    # K-line derived columns must NEVER come from aux. technical.compute_all
-    # drops pct_change/vol_change as intermediates, which would otherwise let
-    # an aux (e.g. board/industry ranking) inject its own — possibly stale —
-    # values as if they were the stock's daily return.
-    skip = {"date", "stock_code", "pct_change", "vol_change"}
-    available = [c for c in a.columns if c not in skip]
-    # Drop aux columns that collide with existing df columns (e.g. block_trade
-    # has 'volume'/'amount' which clash with K-line OHLCV). Colliding columns
-    # would cause pandas merge to create _x/_y suffixes, breaking downstream
-    # column name access.
-    df_cols = set(df.columns)
-    colliding = [c for c in available if c in df_cols]
-    if colliding:
-        available = [c for c in available if c not in df_cols]
-    # Drop non-numeric columns (e.g. 'buyer'/'seller' in block_trade) — they
-    # can't be ZI-filled or cast to float32.
-    available = [c for c in available
-                 if pd.api.types.is_numeric_dtype(a[c]) or c.startswith("has_")]
-    if not available:
-        return df
-
-    df = df.merge(a[["date"] + available], on="date", how="left")
-    _batch_fill_shift(df, available)
-    return df
-
-
-def _aggregate_concept_long(concept_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate concept data from long format to per-stock-per-date.
-
-    ConceptBlockEncoder outputs one row per (date, stock_code, board_name).
-    Multi-hot columns (cb_*) and per-board momentum columns need to be
-    collapsed to a single row per (date, stock_code) before merging with
-    the main feature DataFrame.
-    """
-    agg_spec = {}
-    # Multi-hot: max works as OR (1 if any board has the flag)
-    cb_cols = [c for c in concept_df.columns if c.startswith("cb_")]
-    agg_spec.update({c: (c, "max") for c in cb_cols})
-    # Per-board momentum: average across boards
-    mom_cols = [c for c in concept_df.columns if c.startswith("concept_momentum_")]
-    agg_spec.update({c: (c, "mean") for c in mom_cols})
-    bmom_cols = [c for c in concept_df.columns if c.startswith("board_momentum_")]
-    agg_spec.update({c: (c, "mean") for c in bmom_cols})
-    # Per-stock columns: same value across rows (take first)
-    static_cols = [
-        c for c in concept_df.columns
-        if c not in {"date", "stock_code", "board_name"}
-        and c not in cb_cols
-        and c not in mom_cols
-        and c not in bmom_cols
-    ]
-    agg_spec.update({c: (c, "first") for c in static_cols})
-
-    key_cols = ["date", "stock_code"]
-    available = [c for c in key_cols if c in concept_df.columns]
-    return (
-        concept_df.groupby(available, as_index=False)
-        .agg(**agg_spec)
-        .reset_index(drop=True)
-    )

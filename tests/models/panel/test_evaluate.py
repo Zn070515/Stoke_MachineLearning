@@ -18,9 +18,17 @@ from stoke_ml.models.panel.evaluate import (
     evaluate_portfolio,
     _candidate_pool,
     _combine_book_daily,
+    _ls_exposure_ledger,
     _run_sleeve_sim,
     _simulate_sleeve_account,
 )
+
+
+def _ledger_pnl(ledger):
+    """Total per-position P&L of a ledger: unresolved rows carry
+    `unrealized_pnl`, all others `net_pnl` (§十三-3)."""
+    return sum(r["unrealized_pnl"] if r["exit_status"] == "unresolved"
+               else r["net_pnl"] for r in ledger)
 
 
 class TestSharpe:
@@ -140,6 +148,25 @@ class TestBootstrapSharpeCI:
             rets, horizon=1, n_boot=600, block_len=1)
         assert (hi_b - lo_b) > (hi_i - lo_i), (
             f"block CI {hi_b - lo_b:.4f} should exceed iid CI {hi_i - lo_i:.4f}"
+        )
+
+    def test_horizon_floored_block_not_narrower(self):
+        # §十五-3: with horizon>1 the adjacent daily returns share overlapping
+        # holdings.  A block floored at the horizon must NOT give a narrower CI
+        # than a tiny block on an autocorrelated series (the floor preserves the
+        # overlap structure the sleeve actually has).
+        rng = np.random.RandomState(3)
+        n = 240
+        rets = np.zeros(n)
+        for t in range(1, n):
+            rets[t] = 0.7 * rets[t - 1] + rng.randn() * 0.01 + 0.0002
+        lo_f, hi_f = compute_bootstrap_sharpe_ci(
+            rets, horizon=1, n_boot=600, block_len=20)
+        lo_s, hi_s = compute_bootstrap_sharpe_ci(
+            rets, horizon=1, n_boot=600, block_len=2)
+        assert (hi_f - lo_f) >= (hi_s - lo_s), (
+            f"horizon-floored CI {hi_f - lo_f:.4f} must not be narrower "
+            f"than small-block CI {hi_s - lo_s:.4f}"
         )
 
 
@@ -847,6 +874,83 @@ class TestSleeveDelayedDelist:
         assert counts["clean"] == 0
 
 
+class TestSleeveDelistForceSell:
+    """§七-1: a stock with a KNOWN delisting record (delist_day >= 0) is
+    FORCE-sold at its last carried close on the delisting day — even before
+    the sleeve's scheduled exit — and classified DELISTED.  A stock without
+    such a record (delist_day == -1) keeps the old unresolved semantics."""
+
+    def test_known_delist_force_sold_before_scheduled_exit(self):
+        """Stock 0 is delisted at sim column 1 (delist_day=1), before its
+        scheduled exit at d=2.  It is force-sold at the carried close 11.0 and
+        booked DELISTED with actual_exit_day=1."""
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, 12.0, 13.0],
+                          [20.0, 21.0, 22.0, 23.0]], dtype=np.float32)
+        open_ = np.array([[10.5, 11.5, 12.5, 13.5],
+                          [20.5, 21.5, 22.5, 23.5]], dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        delist_day = np.array([1, -1])
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=2, top_fraction=0.5,
+            cost=0.0, mode="long", return_ledger=True, delist_day=delist_day)
+        counts = res["exit_stats"]["counts"]
+        assert counts["delisted"] == 1, f"expected exactly one delisted, got {counts}"
+        assert counts["clean"] == 0, f"delist must not be clean: {counts}"
+        assert counts["delayed"] == 0, f"delist must not be delayed: {counts}"
+        assert counts["unresolved"] == 0, f"delist must not dangle unresolved: {counts}"
+        ledger = res["ledger"]
+        assert len(ledger) == 1
+        rec = ledger[0]
+        assert rec["exit_status"] == "delisted"
+        assert rec["actual_exit_day"] == 1, f"force-sell day wrong: {rec}"
+        assert rec["exit_price"] == 11.0, f"delisting close wrong: {rec}"
+
+    def test_known_delist_without_data_dies_never_delists(self):
+        """A stock whose data just ENDS (like before) but has NO delist record
+        (delist_day == -1) stays UNRESOLVED — the §七-1 force-sell is gated on
+        the universe record, not on the price path ending."""
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, np.nan],
+                          [20.0, 21.0, 22.0]], dtype=np.float32)
+        open_ = np.array([[10.5, np.nan, np.nan],
+                          [20.5, 21.5, 22.5]], dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=1, top_fraction=0.5,
+            cost=0.0, mode="long", delist_day=np.array([-1, -1]))
+        counts = res["exit_stats"]["counts"]
+        assert counts["unresolved"] == 1, f"expected unresolved, got {counts}"
+        assert counts["delisted"] == 0, f"no delist record → no force-sell: {counts}"
+
+    def test_delist_day_outside_window_never_fires(self):
+        """A delist day pointing past the price path (>= Wp) never fires within
+        the sim: the position exits at its scheduled open like normal."""
+        preds = np.array([[0.9], [0.1]], dtype=np.float32)
+        close = np.array([[10.0, 11.0, 12.0],
+                          [20.0, 21.0, 22.0]], dtype=np.float32)
+        open_ = np.array([[10.5, 11.5, 12.5],
+                          [20.5, 21.5, 22.5]], dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        res = _simulate_sleeve_account(
+            preds, close, open_, pool, horizon=2, top_fraction=0.5,
+            cost=0.0, mode="long", delist_day=np.array([99, -1]))
+        counts = res["exit_stats"]["counts"]
+        assert counts["delisted"] == 0, f"out-of-window delist must not fire: {counts}"
+        assert counts["clean"] == 1, f"scheduled exit should be clean: {counts}"
+        assert counts["unresolved"] == 0
+
+    def test_delist_day_wrong_shape_raises(self):
+        preds = np.ones((2, 1), dtype=np.float32)
+        close = np.ones((2, 3), dtype=np.float32)
+        open_ = np.ones((2, 3), dtype=np.float32)
+        pool = np.ones((2, 1), dtype=bool)
+        with pytest.raises(ValueError):
+            _run_sleeve_sim(preds, close, open_, pool, horizon=1,
+                            top_fraction=0.5, cost=0.0, mode="long",
+                            delist_day=np.array([0, 0, 0]))
+
+
 class TestLsAlgebra:
     """`short_d` is ALREADY the short account's real
     daily return (side=-1 applied inside the simulator), so the long-short book
@@ -907,6 +1011,146 @@ class TestLsAlgebra:
         short_d = np.asarray(short_a["daily"])
         assert short_d.mean() > 0.003, (
             f"short NAV must rise when the bottom falls: {short_d.mean():+.4f}")
+
+
+class TestExposureLedger:
+    """§十三-1 / §十三-2: the LS exposure ledger normalizes by close NAV
+    (value shares, signed short) so the accounting identity holds on every
+    solvent day, and a bankrupt leg/book (NAV <= 0) is NaN in the daily ledger
+    and excluded from the summary instead of divided by a fake 1.0."""
+
+    SEQ_LEN, HORIZON, N_TS = 60, 5, 320
+
+    def test_exposure_identities_hold_every_day(self):
+        """End-to-end: on every solvent day, long + short + cash == 1 with
+        gross == |long| + |short| and net == long + short (signed short)."""
+        panel = _make_priced_panel(
+            n_stocks=12, n_timesteps=self.N_TS, seq_len=self.SEQ_LEN,
+            horizon=self.HORIZON, up_stocks=(1,), down_stocks=(2,), seed=10)
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON)
+        m = evaluate_portfolio(
+            _StaticMarkerModel(), panel, cfg, torch.device("cpu"),
+            horizon=self.HORIZON)
+        daily = m["exposure"]["realized"]["daily"]
+        long_mv = np.asarray(daily["long_market_value"], dtype=np.float64)
+        short_mv = np.asarray(daily["short_market_value"], dtype=np.float64)
+        cash = np.asarray(daily["cash"], dtype=np.float64)
+        gross = np.asarray(daily["gross_exposure"], dtype=np.float64)
+        net = np.asarray(daily["net_exposure"], dtype=np.float64)
+        finite = np.isfinite(long_mv) & np.isfinite(short_mv) & np.isfinite(cash)
+        assert finite.any(), "expected at least one solvent day with a ledger"
+        assert np.max(np.abs(long_mv[finite] + short_mv[finite] + cash[finite]
+                             - 1.0)) <= 1e-6, (
+            "long + short + cash must equal the unit account on solvent days")
+        assert np.max(np.abs(gross[finite] - (np.abs(long_mv[finite])
+                                              + np.abs(short_mv[finite])))) <= 1e-6
+        assert np.max(np.abs(net[finite] - (long_mv[finite] + short_mv[finite]))) <= 1e-6
+        assert (short_mv[finite] <= 0.0).all(), (
+            "the short leg's value share must be signed negative")
+
+    def test_exposure_stable_under_large_gap(self):
+        """§十六: a large (but not bankrupting) intraday gap must not break the
+        exposure 口径 — the close-NAV-relative value shares still satisfy
+        long + short + cash == 1 and stay finite on every day, no fabricated
+        normalization denominator."""
+        long_d = np.array([0.30, -0.25, 0.15, 0.10])   # ±30% swings
+        short_d = np.array([0.20, -0.30, 0.10, 0.05])
+        comb_nav = 0.5 * np.cumprod(1.0 + long_d) + 0.5 * np.cumprod(1.0 + short_d)
+        assert (comb_nav > 0.0).all(), "scenario must stay solvent every day"
+        long_a = {
+            "daily": long_d,
+            "net_exposure": np.ones(4),        # long-only → net == gross
+            "cash_ratio": np.zeros(4),
+            "delayed_capital": np.zeros(4),
+            "active_sleeves": np.zeros(4, dtype=int),
+            "bankrupt_day": None,
+        }
+        short_a = {
+            "daily": short_d,
+            "net_exposure": -np.ones(4),       # short value is negative
+            "cash_ratio": np.full(4, 2.0),     # 1.0 proceeds + 1.0 collateral
+            "delayed_capital": np.zeros(4),
+            "active_sleeves": np.zeros(4, dtype=int),
+            "bankrupt_day": None,
+        }
+        led = _ls_exposure_ledger(long_a, short_a)
+        daily = led["realized"]["daily"]
+        long_mv = np.asarray(daily["long_market_value"], dtype=np.float64)
+        short_mv = np.asarray(daily["short_market_value"], dtype=np.float64)
+        cash = np.asarray(daily["cash"], dtype=np.float64)
+        gross = np.asarray(daily["gross_exposure"], dtype=np.float64)
+        net = np.asarray(daily["net_exposure"], dtype=np.float64)
+        assert np.isfinite(long_mv).all() and np.isfinite(short_mv).all()
+        assert np.isfinite(cash).all() and np.isfinite(gross).all()
+        assert np.max(np.abs(long_mv + short_mv + cash - 1.0)) <= 1e-6
+        assert np.max(np.abs(gross - (np.abs(long_mv) + np.abs(short_mv)))) <= 1e-6
+        assert np.max(np.abs(net - (long_mv + short_mv))) <= 1e-6
+        assert (short_mv <= 0.0).all()
+
+    def test_combine_book_daily_freezes_after_bankruptcy(self):
+        """§十三-2: once the blended NAV goes <= 0 the return series records
+        the blow-up ratio and then freezes — no fake-1.0 post-bankruptcy
+        returns."""
+        long_d = np.array([-0.4, -0.4, 0.1])
+        short_d = np.array([-0.4, -0.4, 0.1])
+        out = _combine_book_daily(long_d, short_d, 1.0, 1.0, subtract=1.0)
+        a = np.cumprod(1.0 + long_d)
+        b = np.cumprod(1.0 + short_d)
+        nav = a + b - 1.0
+        assert nav[0] > 0 and nav[1] <= 0, f"scenario must blow up: nav={nav}"
+        assert np.isclose(out[0], nav[0] - 1.0)
+        assert np.isclose(out[1], nav[1] / nav[0] - 1.0), (
+            "the blow-up day still reports the true NAV ratio")
+        assert (out[2:] == 0.0).all(), "post-bankruptcy days must freeze to 0"
+
+    def test_short_leg_bankrupts_and_freezes(self):
+        """A shorted stock that more than doubles makes the short leg's NAV go
+        negative; the account latches bankrupt_day, records the blow-up return
+        once, and stops marking afterwards."""
+        preds = np.array([[0.5]], dtype=np.float32)
+        close = np.array([[10.0, 30.0, 31.0, 32.0]], dtype=np.float32)
+        open_ = np.array([[10.0, 30.0, 31.0, 32.0]], dtype=np.float32)
+        pool = np.ones((1, 1), dtype=bool)
+        res = _run_sleeve_sim(preds, close, open_, pool, horizon=1,
+                              top_fraction=0.5, cost=0.0, mode="short")
+        assert res["bankrupt_day"] == 1, (
+            f"blow-up on the exit day, got {res['bankrupt_day']}")
+        daily = np.asarray(res["daily"])
+        assert daily[1] <= -1.0, f"blow-up day return must be <= -1: {daily[1]}"
+        assert (daily[2:] == 0.0).all(), "post-bankruptcy days must freeze"
+        assert np.isclose(res["final_nav"], -1.0, atol=1e-6), (
+            f"final_nav pins at the blow-up mark: {res['final_nav']}")
+        counts = res["exit_stats"]["counts"]
+        assert counts["clean"] == 1 and counts["unresolved"] == 0
+
+    def test_ledger_nans_bankrupt_day(self):
+        """A bankrupt leg (short NAV <= 0 on day 2) makes that day NaN in the
+        ledger and surfaces `bankrupt.short_day`; the summary only uses the
+        remaining solvent days."""
+        long_a = {
+            "daily": np.zeros(4),
+            "net_exposure": np.zeros(4),
+            "cash_ratio": np.ones(4),
+            "delayed_capital": np.zeros(4),
+            "active_sleeves": np.zeros(4, dtype=int),
+            "bankrupt_day": None,
+        }
+        short_a = {
+            "daily": np.array([0.0, 0.0, -2.0, 0.1]),
+            "net_exposure": np.array([0.0, 0.0, -2.0, -2.0]),
+            "cash_ratio": np.array([1.0, 1.0, 3.0, 3.0]),
+            "delayed_capital": np.zeros(4),
+            "active_sleeves": np.zeros(4, dtype=int),
+            "bankrupt_day": 2,
+        }
+        led = _ls_exposure_ledger(long_a, short_a)
+        long_mv = np.asarray(led["realized"]["daily"]["long_market_value"])
+        assert np.isnan(long_mv[2]) and np.isnan(long_mv[3]), (
+            "bankrupt days must be NaN in the daily ledger")
+        assert np.isfinite(long_mv[0]) and np.isfinite(long_mv[1])
+        assert led["bankrupt"] == {"long_day": None, "short_day": 2}
+        # Only the 2 solvent days enter the summary.
+        assert led["realized"]["mean_gross_exposure"] == 0.0
 
 
 class TestLsNoRebalance:
@@ -1043,9 +1287,9 @@ class TestSleeveAccountIdentity:
         for mode in ("long", "short", "ew"):
             res = _run_sleeve_sim(preds, close, open_, pool, self.HORIZON,
                                   0.1, 0.001, mode, return_ledger=True)
-            total = sum(r["net_pnl"] for r in res["ledger"])
+            total = _ledger_pnl(res["ledger"])
             assert np.isclose(total, res["final_nav"] - 1.0, atol=1e-8), (
-                f"{mode}: sum(net_pnl)={total:.10f} != "
+                f"{mode}: sum(ledger pnl)={total:.10f} != "
                 f"final_nav-1={res['final_nav'] - 1.0:.10f}")
 
 
@@ -1130,16 +1374,21 @@ class TestLastHorizonSuspendedExit:
         # 105→110 on 1/5 weight minus the entry cost → final NAV > 1.
         assert res["final_nav"] > 1.0, f"NAV untouched? final_nav={res['final_nav']:.6f}"
         # The audit trail records the locked capital: entry cost charged, no
-        # fictitious sell cost, exit at the final carried close.
+        # fictitious sell cost, and the held position MARKED at the final
+        # carried close (§十三-3) — not fabricated as a realized exit.
         led = res["ledger"]
         assert len(led) == 1, f"expected the single filled sleeve, got {len(led)}"
         r = led[0]
         assert r["exit_status"] == "unresolved"
         assert r["entry_price"] == 100.0
-        assert r["exit_price"] == 110.0, "unresolved books the final carried mark"
+        assert r["actual_exit_day"] is None
+        assert r["mark_day"] == 5
+        assert r["mark_price"] == 110.0, "unresolved marks the final carried close"
+        assert r["exit_price"] is None and r["realized_return"] is None
+        assert r["net_pnl"] is None
         assert r["entry_cost"] > 0.0 and r["exit_cost"] == 0.0
         # Ledger reconciles to the account identity even with capital locked.
-        assert np.isclose(r["net_pnl"], res["final_nav"] - 1.0, atol=1e-9)
+        assert np.isclose(r["unrealized_pnl"], res["final_nav"] - 1.0, atol=1e-9)
 
 
 class TestRawReturnUnits:
@@ -1284,10 +1533,11 @@ class TestSleeveLedger:
     (preds + price paths + pool + metadata) replayed through _run_sleeve_sim."""
 
     _SCHEMA = {
-        "entry_day", "stock", "mode", "entry_price", "entry_value",
-        "executed_weight", "shares",
+        "entry_day", "stock", "mode", "entry_price", "entry_notional",
+        "target_weight", "executed_weight", "entry_nav", "shares",
         "scheduled_exit_day", "actual_exit_day", "exit_status", "exit_price",
-        "realized_return", "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
+        "realized_return", "mark_day", "mark_price", "gross_pnl",
+        "entry_cost", "exit_cost", "net_pnl", "unrealized_pnl",
     }
 
     def test_ledger_reconciles_to_final_nav(self):
@@ -1310,15 +1560,31 @@ class TestSleeveLedger:
             # cost only when a real exit was executed — unresolved has none).
             if r["exit_status"] == "unresolved":
                 assert r["exit_cost"] == 0.0
-            assert np.isclose(
-                r["net_pnl"],
-                r["gross_pnl"] - r["entry_cost"] - r["exit_cost"], atol=1e-12)
-            assert np.isclose(r["entry_value"], r["shares"] * r["entry_price"],
+                # §十三-3: unresolved holds are marked, not exited — no exit
+                # price/return/realized net; P&L is unrealized at the mark.
+                assert r["actual_exit_day"] is None
+                assert r["mark_day"] is not None and r["mark_price"] is not None
+                assert r["exit_price"] is None and r["realized_return"] is None
+                assert r["net_pnl"] is None
+                pnl = r["unrealized_pnl"]
+            else:
+                assert r["mark_day"] is None and r["mark_price"] is None
+                assert r["unrealized_pnl"] is None
+                pnl = r["net_pnl"]
+            assert np.isclose(pnl, r["gross_pnl"] - r["entry_cost"] - r["exit_cost"],
+                              atol=1e-12)
+            assert np.isclose(r["entry_notional"], r["shares"] * r["entry_price"],
                               rtol=1e-6)
-        total = sum(r["net_pnl"] for r in led)
+            # §十四-2: executed_weight is the REAL fraction of entry NAV, never a
+            # nominal amount; the cash cap can only push it below target_weight.
+            assert np.isclose(r["executed_weight"],
+                              r["entry_notional"] / r["entry_nav"], rtol=1e-6)
+            assert r["target_weight"] > 0
+            assert r["executed_weight"] <= r["target_weight"] + 1e-9
+        total = _ledger_pnl(led)
         final_nav = float(np.prod(1.0 + res["daily"]))
         assert np.isclose(total, final_nav - 1.0, atol=1e-9), (
-            f"sum(net_pnl)={total:.8f} != final_nav - 1 = {final_nav - 1:.8f}")
+            f"sum(ledger pnl)={total:.8f} != final_nav - 1 = {final_nav - 1:.8f}")
 
     def test_ledger_exposed_via_evaluate_portfolio(self):
         panel = _make_priced_panel(
@@ -1333,8 +1599,27 @@ class TestSleeveLedger:
         assert set(led[0]) == self._SCHEMA, set(led[0])
         assert {r["exit_status"] for r in led} <= {"clean", "delayed", "unresolved"}
         # Filled positions have a real entry price and positive value.
-        assert all(np.isfinite(r["entry_price"]) and r["entry_value"] > 0
+        assert all(np.isfinite(r["entry_price"]) and r["entry_notional"] > 0
                    for r in led)
+        # §十四-1: every leg's ledger is exposed, not just the long one.
+        short_led = m.get("short_ledger")
+        assert short_led is not None and len(short_led) > 0, "short ledger missing"
+        assert {r["mode"] for r in short_led} == {"short"}
+        assert set(short_led[0]) == self._SCHEMA, set(short_led[0])
+        ew_led = m.get("ew_ledger")
+        assert ew_led is not None and len(ew_led) > 0, "ew ledger missing"
+        assert {r["mode"] for r in ew_led} == {"ew"}
+        sel_led = m.get("selected_universe_ew_ledger")
+        assert sel_led is not None and len(sel_led) > 0, "selected-universe ledger missing"
+        assert {r["mode"] for r in sel_led} == {"ew"}
+        ls_led = m.get("ls_ledger")
+        assert ls_led is not None and len(ls_led) > 0, "ls ledger missing"
+        assert {r["mode"] for r in ls_led} == {"long", "short"}
+        # LS tape is long+short concatenated and sorted by (entry_day, stock, mode).
+        assert len(ls_led) == len(led) + len(short_led)
+        keys = [(r["entry_day"], r["stock"], r["mode"]) for r in ls_led]
+        assert keys == sorted(keys)
+        assert set(ls_led[0]) == self._SCHEMA, set(ls_led[0])
 
     def test_tape_roundtrip_replays_long_account(self):
         """A tape holding preds + close/open price paths + pool + metadata (the
@@ -1374,9 +1659,157 @@ class TestSleeveLedger:
             int(z["horizon"]), float(z["top_fraction"]), float(z["cost"]),
             mode="long", return_ledger=True)
 
-        orig_final = 1.0 + sum(r["net_pnl"] for r in orig_ledger)
+        orig_final = 1.0 + _ledger_pnl(orig_ledger)
         replay_final = float(np.prod(1.0 + replay["daily"]))
         assert np.isclose(replay_final, orig_final, rtol=1e-6, atol=1e-9), (
             f"tape replay final NAV {replay_final:.8f} != original {orig_final:.8f}")
-        replay_net = sum(r["net_pnl"] for r in replay["ledger"])
+        replay_net = _ledger_pnl(replay["ledger"])
         assert np.isclose(replay_net, replay_final - 1.0, atol=1e-9)
+
+
+class TestContinuousOosReplay:
+    """§十四-4: ONE continuous long sleeve account replayed across all fold
+    tapes.  A fold's NAV restarts at 1 and is aggregated by mean Sharpe — that
+    is a set of disjoint OOS signal windows, not a continuous strategy.  The
+    replay keeps a single account whose NAV carries over fold boundaries (the
+    previous fold's sleeves keep settling while the next fold's model signals),
+    and the final Sharpe/MDD/CAGR come from that account only."""
+
+    def _write_tape(self, path, *, stocks, dates, price_dates, preds, pool,
+                    close, open, horizon, seq_len, top_fraction, cost):
+        np.savez(path, preds=preds, dates=np.array(dates),
+                 stocks=np.array(stocks), decision_eligible=pool,
+                 history_eligible=pool, pool=pool,
+                 entry_eligible=np.ones_like(pool),
+                 return_target_mask=np.ones_like(pool),
+                 return_target=np.zeros_like(pool),
+                 close_price=close, open_price=open,
+                 price_dates=np.array(price_dates),
+                 horizon=horizon, seq_len=seq_len,
+                 top_fraction=top_fraction, cost=cost,
+                 data_version="test", model_hash="test", weight_hash="test")
+
+    def test_account_carries_across_fold_boundary(self, tmp_path):
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        # Global price axis: 10 days.  stock0 rises monotonically, stock1 falls.
+        dates = [f"2025-01-{d:02d}" for d in range(1, 11)]
+        close0 = np.arange(10, 20, dtype=np.float32)     # 10 .. 19
+        close1 = np.arange(20, 10, -1, dtype=np.float32)  # 20 .. 11
+        stocks = ["000001", "000002"]
+        # Fold 1 (OLDER): signal days dates[0:4], price tail dates[0:6].
+        # Fold 0 (NEWER): signal days dates[4:8], price tail dates[4:10].
+        # Lexicographic tape order fold_000/fold_001 = NEWEST/OLDEST.
+        fold_new = {
+            "stocks": stocks,
+            "dates": dates[4:8],
+            "price_dates": dates[4:10],
+            # picks stock1 (row 1 = 000002) — the falling name.
+            "preds": np.array([[0.1, 0.1, 0.1, 0.1],
+                               [0.9, 0.9, 0.9, 0.9]], dtype=np.float32),
+            "pool": np.ones((2, 4), dtype=bool),
+            "close": np.stack([close0[4:10], close1[4:10]]),
+            "open": np.stack([close0[4:10], close1[4:10]]),
+        }
+        fold_old = {
+            "stocks": stocks,
+            "dates": dates[0:4],
+            "price_dates": dates[0:6],
+            # picks stock0 (row 0 = 000001) — the rising name.
+            "preds": np.array([[0.9, 0.9, 0.9, 0.9],
+                               [0.1, 0.1, 0.1, 0.1]], dtype=np.float32),
+            "pool": np.ones((2, 4), dtype=bool),
+            "close": np.stack([close0[0:6], close1[0:6]]),
+            "open": np.stack([close0[0:6], close1[0:6]]),
+        }
+        horizon, seq_len, top_fraction, cost = 2, 60, 0.5, 0.0
+        self._write_tape(str(tmp_path / "fold_000.npz"), horizon=horizon,
+                         seq_len=seq_len, top_fraction=top_fraction, cost=cost,
+                         **fold_new)
+        self._write_tape(str(tmp_path / "fold_001.npz"), horizon=horizon,
+                         seq_len=seq_len, top_fraction=top_fraction, cost=cost,
+                         **fold_old)
+
+        cont = _replay_continuous_oos(str(tmp_path))
+        assert cont is not None
+        acc = cont["account"]
+        daily = np.asarray(acc["daily"], dtype=np.float64)
+        # ONE account ran the FULL union price path — not per-fold NAV restarts.
+        assert len(daily) == len(dates) == 10
+        assert cont["price_dates"] == dates
+        assert cont["stocks"] == stocks
+        final_nav = acc["final_nav"]
+        assert final_nav is not None and final_nav > 0
+        assert np.isclose(float(np.prod(1.0 + daily)), final_nav, rtol=1e-5)
+
+        # Model switch at the fold boundary: the ledger carries fills from BOTH
+        # folds (old signals days 0-3, new signals days 4-7) in one account.
+        led = cont["ledger"]
+        assert led is not None and len(led) > 0
+        entry_days = set(int(d) for d in led["entry_day"])
+        assert entry_days & set(range(0, 4)), "expected fold-OLD signals"
+        assert entry_days & set(range(4, 8)), "expected fold-NEW signals"
+        # A position entered in the OLD fold settles INSIDE the new fold's
+        # window in the same account: entry at signal day 3 schedules exit at
+        # day 5 (horizon=2), which is a real price day in the union grid.
+        d3 = led[led["entry_day"] == 3]
+        assert len(d3) == 1
+        assert int(d3.iloc[0]["actual_exit_day"]) == 5
+        assert d3.iloc[0]["exit_status"] == "clean"
+        assert d3.iloc[0]["stock_code"] == "000001"
+        assert d3.iloc[0]["entry_date"] == dates[3]
+
+        # Ledger rows map to union stocks / dates and the metrics derive from
+        # the continuous account.
+        assert set(led["stock_code"]) <= set(cont["stocks"])
+        assert all(d in cont["price_dates"] for d in led["entry_date"])
+        m = cont["metrics"]
+        assert m["n_days"] == 10 and m["n_stocks"] == 2
+        assert np.isfinite(m["sharpe"])
+        assert m["maxdd"] >= 0.0
+        assert m["final_nav"] == final_nav
+
+    def test_merged_tape_dates_strictly_increasing_with_scrambled_fold(
+            self, tmp_path):
+        """§十六: the merged continuous-OOS price axis must be strictly
+        increasing even when a fold tape stores its price_dates out of
+        chronological order.  The union grid is keyed by date, so the account
+        stays monotonic and column d ↔ date holds without assuming the producer
+        wrote the rows in order."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 6)]  # 01 .. 05
+        stocks = ["000001"]
+        close0 = np.arange(10, 15, dtype=np.float32)  # 10 .. 14, monotonic
+        # Fold tape stores price rows REVERSED (dates and prices stay aligned
+        # with each other, but the date column itself is out of order).
+        scrambled = list(reversed(dates))
+        scrambled_close = np.stack([close0[::-1]])  # aligned to scrambled dates
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=stocks,
+            dates=dates[:3],
+            price_dates=scrambled,
+            preds=np.array([[0.9, 0.9, 0.9]], dtype=np.float32),
+            pool=np.ones((1, 3), dtype=bool),
+            close=scrambled_close,
+            open=scrambled_close,
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+        )
+
+        cont = _replay_continuous_oos(str(tmp_path))
+        assert cont is not None
+        merged = cont["price_dates"]
+        assert merged == dates  # the union grid is re-sorted chronologically
+        assert all(a < b for a, b in zip(merged, merged[1:])), (
+            "merged tape dates must be strictly increasing")
+        # One account column per merged price day — the monotonic grid is the
+        # account's time axis.
+        assert len(np.asarray(cont["account"]["daily"])) == len(dates)
+        final_nav = cont["account"]["final_nav"]
+        assert final_nav is not None and final_nav > 0
+
+    def test_no_tapes_returns_none(self, tmp_path):
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        assert _replay_continuous_oos(str(tmp_path)) is None

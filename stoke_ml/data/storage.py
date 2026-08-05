@@ -414,6 +414,25 @@ class DataStorage:
             finally:
                 _release_lock(handle)
 
+    def save_daily_repair(
+        self, df: pd.DataFrame, market: str = "a_shares",
+        run_id: str | None = None,
+    ):
+        """Save a repaired canonical-daily frame, carrying each stock's existing
+        manifest ``source``/``adjust`` forward (§八-1).
+
+        In-place maintenance scripts (clip negatives, re-derive ``pct_change``,
+        merge a provider column) change values but not the underlying provider,
+        so a raw :meth:`save_daily` would degrade the manifest provenance to the
+        ``attrs`` default.  This preserves the current attribution for every
+        stock in ``df`` before routing through :meth:`save_daily`.
+        """
+        for code, group in df.groupby("stock_code"):
+            m = self.manifest(code, market)
+            group.attrs["source"] = (m or {}).get("source", "unknown")
+            group.attrs["adjustment_mode"] = (m or {}).get("adjust", "unknown")
+            self.save_daily(group, market=market, run_id=run_id)
+
     def load_daily(
         self, stock_code: str, start_date: str, end_date: str,
         market: str = "a_shares", require_valid_manifest: bool = False

@@ -37,6 +37,49 @@ class PreprocessingQualityError(Exception):
         )
 
 
+class PreprocessingScopeError(Exception):
+    """Raised by the formal full-history path when a chain holds fold_train_only steps.
+
+    A ``fold_train_only`` step must be fit per fold on train-only rows; running
+    it over full history bakes validation/future information into its learned
+    parameters (e.g. a concept vocabulary or a drift baseline).  The formal
+    offline path refuses such chains rather than silently fitting on everything
+    (§十-1).  Carry the split chains so the caller can re-route the step to the
+    per-fold path instead of just losing the run.
+    """
+
+    def __init__(
+        self,
+        chain_name: str,
+        step_types: list[str],
+        offline_chain=None,
+        fold_chain=None,
+    ):
+        self.chain_name = chain_name
+        self.step_types = list(step_types)
+        self.offline_chain = offline_chain
+        self.fold_chain = fold_chain
+        super().__init__(
+            f"PreprocessingScope[{chain_name}] fold_train_only step(s) must not "
+            f"run in full-history offline preprocessing: {self.step_types}"
+        )
+
+
+class DriftMonitorError(Exception):
+    """Raised by ``PreprocessingPipeline.drift_check(..., on_drift="raise")``
+    when the eval window drifted beyond the fitted baseline (§十-3).
+
+    Carries the full drift report (``.report``) for the caller to persist.
+    """
+
+    def __init__(self, report: list[dict]):
+        self.report = report
+        features = [r.get("feature") for r in report]
+        super().__init__(
+            f"DriftMonitor: {len(features)} drifted/missing feature(s): {features}"
+        )
+
+
 class PreprocessingPipeline:
     """Register and run named preprocessing chains.
 
@@ -53,12 +96,18 @@ class PreprocessingPipeline:
         self._chains[name] = chain
 
     def run(self, chain_name: str, df: pd.DataFrame, *, strict: bool = False,
-            **kwargs) -> pd.DataFrame:
+            formal: bool = False, **kwargs) -> pd.DataFrame:
         """Run a named chain on *df*, returning transformed DataFrame.
 
         With ``strict=True``, error-level quality problems raise
         :class:`PreprocessingQualityError` instead of degrading silently —
         the caller must decide whether to persist the staged output.
+
+        With ``formal=True`` the caller declares this is full-history offline
+        preprocessing; any ``fold_train_only`` step in the chain raises
+        :class:`PreprocessingScopeError` (§十-1).  Such steps must be fit per
+        fold on train-only rows via :meth:`PreprocessingChain.fold_fitted_chain`,
+        not over the whole window.
         """
         chain = self._chains.get(chain_name)
         if chain is None:
@@ -66,6 +115,15 @@ class PreprocessingPipeline:
                 f"Chain '{chain_name}' not found. "
                 f"Available: {self.list_chains()}"
             )
+        if formal:
+            forbidden = chain.fold_train_only_steps()
+            if forbidden:
+                raise PreprocessingScopeError(
+                    chain_name,
+                    [type(s).__name__ for s in forbidden],
+                    offline_chain=chain.offline_pit_chain(),
+                    fold_chain=chain.fold_fitted_chain(),
+                )
         out = chain.fit_transform(df, **kwargs)
         qm = getattr(self, "_quality_monitor", None)
         if qm is not None:
@@ -92,6 +150,23 @@ class PreprocessingPipeline:
     def list_chains(self) -> list[str]:
         return sorted(self._chains.keys())
 
+    def offline_pit_chains(self) -> dict[str, "PreprocessingChain"]:
+        """Map chain name → offline-safe sub-chain (fold_train_only steps dropped).
+
+        A full-history offline preprocess pass runs exactly these sub-chains —
+        the ``fold_train_only`` steps are routed to the per-fold path instead
+        (§十-1).
+        """
+        return {name: c.offline_pit_chain() for name, c in self._chains.items()}
+
+    def fold_fitted_chains(self) -> dict[str, "PreprocessingChain"]:
+        """Map chain name → per-fold sub-chain (fold_train_only steps only).
+
+        These are the steps a fold-aware trainer fits on its training slice
+        before transforming the fold (§十-1).
+        """
+        return {name: c.fold_fitted_chain() for name, c in self._chains.items()}
+
     @property
     def topic_modeler(self):
         """The TopicModeler instance, if configured. May be None."""
@@ -106,6 +181,62 @@ class PreprocessingPipeline:
     def drift_monitor(self):
         """The DriftMonitor instance, if configured. May be None."""
         return getattr(self, "_drift_monitor", None)
+
+    def drift_fit(self, df: pd.DataFrame) -> None:
+        """Fit the DriftMonitor baseline on a TRAIN slice (§十-3).
+
+        The baseline must be fit on training-fold rows only — fitting on the
+        full window would benchmark each window against itself.  Raises when
+        no DriftMonitor is configured (preprocessing.monitor.enabled=false).
+        """
+        dm = self.drift_monitor
+        if dm is None:
+            raise RuntimeError(
+                "No DriftMonitor configured "
+                "(preprocessing.monitor.enabled=false)."
+            )
+        dm.fit(df)
+        logger.info(
+            "DriftMonitor baseline fit on %d rows, %d features",
+            len(df), len(dm.baseline_),
+        )
+
+    def drift_check(self, df: pd.DataFrame, *, on_drift: str = "warn") -> list[dict]:
+        """Compare an EVAL slice against the fitted baseline (§十-3).
+
+        Returns the drift report (one entry per drifted / missing feature).
+        ``on_drift="raise"`` raises :class:`DriftMonitorError` when any feature
+        drifted; ``"warn"`` (default) logs and returns the report.  Raises
+        RuntimeError when no baseline was fitted — call ``drift_fit`` on the
+        train fold first, so monitoring is never silently skipped.
+        """
+        if on_drift not in ("warn", "raise"):
+            raise ValueError(
+                f"on_drift must be 'warn' or 'raise', got {on_drift!r}"
+            )
+        dm = self.drift_monitor
+        if dm is None:
+            raise RuntimeError(
+                "No DriftMonitor configured "
+                "(preprocessing.monitor.enabled=false)."
+            )
+        if not dm.baseline_:
+            raise RuntimeError(
+                "DriftMonitor has no baseline — call pp.drift_fit(train_df) on "
+                "the training fold before checking eval data (§十-3)."
+            )
+        dm.transform(df)
+        report = dm.drift_report
+        if report:
+            logger.warning(
+                "DriftMonitor: %d drifted/missing feature(s): %s",
+                len(report), report[:5],
+            )
+        else:
+            logger.info("DriftMonitor: no drifted features")
+        if on_drift == "raise" and report:
+            raise DriftMonitorError(report)
+        return report
 
     @property
     def registry(self):

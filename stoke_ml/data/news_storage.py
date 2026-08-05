@@ -248,7 +248,7 @@ class NewsStorage:
         # Topic assignment (cross-stock model, per-stock transform)
         tm = pp.topic_modeler
         if tm is not None and tm._enabled:
-            silver = tm.transform(silver)
+            silver = tm.transform(silver, source="news")
 
         # Daily aggregation (includes topic features)
         gold = pp.run("text_aggregate", silver)

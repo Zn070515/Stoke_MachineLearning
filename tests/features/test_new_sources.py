@@ -49,8 +49,8 @@ def test_merge_market_env_global(tmp_path):
                         use_temporal_stats=False, use_pledge=False, use_limit_up=False,
                         use_index_membership=False, use_market_env=True)
     # _merge_market_env reads from cfg data_dir; bypass by injecting cache.
-    p._market_env_cache = me
-    out = p._merge_market_env(df)
+    p._aux._market_env_cache = me
+    out = p._aux._merge_market_env(df)
     assert "high_low_ratio" in out.columns
     # lagged: out[t] == me[t-1]
     assert np.allclose(out["high_low_ratio"].iloc[1:].values, me["high_low_ratio"].iloc[:-1].values)

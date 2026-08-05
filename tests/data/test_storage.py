@@ -162,6 +162,63 @@ class TestListStocks:
         assert store.list_stocks() == ["000001"]
 
 
+class TestSaveDailyRepair:
+    """save_daily_repair (§八-1) carries each stock's existing manifest
+    source/adjust forward, so in-place maintenance (clip negatives, re-derive
+    pct_change, merge a provider column) never degrades provenance to the
+    attrs default of "unknown"."""
+
+    def _saved_with_provenance(self, tmp_path, code="000001", source="efinance",
+                               adjust="qfq"):
+        store = DataStorage(str(tmp_path))
+        df = _frame(["2024-01-05", "2024-01-06"], code=code)
+        df.attrs["source"] = source
+        df.attrs["adjustment_mode"] = adjust
+        store.save_daily(df)
+        return store
+
+    def test_repair_preserves_existing_provenance(self, tmp_path):
+        store = self._saved_with_provenance(tmp_path)
+        store.save_daily_repair(_frame(["2024-01-06", "2024-01-07"], closes=[9.9, 9.8]))
+        m = store.manifest("000001")
+        assert m["source"] == "efinance"
+        assert m["adjust"] == "qfq"
+        # The repaired value actually landed.
+        out = store.load_daily("000001", "2024-01-01", "2024-01-31")
+        assert out["close"].tolist() == pytest.approx([10.0, 9.9, 9.8])
+
+    def test_raw_save_daily_without_attrs_degrades_provenance(self, tmp_path):
+        """Control: a plain save_daily with no attrs would flatten the manifest
+        source to "unknown" — which is exactly what save_daily_repair prevents."""
+        store = self._saved_with_provenance(tmp_path)
+        df = _frame(["2024-01-07"], closes=[9.9])
+        assert "source" not in df.attrs
+        store.save_daily(df)
+        m = store.manifest("000001")
+        assert m["source"] == "unknown"
+
+    def test_repair_multi_stock_preserves_each(self, tmp_path):
+        store = self._saved_with_provenance(tmp_path, code="000001",
+                                            source="efinance", adjust="qfq")
+        df2 = _frame(["2024-01-05"], code="600519")
+        df2.attrs["source"] = "baostock"
+        df2.attrs["adjustment_mode"] = "qfq"
+        store.save_daily(df2)
+        repaired = pd.concat([
+            _frame(["2024-01-07"], code="000001"),
+            _frame(["2024-01-06", "2024-01-07"], code="600519"),
+        ])
+        store.save_daily_repair(repaired)
+        assert store.manifest("000001")["source"] == "efinance"
+        assert store.manifest("600519")["source"] == "baostock"
+
+    def test_repair_with_no_prior_manifest_falls_back_unknown(self, tmp_path):
+        store = DataStorage(str(tmp_path))
+        store.save_daily_repair(_frame(["2024-01-05"]))
+        m = store.manifest("000001")
+        assert m is not None and m["source"] == "unknown"
+
+
 class TestManifest:
     """save_daily writes a per-stock contract manifest and the
     storage can validate that the on-disk parquet still matches it.  The whole

@@ -58,13 +58,13 @@
 
 ### 预构建特征存储
 
-`data/features/{stock_code}.parquet` — `scripts/build_features.py` 一次性构建的全市场特征：5530 只 × 3744 列/股（516 基础 + 3228 时序展开），109GB。训练脚本直接读盘，特征工程与训练解耦。
+`data/features/{stock_code}.parquet` — `scripts/production/build_features.py` 一次性构建的全市场特征：5530 只 × 3744 列/股（516 基础 + 3228 时序展开），109GB。训练脚本直接读盘，特征工程与训练解耦。
 
 ### 数据契约与特征缓存
 
 **数据契约** `stoke_ml/data/contract.py`（v6 §十六）— 每个数据集（daily_equity / margin / northbound / dragon_tiger / fundamentals）用一份冻结的 `DataContract` 描述 schema、主键、单位、复权口径、时区、日历与源优先级，下载器 / 存储 / 质量门禁 / 特征构建器共享同一份契约。质量门禁的 `contract_schema` 检查按 `DAILY_EQUITY` 验证每个 daily 文件（必需列、主键唯一、日期规则、单位符号），任一违反即 fail。
 
-**特征缓存 manifest** `stoke_ml/features/cache_manifest.py`（v6 §十二）— 每个预构建特征 parquet 携带 sidecar JSON manifest（`data/features/.manifests/{code}.json`），记录 git_commit、config_hash、feature_schema_hash、horizon、seq_len、panel_mode 与逐通道源文件指纹。`build_features.py` 缓存命中必须比较这些 hash；训练侧 `FeaturePipeline` 对 prebuilt 目录做 lineage 警告式校验。
+**特征缓存 manifest** `stoke_ml/features/cache_manifest.py`（v6 §十二 / v10 §十一）— 每个预构建特征 parquet 携带 sidecar JSON manifest（`data/features/.manifests/{code}.json`），记录 git_commit、config_hash、feature_schema_hash、horizon、seq_len、panel_mode 与逐通道源文件指纹。`config_hash` 覆盖完整特征相关 config.yaml 区块（features / preprocessing / universe / fundamental，含技术指标开关、缺失处理、阈值、横截面归一化参数与源 effective-date/persistence 策略），同一 commit 下改 config 也会使缓存失效；start/end 单独以源文件 range 校验。`build_features.py` 缓存命中必须比较这些 hash；训练侧 `FeaturePipeline` 对 prebuilt 目录做 lineage 校验，`--require-feature-manifest`（默认开）时缺失 / stale（schema 漂移、git commit 不一致、config 漂移）直接 fail。
 
 ### 格式
 
@@ -140,7 +140,7 @@
 |------|------|
 | Panel Model (VSN + xLSTM) | 主力模型：Panel联合训练，多任务学习 (方向+涨跌幅+波动率)，RTX 4090 |
 | XGBoost baseline | 展平特征 + 梯度提升树，Phase 1 |
-| Panel 基线 (Ridge / LightGBM / MLP / naive momentum) | 同 inner_val 日历口径的截面对照基线 (v8 四-2)；评估器版本 `evaluator_version 2026-08-04` |
+| Panel 基线 (Ridge / LightGBM / MLP / naive momentum) | 同 inner_val 日历口径的截面对照基线 (v8 四-2)；评估器版本 `evaluator_version 2026-08-05` |
 | LSTM | 2层单向 LSTM + PyTorch Lightning，Phase 2 |
 | class_weight | 处理涨跌样本不均衡，自动计算 neg/pos |
 
@@ -176,7 +176,7 @@
 | 术语 | 含义 |
 |------|------|
 | Panel | (N_stocks, T_timesteps, D_features) 三维数组，区别于单stock (T, D) |
-| Static features | PIT 静态特征 (4维)：price_60d_q / amt_60d_q（60日滚动均值的截面分位）/ listing_days / board_code。全部可由决策日已知数据推导（v8 §三-2）。~~industry_code~~ 已排除：唯一可用的 stock→industry 映射是当前快照（sector_map.json / stock_sector_cache.csv），无 PIT 成分历史，作静态特征会把今日分类回填到历史行 |
+| Static features | PIT 静态特征 (9维)：price_60d_q / amt_60d_q（60日滚动均值的截面分位）/ listing_days / board_*（6维交易所板块 one-hot：sh_main/star/sz_main/chinext/bse/unknown）。全部可由决策日已知数据推导（v8 §三-2）。~~industry_code~~ 已排除：唯一可用的 stock→industry 映射是当前快照（sector_map.json / stock_sector_cache.csv），无 PIT 成分历史，作静态特征会把今日分类回填到历史行 |
 | Past Known (PK) | 已知历史特征 (255维)：价格、技术指标、情感、资金流等，含close用于target计算 |
 | Past Observed (PO) | 观测历史特征 (1418维)：换手率、振幅、涨跌幅等，不含close。维度由当前预构建特征面板动态决定 |
 | Cross-sectional normalization | 跨股票截面归一化：按日期 groupby → z-score，解决不同股票量纲差异 |
@@ -213,6 +213,8 @@
 **Walk-Forward 参数**: 
 - XGBoost/LSTM: 2年训练 / 3月验证 / 3月步长
 - Panel: 增长式训练窗口（[0, val_start−purge) 逐 fold 增长）/ 非重叠 fold（step=val_len）/ inner_val 选择最佳 epoch + outer_test 单次评估 / purge=seq_len（walk-backward，从最新数据倒排 + 末尾 lockbox 保留）
+- Panel OOS 连续账户：把全部 fold 的 OOS 预测按时间排序接到一个账户上重放（fold 边界处切换模型），最终 Sharpe/MDD/CAGR 只取该连续账户 → 产出 `oos_continuous.parquet` / `oos_continuous_ledger.parquet`（替代逐 fold 各自归一的 NAV）
+- 多重试验修正（§十五-1）：PSR（Probabilistic Sharpe，非正态 SR 显著性）/ DSR（Deflated Sharpe，按项目累计实验数 N 与试验 Sharpe 离散度折价）/ SPA（Hansen 2005，best-of-K 相对基准的重采样 p 值），报告同时输出 `long_psr / long_dsr / ls_psr / ls_dsr / spa_*`，连续 OOS 账户也带 `psr / dsr / dsr_n_trials`。实验注册表落在 `reports/experiments/experiment_registry.json`（每次训练原子追加一行），DSR 的 N = 注册表已有实验数 + 1
 
 ---
 
@@ -271,7 +273,7 @@
 - ~~用收盘价预测收盘价~~ → 预测的是次日涨跌**方向**（0/1），不是价格
 - ~~在全部数据上 fit StandardScaler~~ → 只在训练窗口上 fit，验证窗口仅 transform
 - ~~在全量历史上算 normalization 再拿去训练早期窗口~~ → 已审计（v8 §三-1）：所有 scaler/normalizer 均为 PIT 安全——CrossSectionNormalizer 按日期截面、RobustScaler/OutlierDetector 按滚动/回溯窗口、MissingImputer 因果插值，fit 均无状态；每个 `PreprocessingStep` 记录 `fit_start`/`fit_end`（fit 输入日期范围），`tests/preprocessing/test_pit_fit_range.py` 用「追加未来行不改过去输出」的截断不变性测试兜底
-- ~~static 特征用"现在回填历史"的值~~ → 已审计（v8 §三-2）：static 4 维全部由决策日已知数据推导（price_60d_q/amt_60d_q=60日滚动均值→截面分位、listing_days、board_code），财务/估值列（pe/pb/roe…）经 disclose_date 前向填充 + `_batch_fill_shift` 滞后 1 日 + 滚动 252 日分位（`FundamentalRefiner`），均为 PIT；`industry_code` 因无 PIT 成分历史源（`sector_map.json`/`stock_sector_cache.csv` 只是当前快照）已从 `_PIT_STATIC_COLS` 移除，`tests/features/test_static_feature_pit.py` 用截断不变性 + 滞后性测试兜底
+- ~~static 特征用"现在回填历史"的值~~ → 已审计（v8 §三-2）：static 9 维全部由决策日已知数据推导（price_60d_q/amt_60d_q=60日滚动均值→截面分位、listing_days、board_* 交易所板块 one-hot 6 维），财务/估值列（pe/pb/roe…）经 disclose_date 前向填充 + `_batch_fill_shift` 滞后 1 日 + 滚动 252 日分位（`FundamentalRefiner`），均为 PIT；`industry_code` 因无 PIT 成分历史源（`sector_map.json`/`stock_sector_cache.csv` 只是当前快照）已从 `_PIT_STATIC_COLS` 移除，`tests/features/test_static_feature_pit.py` 用截断不变性 + 滞后性测试兜底
 - ~~"情绪分析"~~ → 统一用"情感分析"（sentiment）
 - ~~裸 `python`~~ → 必须 `PYTHONPATH=. ./.venv/Scripts/python`（系统 Anaconda 缺依赖）
 - ~~用 `use_limit_up=True`~~ → limit-up 生态 19 列已定义但未接线（`use_limit_up=False`），勿在训练中开启

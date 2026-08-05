@@ -9,35 +9,83 @@ import datetime as dt
 import json
 import os
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 def default_path(data_dir: str) -> str:
     return os.path.join(data_dir, "a_shares", "download_manifest.json")
 
 
+def run_manifest_path(data_dir: str, dataset: str) -> str:
+    """Where a dataset-scoped download run manifest lives.
+
+    Every download script records its run here so a partial run ("2998 of 3000
+    fetched, 2 failed, script said done") is never mistaken for complete — the
+    repo-wide download-state invariant (§五-5).
+    """
+    return os.path.join(data_dir, dataset, "download_manifest.json")
+
+
+def write_run_manifest(
+    data_dir: str,
+    dataset: str,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    requested: list[str],
+    failed: list[str],
+    complete: set[str],
+    success_count: int | None = None,
+    skipped_existing_count: int = 0,
+) -> dict:
+    """Dataset-scoped wrapper over :func:`write_manifest`.
+
+    ``dataset`` is the subdirectory under ``data_dir`` that owns the artifact
+    (e.g. ``a_shares/pledge`` → ``pledge``).  ``complete`` must be the set of
+    requested units that actually landed validly this run; ``failed`` the units
+    whose fetch returned empty or raised.  ``missing`` (requested but not
+    complete) can never be silently zero, so ``all_complete`` is honest.
+    """
+    return write_manifest(
+        run_manifest_path(data_dir, dataset),
+        market=dataset,
+        start_date=start_date,
+        end_date=end_date,
+        requested=requested,
+        failed=failed,
+        complete=complete,
+        success_count=success_count if success_count is not None else len(complete),
+        skipped_existing_count=skipped_existing_count,
+    )
+
+
 def write_manifest(
     path: str,
     *,
     market: str,
-    start_date: str,
-    end_date: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
     requested: list[str],
     failed: list[str],
-    on_disk: set[str],
+    complete: set[str],
     success_count: int,
     skipped_existing_count: int = 0,
 ) -> dict:
     """Persist a download-run manifest and return it.
 
     `requested` is the full universe this run set out to fetch; `failed` is the
-    subset whose fetch returned empty; `on_disk` is the set of codes actually
-    present in the flat store at the end of the run.  `missing` (requested but
-    not on disk) is the number that matters — it cannot be silently zero.
+    subset whose fetch returned empty.  `complete` MUST be the set of requested
+    codes that both validate against their contract manifest AND cover the
+    requested date range — the caller computes it via
+    ``DataStorage.validate_manifest`` plus a range check, never from mere file
+    presence.  `missing` (requested but not complete) is the number that
+    matters: a parquet on disk does not mean the history is complete, so
+    `all_complete` only holds when every requested stock is validated AND
+    range-covered (§五-4).
     """
     requested_sorted = sorted(set(requested))
     failed_sorted = sorted(set(failed))
-    missing = sorted(set(requested_sorted) - set(on_disk))
+    missing = sorted(set(requested_sorted) - set(complete))
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -48,7 +96,7 @@ def write_manifest(
         "success_count": int(success_count),
         "failed_count": len(failed_sorted),
         "skipped_existing_count": int(skipped_existing_count),
-        "on_disk_count": len(on_disk),
+        "complete_count": len(complete),
         "missing_count": len(missing),
         "failed": failed_sorted,
         "missing": missing,

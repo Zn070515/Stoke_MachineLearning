@@ -15,48 +15,48 @@ PYTHONPATH=. ./.venv/Scripts/python <script>
 
 ```bash
 # Download K-line for all A-shares (5530 stocks, 2000–2026)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_data.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_data.py
 
 # Download news + sentiment (multi-source: EastMoney THS + Sina)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --source all --max-pages 5
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_news.py --source all --max-pages 5
 
 # Download Guba forum posts + sentiment (802 stocks)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_guba.py --max-pages 10
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_guba.py --max-pages 10
 
 # Download AKShare comment sentiment (5184 stocks)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_comment.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_comment.py
 
 # Download market data (margin/northbound/dragon_tiger)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_market_data.py --type all
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_market_data.py --type all
 
 # Download fundamental data (quarterly financials)
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_fundamentals.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_fundamentals.py
 
 # Single stock test
-PYTHONPATH=. ./.venv/Scripts/python scripts/download_news.py --stocks 600519 --max-pages 3
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_news.py --stocks 600519 --max-pages 3
 ```
 
 ### Training
 
 ```bash
 # XGBoost baseline (flat features, walk-forward validation)
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py --stock 000001
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_baseline.py  # all stocks
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_baseline.py --stock 000001
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_baseline.py  # all stocks
 
 # Prebuild features once (decouples feature engineering from training)
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py                 # flat → data/features/ (5530 × ~3744 cols)
-PYTHONPATH=. ./.venv/Scripts/python scripts/build_features.py --panel-mode    # panel → data/features_panel/ (cross-sectional z-score)
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py                 # flat → data/features/ (5530 × ~3744 cols)
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_features.py --panel-mode    # panel → data/features_panel/ (cross-sectional z-score)
 
 # Panel (VSN+xLSTM, main model) — read prebuilt features directly
-PYTHONPATH=. ./.venv/Scripts/python scripts/train_panel.py --stocks 500 --prebuilt data/features_panel --epochs 30 --max-folds 3
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --stocks 500 --prebuilt data/features_panel --epochs 30 --max-folds 3
 
 # Docs-vs-code drift guard (exit 1 on mismatch)
-PYTHONPATH=. ./.venv/Scripts/python scripts/check_docs_consistency.py
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/check_docs_consistency.py
 ```
 
 ### Testing
 
-~48 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
+~53 test files under `tests/{features,models,preprocessing,data,evaluation}/`. Run via the venv interpreter:
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q                    # fast smoke (default, excludes slow/network)
@@ -69,7 +69,7 @@ Tests that train a model or run a full end-to-end pipeline chain carry the
 excluded from the default smoke run (pyproject.toml addopts) — the default
 `pytest` is the fast smoke (~30-60s), `-m ""` overrides it to run everything.
 
-Docs drift is guarded by `scripts/check_docs_consistency.py` (see Commands).
+Docs drift is guarded by `scripts/production/check_docs_consistency.py` (see Commands).
 
 ## Architecture
 
@@ -155,7 +155,7 @@ Pipeline steps:
 4. Microstructure: is_limit_up/down, gap_up/down_pct, volume_anomaly, limit_up_streak
 5. Temporal features (`temporal.py`): lags (1/2/3/5/10/20), rolling stats (5/10/20/60), calendar features
 6. Sequence creation: `seq_len=60` windows → `(n, seq_len, n_features)` or flat `(n, n_features*seq_len)` for XGBoost
-7. Prebuild: `scripts/build_features.py` engineers the full market once (5530 × ~3744 cols, 109GB flat; `features_panel/` for panel z-score mode) — training reads prebuilt parquet instead of re-engineering in-loop. Flat ALL-mode dimensionality (~24,300) is why panel mode + IC pre-filtering is preferred.
+7. Prebuild: `scripts/production/build_features.py` engineers the full market once (5530 × ~3744 cols, 109GB flat; `features_panel/` for panel z-score mode) — training reads prebuilt parquet instead of re-engineering in-loop. Flat ALL-mode dimensionality (~24,300) is why panel mode + IC pre-filtering is preferred.
 
 **News NLP** (`news_nlp.py`) — 3-tier sentiment:
 - L1: FinBERT Chinese (`yiyanghkust/finbert-tone-chinese`) via HF mirror (`hf-mirror.com`) or local cache
@@ -167,9 +167,9 @@ Pipeline steps:
 
 ### Model Layer (`stoke_ml/models/`)
 
-- `PanelModel` (`models/panel/`): VSN (Variable Selection Network) + xLSTM backbone (sLSTM+mLSTM), multi-task heads (direction/return/volatility). Trained via `scripts/train_panel.py` — reads prebuilt panel features (`--prebuilt data/features_panel`) so feature engineering runs once offline, not in the training loop.
+- `PanelModel` (`models/panel/`): VSN (Variable Selection Network) + xLSTM backbone (sLSTM+mLSTM), multi-task heads (direction/return/volatility). Trained via `scripts/production/train_panel.py` — reads prebuilt panel features (`--prebuilt data/features_panel`) so feature engineering runs once offline, not in the training loop.
 - `XGBoostBaseline` (`models/baseline/`): Flat mode classifier, sklearn-compatible `fit/predict/save`
-- Panel baselines (`models/baseline/panel_baselines.py`): Ridge / LightGBM / MLP / naive momentum, evaluated on the same inner_val schedule as the main model (evaluator_version 2026-08-04)
+- Panel baselines (`models/baseline/panel_baselines.py`): Ridge / LightGBM / MLP / naive momentum, evaluated on the same inner_val schedule as the main model (evaluator_version 2026-08-05)
 
 Existing checkpoints: `xgboost_000001_best.json`, `xgboost_600519_best.json`
 

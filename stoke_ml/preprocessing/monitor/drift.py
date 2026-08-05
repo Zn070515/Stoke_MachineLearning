@@ -14,6 +14,11 @@ class DriftMonitor(PreprocessingStep):
     Sigma distance = |current_mean - baseline_mean| / baseline_std
     """
 
+    # fit() records a baseline distribution that transform() compares against;
+    # a full-history fit would benchmark the current window against itself.
+    # Fit on a train fold only, then transform eval windows (§十-1).
+    fit_scope = "fold_train_only"
+
     def __init__(self, sigma_threshold: float = 3.0):
         self.sigma_threshold = sigma_threshold
         self.baseline_: dict[str, dict] = {}

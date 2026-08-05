@@ -10,6 +10,17 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import inspect
 
+# Every step declares which preprocessing regime it belongs to (§十-1):
+#   stateless_pit   — deterministic per-date transform, no learned state.  Safe
+#                     to run over full history offline; fit() only records range.
+#   fold_train_only — learns parameters from training rows (vocabulary, scaler
+#                     baseline, drift baseline).  MUST be re-fit per fold on
+#                     train-only data; a formal full-history pass REFUSES these.
+#   global_frozen   — fit once on a pinned reference (e.g. a corpus cutoff) and
+#                     frozen; safe offline ONLY when the artifact is pinned and
+#                     not re-fit on the full window.
+FIT_SCOPES = ("stateless_pit", "fold_train_only", "global_frozen")
+
 
 class PreprocessingStep(ABC):
     """One preprocessing operation with fit/transform/fit_transform.
@@ -21,6 +32,10 @@ class PreprocessingStep(ABC):
     compute statistics point-in-time inside transform(); the recorded range
     documents the caller's fit discipline.
     """
+
+    # One of FIT_SCOPES; see the module docstring above (§十-1).  A subclass
+    # must set this when it learns parameters from the data it is fit on.
+    fit_scope = "stateless_pit"
 
     # PIT fit-range provenance, set by _record_fit_range() during fit().
     fit_start = None
@@ -99,8 +114,37 @@ class PreprocessingChain(PreprocessingStep):
         return current
 
     def add(self, step: PreprocessingStep) -> PreprocessingChain:
+        if step.fit_scope not in FIT_SCOPES:
+            raise ValueError(
+                f"step {type(step).__name__} has unknown fit_scope "
+                f"{step.fit_scope!r} (expected one of {FIT_SCOPES})"
+            )
         self.steps.append(step)
         return self
+
+    def fold_train_only_steps(self) -> list[PreprocessingStep]:
+        """Steps that must be re-fit per fold on train-only rows (§十-1)."""
+        return [s for s in self.steps if s.fit_scope == "fold_train_only"]
+
+    def offline_pit_chain(self) -> "PreprocessingChain":
+        """Sub-chain safe to run in full-history offline preprocessing.
+
+        Drops every ``fold_train_only`` step — those must be fit per fold on
+        train-only data and are refused by the formal offline path (§十-1).
+        """
+        sub = PreprocessingChain(name=f"{self.name}_offline_pit")
+        sub.steps = [s for s in self.steps if s.fit_scope != "fold_train_only"]
+        return sub
+
+    def fold_fitted_chain(self) -> "PreprocessingChain":
+        """Sub-chain of steps that MUST be fit per fold on train-only rows.
+
+        The complement of :meth:`offline_pit_chain` — the steps a fold-aware
+        trainer fits on its training slice before transforming the fold (§十-1).
+        """
+        sub = PreprocessingChain(name=f"{self.name}_fold_fitted")
+        sub.steps = [s for s in self.steps if s.fit_scope == "fold_train_only"]
+        return sub
 
     def to_config(self) -> dict:
         recorded = []
@@ -110,7 +154,11 @@ class PreprocessingChain(PreprocessingStep):
                 if not k.endswith("_") and not callable(v)
                 and not k.startswith("_")
             }
-            recorded.append({"type": type(s).__name__, "params": params})
+            recorded.append({
+                "type": type(s).__name__,
+                "fit_scope": s.fit_scope,
+                "params": params,
+            })
         return {"name": self.name, "steps": recorded}
 
     def __repr__(self) -> str:

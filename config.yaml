@@ -16,6 +16,16 @@ markets:
     stock_universe: [sp500]
     start_date: "2015-01-01"
 
+# Research-universe eligibility (§七-3): PIT gates merged into the candidate
+# pool.  A stock-day is eligible only when listed, not long-suspended, and (for
+# stocks with a canonical `amount`) liquid.  The 未退市 delist gate and the
+# per-day index-membership gate are applied per-fold in train_panel because
+# they need the external universe status / membership records.
+universe:
+  min_amount_60d: 5000000      # trailing-60d mean turnover floor (CNY)
+  long_suspension_days: 60     # consecutive missing closes = long halt
+  suspension_lookback: 60      # trading columns after a long halt stay disqualified
+
 # Crawler configuration
 crawler:
   tls_impersonate: "chrome120"
@@ -59,7 +69,7 @@ features:
   use_sentiment: true
   target_horizon: 1
   # FE v2 特征家族开关 (use_pledge / use_market_env / use_index_membership /
-  # use_market_env_refine) 不在 config.yaml 中设置——由 scripts/build_features.py
+  # use_market_env_refine) 不在 config.yaml 中设置——由 scripts/production/build_features.py
   # CLI 控制 (--no-pledge / --no-market-env / --no-index-membership /
   # --no-market-env-refine)，默认全开。预构建特征存于 data/features/{code}.parquet。
 
@@ -115,6 +125,17 @@ preprocessing:
   output_dir: "data/preprocessed"
   registry_path: "models/features/feature_registry.json"
 
+  # ── fit_scope / offline vs fold split (§十-1) ──────────────────────────
+  # Every preprocessing step declares a fit_scope in code:
+  #   stateless_pit   → safe to run in the full-history offline pass (no learned
+  #                     state; e.g. text_pre/text_aggregate/numeric/flow/event_*/
+  #                     board/sector chains)
+  #   fold_train_only → must be fit per fold on train-only rows; a formal
+  #                     full-history pass REFUSES these (concept encoding,
+  #                     numeric_full scaling, DriftMonitor)
+  #   global_frozen   → fit once on a pinned reference and frozen (topic model)
+  # Call PreprocessingPipeline.run(name, df, formal=True) to enforce the split;
+  # PreprocessingChain.offline_pit_chain() / fold_fitted_chain() re-route steps.
   text:
     quality_filter:
       min_text_length: 5
@@ -132,6 +153,12 @@ preprocessing:
       min_topic_size: 50
       model_cache_dir: "models/bertopic"
       embedding_model: "finbert"
+      # Pinned production corpus cutoff (TRAIN_END, YYYY-MM-DD).  After running
+      # `python scripts/production/fit_topic_model.py --source {news,guba} --cutoff <TRAIN_END>`,
+      # set this to that cutoff: transform() then auto-loads the cached model fit
+      # on that corpus, and an unfitted TopicModeler raises instead of silently
+      # dropping the topic_* features (§十-2).
+      corpus_cutoff: null
     aggregation:
       windows: [3, 5, 10, 20]
       use_body_sentiment: true
@@ -216,6 +243,14 @@ preprocessing:
       enabled: true
       momentum_windows: [5, 20, 60, 252]
       breadth_normalize_window: 252
+      # §十-4: stock→sector membership must be point-in-time.  The only free
+      # sources (stock_sector_cache.csv / sector_map.json) are CURRENT-SNAPSHOT
+      # classifications — applying them to the whole window present-backfills
+      # today's sector onto history.  scripts/production/preprocess_new_data.py --type
+      # sector therefore bounds the static map to rows >= --sector-snapshot-asof
+      # (default: the cache file's mtime); older rows get unknown-sector
+      # features (zeroed).  Provide data/a_shares/sector_membership.parquet
+      # [date, stock_code, sector_code] for a genuine PIT source instead.
 
   # Shape D: categorical — concept block encoding
   concept:
@@ -226,8 +261,10 @@ preprocessing:
   monitor:
     enabled: true
     # QualityMonitor is wired into PreprocessingPipeline.run() (summary logs).
-    # DriftMonitor is attached via pp.drift_monitor but needs a fit-on-train /
-    # transform-on-eval lifecycle — not yet invoked (follow-up).
+    # DriftMonitor lifecycle is executed via pp.drift_fit(train_df) /
+    # pp.drift_check(eval_df): fit the baseline on the training fold, then
+    # compare each eval window (§十-3).  drift_check raises if called with no
+    # baseline, so monitoring is never silently skipped.
     log_dir: "logs/quality"
     missing_warn_threshold: 0.2
     missing_error_threshold: 0.5

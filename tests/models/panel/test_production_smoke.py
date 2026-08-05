@@ -11,15 +11,19 @@ evaluate.py call NEW Panel interface" contract holds on a real forward pass, and
 that the price-path sleeve account runs (its internal account-identity
 assertion fires) rather than silently falling back to the legacy estimator.
 """
+import dataclasses
+
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
+from scripts.production.train_panel import _weight_hash
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.features.pipeline import FeaturePipeline
+from stoke_ml.features.pipeline import FeaturePipeline, _PIT_STATIC_COLS
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.evaluate import _simulate_sleeve_account, evaluate_portfolio
+from stoke_ml.models.panel.model import PanelModel
 from stoke_ml.models.panel.train import train_panel
 
 N_STOCKS = 12
@@ -108,10 +112,10 @@ class TestBuildPanelFeatures:
         assert T == N_DAYS
         for key in ("static_features", "past_known", "past_observed"):
             assert data[key].dtype == np.float32
-        # 4 PIT-static cols: price_60d_q / amt_60d_q /
-        # listing_days / board_code.  industry_code excluded — no PIT
+        # 9 PIT-static cols: price_60d_q / amt_60d_q / listing_days
+        # + 6 board one-hot.  industry_code excluded — no PIT
         # industry-membership source exists, only a present-snapshot map.
-        assert data["static_features"].shape == (N, T, 4)
+        assert data["static_features"].shape == (N, T, len(_PIT_STATIC_COLS))
         for key in ("y_direction", "y_return", "y_volatility"):
             assert data[key].shape == (N, T)
         for key in ("observation_mask", "entry_eligible_mask", "return_target_mask",
@@ -194,3 +198,67 @@ class TestSleeveAccountIdentity:
         # The cost=0 gross series can only bound the net NAV from above.
         gross = res["gross_daily"]
         assert float(np.prod(1 + gross)) >= final_nav - 1e-9
+
+
+class TestPersistBestCheckpoint:
+    """§十二-1: the per-fold best-inner-val checkpoint must be persistable and
+    its trained-parameter hash must distinguish it from every other fold.
+
+    The version-dict `model_hash` fingerprints config + architecture source and
+    is therefore shared by all folds; `_weight_hash` hashes the actual
+    state_dict so an OOS tape row maps to exactly one set of weights.
+    """
+
+    @pytest.mark.slow
+    def test_weight_hash_roundtrip_and_fold_distinction(self, tmp_path):
+        panel = _make_synthetic_panel()
+        panel_data = _pipeline().build_panel_features(panel, horizon=HORIZON)
+        train_stop = 140
+        val_stop = N_DAYS
+        train_data = _slice_time(panel_data, 0, train_stop)
+        val_data = _slice_time(panel_data, train_stop, val_stop, price_pad=HORIZON)
+
+        def _config(seed):
+            return PanelConfig(
+                static_dim=panel_data["static_features"].shape[2],
+                past_known_dim=panel_data["past_known"].shape[2],
+                past_observed_dim=panel_data["past_observed"].shape[2],
+                hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
+                grn_layers=1, seq_len=SEQ_LEN, min_history=SEQ_LEN,
+                batch_size=16, max_epochs=1, compile_model=False,
+                num_workers=0, horizon=HORIZON, seed=seed, rank_loss_weight=0.0,
+                min_stocks_per_day=5,
+            )
+
+        device = torch.device("cpu")
+        model, history = train_panel(
+            _config(0), train_data, val_data, device,
+            raw_val_returns=val_data["realized_return"],
+        )
+        model2, _ = train_panel(
+            _config(1), train_data, val_data, device,
+            raw_val_returns=val_data["realized_return"],
+        )
+
+        wh = _weight_hash(model)
+        # Deterministic on identical weights.
+        assert wh == _weight_hash(model)
+        # Two folds with different seeds → different trained weights → hash
+        # must differ even though version_info["model_hash"] would not.
+        assert wh != _weight_hash(model2)
+
+        # Persist the exact checkpoint dict a fold writes, then reload: the
+        # hash recomputed from the loaded state_dict must match the recorded
+        # one — proving the recorded weight_hash really identifies these
+        # weights (the offline-replay contract of fold_XXX_model.pt).
+        ckpt_path = tmp_path / "fold_001_model.pt"
+        torch.save({
+            "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+            "config": dataclasses.asdict(_config(0)),
+            "weight_hash": wh,
+            "best_epoch": history.get("best_epoch_idx", 0) + 1,
+        }, ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        reloaded = PanelModel(PanelConfig(**ckpt["config"])).to(device)
+        reloaded.load_state_dict(ckpt["state_dict"])
+        assert _weight_hash(reloaded) == ckpt["weight_hash"]

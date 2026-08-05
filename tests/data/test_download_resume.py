@@ -9,6 +9,7 @@ import os
 import pandas as pd
 
 from stoke_ml.data.download_resume import (
+    STATUS_BOUNDED_COMPLETE,
     STATUS_COMPLETE,
     STATUS_DEGRADED,
     STATUS_FAILED,
@@ -94,6 +95,22 @@ class TestMarkStockResult:
         assert m["pages_requested"] == 5
         assert m["pages_fetched"] == 3
         assert m["pagination_exhausted"] is True
+        assert m["provider_exhausted"] is True  # §五-1 canonical field
+
+    def test_bounded_provider_exhausted_not_covered(self, tmp_path):
+        """A provider that only keeps the recent 3 years: provider has no more
+        data (exhausted) but the requested window is NOT reached -> status must
+        be BOUNDED_COMPLETE and covers_request must be False (§五-1)."""
+        mark_stock_result(
+            str(tmp_path), "000001", _frame(["2024-01-01", "2024-01-02"]),
+            dataset="news_raw", requested_start="2015-01-01",
+            pagination_exhausted=True,
+        )
+        m = read_stock_manifest(str(tmp_path), "000001")
+        assert m["status"] == STATUS_BOUNDED_COMPLETE
+        assert m["covers_request"] is False
+        assert m["request_covered"] is False
+        assert m["provider_exhausted"] is True
 
     def test_provider_range_guaranteed_defaults_to_complete(self, tmp_path):
         mark_stock_result(
@@ -186,6 +203,41 @@ class TestSkipCompletedStocks:
         )
         pending, skipped = skip_completed_stocks(
             str(tmp_path), ["000001"], start_date="2024-01-01"
+        )
+        assert pending == ["000001"]
+        assert skipped == 0
+
+    def test_stored_covers_true_but_dates_lie_not_skipped(self, tmp_path):
+        """§五-2: a COMPLETE manifest that claims covers_request=True but whose
+        actual dates do NOT reach the request must be re-verified against the
+        request and re-downloaded — the stored boolean is never trusted."""
+        write_stock_manifest(
+            str(tmp_path), "000001", status=STATUS_COMPLETE,
+            covers_request=True,
+            actual_start="2024-01-01", actual_end="2024-12-31",
+        )
+        pending, skipped = skip_completed_stocks(
+            str(tmp_path), ["000001"], start_date="2020-01-01"
+        )
+        assert pending == ["000001"]
+        assert skipped == 0
+        # The same manifest DOES cover a request inside its actual range.
+        pending, skipped = skip_completed_stocks(
+            str(tmp_path), ["000001"], start_date="2024-06-01"
+        )
+        assert pending == []
+        assert skipped == 1
+
+    def test_bounded_provider_never_skipped(self, tmp_path):
+        """BOUNDED_COMPLETE (provider exhausted but request not reached) is
+        never trusted for skip: resume must try another provider / retry."""
+        mark_stock_result(
+            str(tmp_path), "000001", _frame(["2024-01-01", "2024-01-02"]),
+            dataset="news_raw", requested_start="2015-01-01",
+            pagination_exhausted=True,
+        )
+        pending, skipped = skip_completed_stocks(
+            str(tmp_path), ["000001"], start_date="2015-01-01"
         )
         assert pending == ["000001"]
         assert skipped == 0

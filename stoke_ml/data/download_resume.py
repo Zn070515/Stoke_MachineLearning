@@ -18,8 +18,17 @@ data (news / guba / comments / announcements) min/max dates cannot prove
 completeness — a capped page loop looks identical to a fully-downloaded
 history.  ``mark_stock_result`` therefore defaults an evidence-less non-empty
 result to PARTIAL, and only upgrades to COMPLETE when the caller supplies
-proof: ``pagination_exhausted=True``, ``provider_range_guaranteed=True``, or
-``expected_rows == actual_rows``.
+proof: ``provider_exhausted=True`` (provider has no more data),
+``provider_range_guaranteed=True``, or ``expected_rows == actual_rows``.
+
+Provider exhaustion and request coverage are separate facts (§五-1).  A
+bounded provider that only keeps the recent N years reports
+``provider_exhausted=True`` yet ``request_covered=False``, and the manifest is
+recorded BOUNDED_COMPLETE (never ``covers_request=True``).  ``covers_request``
+is derived from the date formula
+``actual_start <= requested_start and actual_end >= requested_end and
+missing_intervals == []``, and ``_manifest_matches`` re-verifies it against the
+actual dates instead of trusting a stored boolean (§五-2).
 """
 import hashlib
 import json
@@ -38,6 +47,9 @@ STATUS_PARTIAL = "PARTIAL"
 STATUS_UNKNOWN = "UNKNOWN"
 STATUS_FAILED = "FAILED"
 STATUS_DEGRADED = "DEGRADED"
+# Provider has nothing more to give but the fetched data does not reach the
+# requested window (bounded history / later listing).  Never trusted for skip.
+STATUS_BOUNDED_COMPLETE = "BOUNDED_COMPLETE"
 
 
 def evidence_says_complete(
@@ -45,13 +57,18 @@ def evidence_says_complete(
     *,
     expected_rows: int | None = None,
     pagination_exhausted: bool | None = None,
+    provider_exhausted: bool | None = None,
     provider_range_guaranteed: bool | None = None,
 ) -> bool:
     """Whether the supplied evidence proves a fetched frame is complete.
 
+    This answers only "did we reach the end of what this provider has" —
+    NOT whether the request was covered (that is ``request_covered``).
+
     Only three proofs are accepted:
-      * ``pagination_exhausted=True`` — a paged fetch reached the end of the
-        provider's history (last page short / empty / older than the window).
+      * ``provider_exhausted=True`` (legacy alias ``pagination_exhausted``) —
+        a paged fetch reached the end of the provider's history (last page
+        short / empty / older than the window).
       * ``provider_range_guaranteed=True`` — the source returns the complete
         record set for a date-range query in a single call (dense data).
       * ``expected_rows == actual rows`` — an independent count matched.
@@ -60,13 +77,42 @@ def evidence_says_complete(
     """
     if df.empty:
         return False
-    if pagination_exhausted is True:
+    if provider_exhausted is True or pagination_exhausted is True:
         return True
     if provider_range_guaranteed is True:
         return True
     if expected_rows is not None and len(df) == expected_rows:
         return True
     return False
+
+
+def request_covered(
+    *,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    actual_start=None,
+    actual_end=None,
+    missing_intervals: list | None = None,
+) -> bool | None:
+    """Whether fetched dates cover the requested window (§五-1 formula).
+
+    ``actual_start <= requested_start and actual_end >= requested_end and
+    missing_intervals == []``.  Returns None when no requested range was
+    supplied (coverage not assessable).  Pre-listing no-data — a stock listed
+    after ``requested_start`` — is NOT counted as covered here; callers that
+    know the listing date pin ``covers_request`` explicitly.
+    """
+    if requested_start is None and requested_end is None:
+        return None
+    if missing_intervals:
+        return False
+    if requested_start is not None:
+        if actual_start is None or pd.Timestamp(actual_start) > pd.Timestamp(requested_start):
+            return False
+    if requested_end is not None:
+        if actual_end is None or pd.Timestamp(actual_end) < pd.Timestamp(requested_end):
+            return False
+    return True
 
 
 def schema_hash(df: pd.DataFrame) -> str:
@@ -129,11 +175,13 @@ def write_stock_manifest(
     pages_requested: int | None = None,
     pages_fetched: int | None = None,
     pagination_exhausted: bool | None = None,
+    provider_exhausted: bool | None = None,
     provider_range_guaranteed: bool | None = None,
     source: str | None = None,
     adjustment: str | None = None,
     schema_hash: str | None = None,
     covers_request: bool | None = None,
+    request_covered: bool | None = None,
     status: str = STATUS_COMPLETE,
 ) -> str:
     """Atomically write a per-stock completion manifest. Returns its path."""
@@ -149,7 +197,10 @@ def write_stock_manifest(
         "missing_intervals": missing_intervals or [],
         "pages_requested": pages_requested,
         "pages_fetched": pages_fetched,
-        "pagination_exhausted": pagination_exhausted,
+        # provider_exhausted is the §五-1 canonical field; pagination_exhausted
+        # is kept as a legacy alias so old consumers still read it.
+        "provider_exhausted": provider_exhausted if provider_exhausted is not None else pagination_exhausted,
+        "pagination_exhausted": pagination_exhausted if pagination_exhausted is not None else provider_exhausted,
         "provider_range_guaranteed": provider_range_guaranteed,
         "source": source,
         "adjustment": adjustment,
@@ -157,10 +208,12 @@ def write_stock_manifest(
         "status": status,
         "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    # covers_request is only recorded when the writer decided it; absence means
-    # coverage falls back to actual_start/actual_end comparison (legacy).
+    # covers_request / request_covered are only recorded when decided; absence
+    # means coverage falls back to actual_start/actual_end comparison (legacy).
     if covers_request is not None:
         payload["covers_request"] = covers_request
+    if request_covered is not None:
+        payload["request_covered"] = request_covered
     path = _manifest_path(raw_dir, stock_code)
     _write_json(path, payload)
     return path
@@ -187,6 +240,7 @@ def mark_stock_result(
     pages_requested: int | None = None,
     pages_fetched: int | None = None,
     pagination_exhausted: bool | None = None,
+    provider_exhausted: bool | None = None,
     provider_range_guaranteed: bool | None = None,
     missing_intervals: list | None = None,
 ) -> str:
@@ -196,37 +250,57 @@ def mark_stock_result(
 
     Status rules:
       * empty ``df`` → DEGRADED (attempt recorded, never trusted for resume);
-      * non-empty with proof (``pagination_exhausted=True`` /
-        ``provider_range_guaranteed=True`` / ``expected_rows == actual_rows``)
-        → COMPLETE;
+      * non-empty with proof (``provider_exhausted`` / legacy
+        ``pagination_exhausted=True`` / ``provider_range_guaranteed=True`` /
+        ``expected_rows == actual_rows``) AND the request covered → COMPLETE;
+      * fetch proved complete but the requested window not reached (bounded
+        provider / later listing) → BOUNDED_COMPLETE — never skipped by resume;
       * non-empty without proof → PARTIAL — the fetch may have been truncated
         by a page cap or rate limit, so resume must NOT skip it.
 
-    ``covers_request`` defaults to ``status == COMPLETE``: only a proven-complete
-    fetch claims to satisfy the request.  Pass it explicitly to override (e.g.
-    a bounded provider that has no data before the stock's listing, where the
-    fetch is complete yet cannot reach ``requested_start``).
+    ``covers_request`` is DERIVED from the §五-1 date formula
+    (``actual_start <= requested_start and actual_end >= requested_end and
+    missing_intervals == []``), never from status alone — a bounded provider
+    that reports ``provider_exhausted=True`` yet cannot reach the request is
+    recorded ``request_covered=False``.  Pass ``covers_request`` explicitly to
+    override (e.g. a bounded provider with no pre-listing data, where the fetch
+    is complete yet cannot reach ``requested_start`` because the stock listed
+    later — the caller knows the listing date and asserts the window).
     """
-    if status is None:
-        if df.empty:
-            status = STATUS_DEGRADED
-        elif evidence_says_complete(
-            df,
-            expected_rows=expected_rows,
-            pagination_exhausted=pagination_exhausted,
-            provider_range_guaranteed=provider_range_guaranteed,
-        ):
-            status = STATUS_COMPLETE
-        else:
-            status = STATUS_PARTIAL
-    if covers_request is None:
-        covers_request = status == STATUS_COMPLETE
     if date_col in df.columns and not df.empty:
-        dates = pd.to_datetime(df[date_col], errors="coerce")
+        dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
         actual_start = dates.min()
         actual_end = dates.max()
     else:
         actual_start = actual_end = None
+    cov = request_covered(
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=actual_start,
+        actual_end=actual_end,
+        missing_intervals=missing_intervals,
+    )
+    if status is None:
+        if df.empty:
+            status = STATUS_DEGRADED
+        elif not evidence_says_complete(
+            df,
+            expected_rows=expected_rows,
+            pagination_exhausted=pagination_exhausted,
+            provider_exhausted=provider_exhausted,
+            provider_range_guaranteed=provider_range_guaranteed,
+        ):
+            status = STATUS_PARTIAL
+        elif covers_request is True:
+            # Caller asserts the window is genuinely covered (e.g. known
+            # listing date): the explicit claim wins over the date gap.
+            status = STATUS_COMPLETE
+        elif cov is not False:
+            status = STATUS_COMPLETE
+        else:
+            status = STATUS_BOUNDED_COMPLETE
+    if covers_request is None:
+        covers_request = cov if cov is not None else status == STATUS_COMPLETE
     return write_stock_manifest(
         raw_dir, stock_code,
         dataset=dataset,
@@ -240,11 +314,13 @@ def mark_stock_result(
         pages_requested=pages_requested,
         pages_fetched=pages_fetched,
         pagination_exhausted=pagination_exhausted,
+        provider_exhausted=provider_exhausted,
         provider_range_guaranteed=provider_range_guaranteed,
         source=source,
         adjustment=adjustment,
         schema_hash=schema_hash(df),
         covers_request=covers_request,
+        request_covered=cov,
         status=status,
     )
 
@@ -310,15 +386,24 @@ def _manifest_matches(
     requested_end: str | None = None,
     schema_hash: str | None = None,
 ) -> bool:
-    """A manifest satisfies the request only when it is COMPLETE and covers it."""
+    """A manifest satisfies the request only when it is COMPLETE and covers it.
+
+    Coverage is RE-VERIFIED against the requested dates every time (§五-2): a
+    stored ``covers_request`` / ``request_covered`` boolean is never trusted
+    on its own, because a stale, partial or hand-edited manifest could claim
+    coverage it does not have.  The date check runs whenever a requested bound
+    is supplied; the stored booleans only serve as a denial veto (explicit
+    False still forces a re-download).
+    """
     if not manifest or manifest.get("status") != STATUS_COMPLETE:
         return False
     if schema_hash and manifest.get("schema_hash") != schema_hash:
         return False
-    # New manifests declare coverage explicitly (handles empty-but-successful
-    # windows and bounded sources).  Legacy manifests fall back to dates.
-    if "covers_request" in manifest:
-        return manifest["covers_request"] is True
+    # Explicit denial recorded by the writer (bounded provider, truncated
+    # window, caller-forced false) must always force a re-download.
+    if manifest.get("request_covered") is False or manifest.get("covers_request") is False:
+        return False
+    # Re-derive coverage from the stored actual dates against this request.
     if requested_start:
         a = manifest.get("actual_start")
         if not a or pd.Timestamp(a) > pd.Timestamp(requested_start):

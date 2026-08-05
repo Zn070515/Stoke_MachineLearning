@@ -6,13 +6,18 @@ from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 from stoke_ml.models.panel.config import PanelConfig
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
+from stoke_ml.models.panel.inference import (
+    compute_deflated_sharpe,
+    compute_psr,
+    spa_test,
+)
 
 logger = logging.getLogger(__name__)
 
 # Version stamp for the panel evaluator — experiments freeze the evaluator
 # that produced their numbers.  Bump on any behavioral change to
 # the sleeve-account / IC / quintile logic.
-EVALUATOR_VERSION = "2026-08-04"
+EVALUATOR_VERSION = "2026-08-05"
 
 
 def compute_sharpe(
@@ -376,6 +381,7 @@ def _run_sleeve_sim(
     cost: float,
     mode: str = "long",
     return_ledger: bool = False,
+    delist_day: np.ndarray | None = None,
 ) -> dict:
     """Chronological sleeve-account backtest, ONE run at a fixed cost.
 
@@ -412,6 +418,16 @@ def _run_sleeve_sim(
     distinguish a real delisting from a dead data row, so the position is never
     force-sold at 0.  exit_status covers every successfully entered position.
 
+    A stock with a KNOWN delisting day (§七-1) is the exception: `delist_day`
+    carries the per-stock simulation-column index where the stock is delisted
+    (-1 = never).  A held position on a stock at/after its delist day is
+    FORCE-sold at the last carried close (the delisting close) and classified
+    DELISTED — even before the sleeve's scheduled exit day, because a delisted
+    stock cannot be held to horizon.  This is how a real delisting (from the
+    universe delisting record) is told apart from a dead data row: only stocks
+    with a delist record reach the force-sell path; everything else stays
+    unresolved.
+
     Fills respect entry eligibility: a selected stock with no real open[d]
     stays unfilled (its weight remains cash) and is NEVER backfilled.  Long/EW
     entries are additionally capped so total spend (notional
@@ -432,11 +448,23 @@ def _run_sleeve_sim(
     Wp = close_np.shape[1]
     if Wp < W:
         raise ValueError(f"close path {Wp} columns < preds {W} columns")
+    if delist_day is None:
+        delist_day = np.full(N, -1, dtype=int)
+    else:
+        dd = np.asarray(delist_day, dtype=int)
+        if dd.shape != (N,):
+            raise ValueError(f"delist_day shape {dd.shape} != preds {preds_np.shape}")
+        delist_day = dd
     side = {"long": 1.0, "ew": 1.0, "short": -1.0}[mode]
     carried = _ffill_last_np(close_np)
 
     nav_prev = 1.0
     cash = 1.0
+    # §十三-2: the day the account's NAV first goes <= 0 (blow-up).  From that
+    # day on the account is frozen — no entries, no marks, no further returns —
+    # so post-bankruptcy days cannot manufacture economically meaningless
+    # returns/exposures.
+    bankrupt_day: int | None = None
     sleeves: dict[int, dict] = {}
     net_daily = np.zeros(Wp)
     cost_paid = np.zeros(Wp)
@@ -457,45 +485,71 @@ def _run_sleeve_sim(
     exit_days = {k: 0.0 for k in exit_counts}
     # Per-position ledger: one record per FILLED position,
     # with entry/exit price, scheduled/actual exit day, exit status, gross PnL
-    # and attributed costs.  Sum(net_pnl) == final_nav - 1 by construction —
-    # each position's gross PnL matches exit_pnl aggregation and entry/exit
-    # costs match cost_paid day-by-day.  Built only when requested.
+    # and attributed costs.  Sum(net_pnl) == final_nav - 1 by construction for
+    # resolved positions; unresolved ones carry unrealized_pnl instead (§十三-3)
+    # and sum over both fields == final_nav - 1.  Each position's gross PnL
+    # matches exit_pnl aggregation and entry/exit costs match cost_paid
+    # day-by-day.  Built only when requested.
     ledger: list[dict] = []
 
     for d in range(Wp):
         nav_before_day[d] = nav_prev
+        if bankrupt_day is not None:
+            # Frozen post-bankruptcy: NAV pinned at the blow-up level so
+            # prod(1+daily) == final_nav still holds; no new entries, no marks.
+            continue
         # ── Liquidate positions whose scheduled exit is due (or overdue) ──
         for c, sl in list(sleeves.items()):
             held = sl["mask"]
             if not held.any():
                 del sleeves[c]
                 continue
+            # A stock DELISTED on/before today (KNOWN from the universe delisting
+            # record) is FORCE-sold at its last carried close — the delisting
+            # event forces the exit, even before the sleeve's scheduled exit
+            # day, because a delisted stock cannot be held to horizon.
+            delisted_here = held & (delist_day >= 0) & (d >= delist_day)
+            # Valid (all-False) in the early-branch path so `is_clean` below is
+            # always defined; the real value is assigned in the else branch.
+            ex_open_ok = np.zeros(N, dtype=bool)
             if d < sl["scheduled_exit_day"]:
-                continue
-            ex_open = open_np[:, d]
-            ex_open_ok = np.isfinite(ex_open) & (ex_open > 0)
-            exitable = held & ex_open_ok
-            if d == sl["scheduled_exit_day"]:
-                # First attempt: positions that cannot exit become PENDING and
-                # are held (marked to last close) until a real open appears.
-                sl["pending"] |= held & (~ex_open_ok) & (carried[:, d] > 0)
-            # A held position whose carried close is <= 0 is DATA-MISSING, not
-            # an executable delist: price<=0 after ffill
-            # cannot tell a real delisting from a dead data row, so it is never
-            # force-sold at 0.  It stays held at its (zero) carried mark and
-            # resolves as UNRESOLVED_AT_END at the path end.
-            liquidate = exitable
+                if not delisted_here.any():
+                    continue
+                liquidate = delisted_here
+            else:
+                ex_open = open_np[:, d]
+                ex_open_ok = np.isfinite(ex_open) & (ex_open > 0)
+                exitable = held & ex_open_ok
+                if d == sl["scheduled_exit_day"]:
+                    # First attempt: positions that cannot exit become PENDING and
+                    # are held (marked to last close) until a real open appears.
+                    # A delisted position is NOT pending — it is force-sold below.
+                    sl["pending"] |= held & (~ex_open_ok) & (carried[:, d] > 0) & (~delisted_here)
+                # A held position whose carried close is <= 0 is DATA-MISSING, not
+                # an executable delist: price<=0 after ffill
+                # cannot tell a real delisting from a dead data row, so it is never
+                # force-sold at 0.  It stays held at its (zero) carried mark and
+                # resolves as UNRESOLVED_AT_END at the path end.
+                liquidate = exitable | delisted_here
             if liquidate.any():
-                ex_price = np.where(ex_open_ok, ex_open, carried[:, d])
+                # Delisted positions sell at the last carried close (the
+                # delisting close); normal positions sell at the day's real open.
+                ex_price = carried[:, d].copy()
+                normal = liquidate & ~delisted_here
+                if normal.any():
+                    ex_price[normal] = np.where(
+                        ex_open_ok[normal], ex_open[normal], carried[normal, d])
                 ex_value = sl["shares"] * ex_price
                 proceeds = side * ex_value[liquidate].sum()
                 cost_here = cost * np.abs(ex_value[liquidate]).sum()
                 cash += proceeds - cost_here
                 cost_paid[d] += cost_here
                 sell_notional[d] += np.abs(ex_value[liquidate]).sum()
-                is_clean = (d == sl["scheduled_exit_day"]) & ex_open_ok & (~sl["pending"])
+                is_clean = ((d == sl["scheduled_exit_day"]) & ex_open_ok
+                            & (~sl["pending"]) & (~delisted_here))
                 for cls, cm in (("clean", liquidate & is_clean),
-                                ("delayed", liquidate & ~is_clean)):
+                                ("delayed", liquidate & ~is_clean & ~delisted_here),
+                                ("delisted", liquidate & delisted_here)):
                     if cm.any():
                         cls_pnl = side * (ex_value[cm].sum() - sl["entry_val"][cm].sum())
                         exit_pnl[cls] += float(cls_pnl)
@@ -510,18 +564,26 @@ def _run_sleeve_sim(
                             "stock": int(j),
                             "mode": mode,
                             "entry_price": float(open_np[j, c]),
-                            "entry_value": ej,
-                            "executed_weight": float(ej),
+                            "entry_notional": ej,
+                            "target_weight": (float(sl["target_w"] / sl["entry_nav"])
+                                              if sl["entry_nav"] > 0 else 0.0),
+                            "executed_weight": (float(ej / sl["entry_nav"])
+                                                if sl["entry_nav"] > 0 else 0.0),
+                            "entry_nav": float(sl["entry_nav"]),
                             "shares": float(sl["shares"][j]),
                             "scheduled_exit_day": int(sl["scheduled_exit_day"]),
                             "actual_exit_day": d,
-                            "exit_status": "clean" if is_clean[j] else "delayed",
+                            "exit_status": ("delisted" if delisted_here[j]
+                                            else ("clean" if is_clean[j] else "delayed")),
                             "exit_price": float(ex_price[j]),
                             "realized_return": float((xj - ej) / ej) if ej > 0 else 0.0,
+                            "mark_day": None,
+                            "mark_price": None,
                             "gross_pnl": float(side * (xj - ej)),
                             "entry_cost": cost * ej,
                             "exit_cost": cost * abs(xj),
                             "net_pnl": float(side * (xj - ej) - cost * ej - cost * abs(xj)),
+                            "unrealized_pnl": None,
                         })
                 sl["mask"] = held & ~liquidate
             if not sl["mask"].any():
@@ -535,6 +597,15 @@ def _run_sleeve_sim(
             shares = np.zeros(N)
             entry_val = np.zeros(N)
             fillable = np.zeros(N, dtype=bool)  # empty pool → empty (cash) sleeve
+            # §十四-2: `target_w` is the uncapped per-stock nominal the sleeve
+            # intended (w/|chosen|, NAV units) and `entry_nav` is the account NAV
+            # at this sleeve's entry — together they let the ledger report an
+            # honest `target_weight` (1/(horizon*|chosen|)) vs `executed_weight`
+            # (entry_notional/entry_nav): when the cash cap bites, executed
+            # drops below target instead of silently passing the capped amount
+            # off as a "weight".
+            target_w = 0.0
+            entry_nav = nav_prev
             if pool_idx.size > 0:
                 if mode == "ew":
                     chosen = pool_idx
@@ -553,7 +624,8 @@ def _run_sleeve_sim(
                     # cap the whole sleeve at available cash so leverage cannot
                     # drift past what the account holds; the
                     # short leg is a theoretical factor book and needs no cap.
-                    per_stock = w / chosen.size
+                    target_w = w / chosen.size
+                    per_stock = target_w
                     if side > 0:
                         # Cap total spend (notional + entry cost) at available
                         # cash: per_stock*n_fill*(1+cost) <= cash
@@ -569,6 +641,7 @@ def _run_sleeve_sim(
                     cost_paid[d] += cost * spent
                     buy_notional[d] = spent
             sleeves[d] = {"shares": shares, "mask": fillable, "entry_val": entry_val,
+                          "target_w": target_w, "entry_nav": entry_nav,
                           "scheduled_exit_day": d + horizon,
                           "pending": np.zeros(N, dtype=bool)}
 
@@ -591,15 +664,25 @@ def _run_sleeve_sim(
         # series — dropping it broke the identity prod(1+daily) == final_nav.
         if nav_prev > 0:
             net_daily[d] = nav_close / nav_prev - 1.0
-            # Exposure ratios scale the held notional by the day's capital base:
-            # the nominal 1/h-per-sleeve book is only an
-            # approximation — unfilled slots stay cash (gross < target) while
-            # delayed/unresolved sleeves push gross above it.
-            gross_exposure[d] = gross_value / nav_prev
-            net_exposure[d] = pos_value / nav_prev
-            cash_ratio[d] = cash / nav_prev
         active_sleeves[d] = active_count
-        delayed_capital[d] = delayed_value / nav_prev if nav_prev > 0 else 0.0
+        if nav_close > 0:
+            # Exposure ratios are close-market-value / close-NAV (§十三-1) —
+            # exactly the position's value share at that close.  The old
+            # start-of-day base produced an "open-NAV multiple of close value"
+            # hybrid that, once the LS ledger rescaled it by the end-of-day
+            # NAV, re-applied the day's price change.  The nominal
+            # 1/h-per-sleeve book is only an approximation — unfilled slots
+            # stay cash (gross < target) while delayed/unresolved sleeves push
+            # gross above it.
+            gross_exposure[d] = gross_value / nav_close
+            net_exposure[d] = pos_value / nav_close
+            cash_ratio[d] = cash / nav_close
+            delayed_capital[d] = delayed_value / nav_close
+        else:
+            # NAV <= 0 → bankruptcy (§十三-2): the account is dead at this
+            # mark.  The blow-up day's return above already records the
+            # collapse; from here the account is frozen (see loop top).
+            bankrupt_day = d
         nav_prev = nav_close
 
     # ── End of price path: any holding that never found a real exit is
@@ -609,9 +692,15 @@ def _run_sleeve_sim(
     for c, sl in sleeves.items():
         held = sl["mask"]
         if held.any():
-            # Book the unresolved hold at the FINAL carried mark:
+            if bankrupt_day is not None:
+                # §十三-2: the account is already dead — the frozen positions'
+                # value is embedded in the blow-up day's return.  Booking them
+                # again at the final mark would double-count later price moves,
+                # so a bankrupt account books no unresolved P&L.
+                continue
+            # Mark the unresolved hold at the FINAL carried close:
             # carried[:, Wp-1] is what final_nav's mark-to-market used on the
-            # last day, so the P&L ledger reconciles with the NAV series.  The
+            # last day, so the ledger reconciles with the NAV series.  The
             # old min(c+horizon, Wp-1) booked at the scheduled exit day, which
             # drifts from final_nav whenever price moved after that day.
             last_close = carried[:, Wp - 1]
@@ -629,18 +718,30 @@ def _run_sleeve_sim(
                         "stock": int(j),
                         "mode": mode,
                         "entry_price": float(open_np[j, c]),
-                        "entry_value": ej,
-                        "executed_weight": float(ej),
+                        "entry_notional": ej,
+                        "target_weight": (float(sl["target_w"] / sl["entry_nav"])
+                                          if sl["entry_nav"] > 0 else 0.0),
+                        "executed_weight": (float(ej / sl["entry_nav"])
+                                            if sl["entry_nav"] > 0 else 0.0),
+                        "entry_nav": float(sl["entry_nav"]),
                         "shares": float(sl["shares"][j]),
                         "scheduled_exit_day": int(sl["scheduled_exit_day"]),
-                        "actual_exit_day": int(Wp - 1),
+                        # §十三-3: an unresolved hold is NOT a realized exit.
+                        # actual_exit_day stays null and the end-of-path close is
+                        # a mark, so no exit_price/realized_return/net_pnl are
+                        # fabricated — the open P&L is unrealized_pnl at
+                        # mark_day/mark_price instead.
+                        "actual_exit_day": None,
                         "exit_status": "unresolved",
-                        "exit_price": float(last_close[j]),
-                        "realized_return": float((xj - ej) / ej) if ej > 0 else 0.0,
+                        "exit_price": None,
+                        "realized_return": None,
+                        "mark_day": int(Wp - 1),
+                        "mark_price": float(last_close[j]),
                         "gross_pnl": float(side * (xj - ej)),
                         "entry_cost": cost * ej,
                         "exit_cost": 0.0,
-                        "net_pnl": float(side * (xj - ej) - cost * ej),
+                        "net_pnl": None,
+                        "unrealized_pnl": float(side * (xj - ej) - cost * ej),
                     })
 
     total_pnl = sum(exit_pnl.values())
@@ -650,7 +751,8 @@ def _run_sleeve_sim(
     # ALL entry/exit costs must equal the account's total NAV change.  Booked
     # at a mark different from the final one (or costs missing from cost_paid)
     # would silently break this identity, so assert it explicitly.
-    if np.isfinite(nav_close) and np.isfinite(total_pnl):
+    if (bankrupt_day is None and np.isfinite(nav_close)
+            and np.isfinite(total_pnl)):
         reconciled = float(total_pnl) - float(cost_paid.sum())
         target = float(nav_close) - 1.0
         if not np.isclose(reconciled, target, rtol=1e-5, atol=1e-6):
@@ -702,6 +804,8 @@ def _run_sleeve_sim(
         "cash_ratio": cash_ratio,
         "active_sleeves": active_sleeves,
         "delayed_capital": delayed_capital,
+        # §十三-2: first day NAV <= 0 (None = account survived the full path).
+        "bankrupt_day": bankrupt_day,
         # Per-position ledger; empty unless return_ledger.
         "ledger": ledger,
     }
@@ -717,6 +821,7 @@ def _simulate_sleeve_account(
     cost: float,
     mode: str = "long",
     return_ledger: bool = False,
+    delist_day: np.ndarray | None = None,
 ) -> dict:
     """Sleeve-account backtest with a TRUE cost-free gross counterfactual.
 
@@ -733,13 +838,15 @@ def _simulate_sleeve_account(
     `return_ledger` surfaces the NET run's per-position ledger so a caller can
     persist every filled position's entry/exit prices,
     status and attributed costs — the audit trail that lets the OOS account be
-    reconstructed offline from a tape.
+    reconstructed offline from a tape.  `delist_day` is forwarded to
+    `_run_sleeve_sim` so known-delisted stocks are force-sold (§七-1).
     """
     net = _run_sleeve_sim(preds_np, close_np, open_np, select_pool,
                           horizon, top_fraction, cost, mode=mode,
-                          return_ledger=return_ledger)
+                          return_ledger=return_ledger, delist_day=delist_day)
     gross = _run_sleeve_sim(preds_np, close_np, open_np, select_pool,
-                            horizon, top_fraction, 0.0, mode=mode)
+                            horizon, top_fraction, 0.0, mode=mode,
+                            delist_day=delist_day)
     out = {
         "daily": net["daily"],
         "gross_daily": gross["daily"],
@@ -752,6 +859,7 @@ def _simulate_sleeve_account(
         "cash_ratio": net["cash_ratio"],
         "active_sleeves": net["active_sleeves"],
         "delayed_capital": net["delayed_capital"],
+        "bankrupt_day": net["bankrupt_day"],
     }
     if return_ledger:
         out["ledger"] = net["ledger"]
@@ -762,11 +870,31 @@ def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
     """Combined LS-book daily exposure ledger + summary.
 
     The LS book holds the long and short sub-accounts at 0.5 weight each.  Each
-    sub-account reports NAV-relative ratios from its own simulation; weighting
-    them by each leg's realized NAV path (cumprod of the daily series) yields
-    the combined book's true ratios even when the two sub-accounts drift apart.
-    `long_market_value` / `short_market_value` / `cash` are value shares of the
-    combined NAV (initial capital = 1.0, so share ≈ money units at inception).
+    sub-account reports close-NAV-relative ratios from its own simulation
+    (close market value / close NAV, §十三-1); rescaling that ratio by the same
+    end-of-day NAV recovers the leg's currency value, so the day's price change
+    is applied exactly once — the old start-of-day base double-counted it.
+
+    Sign convention: `long_market_value` / `short_market_value` are the SIGNED
+    position values of each leg as fractions of the combined NAV — the short
+    leg is negative because a short position has negative value (a liability).
+    This makes the accounting identity
+
+        long_market_value + short_market_value + cash == 1
+
+    hold exactly on every solvent day (the short leg's cash collateral backs
+    its liability), with
+
+        gross == abs(long_market_value) + abs(short_market_value)
+        net   == long_market_value + short_market_value
+
+    (`net` is the signed SUM of the legs — the spec's "net == long - short"
+    used short as a positive magnitude, which would double-count the liability
+    and break the identity above; the signed convention is the consistent one).
+
+    On a day where either leg or the combined book is bankrupt (NAV <= 0,
+    §十三-2) the value-share identity is meaningless, so those days are NaN in
+    the daily ledger and excluded from the summary statistics.
 
     `target` is the nominal book construction (100% gross / 0% net); `realized`
     is what actually traded — unfilled cash slots push gross below target while
@@ -777,10 +905,14 @@ def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
     long_nav = np.cumprod(1.0 + long_d)
     short_nav = np.cumprod(1.0 + short_d)
     comb_nav = 0.5 * long_nav + 0.5 * short_nav
-    safe = np.where(comb_nav > 0, comb_nav, 1.0)
+    # §十三-2: a value share is only defined for a solvent book; a bankrupt leg
+    # or combined NAV has no defined share, so those days are NaN (excluded
+    # from stats) rather than silently divided by a fake 1.0 denominator.
+    healthy = (np.isfinite(long_nav) & (long_nav > 0)
+               & np.isfinite(short_nav) & (short_nav > 0)
+               & np.isfinite(comb_nav) & (comb_nav > 0))
+    safe = np.where(healthy, comb_nav, np.nan)
 
-    lg = np.asarray(long_a["gross_exposure"], dtype=np.float64)
-    sg = np.asarray(short_a["gross_exposure"], dtype=np.float64)
     ln = np.asarray(long_a["net_exposure"], dtype=np.float64)
     sn = np.asarray(short_a["net_exposure"], dtype=np.float64)
     lc = np.asarray(long_a["cash_ratio"], dtype=np.float64)
@@ -790,12 +922,32 @@ def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
     la = np.asarray(long_a["active_sleeves"], dtype=np.int64)
     sa = np.asarray(short_a["active_sleeves"], dtype=np.int64)
 
-    long_mv = (0.5 * lg * long_nav) / safe
-    short_mv = (0.5 * sg * short_nav) / safe
-    ls_gross = long_mv + short_mv
-    ls_net = (0.5 * ln * long_nav + 0.5 * sn * short_nav) / safe
+    # Long leg is long-only → net ratio == gross; the short leg's net ratio is
+    # NEGATIVE (short positions have negative value).  Rescaling each leg's
+    # close-NAV ratio by that same close NAV (long_nav) gives the currency
+    # value; dividing by the combined NAV gives the signed value share.
+    long_mv = (0.5 * ln * long_nav) / safe
+    short_mv = (0.5 * sn * short_nav) / safe
     ls_cash = (0.5 * lc * long_nav + 0.5 * sc * short_nav) / safe
+    ls_gross = np.abs(long_mv) + np.abs(short_mv)
+    ls_net = long_mv + short_mv
     ls_delayed = (0.5 * ld * long_nav + 0.5 * sd * short_nav) / safe
+
+    # §十三-1 invariants, enforced on every solvent day.  The identities are
+    # only consistent under the signed-short convention above.
+    if healthy.any():
+        tol = 1e-6
+        ident = long_mv[healthy] + short_mv[healthy] + ls_cash[healthy]
+        g_ident = (ls_gross[healthy] - np.abs(long_mv[healthy])
+                   - np.abs(short_mv[healthy]))
+        n_ident = ls_net[healthy] - long_mv[healthy] - short_mv[healthy]
+        if (np.max(np.abs(ident - 1.0)) > tol or np.max(np.abs(g_ident)) > tol
+                or np.max(np.abs(n_ident)) > tol):
+            raise AssertionError(
+                "LS exposure identities violated on a solvent day: "
+                f"max|long+short+cash-1|={np.max(np.abs(ident - 1.0)):.3e} "
+                f"max|gross-abs-sum|={np.max(np.abs(g_ident)):.3e} "
+                f"max|net-(long+short)|={np.max(np.abs(n_ident)):.3e}")
 
     g = ls_gross[np.isfinite(ls_gross)]
     n = ls_net[np.isfinite(ls_net)]
@@ -832,9 +984,17 @@ def _ls_exposure_ledger(long_a: dict, short_a: dict) -> dict:
                 "delayed_capital": ls_delayed.tolist(),
             },
         },
+        # §十三-2: the first day each leg's NAV went <= 0 (None = survived).
+        "bankrupt": {
+            "long_day": long_a.get("bankrupt_day"),
+            "short_day": short_a.get("bankrupt_day"),
+        },
         "note": ("target = nominal book (ls_sharpe is 100% gross, 50% long / "
                  "50% short, net 0; ls2x_* is 200% gross); realized = daily "
-                 "measured exposure from the sleeve simulation."),
+                 "measured exposure from the sleeve simulation.  Value shares "
+                 "are signed (short leg negative); a bankrupt day (any leg or "
+                 "combined NAV <= 0) is NaN in the daily ledger and excluded "
+                 "from the summary."),
     }
 
 
@@ -855,14 +1015,27 @@ def _combine_book_daily(
     long AND a full unit short, so its NAV = long_nav + short_nav - 1.0 (the
     short leg's margin loan).  The first element is ``nav[0] - 1`` because the
     book starts at unit capital.
+
+    §十三-2: if the blended NAV goes <= 0 the book is bankrupt.  The blow-up
+    day's return is still the true NAV ratio (<= -1); from there the account
+    is closed and produces zero further returns.  The old
+    ``np.where(nav[:-1] > 0, nav[:-1], 1.0)`` substituted a fake 1.0
+    denominator, manufacturing economically meaningless post-bankruptcy
+    returns.
     """
     a = np.cumprod(1.0 + np.asarray(a_daily, dtype=np.float64))
     b = np.cumprod(1.0 + np.asarray(b_daily, dtype=np.float64))
     nav = w_a * a + w_b * b - subtract
     out = np.empty_like(nav)
     out[0] = nav[0] - 1.0
-    prev = np.where(nav[:-1] > 0, nav[:-1], 1.0)
-    out[1:] = nav[1:] / prev - 1.0
+    blowup = nav <= 0
+    if np.any(blowup):
+        first = int(np.argmax(blowup))
+        if first > 0:
+            out[1:first + 1] = nav[1:first + 1] / nav[:first] - 1.0
+        out[first + 1:] = 0.0
+    else:
+        out[1:] = nav[1:] / nav[:-1] - 1.0
     return out
 
 
@@ -876,27 +1049,42 @@ def _sleeve_account_metrics(
     cost: float,
     n_boot: int,
     return_ledger: bool = False,
+    delist_day: np.ndarray | None = None,
+    n_trials: int | None = None,
 ) -> dict:
-    """Run long / short / equal-weight sleeve accounts and assemble metrics."""
+    """Run long / short / equal-weight sleeve accounts and assemble metrics.
+
+    When `n_trials` is given (>1), the report also carries the §十五-1
+    multiple-testing corrections — PSR, DSR and the SPA p-value vs the
+    selected-universe equal-weight benchmark — so the headline Sharpe is read
+    together with how much of it survives data-snooping.
+    """
     long_a = _simulate_sleeve_account(preds_np, close_np, open_np, select_pool,
                                       horizon, top_fraction, cost, "long",
-                                      return_ledger=return_ledger)
+                                      return_ledger=return_ledger,
+                                      delist_day=delist_day)
     short_a = _simulate_sleeve_account(preds_np, close_np, open_np, select_pool,
-                                       horizon, top_fraction, cost, "short")
+                                       horizon, top_fraction, cost, "short",
+                                       return_ledger=return_ledger,
+                                       delist_day=delist_day)
     # Eligible candidate-pool equal-weight: every pool member
     # gets an equal slice — NOT a full-market/index benchmark.  A SEPARATE
     # selected-universe equal-weight proxy (all fold stocks, no eligibility
     # gate) is run below as the naive "buy everything" reference.
     ew_a = _simulate_sleeve_account(preds_np, close_np, open_np, select_pool,
-                                    horizon, top_fraction, cost, "ew")
+                                    horizon, top_fraction, cost, "ew",
+                                    return_ledger=return_ledger,
+                                    delist_day=delist_day)
     sel_uni_a = _simulate_sleeve_account(
         preds_np, close_np, open_np, np.ones_like(select_pool),
-        horizon, top_fraction, cost, "ew")
+        horizon, top_fraction, cost, "ew", return_ledger=return_ledger,
+        delist_day=delist_day)
 
     long_d = np.asarray(long_a["daily"], dtype=np.float64)
     short_d = np.asarray(short_a["daily"], dtype=np.float64)
     long_g = np.asarray(long_a["gross_daily"], dtype=np.float64)
     short_g = np.asarray(short_a["gross_daily"], dtype=np.float64)
+    sel_uni_d = np.asarray(sel_uni_a["daily"], dtype=np.float64)
 
     # `short_d` is already the short account's REAL daily return
     # (side=-1 applied inside), so the long-short book ADDS the legs — NOT
@@ -937,13 +1125,30 @@ def _sleeve_account_metrics(
     selected_universe_ew_sharpe = compute_sharpe(
         torch.tensor(sel_uni_a["daily"], dtype=torch.float32), horizon=1)
 
-    # No forced block_len=horizon — when horizon=1 that would
-    # degenerate to iid resampling.  The default block (ceil(n^(1/3))) keeps
-    # autocorrelation and volatility clustering in the CI.
+    # §十五-3: the daily sleeve returns share overlapping holdings when
+    # horizon>1, so the resampled block is floored at the strategy horizon.
+    # horizon=1 → floor is ceil(n^(1/3)) as before (no iid degeneration); the
+    # `horizon=1` arg here only sets the ANNUALIZATION (√252, per-day returns).
+    ci_block = max(2, int(np.ceil(len(long_d) ** (1 / 3))), horizon)
     long_lo, long_hi = compute_bootstrap_sharpe_ci(
-        long_d, horizon=1, n_boot=n_boot)
+        long_d, horizon=1, n_boot=n_boot, block_len=ci_block)
     ls_lo, ls_hi = compute_bootstrap_sharpe_ci(
-        ls_d, horizon=1, n_boot=n_boot)
+        ls_d, horizon=1, n_boot=n_boot, block_len=ci_block)
+
+    # §十五-1 multiple-testing corrections.  The trial-Sharpe dispersion comes
+    # from the strategies evaluated HERE (long / ls / ls2x / the two ew
+    # proxies) — the within-report multiplicity — while `n_trials` counts the
+    # research trials iterated across the project (experiment registry); the
+    # registry count is passed in by the training script, else it defaults to
+    # the number of strategies in this report.
+    long_psr = compute_psr(long_d, 0.0, 1)
+    ls_psr = compute_psr(ls_d, 0.0, 1)
+    trial_sharpes = [long_m["sharpe"], ls_m["sharpe"], ls2x_m["sharpe"],
+                     eligible_ew_sharpe, selected_universe_ew_sharpe]
+    nt = n_trials if (n_trials is not None and n_trials >= 2) else len(trial_sharpes)
+    long_dsr = compute_deflated_sharpe(long_d, nt, trial_sharpes, 1)
+    ls_dsr = compute_deflated_sharpe(ls_d, nt, trial_sharpes, 1)
+    spa = spa_test(np.stack([long_d, ls_d, ls2x_d]), sel_uni_d, horizon=horizon)
 
     out = {
         "n_periods": int(long_d.size),
@@ -965,6 +1170,16 @@ def _sleeve_account_metrics(
         "ls2x_sharpe": ls2x_m["sharpe"],
         "ls2x_gross_sharpe": ls2x_m["gross_sharpe"],
         "ls2x_maxdd": ls2x_m["maxdd"],
+        # §十五-1 multiple-testing corrections (NaN when the series is too
+        # short or the multiplicity undefined).
+        "long_psr": long_psr,
+        "long_dsr": long_dsr,
+        "ls_psr": ls_psr,
+        "ls_dsr": ls_dsr,
+        "dsr_n_trials": nt,
+        "spa_stat": spa["stat"],
+        "spa_p_value": spa["p_value"],
+        "spa_n_strategies": spa["n_strategies"],
         # The short leg is a theoretical bottom-quantile factor book (A-share
         # stocks cannot be shorted directly) — the exposure metadata keeps the
         # leverage assumption explicit.  The
@@ -993,7 +1208,24 @@ def _sleeve_account_metrics(
         "eligible_ew_exit_status": ew_a["exit_stats"],
     }
     if return_ledger:
+        # §十四-1: the long-only ledger was the only one saved, which hid the
+        # short / equal-weight legs' own entry/exit tapes.  Expose each leg's
+        # ledger, plus a combined long+short LS tape sorted by (entry_day,
+        # stock, mode) — every row already carries its own `mode`, so the
+        # concatenation is directly replayable.
         out["long_ledger"] = long_a.get("ledger")
+        out["short_ledger"] = short_a.get("ledger")
+        out["ew_ledger"] = ew_a.get("ledger")
+        out["selected_universe_ew_ledger"] = sel_uni_a.get("ledger")
+        ls_ledger = []
+        if long_a.get("ledger") is not None:
+            ls_ledger.extend(long_a["ledger"])
+        if short_a.get("ledger") is not None:
+            ls_ledger.extend(short_a["ledger"])
+        out["ls_ledger"] = sorted(
+            ls_ledger,
+            key=lambda r: (r["entry_day"], r["stock"], r["mode"]),
+        )
     return out
 
 
@@ -1040,6 +1272,8 @@ def evaluate_portfolio(
     n_boot: int = 2000,
     require_price_path: bool = False,
     return_ledger: bool = False,
+    delist_day: np.ndarray | None = None,
+    n_trials: int | None = None,
 ) -> dict:
     """Multi-angle portfolio evaluation.
 
@@ -1169,7 +1403,8 @@ def evaluate_portfolio(
         pm = _sleeve_account_metrics(
             preds_np, close_np, open_np, pool_np,
             horizon, top_fraction, config.txn_cost, n_boot,
-            return_ledger=return_ledger,
+            return_ledger=return_ledger, delist_day=delist_day,
+            n_trials=n_trials,
         )
         n_periods = pm["n_periods"]
         if n_periods < 2:
@@ -1208,6 +1443,14 @@ def evaluate_portfolio(
             "exposure": pm["exposure"],
             "eligible_ew_sharpe": pm["eligible_ew_sharpe"],
             "selected_universe_ew_sharpe": pm["selected_universe_ew_sharpe"],
+            "long_psr": pm["long_psr"],
+            "long_dsr": pm["long_dsr"],
+            "ls_psr": pm["ls_psr"],
+            "ls_dsr": pm["ls_dsr"],
+            "dsr_n_trials": pm["dsr_n_trials"],
+            "spa_stat": pm["spa_stat"],
+            "spa_p_value": pm["spa_p_value"],
+            "spa_n_strategies": pm["spa_n_strategies"],
             "long_turnover": pm["long_turnover"],
             "ls_turnover": pm["ls_turnover"],
             "ew_turnover": pm["ew_turnover"],
@@ -1215,7 +1458,12 @@ def evaluate_portfolio(
             "long_exit_status": pm["long_exit_status"],
             "short_exit_status": pm["short_exit_status"],
             "eligible_ew_exit_status": pm["eligible_ew_exit_status"],
+            # §十四-1: forward every leg's ledger, not just the long one.
             "long_ledger": pm.get("long_ledger"),
+            "short_ledger": pm.get("short_ledger"),
+            "ls_ledger": pm.get("ls_ledger"),
+            "ew_ledger": pm.get("ew_ledger"),
+            "selected_universe_ew_ledger": pm.get("selected_universe_ew_ledger"),
             **quintile_metrics,
         }
 
@@ -1312,6 +1560,11 @@ def evaluate_portfolio(
         **quintile_metrics,
         "eligible_ew_sharpe": eligible_ew_sharpe,
         "selected_universe_ew_sharpe": selected_universe_ew_sharpe,
+        "long_psr": float("nan"), "long_dsr": float("nan"),
+        "ls_psr": float("nan"), "ls_dsr": float("nan"),
+        "dsr_n_trials": 0,
+        "spa_stat": float("nan"), "spa_p_value": float("nan"),
+        "spa_n_strategies": 0,
     }
 
 
@@ -1403,6 +1656,7 @@ _EMPTY_EXPOSURE = {
             "delayed_capital": [],
         },
     },
+    "bankrupt": {"long_day": None, "short_day": None},
     "note": ("no price path — no realized exposure measured; target = nominal "
              "book (100% gross, 50% long / 50% short, net 0)."),
 }
@@ -1443,7 +1697,16 @@ def _empty_result() -> dict:
         "q5mq1_ret": 0.0, "q_monotonic": 0.0,
         "eligible_ew_sharpe": 0.0,
         "selected_universe_ew_sharpe": 0.0,
+        "long_psr": float("nan"), "long_dsr": float("nan"),
+        "ls_psr": float("nan"), "ls_dsr": float("nan"),
+        "dsr_n_trials": 0,
+        "spa_stat": float("nan"), "spa_p_value": float("nan"),
+        "spa_n_strategies": 0,
         "long_ledger": None,
+        "short_ledger": None,
+        "ls_ledger": None,
+        "ew_ledger": None,
+        "selected_universe_ew_ledger": None,
     }
 
 

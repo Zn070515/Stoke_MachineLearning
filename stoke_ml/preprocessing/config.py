@@ -135,6 +135,7 @@ def build_pipeline_from_config(cfg: dict) -> PreprocessingPipeline:
             min_topic_size=topic_cfg.get("min_topic_size", 50),
             model_cache_dir=topic_cfg.get("model_cache_dir", "models/bertopic"),
             embedding_model=topic_cfg.get("embedding_model", "finbert"),
+            corpus_cutoff=topic_cfg.get("corpus_cutoff"),
         )
 
     # Numeric cleaning chain (FeaturePipeline-safe: no scaling, no higher-order)
