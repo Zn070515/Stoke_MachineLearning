@@ -35,8 +35,19 @@ class DailyAggregator(PreprocessingStep):
             return df
         df[date_col] = pd.to_datetime(df[date_col])
 
-        daily = df.groupby(date_col).apply(_daily_stats)
-        daily = daily.reset_index(level=-1, drop=True).reset_index()
+        # Group by day and reduce each group to a row of stats.  Each group's
+        # Series (one scalar per stat) becomes a row, the group key becomes the
+        # index — this avoids DataFrameGroupBy.apply, which is deprecated for
+        # frame/Series-returning funcs in pandas 3.0 (§二十一 D1).  Output shape
+        # is unchanged: one row per date, stat names as columns.
+        keys = []
+        stat_rows = []
+        for k, g in df.groupby(date_col):
+            keys.append(k)
+            stat_rows.append(_daily_stats(g))
+        daily = pd.DataFrame(stat_rows, index=keys)
+        daily.index.name = date_col
+        daily = daily.reset_index()
         daily.rename(columns={date_col: "date"}, inplace=True)
 
         if len(daily) > 0:
@@ -58,7 +69,14 @@ class DailyAggregator(PreprocessingStep):
 
 
 def _daily_stats(group: pd.DataFrame) -> pd.Series:
-    """Compute daily aggregate stats for one day's posts."""
+    """Compute daily aggregate stats for one day's posts (returned as a Series).
+
+    Returning a ``pd.Series`` (one scalar stat per column) is what lets the
+    caller collapse each day's group into a single row without the deprecated
+    DataFrameGroupBy.apply path (§二十一 D1).  The stat-name index is identical
+    across groups except for optional columns (``weighted_sent`` /
+    ``body_sent_*`` / ``topic_*``), which pandas fills with NaN on concat.
+    """
     if "sentiment_title" not in group.columns:
         return pd.Series({
             "bipolar_sent": np.nan, "agreement": np.nan, "attention": np.nan,
@@ -162,7 +180,7 @@ def _daily_stats(group: pd.DataFrame) -> pd.Series:
             stats["topic_dominant"] = -1
             stats["topic_sent_dispersion"] = 0.0
 
-    return pd.DataFrame([stats])
+    return pd.Series(stats)
 
 
 def _safe_skew(arr: np.ndarray) -> float:

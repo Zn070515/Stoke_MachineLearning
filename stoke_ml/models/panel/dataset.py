@@ -201,15 +201,18 @@ class DateGroupedSampler(Sampler):
         return int(self.valid_mask.sum().item())
 
     def __iter__(self):
+        # §七 P0: streamed generator instead of materializing the full
+        # (up to n_stocks * n_windows) Python int list in memory.  The RNG
+        # call order — one randperm per window, then one per stock inside —
+        # is preserved exactly, so the sampling distribution and seed
+        # reproducibility are unchanged.
         # Shuffle dates
         date_order = torch.randperm(self.n_windows).tolist()
-        indices = []
         for window_idx in date_order:
             stock_order = torch.randperm(self.n_stocks).tolist()
             for stock_idx in stock_order:
                 if self.valid_mask[stock_idx, window_idx]:
-                    indices.append(stock_idx * self.n_windows + window_idx)
-        return iter(indices)
+                    yield stock_idx * self.n_windows + window_idx
 
 
 def panel_collate(batch: list) -> tuple:
