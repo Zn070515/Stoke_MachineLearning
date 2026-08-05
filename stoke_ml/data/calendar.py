@@ -15,6 +15,7 @@ strict-mode calendars (used by formal OOS flows) FAIL on any query beyond the
 verified range instead of silently guessing.
 """
 import datetime as dt
+import hashlib
 import pathlib
 
 import pandas as pd
@@ -558,3 +559,56 @@ def validate_calendar(
         "reason": "" if total == 0 else "artifact disagrees with the generator: " + ", ".join(parts),
         "problems": problems,
     }
+
+
+def calendar_artifact_hash(
+    data_dir: str | pathlib.Path, market: str = "a_shares"
+) -> str:
+    """Deterministic content hash (sha1, 16-hex) of the trading calendar the
+    given data root resolves to.
+
+    Text-canonical, not parquet bytes: ``generated_at`` and parquet-engine
+    metadata are dropped so a fresh ``save_calendar`` round-trip hashes
+    identically across pandas/parquet versions.  When the frozen artifact is
+    absent the code-derived frame is hashed instead — that is the calendar a
+    lenient consumer would transparently fall back to.  The digest matches the
+    one ``train_panel`` records as experiment identity (``calendar_artifact_hash``),
+    so a data-quality-gate report can be cross-checked against it (§九).
+    """
+    try:
+        frame = load_calendar(data_dir, market)
+    except Exception:
+        frame = None
+    if frame is None:
+        frame = build_calendar_frame(market)
+    return _calendar_frame_hash(frame)
+
+
+def _calendar_frame_hash(frame: pd.DataFrame) -> str:
+    canonical = (
+        frame.drop(columns=["generated_at"])
+        if "generated_at" in frame.columns else frame
+    )
+    cols = sorted(canonical.columns)
+    canon_sorted = canonical.sort_values("date").reset_index(drop=True)
+    lines = ["|".join(str(row[c]) for c in cols)
+             for _, row in canon_sorted.iterrows()]
+    return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+
+
+def most_recent_completed_trading_day(
+    calendar: TradingCalendar, ref_date: dt.date
+) -> dt.date:
+    """Most recent trading day whose session is complete as of ``ref_date``.
+
+    A trading day's data is published after its close, so the current day (when
+    it is itself a trading day) is not yet complete — the most recently
+    completed session is the last trading day strictly before ``ref_date``.
+    Across 春节/国庆 7-8 day closures this walks back over the holiday weekdays
+    to the last real session, so a fully-current dataset is never judged stale
+    by natural-day age (§九).
+    """
+    d = ref_date - dt.timedelta(days=1)
+    while not calendar.is_trading_day(d):
+        d -= dt.timedelta(days=1)
+    return d

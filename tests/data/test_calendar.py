@@ -5,6 +5,7 @@ calendar is weekdays MINUS official SSE/SZSE holiday closures, verified to
 match the SSE official trading calendar exactly for 2001-2026.
 """
 import datetime as dt
+import hashlib
 
 import pandas as pd
 import pytest
@@ -14,8 +15,10 @@ from stoke_ml.data.calendar import (
     VERIFIED_UNTIL,
     TradingCalendar,
     build_calendar_frame,
+    calendar_artifact_hash,
     get_research_calendar,
     load_calendar,
+    most_recent_completed_trading_day,
     save_calendar,
     validate_calendar,
 )
@@ -391,3 +394,67 @@ class TestResearchCalendarFactory:
         cal = get_research_calendar()
         assert cal._external is not None
         assert cal.verified_until == VERIFIED_UNTIL["a_shares"]
+
+
+class TestCalendarArtifactHash:
+    """§九: the gate report must bind the artifact's CONTENT hash, not a version
+    string.  The hash is text-canonical (drops generated_at / parquet metadata)
+    so a fresh save round-trips identically, and it matches the digest
+    ``train_panel`` freezes as experiment identity for the same data root."""
+
+    def test_hash_is_deterministic_after_roundtrip(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        h = calendar_artifact_hash(tmp_path)
+        assert h == calendar_artifact_hash(tmp_path)
+        assert len(h) == 16
+        assert all(ch in "0123456789abcdef" for ch in h)
+
+    def test_hash_is_content_sensitive(self, tmp_path):
+        save_calendar(tmp_path, "a_shares")
+        h = calendar_artifact_hash(tmp_path)
+        frame = load_calendar(tmp_path, "a_shares")
+        # Flip one real trading day to closed: content changed → hash flips.
+        frame.loc[frame["date"] == pd.Timestamp("2010-02-24"), "is_open"] = False
+        frame.to_parquet(tmp_path / "exchange_calendar" / "a_shares.parquet")
+        assert calendar_artifact_hash(tmp_path) != h
+
+    def test_missing_artifact_hashes_code_fallback(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        h = calendar_artifact_hash(empty)
+        assert h == calendar_artifact_hash(empty)
+        assert len(h) == 16
+
+    def test_hash_matches_train_panel_canonical_digest(self, tmp_path):
+        """The digest equals the canonical text encoding train_panel records as
+        experiment identity — a gate report can be cross-checked against it."""
+        save_calendar(tmp_path, "a_shares")
+        frame = load_calendar(tmp_path, "a_shares").drop(columns=["generated_at"])
+        cols = sorted(frame.columns)
+        frame = frame.sort_values("date").reset_index(drop=True)
+        digest = "\n".join(
+            "|".join(str(row[c]) for c in cols) for _, row in frame.iterrows()
+        ).encode("utf-8")
+        assert calendar_artifact_hash(tmp_path) == hashlib.sha1(digest).hexdigest()[:16]
+
+
+class TestMostRecentCompletedTradingDay:
+    """§九: the freshness reference is the most recent COMPLETED session — a
+    dataset current through it stays fresh across 春节/国庆 7-8 day closures."""
+
+    def test_ref_on_closure_day_walks_back_over_holiday(self, cal):
+        # 2026-02-23 is a 春节 closure Monday; the last real session is 2/13.
+        assert most_recent_completed_trading_day(
+            cal, dt.date(2026, 2, 23)) == dt.date(2026, 2, 13)
+
+    def test_ref_on_trading_day_is_previous_session(self, cal):
+        # Today's own session is not yet complete — the most recent completed is
+        # the previous trading day.
+        assert most_recent_completed_trading_day(
+            cal, dt.date(2026, 8, 5)) == dt.date(2026, 8, 4)
+        assert most_recent_completed_trading_day(
+            cal, dt.date(2026, 2, 13)) == dt.date(2026, 2, 12)
+
+    def test_ref_on_weekend_is_previous_friday(self, cal):
+        assert most_recent_completed_trading_day(
+            cal, dt.date(2026, 8, 1)) == dt.date(2026, 7, 31)

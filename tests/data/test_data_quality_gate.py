@@ -19,6 +19,13 @@ import pandas as pd
 import pytest
 
 import scripts.production.data_quality_gate as gate_mod
+from stoke_ml.data.calendar import (
+    calendar_artifact_hash,
+    get_research_calendar,
+    load_calendar,
+    most_recent_completed_trading_day,
+    save_calendar,
+)
 from stoke_ml.data.storage import _provenance_from_attrs, _schema_hash
 from scripts.production.data_quality_gate import (
     CHECKS,
@@ -1044,3 +1051,141 @@ class TestUniverseReconciliationFormalReport:
             "--output", str(tmp_path / "report"),
         ], monkeypatch)
         assert rc == 1
+
+
+class TestCalendarArtifactAndFreshness:
+    """v14 §九: the gate must (1) load the frozen calendar artifact for the
+    data-dir being validated — never a module-import singleton, (2) record the
+    artifact's CONTENT hash (not a version string), (3) fail in formal mode when
+    the artifact is missing (no silent fallback to code holiday rules), and
+    (4) judge freshness against the most recent COMPLETED trading day so a
+    fully-current dataset never trips a natural-day ceiling over 春节/国庆."""
+
+    @staticmethod
+    def _daily_dir(tmp_path, root=None):
+        root = root if root is not None else (tmp_path / "data")
+        daily_dir = root / "a_shares" / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        return root, daily_dir
+
+    # ── artifact binding + report content hash ──────────────────────────
+
+    def test_report_records_data_dir_artifact_content_hash(self, tmp_path, monkeypatch):
+        """The gate resolves the calendar from the --data-dir being validated:
+        two roots with DIFFERENT frozen artifacts yield DIFFERENT content hashes
+        in their reports (never a built-in calendar or a bare version string)."""
+        root_a, _ = self._daily_dir(tmp_path)
+        root_b, _ = self._daily_dir(tmp_path, root=tmp_path / "data_b")
+        for root in (root_a, root_b):
+            save_calendar(root, "a_shares")
+            _daily(TRADE_DATES, [10.0] * 5).to_parquet(
+                root / "a_shares" / "daily" / "000001.parquet", index=False)
+        # Tamper B's artifact: flip one real trading day to closed.
+        frame = load_calendar(root_b, "a_shares")
+        frame.loc[frame["date"] == pd.Timestamp("2010-02-24"), "is_open"] = False
+        frame.to_parquet(root_b / "exchange_calendar" / "a_shares.parquet")
+        hashes = {}
+        for i, root in enumerate((root_a, root_b)):
+            out = tmp_path / f"rep{i}"
+            _run_gate([
+                "data_quality_gate.py", "--data-dir", str(root),
+                "--check", "datasets",
+                "--min-span-days", "0", "--max-stale-days", "10000",
+                "--output", str(out),
+            ], monkeypatch)
+            report = json.loads(
+                (out / "data_quality_gate.json").read_text(encoding="utf-8"))
+            assert report["calendar_artifact_present"] is True
+            hashes[root] = report["calendar_artifact_hash"]
+        # Different artifact content → different report hash, and it is THAT
+        # root's canonical content hash — not a global version string.
+        assert hashes[root_a] != hashes[root_b]
+        assert hashes[root_a] == calendar_artifact_hash(root_a, "a_shares")
+        assert hashes[root_b] == calendar_artifact_hash(root_b, "a_shares")
+
+    # ── formal mode: missing artifact must fail, not fall back ──────────
+
+    def test_formal_missing_artifact_fails(self, tmp_path, monkeypatch):
+        """§九: formal mode with NO frozen calendar artifact FAILS the gate
+        (rc 1, passed False, present False) instead of silently validating
+        against the code holiday rules."""
+        root, daily_dir = self._daily_dir(tmp_path)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        rc = _run_gate([
+            "data_quality_gate.py", "--data-dir", str(root),
+            "--check", "datasets",
+            "--profile", "formal",
+            "--output", str(tmp_path / "report"),
+        ], monkeypatch)
+        assert rc == 1
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8"))
+        assert report["passed"] is False
+        assert report["calendar_artifact_present"] is False
+        assert report["calendar_artifact_hash"] is None
+
+    def test_formal_with_artifact_not_refused_on_calendar(self, tmp_path, monkeypatch):
+        """With the frozen artifact present, a fully-current 5-year dataset
+        clears the formal profile — the calendar artifact is not the blocker."""
+        root, daily_dir = self._daily_dir(tmp_path)
+        save_calendar(root, "a_shares")
+        cal = get_research_calendar(data_dir=root)
+        last = most_recent_completed_trading_day(
+            cal, pd.Timestamp.now().normalize().date())
+        dates = pd.bdate_range("2019-01-02", last).strftime("%Y-%m-%d")
+        _daily(dates, np.arange(len(dates), dtype="float64") + 10.0).to_parquet(
+            daily_dir / "000001.parquet", index=False)
+        rc = _run_gate([
+            "data_quality_gate.py", "--data-dir", str(root),
+            "--check", "datasets",
+            "--profile", "formal",
+            "--output", str(tmp_path / "report"),
+        ], monkeypatch)
+        assert rc == 0
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8"))
+        assert report["calendar_artifact_present"] is True
+        assert report["calendar_artifact_hash"] == calendar_artifact_hash(root, "a_shares")
+
+    # ── freshness: positional against the most recent COMPLETED session ──
+
+    def test_freshness_holiday_safe_over_spring_festival(self, tmp_path, monkeypatch):
+        """A dataset current through the last COMPLETED session (2026-02-13) is
+        FRESH when the gate runs 10 natural days later inside 春节 2026 — the
+        natural-day ceiling must not trigger."""
+        root, daily_dir = self._daily_dir(tmp_path)
+        save_calendar(root, "a_shares")
+        # 春节 2026 closures 2/16-2/23; last real session before is 2/13 (Fri).
+        dates = pd.bdate_range("2026-01-05", "2026-02-13").strftime("%Y-%m-%d")
+        _daily(dates, np.arange(len(dates), dtype="float64") + 10.0).to_parquet(
+            daily_dir / "000001.parquet", index=False)
+        monkeypatch.setattr("scripts.production.data_quality_gate.A_SHARES",
+                            root / "a_shares")
+        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily_dir)
+        monkeypatch.setattr("scripts.production.data_quality_gate.MIN_SPAN_DAYS", 0)
+        monkeypatch.setattr("scripts.production.data_quality_gate.MAX_STALE_DAYS", 4)
+        monkeypatch.setattr("scripts.production.data_quality_gate._now",
+                            lambda: pd.Timestamp("2026-02-23"))
+        res = check_datasets(0)
+        assert res.passed is True
+        assert not any("stale=" in d for _f, d in res.issues)
+
+    def test_freshness_fails_when_behind_most_recent_completed(self, tmp_path, monkeypatch):
+        """A dataset one session behind the last COMPLETED trading day IS stale
+        under a zero-tolerance freshness floor (MAX_STALE_DAYS=0)."""
+        root, daily_dir = self._daily_dir(tmp_path)
+        save_calendar(root, "a_shares")
+        # Ends 2026-02-12 — 2/13 was the last real session before 春节.
+        dates = pd.bdate_range("2026-01-05", "2026-02-12").strftime("%Y-%m-%d")
+        _daily(dates, np.arange(len(dates), dtype="float64") + 10.0).to_parquet(
+            daily_dir / "000001.parquet", index=False)
+        monkeypatch.setattr("scripts.production.data_quality_gate.A_SHARES",
+                            root / "a_shares")
+        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily_dir)
+        monkeypatch.setattr("scripts.production.data_quality_gate.MIN_SPAN_DAYS", 0)
+        monkeypatch.setattr("scripts.production.data_quality_gate.MAX_STALE_DAYS", 0)
+        monkeypatch.setattr("scripts.production.data_quality_gate._now",
+                            lambda: pd.Timestamp("2026-02-23"))
+        res = check_datasets(0)
+        assert res.passed is False
+        assert any("stale=" in d for _f, d in res.issues)

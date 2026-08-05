@@ -53,6 +53,7 @@ Usage:
       --requested-universe universe.txt --min-universe-rows 500
 """
 import argparse
+import datetime as dt
 import glob
 import hashlib
 import json
@@ -67,7 +68,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import (
+    TradingCalendar,
+    calendar_artifact_hash,
+    get_research_calendar,
+    load_calendar,
+    most_recent_completed_trading_day,
+)
 from stoke_ml.data.codes import normalize_stock_code
 from stoke_ml.data.contract import get_contract, validate_contract
 from stoke_ml.data.download_manifest import load_manifest
@@ -92,13 +99,43 @@ FEAT_DIR = PROJECT / "data" / "features"
 # mandatory (not opt-in): the gate always passes the official trading-day set
 # so official holidays are caught, not just weekends.  Cached per (start, end)
 # span because a full run revisits the same ranges across files.
-_CALENDAR = TradingCalendar("a_shares")
 _TRADING_CACHE: dict[tuple, frozenset] = {}
 
 # §九-3: the formal profile must not bless forward-estimate trading days as
 # verified exchange fact.  Only enforced under --profile formal (see main()).
-VERIFIED_UNTIL = _CALENDAR.verified_until
 ENFORCE_VERIFIED_UNTIL = False
+
+# §九: the frozen calendar is resolved per DATA ROOT (``A_SHARES.parent``), NOT
+# as a module-import singleton — a --data-dir redirect must validate the SAME
+# calendar artifact the feature pipeline reads from that root.  Cached per root;
+# main() clears the cache when --data-dir changes.
+_CALENDAR_CACHE: dict[str, TradingCalendar] = {}
+
+
+def _get_calendar() -> TradingCalendar:
+    """The frozen calendar for the CURRENT data root (``A_SHARES.parent``).
+
+    Resolved through ``get_research_calendar(data_dir=...)`` so the artifact at
+    ``<root>/exchange_calendar/a_shares.parquet`` is authoritative when present;
+    a bootstrap run with no artifact transparently falls back to the code holiday
+    set (formal mode refuses that fallback in main()).
+    """
+    root = str(Path(A_SHARES.parent).resolve())
+    cal = _CALENDAR_CACHE.get(root)
+    if cal is None:
+        cal = get_research_calendar(data_dir=root)
+        _CALENDAR_CACHE[root] = cal
+    return cal
+
+
+def _now() -> pd.Timestamp:
+    """Wall-clock now, normalized to midnight (the freshness reference date).
+
+    A test seam: monkeypatching this simulates running the gate on a specific
+    date (e.g. a 春节/国庆 closure day) so holiday-safe freshness is provable
+    without waiting for a real holiday.
+    """
+    return pd.Timestamp.now().normalize()
 
 
 def _official_trading_days(dates: pd.Series) -> frozenset:
@@ -107,7 +144,7 @@ def _official_trading_days(dates: pd.Series) -> frozenset:
     key = (lo, hi)
     cached = _TRADING_CACHE.get(key)
     if cached is None:
-        cached = frozenset(_CALENDAR.get_trading_days(lo, hi))
+        cached = frozenset(_get_calendar().get_trading_days(lo, hi))
         _TRADING_CACHE[key] = cached
     return cached
 
@@ -321,6 +358,30 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _calendar_status() -> dict:
+    """Presence + content hash + path of the frozen calendar artifact for the
+    CURRENT data root (``A_SHARES.parent``).
+
+    ``present`` is False when the artifact is absent or unusable.  ``hash`` is
+    the content hash of the calendar the gate ACTUALLY resolved — the artifact
+    when present, else ``None`` (formal mode refuses that code fallback) — so
+    the report records what was really validated (§九), not a version string.
+    """
+    root = A_SHARES.parent
+    p = Path(root) / "exchange_calendar" / "a_shares.parquet"
+    try:
+        present = load_calendar(root, "a_shares") is not None
+    except Exception as exc:
+        return {"present": False, "hash": None, "path": str(p),
+                "reason": f"unusable: {exc}"}
+    if not present:
+        return {"present": False, "hash": None, "path": str(p),
+                "reason": "missing"}
+    return {"present": True,
+            "hash": calendar_artifact_hash(root, "a_shares"),
+            "path": str(p), "reason": ""}
+
+
 def _exchange_of(code: str) -> str:
     """A-share exchange bucket from the stock-code first digit."""
     first = code[0] if code else ""
@@ -417,16 +478,28 @@ def _scan_dataset(name: str, d: Path, sample: int) -> tuple[list, int, int, int,
         span = (hi - lo).days
         if span < MIN_SPAN_DAYS:
             issues.append((f"{name}", f"span={span}d < min={MIN_SPAN_DAYS}d"))
-        stale = (pd.Timestamp.now().normalize() - pd.Timestamp(hi)).days
-        if stale > MAX_STALE_DAYS:
-            issues.append((f"{name}", f"stale={stale}d > max={MAX_STALE_DAYS}d"))
+        # §九: freshness is positional against the frozen calendar, not natural
+        # age.  A dataset current through the most recent COMPLETED trading day
+        # is fresh even across 春节/国庆 7-8 day closures (a fully-current dataset
+        # never trips a natural-day ceiling).  ``behind`` counts trading days in
+        # (latest, most_recent_completed]; > MAX_STALE_DAYS is stale.
+        cal = _get_calendar()
+        most_recent = most_recent_completed_trading_day(cal, _now().date())
+        latest = hi.date()
+        behind = 0
+        if latest < most_recent:
+            behind = len(cal.get_trading_days(
+                latest + dt.timedelta(days=1), most_recent))
+        if behind > MAX_STALE_DAYS:
+            issues.append((f"{name}",
+                           f"stale={behind} trading-days > max={MAX_STALE_DAYS}"))
         # §九-3: forward-estimate trading days (2027+ A-share closures) are not
         # verified exchange fact — the formal profile refuses data that uses
         # them rather than validating it against guessed holidays.
-        if ENFORCE_VERIFIED_UNTIL and hi.date() > VERIFIED_UNTIL:
+        if ENFORCE_VERIFIED_UNTIL and latest > cal.verified_until:
             issues.append((f"{name}",
-                           f"extends_past_verified_until={hi.date()} > "
-                           f"{VERIFIED_UNTIL}"))
+                           f"extends_past_verified_until={latest} > "
+                           f"{cal.verified_until}"))
     elif scan:
         issues.append((f"{name}", "empty_rows"))
     return issues, len(files), len(scan), total_rows, unreadable
@@ -1078,7 +1151,7 @@ def reconcile_requested_universe(
         try:
             req_lo = pd.Timestamp(requested_start).date()
             req_hi = pd.Timestamp(requested_end).date()
-            req_days = frozenset(_CALENDAR.get_trading_days(req_lo, req_hi))
+            req_days = frozenset(_get_calendar().get_trading_days(req_lo, req_hi))
         except Exception:
             req_days = None
     missing: list[str] = []
@@ -1287,7 +1360,10 @@ def main():
     ap.add_argument("--min-span-days", type=int, default=MIN_SPAN_DAYS,
                     help="minimum earliest→latest span per required dataset")
     ap.add_argument("--max-stale-days", type=int, default=MAX_STALE_DAYS,
-                    help="max calendar days since latest date before FAIL")
+                    help="max TRADING days the dataset may lag the most recent "
+                         "completed trading day (per the frozen calendar) "
+                         "before FAIL — natural days across 春节/国庆 closures "
+                         "do not count")
     ap.add_argument("--max-unreadable-ratio", type=float, default=None,
                     help="max unreadable-file share per required dataset "
                          "(default: 0.05; formal profile forces 0.0, §六-3)")
@@ -1352,6 +1428,10 @@ def main():
     if args.data_dir:
         root = Path(args.data_dir).resolve()
         _DAILY_CACHE.clear()
+        # §九: a --data-dir redirect must re-resolve the calendar + trading-day
+        # caches for the NEW root, never reuse the previous root's entries.
+        _CALENDAR_CACHE.clear()
+        _TRADING_CACHE.clear()
         A_SHARES = root / "a_shares"
         DAILY_DIR = A_SHARES / "daily"
         FEAT_DIR = root / "features"
@@ -1390,6 +1470,20 @@ def main():
             print(f"         {file}: {detail}")
 
     passed = all(r.passed for r in results)
+    # §九: formal mode refuses to silently fall back to code holiday rules when
+    # the frozen calendar artifact is absent — the gate must validate the SAME
+    # calendar the feature pipeline reads from this data root.  All checks still
+    # run so the report stays informative; the run is failed regardless.
+    cal_status = _calendar_status()
+    if args.profile == "formal" and not cal_status["present"]:
+        passed = False
+        print(
+            f"ERROR: --profile formal requires the frozen calendar artifact at "
+            f"{cal_status['path']} ({cal_status['reason']}) — refusing to "
+            f"silently fall back to code holiday rules. Run save_calendar() for "
+            f"this data root first.",
+            file=sys.stderr,
+        )
     os.makedirs(args.output, exist_ok=True)
     # §七.2: record the run's audit scope so a consumer can tell a full scan
     # from a --quick sample.  manifest/contract_schema are always full-scan
@@ -1422,6 +1516,12 @@ def main():
         "quality_gate_version": QUALITY_GATE_VERSION,
         "data_root": str(A_SHARES.parent),
         "calendar_version": TradingCalendar.CALENDAR_VERSION,
+        # §九: the report binds the ACTUAL frozen artifact of the validated data
+        # root (content hash, not a version string) so a consuming run can verify
+        # the gate reviewed the same calendar the feature pipeline reads.
+        "calendar_artifact_hash": cal_status["hash"],
+        "calendar_artifact_path": cal_status["path"],
+        "calendar_artifact_present": cal_status["present"],
         "contract_version": contract_version(),
         "required_datasets": list(REQUIRED_DATASETS),
         "dataset_paths": {
