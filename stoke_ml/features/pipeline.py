@@ -62,7 +62,7 @@ from stoke_ml.features.panel_helpers import (
     _constant_col_indices,
     fold_dead_feature_columns,
     _sparse_kept,
-    _panel_calendar,
+    _panel_calendar,  # frozen None snapshot — use _get_panel_calendar() (lives in panel_helpers)
     _get_panel_calendar,
     _BOARD_NAMES,
     _BOARD_ONEHOT_COLS,
