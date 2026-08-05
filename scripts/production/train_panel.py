@@ -2137,6 +2137,16 @@ def _replay_continuous_oos(
         raise ValueError(
             "formal continuous-OOS replay: tape missing required delist_day — "
             "refusing to blend a legacy tape (§十五-2)")
+    # §十八-1: FORMAL replay requires weight_hash in EVERY fold.  `rec["weight_hash"]`
+    # is None exactly when the tape's npz LACKS the key (the reader stringifies a
+    # stored value), so a tape whose predictions cannot be tied to a retained
+    # checkpoint — even if the checkpoint itself is absent — is refused instead of
+    # being replayed under the legacy skip in `_verify_tape_weight_hash`.
+    if formal and any(r["weight_hash"] is None for r in recs):
+        raise ValueError(
+            "formal continuous-OOS replay: tape missing required weight_hash — "
+            "refusing to replay a tape whose predictions cannot be tied to a "
+            "retained checkpoint (§十八-1)")
 
     # §十八-C1: verify each tape's recorded weight_hash against the retained
     # checkpoint.  The deep folds write weight_hash = _state_dict_hash(state_dict)

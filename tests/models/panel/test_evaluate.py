@@ -1695,7 +1695,7 @@ class TestContinuousOosReplay:
                   data_version=data_version,
                   universe_status_hash=universe_status_hash,
                   membership_hash=membership_hash,
-                  model_hash="test", weight_hash=weight_hash)
+                  model_hash="test")
         # §十五-1/§十五-2/§十六: the policy + full metadata + model-identity
         # keys a FORMAL replay requires.  Omitted by default so legacy-behaviour
         # tests (missing keys → tolerated in non-formal mode) keep exercising
@@ -1707,7 +1707,8 @@ class TestContinuousOosReplay:
                      ("strategy_mode", strategy_mode),
                      ("model_source_hash", model_source_hash),
                      ("model_config_hash", model_config_hash),
-                     ("feature_schema_hash", feature_schema_hash)]:
+                     ("feature_schema_hash", feature_schema_hash),
+                     ("weight_hash", weight_hash)]:
             if v is not None:
                 kw[k] = v
         if delist_day is not None:
@@ -2240,3 +2241,150 @@ class TestContinuousOosReplay:
         cont = _replay_continuous_oos(str(tmp_path), formal=True)
         assert cont is not None
         assert cont["account"]["final_nav"] > 0
+
+    def test_formal_replay_requires_weight_hash(self, tmp_path):
+        """§十八-1: FORMAL replay requires weight_hash to be present in EVERY
+        fold tape — a tape whose predictions cannot be tied to a retained
+        checkpoint is refused, never silently blended.  Non-formal keeps the
+        legacy tolerance (missing key → skipped verification)."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        # fold_000 carries full metadata + a weight_hash; fold_001 is complete
+        # except its weight_hash KEY is absent (weight_hash=None omits it).
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat1")
+        self._model_meta_tape(tmp_path, ("fold_001.npz", 2, 4),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat1", weight_hash=None)
+        # Non-formal: the missing weight_hash key is tolerated (legacy path).
+        assert _replay_continuous_oos(str(tmp_path)) is not None
+        # Formal: missing weight_hash on any tape → hard failure.
+        with pytest.raises(ValueError, match="weight_hash"):
+            _replay_continuous_oos(str(tmp_path), formal=True)
+
+    def test_weight_hash_mismatch_with_checkpoint_fails(self, tmp_path):
+        """§十八-C1: a tape whose recorded weight_hash does not match its
+        retained checkpoint's OWN recorded weight_hash fails the replay — the
+        tape cannot be tied to the weights on disk.  `_verify_tape_weight_hash`
+        runs unconditionally (not only in formal mode), so a single non-formal
+        tape + a differing checkpoint is enough."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 4)]
+        close = np.arange(10, 13, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=["000001"], dates=dates[0:2], price_dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close[0:2]]), open=np.stack([close[0:2]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            weight_hash="w-tape")
+        torch.save(
+            {"state_dict": {"layer.weight": torch.tensor([[1.0, 2.0],
+                                                          [3.0, 4.0]])},
+             "weight_hash": "w-ckpt"},
+            str(tmp_path / "fold_000_model.pt"))
+        with pytest.raises(ValueError, match="§十八-C1"):
+            _replay_continuous_oos(str(tmp_path))
+
+    def test_weight_hash_state_dict_recompute_fails(self, tmp_path):
+        """§十八-C1: even when the checkpoint's stored weight_hash EQUALS the
+        tape's, a state_dict that re-derives to a different hash fails — the
+        recorded value matching is necessary but not sufficient.  Exercises the
+        recompute branch (_state_dict_hash(state_dict) != tape weight_hash)."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 4)]
+        close = np.arange(10, 13, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"),
+            stocks=["000001"], dates=dates[0:2], price_dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close[0:2]]), open=np.stack([close[0:2]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            weight_hash="w-tape")
+        # Stored weight_hash matches the tape, but the actual state_dict hashes
+        # to a DIFFERENT value → the recomputed check must reject it.
+        torch.save(
+            {"state_dict": {"layer.weight": torch.tensor([[1.0, 2.0],
+                                                          [3.0, 4.0]])},
+             "weight_hash": "w-tape"},
+            str(tmp_path / "fold_000_model.pt"))
+        with pytest.raises(ValueError, match="§十八-C1"):
+            _replay_continuous_oos(str(tmp_path))
+
+    def test_weight_hash_matches_checkpoint_passes(self, tmp_path):
+        """§十八-C1 (positive): a tape whose weight_hash round-trips against its
+        retained checkpoint — recorded value equal AND re-derived state_dict hash
+        equal — replays cleanly in formal mode, locking the honest weight binding
+        through the FULL replay path (production smoke only covers _weight_hash at
+        the model level, not the tape-vs-checkpoint verification)."""
+        from scripts.production.train_panel import (
+            _replay_continuous_oos, _state_dict_hash)
+
+        sd = {"layer.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])}
+        wh = _state_dict_hash(sd)
+        self._model_meta_tape(tmp_path, ("fold_000.npz", 0, 2),
+                              dict(self._MODEL_META),
+                              model_source_hash="src1", model_config_hash="cfg1",
+                              feature_schema_hash="feat1", weight_hash=wh)
+        torch.save({"state_dict": sd, "weight_hash": wh},
+                   str(tmp_path / "fold_000_model.pt"))
+        cont = _replay_continuous_oos(str(tmp_path), formal=True)
+        assert cont is not None
+        assert cont["account"]["final_nav"] > 0
+
+    def test_baseline_weight_hash_mismatch_with_pickle_fails(self, tmp_path):
+        """§十八-C1 (baseline): a baseline tape's weight_hash is the SHA-256 of
+        its retained .pkl; a pickle whose bytes hash differently fails the
+        replay instead of blending preds of unverifiable provenance."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-{d:02d}" for d in range(1, 4)]
+        close = np.arange(10, 13, dtype=np.float32)
+        self._write_tape(
+            str(tmp_path / "fold_000_lgbm.npz"),
+            stocks=["000001"], dates=dates[0:2], price_dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool),
+            close=np.stack([close[0:2]]), open=np.stack([close[0:2]]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0,
+            **self._MODEL_META,
+            model_source_hash="src1", model_config_hash="cfg1",
+            feature_schema_hash="feat1", weight_hash="w-tape")
+        (tmp_path / "fold_000_lgbm.pkl").write_bytes(b"different-weights")
+        with pytest.raises(ValueError, match="§十八-C1"):
+            _replay_continuous_oos(str(tmp_path), model_name="lgbm", formal=True)
+
+    def test_duplicate_signal_day_fails(self, tmp_path):
+        """§十八-C2: two fold tapes predicting the SAME (stock, signal-day) cell
+        must fail — the folds' signal windows are strictly disjoint (step ==
+        val_len), so an overlapping signal day is a data/overlap bug, not a case
+        to silently overwrite.  Both tapes own the same price axis with IDENTICAL
+        prices so the §十二.2 price-overlap assertion passes FIRST and the
+        signal-overlap check is what fires."""
+        from scripts.production.train_panel import _replay_continuous_oos
+
+        dates = [f"2025-01-0{d}" for d in range(1, 5)]  # 01 .. 04
+        close = np.arange(10, 14, dtype=np.float32)     # 10 .. 13
+        kw_common = dict(
+            stocks=["000001"],
+            price_dates=dates,                      # BOTH own the full price axis
+            close=np.stack([close]), open=np.stack([close]),
+            horizon=1, seq_len=60, top_fraction=0.5, cost=0.0)
+        # fold_000 signals 01,02; fold_001 signals 02,03 → shared day 2025-01-02.
+        self._write_tape(
+            str(tmp_path / "fold_000.npz"), dates=dates[0:2],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool), **kw_common)
+        self._write_tape(
+            str(tmp_path / "fold_001.npz"), dates=dates[1:3],
+            preds=np.ones((1, 2), dtype=np.float32),
+            pool=np.ones((1, 2), dtype=bool), **kw_common)
+        with pytest.raises(ValueError, match="same stock"):
+            _replay_continuous_oos(str(tmp_path))
