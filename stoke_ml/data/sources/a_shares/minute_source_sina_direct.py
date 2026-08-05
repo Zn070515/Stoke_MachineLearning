@@ -15,7 +15,11 @@ import numpy as np
 import pandas as pd
 import requests
 
-from stoke_ml.data.codes import normalize_stock_code
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +42,15 @@ class SinaDirectMinuteSource:
         # §六: single sanitizer, never bare str().zfill(6).
         code = normalize_stock_code(stock_code)
         if code is None:
-            raise ValueError(f"Unusable stock code for minute fetch: {stock_code!r}")
-        if code.startswith(("6", "9")):
-            return f"sh{code}"
-        return f"sz{code}"
+            raise UnsupportedMarketError(
+                f"Unusable stock code for minute fetch: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"Sina direct minute cannot route non-A-share code {code}"
+            )
+        return f"{market.lower()}{code}"
 
     def fetch(
         self,

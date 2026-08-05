@@ -17,7 +17,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from stoke_ml.data.codes import normalize_stock_code
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +36,20 @@ class MinuteSource:
 
     @staticmethod
     def _to_sina_symbol(stock_code: str) -> str:
-        """Map stock code to Sina symbol (sh/sz prefix)."""
+        """Map stock code to Sina symbol (sh/sz/bj prefix)."""
         # §六: route through the single sanitizer — a bare str().zfill(6)
         # turns the float 600001.0 into the illegal "600001.0".
         code = normalize_stock_code(stock_code)
         if code is None:
-            raise ValueError(f"Unusable stock code for minute fetch: {stock_code!r}")
-        if code.startswith(("6", "9")):
-            return f"sh{code}"
-        return f"sz{code}"
+            raise UnsupportedMarketError(
+                f"Unusable stock code for minute fetch: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"Sina minute cannot route non-A-share code {code}"
+            )
+        return f"{market.lower()}{code}"
 
     def fetch(
         self,

@@ -21,6 +21,7 @@ disguised as a seam) would corrupt downstream momentum features.
 import time
 import logging
 import pandas as pd
+from stoke_ml.data.codes import market_of_code, normalize_stock_code
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
 logger = logging.getLogger(__name__)
@@ -57,11 +58,28 @@ class AShareDownloader:
         df = None
         source_used = None
 
+        # §六: derive the market ONCE from the single authority.  A source that
+        # declares it cannot reach that market is skipped before any request —
+        # NOT counted as a failure (an unsupported market is not a fetch error,
+        # so it must not trip the circuit breaker).  The old behaviour asked
+        # every source regardless and let a BJ code masquerade as an SZ/SH
+        # request, polluting the result with another exchange's security.
+        code = normalize_stock_code(stock_code)
+        market = market_of_code(code) if code else None
+
         for source in self._sources:
             name = source.SOURCE_NAME
             if not source.is_available():
                 logger.debug(f"Source {name} unavailable, skipping")
                 continue
+            if market is not None:
+                supports = getattr(source, "supports_market", None)
+                if supports is not None and not supports(market):
+                    logger.debug(
+                        f"Source {name} does not support market {market} "
+                        f"for {stock_code}, skipping without failure"
+                    )
+                    continue
             if self._is_circuit_open(name):
                 logger.debug(f"Circuit open for {name}, skipping")
                 continue

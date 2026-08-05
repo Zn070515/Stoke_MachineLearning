@@ -1,6 +1,11 @@
 """Baostock data source for A-shares (last resort, free)."""
 import logging
 import pandas as pd
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
 logger = logging.getLogger(__name__)
@@ -18,6 +23,27 @@ class BaostockSource(AShareSourceBase):
         except ImportError:
             return False
 
+    @staticmethod
+    def _to_bs_code(stock_code: str) -> str:
+        """Baostock code: ``sh.600519`` / ``sz.000001`` / ``bj.920001``.
+
+        The old ``6/9→sh; 8/4→bj; else sz`` heuristic routed 920001 to
+        ``sh.920001`` (the ``9`` lead matched the SH branch) and 430047 to
+        ``sz.430047`` — both wrong exchanges.  Route every code through
+        market_of_code so BSE is always ``bj.``.
+        """
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise UnsupportedMarketError(
+                f"Unusable stock code: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"Baostock cannot route non-A-share code {code}"
+            )
+        return f"{market.lower()}.{code}"
+
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
@@ -32,12 +58,7 @@ class BaostockSource(AShareSourceBase):
                 logger.warning("Baostock login failed: %s", lg.error_msg)
                 return pd.DataFrame()
 
-            if stock_code.startswith("6") or stock_code.startswith("9"):
-                bs_code = f"sh.{stock_code}"
-            elif stock_code.startswith("8") or stock_code.startswith("4"):
-                bs_code = f"bj.{stock_code}"
-            else:
-                bs_code = f"sz.{stock_code}"
+            bs_code = self._to_bs_code(stock_code)
 
             rs = bs.query_history_k_data_plus(
                 bs_code,

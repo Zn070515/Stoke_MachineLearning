@@ -21,13 +21,27 @@ VALUATION_COLS = ["pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm"]
 
 
 def _bs_code(stock_code: str) -> str:
-    if stock_code.startswith("6"):
-        return f"sh.{stock_code}"
-    elif stock_code.startswith("0") or stock_code.startswith("3"):
-        return f"sz.{stock_code}"
-    elif stock_code.startswith("8") or stock_code.startswith("4"):
-        return f"bj.{stock_code}"
-    raise ValueError(f"Unknown exchange for {stock_code}")
+    """Baostock code via the single market authority: ``sh.`` / ``sz.`` / ``bj.``.
+
+    The old ``6→sh; 0/3→sz; 8/4→bj; else raise`` heuristic raised ValueError
+    for the 920xxx BSE range (e.g. ``920001``), so valuation download skipped
+    every new-code BSE stock.  Route through market_of_code so BSE is ``bj.``.
+    """
+    from stoke_ml.data.codes import (
+        UnsupportedMarketError,
+        market_of_code,
+        normalize_stock_code,
+    )
+
+    code = normalize_stock_code(stock_code)
+    if code is None:
+        raise UnsupportedMarketError(f"Unusable stock code: {stock_code!r}")
+    market = market_of_code(code)
+    if market is None:
+        raise UnsupportedMarketError(
+            f"Baostock cannot route non-A-share code {code}"
+        )
+    return f"{market.lower()}.{code}"
 
 
 def _log(msg: str) -> None:

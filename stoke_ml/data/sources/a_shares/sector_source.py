@@ -18,6 +18,11 @@ import pandas as pd
 import requests
 
 from stoke_ml.crawler.eastmoney import EastMoneyClient
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,23 @@ CONCEPT_BLOCK_COLS = [
 
 
 def _market_code(stock_code: str) -> str:
-    return "1" if stock_code.startswith("6") else "0"
+    """EastMoney secid market id: ``1`` (SH) / ``0`` (SZ + BSE).
+
+    BSE rides market 0 on EastMoney (same as efinance_source), so a BSE code
+    must produce ``0.920001`` — the old ``6→1 else 0`` heuristic already gave
+    ``0`` for BSE, but routing through market_of_code keeps a single authority.
+    """
+    code = normalize_stock_code(stock_code)
+    if code is None:
+        raise UnsupportedMarketError(
+            f"Unusable stock code: {stock_code!r}"
+        )
+    market = market_of_code(code)
+    if market is None:
+        raise UnsupportedMarketError(
+            f"EastMoney cannot route non-A-share code {code}"
+        )
+    return "1" if market == "SH" else "0"
 
 
 # ── Industry ranking (行业板块排名) ─────────────────────────────────────

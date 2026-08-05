@@ -17,6 +17,12 @@ from typing import Optional
 
 import pandas as pd
 
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
+
 logger = logging.getLogger(__name__)
 
 SINA_FFLOW_URL = (
@@ -41,19 +47,27 @@ TENCENT_QUOTE_COLS = [
 
 
 def _sina_market_prefix(code: str) -> str:
-    if code.startswith(("6", "9")):
-        return f"sh{code}"
-    if code.startswith("8"):
-        return f"bj{code}"
-    return f"sz{code}"
+    c = normalize_stock_code(code)
+    if c is None:
+        raise UnsupportedMarketError(f"Unusable stock code: {code!r}")
+    market = market_of_code(c)
+    if market is None:
+        raise UnsupportedMarketError(
+            f"Sina fund flow cannot route non-A-share code {c}"
+        )
+    return f"{market.lower()}{c}"
 
 
 def _tencent_market_prefix(code: str) -> str:
-    if code.startswith(("6", "9")):
-        return f"sh{code}"
-    if code.startswith("8"):
-        return f"bj{code}"
-    return f"sz{code}"
+    c = normalize_stock_code(code)
+    if c is None:
+        raise UnsupportedMarketError(f"Unusable stock code: {code!r}")
+    market = market_of_code(c)
+    if market is None:
+        raise UnsupportedMarketError(
+            f"Tencent quote cannot route non-A-share code {c}"
+        )
+    return f"{market.lower()}{c}"
 
 
 # ── Sina fund flow (新浪资金流备用源) ─────────────────────────────────

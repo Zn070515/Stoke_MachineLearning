@@ -1,6 +1,11 @@
 """AKShare data source using Sina finance API (not EastMoney)."""
 import logging
 import pandas as pd
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
 logger = logging.getLogger(__name__)
@@ -13,8 +18,23 @@ class AKShareSource(AShareSourceBase):
 
     @staticmethod
     def _to_sina_symbol(stock_code: str) -> str:
-        prefix = "sh" if stock_code.startswith("6") else "sz"
-        return f"{prefix}{stock_code}"
+        """Sina symbol: ``sh600519`` / ``sz000001`` / ``bj920001``.
+
+        Sina accepts the ``bj`` prefix for BSE codes (verified against
+        CN_MarketData.getKLineData — ``bj920001`` returns bars while
+        ``sz920001`` returns null).
+        """
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise UnsupportedMarketError(
+                f"Unusable stock code: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"Sina cannot route non-A-share code {code}"
+            )
+        return f"{market.lower()}{code}"
 
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str

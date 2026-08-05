@@ -8,6 +8,12 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
+
 logger = logging.getLogger(__name__)
 
 SINA_NEWS_URL = (
@@ -29,7 +35,23 @@ class SinaNewsSource:
 
     @staticmethod
     def _to_sina_prefix(stock_code: str) -> str:
-        return "sh" if stock_code.startswith("6") else "sz"
+        """Sina news symbol prefix: ``sh`` / ``sz`` / ``bj``.
+
+        Sina's vCB_AllNewsStock.php accepts the ``bj`` prefix for BSE codes
+        (verified against a live 920001 news page), so BSE news must not be
+        fetched under a guessed ``sz``.
+        """
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise UnsupportedMarketError(
+                f"Unusable stock code: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"Sina news cannot route non-A-share code {code}"
+            )
+        return market.lower()
 
     def fetch_news(
         self,

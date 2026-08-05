@@ -21,6 +21,12 @@ from typing import Optional
 
 import pandas as pd
 
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
+
 logger = logging.getLogger(__name__)
 
 SINA_FFLOW_URL = (
@@ -40,12 +46,21 @@ DAILY_NET_COLS = [
 
 
 def _sina_market_code(code: str) -> str:
-    """Sina market prefix: sh for 6xxxxx/9xxxxx, sz for 0xxxxx/3xxxxx, bj for 8xxxxx."""
-    if code.startswith(("6", "9")):
-        return f"sh{code}"
-    if code.startswith("8"):
-        return f"bj{code}"
-    return f"sz{code}"
+    """Sina market prefix: ``sh600519`` / ``sz000001`` / ``bj920001``.
+
+    The old ``6/9→sh; 8→bj; else sz`` heuristic routed 920001 to ``sz920001``
+    (not matching any branch) and 430047 to ``sz430047`` — both wrong.
+    Route through market_of_code so BSE is always ``bj``.
+    """
+    c = normalize_stock_code(code)
+    if c is None:
+        raise UnsupportedMarketError(f"Unusable stock code: {code!r}")
+    market = market_of_code(c)
+    if market is None:
+        raise UnsupportedMarketError(
+            f"Sina capital flow cannot route non-A-share code {c}"
+        )
+    return f"{market.lower()}{c}"
 
 
 class CapitalFlowSource:

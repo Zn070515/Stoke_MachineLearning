@@ -2,6 +2,11 @@
 import os
 import logging
 import pandas as pd
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
 logger = logging.getLogger(__name__)
@@ -40,12 +45,23 @@ class TushareSource(AShareSourceBase):
 
     @staticmethod
     def _to_ts_code(stock_code: str) -> str:
-        if stock_code.startswith("6"):
-            return f"{stock_code}.SH"
-        elif stock_code.startswith("8") or stock_code.startswith("4"):
-            return f"{stock_code}.BJ"
-        else:
-            return f"{stock_code}.SZ"
+        """Tushare symbol: ``600519.SH`` / ``000001.SZ`` / ``920001.BJ``.
+
+        The old ``6→SH / 8|4→BJ / else SZ`` heuristic dropped 920xxx into the
+        ``else`` branch and emitted ``920001.SZ`` — a bogus Shenzhen request.
+        Route every code through market_of_code so BSE is always ``.BJ``.
+        """
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise UnsupportedMarketError(
+                f"Unusable stock code: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"Tushare cannot route non-A-share code {code}"
+            )
+        return f"{code}.{market}"
 
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str

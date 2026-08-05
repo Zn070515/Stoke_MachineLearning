@@ -4,6 +4,11 @@ import time
 
 import pandas as pd
 
+from stoke_ml.data.codes import (
+    UnsupportedMarketError,
+    market_of_code,
+    normalize_stock_code,
+)
 from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 
 logger = logging.getLogger(__name__)
@@ -45,8 +50,23 @@ class EfinanceSource(AShareSourceBase):
 
     @staticmethod
     def _to_secid(stock_code: str) -> str:
-        prefix = "1" if stock_code.startswith("6") else "0"
-        return f"{prefix}.{stock_code}"
+        """EastMoney secid: ``1.600519`` (SH) / ``0.000001`` (SZ).
+
+        BSE rides EastMoney market 0 — 北交所 runs on the SZSE trading
+        platform, so ``920001`` must be ``0.920001`` (verified against the
+        push2his kline API), never the SH ``1.920001`` that returns rc=100.
+        """
+        code = normalize_stock_code(stock_code)
+        if code is None:
+            raise UnsupportedMarketError(
+                f"Unusable stock code for secid: {stock_code!r}"
+            )
+        market = market_of_code(code)
+        if market is None:
+            raise UnsupportedMarketError(
+                f"EastMoney cannot route non-A-share code {code}"
+            )
+        return f"{'1' if market == 'SH' else '0'}.{code}"
 
     def fetch_daily(
         self, stock_code: str, start_date: str, end_date: str

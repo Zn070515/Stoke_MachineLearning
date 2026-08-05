@@ -18,15 +18,65 @@ import pandas as pd
 _EXCHANGE_PREFIXES = ("SH", "SZ", "BJ", "sh", "sz", "bj")
 _EXCHANGE_SUFFIXES = (".SH", ".SZ", ".BJ", ".sh", ".sz", ".bj")
 
+# BSE (北交所) equity prefixes — shared by market_of_code and
+# a_share_equity_segment so the provider router and the equity filter cannot
+# drift apart (§六).  Real BSE ranges: 43xxxx (新三板 精选层), 83xxxx/87xxxx/
+# 88xxxx (旧挂牌), 920xxx (2024+ 新号段).
+_BJ_PREFIXES = ("43", "83", "87", "88", "920")
+
+
+class UnsupportedMarketError(ValueError):
+    """Raised when a provider is asked to route a code it cannot serve.
+
+    The code is either not an A-share common equity code (``market_of_code``
+    returned ``None``) or is in a market the provider deliberately does not
+    support.  Providers MUST NOT translate such a code into a guessed
+    SH/SZ/BJ request — that is exactly how ``920001`` used to leak onto the
+    Shenzhen exchange as a bogus ``.SZ`` / ``sz920001`` symbol.
+    """
+
+
+def market_of_code(code6: str) -> str | None:
+    """Return the exchange market of a normalized 6-digit code.
+
+    THE single authoritative market router for A-share providers (§六).
+    Every provider derives its exchange prefix from this — never from its own
+    leading-digit heuristic.  Caliber:
+      * SH 上海: ``6xxxxx`` (600/601/603/605/688/689 主板 / 科创板)
+      * SZ 深圳: ``0xxxxx`` / ``3xxxxx`` (000/001/002/003/300/301 主板 / 创业板)
+      * BJ 北交所: ``43 / 83 / 87 / 88 / 920``
+    Returns ``None`` for anything else (indices, B-shares, funds, ...).
+
+    Consistent with :func:`a_share_equity_segment` on every A-share common
+    equity prefix; only wider on the ``3xxxxx`` range (e.g. ``399001``
+    深证成指 routes SZ here but is not equity there).
+
+    ``code6`` must already be a normalized 6-digit code — callers normalize
+    via :func:`normalize_stock_code` first.
+    """
+    if code6.startswith("6"):
+        return "SH"
+    if code6.startswith(("0", "3")):
+        return "SZ"
+    if code6.startswith(_BJ_PREFIXES):
+        return "BJ"
+    return None
+
 
 def _code_market(code6: str) -> str | None:
-    """Infer the exchange market from the leading digits of a 6-digit code."""
-    if code6[0] == "6":
-        return "SH"          # 600/601/603/605/688/689 Shanghai
-    if code6[0] in ("0", "3"):
-        return "SZ"          # 000/001/002/003/300/301 Shenzhen
+    """Infer the exchange market from the leading digits of a 6-digit code.
+
+    Thin shim over :func:`market_of_code` used by :func:`normalize_stock_code`
+    to reject an exchange prefix/suffix that contradicts the code.  Keeps the
+    legacy broad ``4xxxxx / 8xxxxx / 92xxxx → BJ`` catch (e.g. 老三板 400xxx)
+    that the strict equity router deliberately does not claim, so the format
+    check keeps accepting historical 老三板 spellings.
+    """
+    market = market_of_code(code6)
+    if market is not None:
+        return market
     if code6[0] in ("4", "8") or code6.startswith("92"):
-        return "BJ"          # 4xxxxx / 8xxxxx / 920xxx Beijing BSE
+        return "BJ"
     return None
 
 
@@ -125,7 +175,7 @@ def a_share_equity_segment(code6: str) -> str | None:
         return "SH"
     if code6.startswith(("000", "001", "002", "003", "300", "301")):
         return "SZ"
-    if code6.startswith(("43", "83", "87", "88", "920")):
+    if code6.startswith(_BJ_PREFIXES):
         return "BJ"
     return None
 
