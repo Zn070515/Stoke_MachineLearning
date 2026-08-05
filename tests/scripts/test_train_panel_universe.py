@@ -137,6 +137,39 @@ def test_csi_intersects_available_stocks(tp):
     assert r == sorted(subset)  # all three are CSI300 ever-members
 
 
+def test_csi_drop_refuses_when_gate_enforced(tp, monkeypatch):
+    """§八-2: when universe reconciliation is ENFORCED (formal=True, i.e.
+    _gate_enforced(args)), csi* members missing daily K-line must refuse with
+    the missing list — the requested index is never silently shrunk to whatever
+    happens to be on disk."""
+    monkeypatch.setattr(
+        tp, "_load_index_universe",
+        lambda data_dir, idx_codes: ["000001", "600519", "300750", "600999"])
+    with pytest.raises(SystemExit) as ei:
+        tp._resolve_universe(ALL, "csi300", None, 42, "data", formal=True)
+    msg = str(ei.value)
+    assert "600999" in msg
+    assert "no daily K-line" in msg
+
+
+def test_csi_drop_warns_and_records_when_not_enforced(tp, monkeypatch, caplog):
+    """§八-2: when reconciliation is NOT enforced (formal=False, e.g.
+    --no-require-quality-gate), csi* members missing daily K-line degrade to a
+    prominent warning + a recorded drop in the description — the run proceeds
+    but the artifact still exposes the gap."""
+    import logging
+    monkeypatch.setattr(
+        tp, "_load_index_universe",
+        lambda data_dir, idx_codes: ["000001", "600519", "300750", "600999"])
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        r, desc = tp._resolve_universe(
+            ALL, "csi300", None, 42, "data", formal=False)
+    assert "600999" not in r
+    assert "dropped 3" in desc   # ALL only contains 000001 of the 4 mocked members
+    assert any("600999" in m for m in caplog.messages)
+    assert any("no daily K-line" in m for m in caplog.messages)
+
+
 # ── _save_artifacts ───────────────────────────────────────────────────
 
 def test_save_artifacts_writes_all_files(tp, tmp_path):
@@ -640,3 +673,67 @@ def test_allow_missing_does_not_escape_degraded_stocks(tp, tmp_path):
         tp._require_quality_gate(
             str(data_dir), str(prebuilt), str(report_path), allow_missing=True)
     assert "degraded stocks" in str(ei.value)
+
+
+# ── _exchange_group (§六 single market authority + BJ fallback) ───────
+
+def test_exchange_group_known_equity_prefixes(tp):
+    assert tp._exchange_group("600519") == "SH"
+    assert tp._exchange_group("000001") == "SZ"
+    assert tp._exchange_group("300750") == "SZ"
+    assert tp._exchange_group("830799") == "BJ"
+
+
+def test_exchange_group_unknown_prefix_falls_back_to_bj(tp):
+    """Anything market_of_code does not recognize (legacy 老三板 4/8 codes AND
+    non-equity/garbage prefixes) must bucket as BJ — never silently SH."""
+    assert tp._exchange_group("400001") == "BJ"   # legacy 老三板
+    assert tp._exchange_group("820001") == "BJ"
+    assert tp._exchange_group("123456") == "BJ"   # not a known equity prefix
+
+
+# ── _require_single_use_lockbox (§二十 default-off) ───────────────────
+
+def test_lockbox_default_off_never_touches_marker(tp, tmp_path):
+    """§二十: lockbox_months=0 (the new DEFAULT) must never write the marker
+    and must never refuse — even a formal run with a prior marker present."""
+    marker = str(tmp_path / "lockbox_used.json")
+    # Prior use exists; a default (0-month) run must ignore it and not raise.
+    tp._mark_lockbox_used(marker, {"universe": "prior"})
+    tp._require_single_use_lockbox(
+        0, formal=True, marker_path=marker,
+        info={"universe": "default", "lockbox_months": 0})
+    # The prior marker is untouched (still the prior run's record).
+    with open(marker, encoding="utf-8") as fh:
+        assert json.load(fh)["universe"] == "prior"
+
+
+def test_lockbox_default_off_no_marker_written_when_absent(tp, tmp_path):
+    marker = str(tmp_path / "lockbox_used.json")
+    tp._require_single_use_lockbox(
+        0, formal=True, marker_path=marker,
+        info={"universe": "default", "lockbox_months": 0})
+    assert not os.path.isfile(marker)
+
+
+def test_lockbox_exploratory_run_never_touches_marker(tp, tmp_path):
+    """§二十: non-formal (--no-require-quality-gate / --no-formal) runs never
+    touch the marker even when a lockbox is requested."""
+    marker = str(tmp_path / "lockbox_used.json")
+    tp._require_single_use_lockbox(
+        12, formal=False, marker_path=marker,
+        info={"universe": "explore", "lockbox_months": 12})
+    assert not os.path.isfile(marker)
+
+
+def test_lockbox_open_refuses_second_formal_use(tp, tmp_path):
+    """§二十: the lockbox is single-use — a formal run that opens it with a
+    prior marker present is refused (this is the behavior the default-off
+    change keeps opt-in)."""
+    marker = str(tmp_path / "lockbox_used.json")
+    tp._mark_lockbox_used(marker, {"universe": "final", "opened_at": "2026-08-05"})
+    with pytest.raises(SystemExit) as ei:
+        tp._require_single_use_lockbox(
+            12, formal=True, marker_path=marker,
+            info={"universe": "sneak", "lockbox_months": 12})
+    assert "单次开启" in str(ei.value) or "single" in str(ei.value).lower()

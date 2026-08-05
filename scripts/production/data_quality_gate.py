@@ -1178,18 +1178,21 @@ def _manifest_contract_full_scan(results, total_daily) -> bool:
     """True only when the manifest + contract_schema full-coverage floor is
     really met (v14 §八-1).
 
-    Both full-scan checks must have actually run, both must have passed, both
-    must have scanned every daily parquet, and neither may report an unreadable
-    file.  A run scoped to ``--check manifest`` (contract_schema never joined
-    ``results``) returns False — closing the old ``bool(full_audit) and
-    files_scanned == total`` bypass that ignored ``passed``/``unreadable_files``
-    and the absent partner check.
+    Both full-scan checks must have actually run, both must have passed, and both
+    must have scanned every daily parquet.  An unreadable file inside either
+    audit already flips that check's ``passed`` to False (§六-3: read errors
+    surface as a ``read_err`` issue), so there is no separate ``unreadable_files``
+    clause to enforce — the count is only populated by the dataset check, which
+    is not part of this pair.  A run scoped to ``--check manifest``
+    (contract_schema never joined ``results``) returns False — closing the old
+    ``bool(full_audit) and files_scanned == total`` bypass that ignored
+    ``passed`` and the absent partner check.
     """
     audit = {r.name: r for r in results if r.name in ("manifest", "contract_schema")}
     if set(audit) != {"manifest", "contract_schema"}:
         return False
     return all(
-        r.passed and r.files_scanned == total_daily and r.unreadable_files == 0
+        r.passed and r.files_scanned == total_daily
         for r in audit.values()
     )
 

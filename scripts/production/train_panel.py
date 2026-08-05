@@ -89,11 +89,13 @@ def _exchange_group(stock_code: str) -> str:
 
     market = market_of_code(stock_code)
     # The panel daily store only holds A-share common equity, so market is
-    # always SH/SZ/BJ; the fallback keeps a legacy 4/8-starting code (老三板)
-    # in the BJ bucket rather than KeyError-ing into by_group.
+    # always SH/SZ/BJ.  market_of_code returns None for anything that is not a
+    # known equity prefix (incl. legacy 老三板 4/8 codes and garbage input); the
+    # fallback keeps that in the BJ bucket rather than KeyError-ing into
+    # by_group or silently mis-bucketing it as SH.
     if market is not None:
         return market
-    return "BJ" if stock_code[:1] in ("4", "8") else "SH"
+    return "BJ"
 
 
 def _load_index_universe(data_dir: str, index_codes: set[str]) -> list[str]:
@@ -162,19 +164,47 @@ def _assess_universe_reconciliation(report: dict, allow_missing: bool) -> list[s
     return problems
 
 
+def _gate_enforced(args) -> bool:
+    """Quality-gate report required and verified for this run (§六-2 / §八-2).
+
+    ``--no-require-quality-gate`` (dev smoke) disables the whole gate.  A
+    gate-enforced run's report must carry the requested-universe reconciliation
+    (§八-2), so this predicate is also "universe reconciliation is enforced" —
+    the csi* member-drop refusal in :func:`_resolve_universe` keys on it, and
+    ``--allow-missing-universe`` only makes sense while the gate is enforced.
+    """
+    return not args.no_require_quality_gate
+
+
+def _formal_mode(args) -> bool:
+    """Formal (non-exploratory) methodology mode (§P0-7).
+
+    ``--no-formal`` marks an exploratory run that may degrade universe gates
+    when a required PIT artifact is missing instead of refusing to start.  The
+    single-use lockbox additionally requires the quality gate to be enforced,
+    so it combines ``_gate_enforced`` AND ``_formal_mode``.
+    """
+    return not args.no_formal
+
+
 def _require_quality_gate(
     data_dir: str,
     prebuilt_dir: str | None,
     report_path: str,
-    universe_name: str | None = None,
-    requested: bool = False,
     allow_missing: bool = False,
+    **deprecated,
 ) -> dict:
     """Verify a matching quality-gate report covers the data this run consumes.
 
     §六-2: training must not read data the gate has not validated, or that
     changed since the gate PASS.  A missing / stale / mismatched report exits
     the run; --no-require-quality-gate disables the whole gate (dev smoke).
+
+    ``universe_name`` / ``requested`` were historically accepted but never read
+    by the body (the reconciliation is validated from the report's own
+    ``universe_reconciliation`` section, not re-scoped by the caller), so they
+    are dropped.  A legacy caller still passing them is absorbed via
+    ``**deprecated`` so the shared baselines entry point keeps working.
 
     §八-2: EVERY enforced run consumes a DEFINED universe, so the gate report
     must carry a ``universe_reconciliation`` of the download Run Manifest's
@@ -187,6 +217,13 @@ def _require_quality_gate(
     present and passed) — the full-scan floor §八-2 wants, verified from the
     checks array rather than the boolean flag alone.
     """
+    if deprecated:
+        bad = sorted(k for k in deprecated if k not in ("universe_name", "requested"))
+        if bad:
+            raise TypeError(
+                f"_require_quality_gate got unexpected keyword arguments: {bad}"
+            )
+
     if not os.path.isfile(report_path):
         raise SystemExit(
             f"quality gate report not found at {report_path} — run "
@@ -349,11 +386,19 @@ def _resolve_universe(
       csi300/500/800 — index constituents (PIT union), --stocks caps count
 
     §八-2: index membership is never silently truncated by missing data.
-    csi* members with no daily K-line on disk are counted and surfaced — a
-    FORMAL run refuses to start (the dropped members are listed, so the gap is
-    visible instead of silently shrinking the index to what happened to be
-    downloaded); exploratory runs warn and record the drop count in the
-    description so the artifact still captures what was dropped.
+    csi* members with no daily K-line on disk are counted and surfaced.  When
+    universe reconciliation is ENFORCED (the quality gate is required — a run
+    whose gate report must reconcile the requested universe, §八-2) the run
+    refuses to start: the dropped members are listed, so the gap is visible
+    instead of silently shrinking the index to what happened to be downloaded.
+    When reconciliation is not enforced (exploratory / --no-formal / dev smoke
+    with --no-require-quality-gate), the run degrades to a prominent warning
+    and records the drop count in the description so the artifact still
+    captures what was dropped.
+
+    ``formal`` is the gate-enforcement predicate (:func:`_gate_enforced`), not
+    merely ``--no-formal`` — the refusal must key on whether the run is
+    actually required to reconcile the requested universe.
     """
     if limit is None:
         limit = len(all_stocks)
@@ -406,9 +451,11 @@ def _resolve_universe(
                 raise SystemExit(
                     f"universe={universe}: {len(dropped)} index members have no "
                     f"daily K-line on disk and would be silently dropped — "
-                    f"refusing to run a formal experiment on a silently-shrunk "
+                    f"refusing to run because universe reconciliation is "
+                    f"enforced: the run must NOT silently shrink the requested "
                     f"index (§八-2).  Missing: {listing}.  Download the missing "
-                    f"members or re-run with --no-formal to degrade explicitly."
+                    f"members or re-run with --no-require-quality-gate to "
+                    f"degrade explicitly and record the drop."
                 )
             logger.warning(
                 "universe=%s: dropped %d/%d index members with no daily K-line "
@@ -2228,11 +2275,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--max-folds", type=int, default=3,
                         help="Limit number of walk-forward folds (default: 3)")
-    parser.add_argument("--lockbox-months", type=int, default=12,
+    parser.add_argument("--lockbox-months", type=int, default=0,
                         help="Reserve the last N months as an untouched lockbox "
-                             "— no fold trains on or "
-                             "evaluates it; kept for a single final run once "
-                             "the design freezes (default: 12)")
+                             "— no fold trains on or evaluates it; kept for a "
+                             "single final run once the design freezes.  The "
+                             "lockbox is single-use: the first FORMAL run that "
+                             "opens it records the marker and a later formal run "
+                             "is refused.  Default 0 = lockbox OFF (opt in for "
+                             "the one final run with --lockbox-months 12).")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--horizon", type=int, default=5,
@@ -2329,13 +2379,12 @@ def main():
     cfg = load_config()
     data_dir = cfg.project.data_dir
 
-    if not args.no_require_quality_gate:
+    if _gate_enforced(args):
         _report_path = args.quality_gate_report or str(
             get_project_root() / "reports" / "data_quality_gate.json"
         )
         gate_report = _require_quality_gate(
             data_dir, args.prebuilt, _report_path,
-            universe_name=args.universe, requested=bool(args.stock_list),
             allow_missing=args.allow_missing_universe,
         )
         logger.info(
@@ -2368,7 +2417,7 @@ def main():
         all_stocks = _discover_stocks(data_dir, None)
         stock_list, universe_desc = _resolve_universe(
             all_stocks, args.universe, args.stocks, args.seed, data_dir,
-            formal=not args.no_formal,
+            formal=_gate_enforced(args),
         )
 
     if not stock_list:
@@ -2501,7 +2550,7 @@ def main():
     # calendar window (see _check_verified_until_scope).  Exploratory runs can
     # pass --no-require-quality-gate to opt out.
     refusal = _check_verified_until_scope(
-        global_dates, enforce=not args.no_require_quality_gate)
+        global_dates, enforce=_gate_enforced(args))
     if refusal:
         raise SystemExit(refusal)
 
@@ -2515,7 +2564,7 @@ def main():
     # formal-mode failure for missing artifacts is enforced separately (§P0-7).
     nd_mask, mem_mask, delist_global, universe_status = _fold_universe_gates(
         global_dates, panel_stocks, args.universe, data_dir,
-        formal=not args.no_formal,
+        formal=_formal_mode(args),
     )
     # §P0-6: content hashes of the exact universe records the gates consumed —
     # every fold tape embeds these so replay can prove it used the same
@@ -2628,33 +2677,37 @@ def main():
                 _fmt_date(global_dates, lockbox_start),
                 _fmt_date(global_dates, n_timesteps - 1))
 
-    # §二十: the lockbox is a SINGLE-USE resource.  A formal run that opens it
-    # must be the first; the marker is written here (as the lockbox is opened)
-    # so even an aborted first run consumes the single use, and a second formal
-    # run — into any outdir — is refused instead of re-opening the untouched
-    # period.  Exploratory runs (--no-require-quality-gate / --no-formal) and
-    # --lockbox-months 0 are never blocked.
+    # Resolve the outdir FIRST so the lockbox marker records the real output
+    # directory (not null) when a default outdir is used (§二十).  The marker is
+    # written here (as the lockbox is opened) so even an aborted first run
+    # consumes the single use; a second formal run — into any outdir — is
+    # refused instead of re-opening the untouched period.  The output directory
+    # itself is NOT created until after the lockbox contract passes, so a
+    # refused run leaves no empty experiment dir behind.
+    outdir = args.outdir or os.path.join(
+        "reports", "experiments", datetime.now().strftime("%Y%m%d_%H%M%S"),
+    )
+    # §二十: the lockbox is a SINGLE-USE resource.  Exploratory runs
+    # (--no-require-quality-gate / --no-formal) and --lockbox-months 0 are
+    # never blocked.
     _require_single_use_lockbox(
         args.lockbox_months,
-        formal=not args.no_require_quality_gate and not args.no_formal,
+        formal=_gate_enforced(args) and _formal_mode(args),
         info={
             "lockbox_months": args.lockbox_months,
             "universe": universe_desc,
             "lockbox_start": _fmt_date(global_dates, lockbox_start),
             "lockbox_end": _fmt_date(global_dates, n_timesteps - 1),
-            "outdir": args.outdir or None,
+            "outdir": outdir,
         },
     )
 
-    outdir = args.outdir or os.path.join(
-        "reports", "experiments", datetime.now().strftime("%Y%m%d_%H%M%S"),
-    )
     oos_dir = os.path.join(outdir, "oos_preds")
     os.makedirs(oos_dir, exist_ok=True)
     # §八-2: the --allow-missing-universe escape proceeded despite requested
     # stocks missing from disk — record the gap in the experiment artifacts so
     # the run's universe is never "silently whatever is on disk".
-    if args.allow_missing_universe and not args.no_require_quality_gate:
+    if args.allow_missing_universe and _gate_enforced(args):
         recon = (gate_report.get("universe_reconciliation") or {})
         missing = sorted(str(c) for c in (recon.get("missing_codes") or []))
         if missing:

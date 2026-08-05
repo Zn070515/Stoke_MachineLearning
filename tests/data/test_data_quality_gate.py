@@ -882,11 +882,15 @@ class TestUniverseReconciliation:
 
 class TestManifestContractFullScan:
     """v14 §八-1: ``manifest_contract_full_scan`` must be True only when BOTH
-    the manifest and contract_schema checks actually ran, both passed, both
-    scanned every daily file, and neither reported an unreadable file.  A run
-    scoped to ``--check manifest`` (contract_schema never joined results) must
-    NOT satisfy the floor — the old ``bool(full_audit)`` only needed one of the
-    two to exist."""
+    the manifest and contract_schema checks actually ran, both passed, and both
+    scanned every daily file.  A run scoped to ``--check manifest``
+    (contract_schema never joined results) must NOT satisfy the floor — the old
+    ``bool(full_audit)`` only needed one of the two to exist.
+
+    ``unreadable_files`` is deliberately NOT part of this pair's decision: the
+    count is only populated by the dataset check, not by manifest/contract_schema
+    — a read error in either audit already flips its ``passed`` to False, so an
+    explicit ``unreadable_files == 0`` clause would be dead."""
 
     @staticmethod
     def _audit(name, passed=True, scanned=None, unreadable=0, total=2):
@@ -944,10 +948,20 @@ class TestManifestContractFullScan:
         ]
         assert _manifest_contract_full_scan(results, total_daily=2) is False
 
-    def test_any_unreadable_is_false(self):
+    def test_unreadable_count_does_not_drive_decision(self):
+        """The unreadable_files count is only populated by the DATASET check,
+        which is not part of this pair — so it must not gate the floor.  A read
+        error inside manifest/contract_schema surfaces as passed=False instead,
+        which this pair DOES enforce (see test_either_check_failed_is_false)."""
         results = [
             self._audit("manifest", total=2),
             self._audit("contract_schema", unreadable=1, total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is True
+        # The same read error as a failed check still fails the floor.
+        results = [
+            self._audit("manifest", total=2),
+            self._audit("contract_schema", passed=False, unreadable=1, total=2),
         ]
         assert _manifest_contract_full_scan(results, total_daily=2) is False
 
