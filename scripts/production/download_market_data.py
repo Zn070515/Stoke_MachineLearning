@@ -132,7 +132,7 @@ def main():
                         actual_start=y_df["date"].min(), actual_end=y_df["date"].max(),
                         actual_rows=len(y_df),
                         n_stocks=y_df["stock_code"].nunique(),
-                        source=label, covers_request=True,
+                        source=label,
                     )
                     all_frames.append(y_df)
                     logger.info("  margin saved %d rows for year %d", len(y_df), year)

@@ -34,10 +34,13 @@ manifest raises instead of being read, so the manifest is a hard constraint,
 not a report.  ``load_daily`` keeps a lenient default for exploratory scripts.
 
 The parquet replace and the manifest write are two ``os.replace`` calls, not
-one atomic transaction.  A crash in between leaves a stale sidecar,
-but the manifest's rows/start/end/schema-hash cross-check detects that pair on
-the next validated read, and the lock + heartbeat keep a live
-writer's lock from being stolen.
+one atomic transaction.  A crash in between leaves a stale sidecar
+(``torn state`` — new parquet + old manifest or vice versa), but the manifest's
+rows/start/end/schema-hash cross-check detects that pair on the next validated
+read, and the lock + heartbeat keep a live writer's lock from being stolen.
+A generation-directory + current-pointer design that switches data + manifest
+as one unit would close the torn-state window entirely (v14 §十三-2); that is a
+P2 engineering refactor, deliberately not part of this change.
 """
 import datetime as dt
 import hashlib
@@ -469,6 +472,18 @@ class DataStorage:
                 else:
                     combined = save_df
                 combined = combined.sort_values("date").reset_index(drop=True)
+                # §十三-3 (v14): a same-date merge overwrite may have CORRECTED
+                # a close (t day), which leaves the adjacent row's pct_change
+                # still based on the pre-correction price.  Recompute the whole
+                # (per-stock) series in the qfq frame — cheap at one stock per
+                # file — so every stored return is consistent with the stored
+                # closes BEFORE the contract gate and manifest hash are
+                # computed.  Row 0 becomes NaN (the honest listing-day value),
+                # which the contract permits.
+                combined["pct_change"] = (
+                    pd.to_numeric(combined["close"], errors="coerce")
+                    .pct_change() * 100.0
+                )
                 # §八-1: the date check must cover the FULL combined span.  A
                 # set built only from the new batch's dates would flag every
                 # existing row that predates the batch as non_trading_day on
@@ -596,8 +611,17 @@ class DataStorage:
         result = pd.read_parquet(flat_path)
         result["date"] = pd.to_datetime(result["date"])
         if require_valid_manifest:
+            # §十三-1 (v14): pass the ALREADY-VALIDATED manifest and the
+            # official trading-day set into the contract, instead of depending
+            # on the parquet engine round-tripping ``df.attrs``.  Different
+            # parquet engines may persist attrs differently, so provenance is
+            # read from the manifest (source/adjust) and the date membership
+            # check runs against the official calendar — the same inputs the
+            # write path uses (:meth:`save_daily`).
             violations = validate_contract(
                 result, RESEARCH_QFQ_DAILY, code=stock_code, formal=True,
+                manifest=report["manifest"],
+                trading_days=self._official_trading_days(result["date"]),
             )
             if violations:
                 raise ValueError(
@@ -678,9 +702,14 @@ class DataStorage:
         if manifest is None:
             return {"exists": True, "ok": False,
                     "reason": "manifest missing — file exists ≠ data complete"}
+        # §二十一 (v14): only genuinely "unreadable file" conditions map to an
+        # unreadable report.  ``KeyError``/``OSError``/``ValueError`` cover
+        # pyarrow's common corruption surface (ArrowIOError ⊂ OSError,
+        # ArrowInvalid ⊂ ValueError); anything else is a programming error and
+        # must propagate loudly rather than masquerade as data corruption.
         try:
             df = pd.read_parquet(flat_path)
-        except Exception as exc:  # pragma: no cover - corruption shape varies
+        except (KeyError, OSError, ValueError) as exc:  # pragma: no cover - corruption shape varies
             return {"exists": True, "ok": False, "reason": f"unreadable: {exc}"}
         df["date"] = pd.to_datetime(df["date"])
         actual = {

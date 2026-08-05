@@ -14,10 +14,16 @@ The contracts harden the schemas from documentation into real constraints:
 * ``validate_ohlc`` — ``low <= open/close <= high`` on every bar.
 * ``validate_pct_change`` — ``pct_change`` must be finite except on the first
   (listing) row; a mid-series NaN means the returns column was repaired or
-  derived inconsistently.
-* ``validate_price_volume_amount_consistency`` — a weak economic check that
-  ``amount / volume`` (the day's VWAP) stays within a 100× band of ``close``,
-  catching a volume/amount unit corruption (手 vs 股, 千元 vs 元).
+  derived inconsistently.  In the qfq research frame it must also equal
+  ``100*(close[t]/close[t-1]-1)`` within tolerance, so a close correction that
+  left the adjacent return stale is caught (v14 §十二/§十三).
+* ``validate_price_volume_amount_consistency`` — a DIAGNOSTIC economic check
+  that ``amount / volume`` (the day's raw nominal VWAP) stays within a 100×
+  band of the QFQ ``close``, catching a volume/amount unit corruption (手 vs 股,
+  千元 vs 元).  The band is deliberately loose because raw-vs-qfq price scale
+  differs across history; it is not a proof of correct units.  Two
+  scale-independent pairings are hard rejections: ``volume==0 && amount>0`` and
+  ``volume>0 && amount==0`` (v14 §十二).
 * ``validate_source_metadata`` — a ``source`` column, when present, must be
   non-empty, and an ``adjustment_mode`` column must hold a legal value.
 * ``validate_required_metadata`` — contracts may declare ``required_metadata``
@@ -223,8 +229,17 @@ def validate_ohlc(df: pd.DataFrame, contract: DataContract) -> list[str]:
     return out
 
 
+# Tolerance (pp) for the §十二/§十三 arithmetic identity
+# ``pct_change == 100*(close[t]/close[t-1]-1)``.  The repo-wide data satisfies
+# the identity to ~1e-9; the tolerance absorbs source rounding without letting
+# a genuinely stale return (a close correction that did not re-derive the
+# adjacent pct_change) pass.
+PCT_CHANGE_TOLERANCE_PP = 0.5
+
+
 def validate_pct_change(df: pd.DataFrame, contract: DataContract) -> list[str]:
-    """``pct_change`` must be finite except on the first (listing) row.
+    """``pct_change`` must be finite except on the first (listing) row, and
+    (v14 §十二/§十三) must equal the qfq-close arithmetic return.
 
     A-share ``pct_change`` is undefined for the first trading day of a stock,
     so row 0 may be NaN; every later row must be finite.  A mid-series NaN
@@ -234,6 +249,14 @@ def validate_pct_change(df: pd.DataFrame, contract: DataContract) -> list[str]:
     ``validate_schema``; an all-NaN column is caught here by the tail check
     (every non-first row NaN), so ``pct_change`` needs no entry in
     ``required_finite_ratio`` (which would reject a legit 2-row listing file).
+
+    The arithmetic identity check only applies inside the qfq research frame
+    (the one contract that pins ``pct_change``): there ``close[t]/close[t-1]``
+    is the true adjusted return, so ``pct_change[t] == 100*(ratio - 1)`` must
+    hold within ``PCT_CHANGE_TOLERANCE_PP``.  A corrected close that left the
+    adjacent day's return based on the pre-correction price fails here instead
+    of reaching the canonical store.  The check is skipped when ``close`` is
+    absent or the neighbouring closes are non-finite (reported elsewhere).
     """
     if "pct_change" not in contract.required_columns:
         return []
@@ -246,22 +269,45 @@ def validate_pct_change(df: pd.DataFrame, contract: DataContract) -> list[str]:
     n_nan_after = int((~np.isfinite(values[1:])).sum())
     if n_nan_after:
         return [f"pct_change_nan_after_first_row:{n_nan_after}"]
-    return []
+    if "close" not in df.columns:
+        return []  # validate_schema reports the missing column
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype="float64")
+    prev, cur = close[:-1], close[1:]
+    valid = np.isfinite(prev) & np.isfinite(cur) & (prev != 0)
+    if not valid.any():
+        return []
+    expected = (cur[valid] / prev[valid] - 1.0) * 100.0
+    actual = values[1:][valid]
+    n_bad = int((np.abs(actual - expected) > PCT_CHANGE_TOLERANCE_PP).sum())
+    return [f"pct_change_inconsistent:{n_bad}"] if n_bad else []
 
 
 def validate_price_volume_amount_consistency(
     df: pd.DataFrame,
     contract: DataContract,
 ) -> list[str]:
-    """Weak economic check: ``amount / volume`` ≈ ``close`` within a 100× band.
+    """Diagnostic economic check: ``amount / volume`` ≈ ``close`` within a
+    100× band, plus hard zero/positive mutual exclusions (v14 §十二).
 
-    ``implied_price = amount / volume`` equals the day's VWAP, which must sit
-    in the same order of magnitude as ``close``.  A unit corruption (volume in
-    手 vs 股, amount in 千元 vs 元) or a mis-scaled amount pushes ``implied_price``
-    orders of magnitude away from ``close``.  The 100× band is deliberately
-    loose — this flags unit-level anomalies, not normal intraday noise — and
-    only rows where OHLC/volume/amount are all finite AND volume > 0 count
-    (a zero-volume suspension row carries no trade, so no VWAP).
+    ``implied_price = amount / volume`` is the day's VWAP in RAW (unadjusted)
+    nominal yuan/shares, while ``close`` is the QFQ (forward-adjusted) research
+    price.  These two are NOT guaranteed to share a price scale: a stock that
+    split or paid dividends since a historical bar has its qfq close scaled far
+    from the nominal price that day's amount/volume were recorded in.  The 100×
+    band is therefore deliberately loose and this check is DIAGNOSTIC — it
+    flags the classic unit corruptions (volume 手 vs 股, amount 千元 vs 元) but is
+    NOT a proof of correct units: a legitimately wide qfq-vs-raw scale gap can
+    fall inside the band while a modest unit error can hide outside it.
+
+    Two pairings are scale-independent and economically impossible, so they are
+    HARD rejections rather than diagnostics:
+      * ``volume == 0 and amount > 0``  — a zero-volume day has no trades, so it
+        cannot carry traded value (``amount_without_volume``).
+      * ``volume > 0 and amount == 0``  — a positive-volume day must have traded
+        value (``volume_without_amount``).
+    Rows where any of the six columns is non-finite are deferred to
+    ``validate_finite`` / ``validate_units`` (NaN, non-positive prices and
+    negative volume/amount are reported there, not here).
     """
     cols = ("open", "high", "low", "close", "volume", "amount")
     if not set(cols).issubset(contract.required_columns):
@@ -272,16 +318,28 @@ def validate_price_volume_amount_consistency(
         c: pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
         for c in cols
     }
-    ok = np.ones(len(df), dtype=bool)
+    out: list[str] = []
+    finite = np.ones(len(df), dtype=bool)
     for c in cols:
-        ok &= np.isfinite(num[c])
-    ok &= num["volume"] > 0
+        finite &= np.isfinite(num[c])
+    vol, amt = num["volume"], num["amount"]
+    n_vol_zero_amt_pos = int(((vol == 0) & (amt > 0) & finite).sum())
+    if n_vol_zero_amt_pos:
+        out.append(f"amount_without_volume:{n_vol_zero_amt_pos}")
+    n_vol_pos_amt_zero = int(((vol > 0) & (amt == 0) & finite).sum())
+    if n_vol_pos_amt_zero:
+        out.append(f"volume_without_amount:{n_vol_pos_amt_zero}")
+    # Band check on the rows that actually traded (volume > 0 and amount > 0);
+    # the zero/positive mismatches above are already reported.
+    ok = finite & (vol > 0) & (amt > 0)
     if not ok.any():
-        return []
-    implied = num["amount"][ok] / num["volume"][ok]
+        return out
+    implied = amt[ok] / vol[ok]
     close = num["close"][ok]
     n = int(((implied < close / 100.0) | (implied > close * 100.0)).sum())
-    return [f"amount_volume_unit_mismatch:{n}"] if n else []
+    if n:
+        out.append(f"amount_volume_unit_mismatch:{n}")
+    return out
 
 
 VALID_ADJUSTMENT_MODES = {"raw", "none", "qfq", "hfq", "n/a"}
