@@ -11,15 +11,19 @@ default (0 file / 0 row = FAIL), only --allow-empty permitting it; and quick
 sampling must be exchange-stratified, not biased toward low-code stocks.
 """
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import scripts.production.data_quality_gate as gate_mod
 from stoke_ml.data.storage import _provenance_from_attrs, _schema_hash
 from scripts.production.data_quality_gate import (
     CHECKS,
+    CheckResult,
+    _manifest_contract_full_scan,
     _read_requested_file,
     _sample_files,
     check_contract_schema,
@@ -34,6 +38,12 @@ from scripts.production.data_quality_gate import (
     dataset_fingerprint,
     reconcile_requested_universe,
 )
+
+
+def _run_gate(argv, monkeypatch):
+    """Invoke the gate's main() with a synthetic argv; returns its exit code."""
+    monkeypatch.setattr(sys, "argv", argv)
+    return gate_mod.main()
 
 
 def _daily(dates, closes, code="000001", stock_code=None, **extra):
@@ -868,3 +878,155 @@ class TestUniverseReconciliation:
         p.write_text('{"foo": 1}', encoding="utf-8")
         with pytest.raises(ValueError):
             _read_requested_file(str(p), require_manifest=True)
+
+
+class TestManifestContractFullScan:
+    """v14 §八-1: ``manifest_contract_full_scan`` must be True only when BOTH
+    the manifest and contract_schema checks actually ran, both passed, both
+    scanned every daily file, and neither reported an unreadable file.  A run
+    scoped to ``--check manifest`` (contract_schema never joined results) must
+    NOT satisfy the floor — the old ``bool(full_audit)`` only needed one of the
+    two to exist."""
+
+    @staticmethod
+    def _audit(name, passed=True, scanned=None, unreadable=0, total=2):
+        return CheckResult(
+            name=name,
+            passed=passed,
+            summary="",
+            files_scanned=total if scanned is None else scanned,
+            unreadable_files=unreadable,
+        )
+
+    def test_manifest_only_is_false(self):
+        """contract_schema absent -> the contract audit is unproven."""
+        results = [self._audit("manifest", total=2)]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+
+    def test_contract_only_is_false(self):
+        """manifest absent -> the range/completeness audit is unproven."""
+        results = [self._audit("contract_schema", total=2)]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+
+    def test_both_covering_all_files_is_true(self):
+        results = [
+            self._audit("manifest", total=2),
+            self._audit("contract_schema", total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is True
+
+    def test_extra_checks_do_not_break_a_full_audit(self):
+        """Unrelated checks may coexist; both audit checks still ran + covered."""
+        results = [
+            self._audit("manifest", total=2),
+            self._audit("contract_schema", total=2),
+            self._audit("datasets", total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is True
+
+    def test_either_check_failed_is_false(self):
+        results = [
+            self._audit("manifest", passed=False, total=2),
+            self._audit("contract_schema", total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+        # Other side failed too.
+        results = [
+            self._audit("manifest", total=2),
+            self._audit("contract_schema", passed=False, total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+
+    def test_any_files_scanned_below_total_is_false(self):
+        results = [
+            self._audit("manifest", scanned=1, total=2),
+            self._audit("contract_schema", total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+
+    def test_any_unreadable_is_false(self):
+        results = [
+            self._audit("manifest", total=2),
+            self._audit("contract_schema", unreadable=1, total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+
+    def test_missing_daily_files_yields_false(self):
+        """A check that scanned nothing cannot cover a non-empty pool."""
+        results = [
+            self._audit("manifest", scanned=0, total=2),
+            self._audit("contract_schema", total=2),
+        ]
+        assert _manifest_contract_full_scan(results, total_daily=2) is False
+
+
+class TestUniverseReconciliationFormalReport:
+    """§八-2: the FORMAL gate (main) must reflect a requested universe's missing
+    stocks as MISSING — never pretend "98% of what exists is valid" — and carry
+    the download run manifest's own completion status next to the on-disk
+    reconciliation.  A missing run manifest fails cleanly (not a traceback)."""
+
+    def _data_root(self, tmp_path):
+        root = tmp_path / "data"
+        daily_dir = root / "a_shares" / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        return root
+
+    @staticmethod
+    def _manifest(root, requested):
+        path = root / "a_shares" / "download_manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1.3", "market": "a_shares",
+            "start_date": "2020-01-02", "requested_end": "2026-07-31",
+            "status": "partial",
+            "requested": list(requested),
+            "failed": [], "missing": [], "complete": [],
+            "requested_count": len(requested),
+            "complete_count": 0, "failed_count": 0, "missing_count": 0,
+            "all_complete": False,
+        }), encoding="utf-8")
+        return path
+
+    def test_formal_report_reflects_missing_stocks(self, tmp_path, monkeypatch):
+        """A requested universe with a stock missing from disk must be reported
+        MISSING (exit 1) — the formal report never claims the on-disk pool is
+        the universe."""
+        root = self._data_root(tmp_path)
+        manifest = self._manifest(root, ["000001", "600519"])
+        rc = _run_gate([
+            "data_quality_gate.py",
+            "--data-dir", str(root),
+            "--check", "universe",
+            "--profile", "formal",
+            "--request-manifest", str(manifest),
+            "--output", str(tmp_path / "report"),
+        ], monkeypatch)
+        assert rc == 1
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is False
+        recon = report["universe_reconciliation"]
+        assert recon["ok"] is False
+        assert recon["requested_count"] == 2
+        assert recon["present_count"] == 1
+        assert recon["missing_codes"] == ["600519"]
+        # The run manifest's own status is recorded next to the on-disk truth.
+        assert recon["run_manifest"]["status"] == "partial"
+        assert recon["run_manifest"]["requested_count"] == 2
+
+    def test_missing_manifest_fails_cleanly_in_formal_mode(self, tmp_path, monkeypatch):
+        """§八-2: a missing --request-manifest FAILS the formal gate with a
+        clean non-zero exit — it never silently resolves to whatever is on
+        disk."""
+        root = self._data_root(tmp_path)
+        rc = _run_gate([
+            "data_quality_gate.py",
+            "--data-dir", str(root),
+            "--check", "universe",
+            "--profile", "formal",
+            "--request-manifest", str(root / "a_shares" / "download_manifest.json"),
+            "--output", str(tmp_path / "report"),
+        ], monkeypatch)
+        assert rc == 1

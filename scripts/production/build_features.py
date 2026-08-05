@@ -267,6 +267,12 @@ def main():
         "--quality-gate", action="store_true",
         help="Run data_quality_gate.py (quick) after the build; exit non-zero on failure",
     )
+    parser.add_argument(
+        "--no-quality-gate-manifest", action="store_true",
+        help="Do NOT forward the download run manifest to the quality gate "
+             "(skip requested-universe reconciliation; §八-2 formal mode wants "
+             "the run manifest by default)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -398,6 +404,14 @@ def main():
         feat = os.path.basename(os.path.normpath(output_dir))
         cmd = [sys.executable, gate, "--quick", "--profile", "formal",
                "--data-dir", data_dir, "--require", f"daily,{feat}"]
+        # §八-2: a formal build gate must reconcile the DOWNLOAD RUN MANIFEST's
+        # requested universe — "whatever is on disk" is not the research
+        # universe.  Forward the run manifest by default so a missing manifest
+        # FAILS the gate cleanly instead of silently resolving to the on-disk
+        # pool; --no-quality-gate-manifest opts out (dev/scratch builds).
+        from stoke_ml.data.download_manifest import default_path as manifest_default_path
+        if not args.no_quality_gate_manifest:
+            cmd += ["--request-manifest", manifest_default_path(data_dir)]
         env = dict(os.environ, PYTHONPATH=str(get_project_root()))
         logger.info("Running data quality gate (quick, formal profile) on %s...",
                     data_dir)

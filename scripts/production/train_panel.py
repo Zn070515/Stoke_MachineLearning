@@ -79,12 +79,21 @@ def _discover_stocks(data_dir: str, limit: int | None = None) -> list[str]:
 
 
 def _exchange_group(stock_code: str) -> str:
-    """Exchange bucket by code prefix: SH=6, SZ=0/3, BJ=4/8."""
-    if stock_code.startswith("6"):
-        return "SH"
-    if stock_code.startswith(("0", "3")):
-        return "SZ"
-    return "BJ"
+    """Exchange bucket via the single market authority (§六): SH/SZ/BJ.
+
+    The old ``6→SH; 0/3→SZ; else BJ`` heuristic already bucketed the real BSE
+    ranges (43/83/87/88/920) into BJ, but it re-derived the market locally.
+    Route through market_of_code so every caller shares one authority.
+    """
+    from stoke_ml.data.codes import market_of_code
+
+    market = market_of_code(stock_code)
+    # The panel daily store only holds A-share common equity, so market is
+    # always SH/SZ/BJ; the fallback keeps a legacy 4/8-starting code (老三板)
+    # in the BJ bucket rather than KeyError-ing into by_group.
+    if market is not None:
+        return market
+    return "BJ" if stock_code[:1] in ("4", "8") else "SH"
 
 
 def _load_index_universe(data_dir: str, index_codes: set[str]) -> list[str]:
@@ -104,16 +113,79 @@ def _load_index_universe(data_dir: str, index_codes: set[str]) -> list[str]:
     return sorted(members)
 
 
+def _assess_universe_reconciliation(report: dict, allow_missing: bool) -> list[str]:
+    """§八-2: validate the gate report's universe_reconciliation.
+
+    EVERY enforced run consumes a DEFINED universe, so the report must carry a
+    reconciliation of the download Run Manifest's requested universe — training
+    is never "whatever is on disk".  Requested stocks missing from disk are
+    refused unless ``allow_missing`` (the explicit --allow-missing-universe
+    escape); present-but-degraded stocks are NEVER escapable.  Returns the
+    problems (empty list = acceptable).
+    """
+    recon = report.get("universe_reconciliation")
+    if not isinstance(recon, dict):
+        return [
+            "universe reconciliation missing from gate report — run the gate "
+            "with the download run manifest (build_features.py --quality-gate "
+            "forwards it by default) so training can verify every requested "
+            "stock is present (§八-2)"
+        ]
+    missing_codes = recon.get("missing_codes") or []
+    missing_count = int(recon.get("missing_count") or len(missing_codes))
+    degraded_codes = recon.get("degraded_codes") or []
+    degraded_count = int(recon.get("degraded_count") or len(degraded_codes))
+    problems: list[str] = []
+    if missing_count and not allow_missing:
+        problems.append(
+            "gate universe reconciliation reports missing stocks: "
+            + ", ".join(sorted(str(c) for c in missing_codes))
+            + f" (requested={recon.get('requested_count')}, "
+            f"present={recon.get('present_count')}).  Re-download the missing "
+            f"members or pass --allow-missing-universe to proceed explicitly "
+            f"and record the gap (§八-2)."
+        )
+    if degraded_count:
+        problems.append(
+            "gate universe reconciliation reports degraded stocks: "
+            + ", ".join(
+                sorted(
+                    str(d.get("code"))
+                    for d in degraded_codes
+                    if isinstance(d, dict) and d.get("code")
+                )
+            )
+            + f" (requested={recon.get('requested_count')}, "
+            f"degraded={degraded_count}).  Present-but-degraded stocks are "
+            f"not covered by --allow-missing-universe (§八-2)."
+        )
+    return problems
+
+
 def _require_quality_gate(
     data_dir: str,
     prebuilt_dir: str | None,
     report_path: str,
+    universe_name: str | None = None,
+    requested: bool = False,
+    allow_missing: bool = False,
 ) -> dict:
     """Verify a matching quality-gate report covers the data this run consumes.
 
     §六-2: training must not read data the gate has not validated, or that
     changed since the gate PASS.  A missing / stale / mismatched report exits
     the run; --no-require-quality-gate disables the whole gate (dev smoke).
+
+    §八-2: EVERY enforced run consumes a DEFINED universe, so the gate report
+    must carry a ``universe_reconciliation`` of the download Run Manifest's
+    requested universe — training is never "whatever is on disk".  Requested
+    stocks missing from disk are refused outright unless ``allow_missing`` (the
+    explicit --allow-missing-universe escape) is passed; the escape still
+    surfaces the missing list so the caller records it.  Present-but-degraded
+    stocks are never escapable.  A ``scope=="full"`` report additionally must
+    have actually audited the ``manifest`` AND ``contract_schema`` checks (both
+    present and passed) — the full-scan floor §八-2 wants, verified from the
+    checks array rather than the boolean flag alone.
     """
     if not os.path.isfile(report_path):
         raise SystemExit(
@@ -124,8 +196,6 @@ def _require_quality_gate(
     with open(report_path, encoding="utf-8") as fh:
         report = json.load(fh)
     problems: list[str] = []
-    if not report.get("passed"):
-        problems.append("gate did not PASS")
     if report.get("quality_gate_version") != QUALITY_GATE_VERSION:
         problems.append(
             f"gate version {report.get('quality_gate_version')!r} "
@@ -176,6 +246,57 @@ def _require_quality_gate(
     live_hash = dataset_fingerprint(data_dir, sorted(gate_required))
     if report.get("data_manifest_hash") != live_hash:
         problems.append("dataset fingerprint changed since the gate PASS")
+    # §八-2: EVERY enforced run consumes a DEFINED universe — the gate report
+    # must reconcile the download Run Manifest's requested universe (missing
+    # stocks are refused outright unless --allow-missing-universe; degraded
+    # stocks are never escapable).
+    problems.extend(_assess_universe_reconciliation(report, allow_missing))
+    # §八-2: a FULL-scope report must have really audited the manifest +
+    # contract_schema checks — both present in the checks array and both passed.
+    # A full-scan report whose checks array lacks either (or ran neither) is a
+    # report that never saw whole files it could have refused on.
+    if report.get("scope") == "full":
+        checks = report.get("checks")
+        if not isinstance(checks, list):
+            problems.append(
+                "full-scope gate report lacks a checks array — cannot verify "
+                "the manifest/contract_schema audit floor (§八-2)"
+            )
+        else:
+            by_name = {c.get("name"): c for c in checks if isinstance(c, dict)}
+            for need in ("manifest", "contract_schema"):
+                entry = by_name.get(need)
+                if entry is None or not entry.get("passed"):
+                    problems.append(
+                        f"full-scope gate check '{need}' missing or not passed "
+                        f"— the manifest/contract_schema audit floor is not met "
+                        f"(§八-2)"
+                    )
+    # §八-2: --allow-missing-universe explicitly tolerates a gate report that
+    # FAILED purely on the universe reconciliation (requested stocks missing
+    # beyond tolerance).  Every OTHER check must still pass and nothing may be
+    # degraded — otherwise the report's failure is not the escapable gap, and
+    # the missing list must still be surfaced for the caller to record.
+    checks_arr = report.get("checks")
+    other_failed = (
+        [
+            c.get("name")
+            for c in checks_arr
+            if isinstance(c, dict) and c.get("name") != "universe" and not c.get("passed")
+        ]
+        if isinstance(checks_arr, list)
+        else ["<no checks array>"]
+    )
+    recon = report.get("universe_reconciliation")
+    universe_escape = (
+        allow_missing
+        and isinstance(recon, dict)
+        and int(recon.get("missing_count") or 0) > 0
+        and int(recon.get("degraded_count") or 0) == 0
+        and not other_failed
+    )
+    if not report.get("passed") and not universe_escape:
+        problems.append("gate did not PASS")
     if problems:
         raise SystemExit(
             "quality-gate report mismatch — refusing to train on unvalidated "
@@ -213,6 +334,7 @@ def _resolve_universe(
     limit: int | None,
     seed: int,
     data_dir: str,
+    formal: bool = False,
 ) -> tuple[list[str], str]:
     """Select the training universe by name.
 
@@ -225,6 +347,13 @@ def _resolve_universe(
       stratified — seeded sample targeting N, balanced across SH/SZ/BJ
       all        — every stock (ignores --stocks)
       csi300/500/800 — index constituents (PIT union), --stocks caps count
+
+    §八-2: index membership is never silently truncated by missing data.
+    csi* members with no daily K-line on disk are counted and surfaced — a
+    FORMAL run refuses to start (the dropped members are listed, so the gap is
+    visible instead of silently shrinking the index to what happened to be
+    downloaded); exploratory runs warn and record the drop count in the
+    description so the artifact still captures what was dropped.
     """
     if limit is None:
         limit = len(all_stocks)
@@ -263,13 +392,74 @@ def _resolve_universe(
         members = _load_index_universe(data_dir, idx_map[universe])
         if not members:
             return [], f"{universe}: no membership data"
-        # Keep only members we actually have daily K-line for — the membership
-        # file includes codes with no data (delisted / not downloaded).
+        # §八-2: keep only members we have daily K-line for, but NEVER silently.
+        # The membership file includes codes with no data (delisted / not
+        # downloaded); a formal run refuses so the index is not silently shrunk
+        # to whatever was downloaded, and exploratory runs record the drop so
+        # the artifact still exposes it.
         have = set(all_stocks)
+        dropped = sorted(c for c in members if c not in have)
         members = [c for c in members if c in have]
+        if dropped:
+            listing = ", ".join(dropped[:20]) + (" ..." if len(dropped) > 20 else "")
+            if formal:
+                raise SystemExit(
+                    f"universe={universe}: {len(dropped)} index members have no "
+                    f"daily K-line on disk and would be silently dropped — "
+                    f"refusing to run a formal experiment on a silently-shrunk "
+                    f"index (§八-2).  Missing: {listing}.  Download the missing "
+                    f"members or re-run with --no-formal to degrade explicitly."
+                )
+            logger.warning(
+                "universe=%s: dropped %d/%d index members with no daily K-line "
+                "on disk (recorded in description): %s",
+                universe, len(dropped), len(dropped) + len(members), listing,
+            )
         chosen = members[:limit] if limit else members
-        return chosen, f"{universe} {len(chosen)} (PIT union, cap={limit})"
+        note = f" (PIT union, cap={limit})"
+        if dropped and not formal:
+            note += f", dropped {len(dropped)} no-data members"
+        return chosen, f"{universe} {len(chosen)}{note}"
     raise ValueError(f"unknown --universe: {universe}")
+
+
+def _require_all_universe_prebuilt(universe: str, prebuilt: str | None) -> None:
+    """§七-P0: ``--universe all`` without ``--prebuilt`` is refused outright.
+
+    The full market cannot be feature-engineered in RAM (~225GB of feature
+    arrays on a ~96GB host); it must read prebuilt panel features
+    (build_features.py --panel-mode).  Extracted from main() so the refusal is
+    unit-testable.
+    """
+    if universe == "all" and not prebuilt:
+        raise SystemExit(
+            "--universe all requires --prebuilt: the full market cannot be "
+            "feature-engineered in memory (5530 stocks x the full feature grid "
+            "~= 225GB on a ~96GB host, §七-P0).  Run "
+            "scripts/production/build_features.py --panel-mode first, then "
+            "re-run with --prebuilt data/features_panel."
+        )
+
+
+def _warn_all_universe_memory(
+    n_stocks: int, n_timesteps: int, n_features: int, threshold_gb: float = 48.0,
+) -> None:
+    """§七-P0: warn when ``--universe all`` puts an impractical panel in RAM.
+
+    Estimate = n_stocks × n_timesteps × n_features × 4 bytes (float32), the
+    dominant resident memory of the loaded panel arrays.  Above the threshold
+    the run will very likely OOM the host, so warn prominently and let the user
+    re-scope instead of watching a swap-death mid-fold.
+    """
+    est_gb = int(n_stocks) * int(n_timesteps) * int(n_features) * 4 / (1024 ** 3)
+    if est_gb > threshold_gb:
+        logger.warning(
+            "universe=all: panel memory estimate %.1f GB (n_stocks=%d x "
+            "n_timesteps=%d x n_features=%d x 4B) exceeds %.0f GB — the feature "
+            "panel will very likely OOM this host (§七-P0).  Re-scope with a "
+            "smaller --stocks cap or load prebuilt features per-fold.",
+            est_gb, n_stocks, n_timesteps, n_features, threshold_gb,
+        )
 
 
 # Channel coverage manifest: every aux channel is loaded
@@ -882,6 +1072,39 @@ def _fmt_date(global_dates, idx):
     return str(np.datetime_as_string(global_dates[idx], unit="D"))
 
 
+def _file_sha256(path: str) -> str:
+    """Content SHA-256 of a file's bytes (full-length digest).
+
+    The baseline tapes' ``weight_hash`` is the SHA-256 of the retained .pkl
+    (train_baselines_panel._file_sha256); the replay re-derives it from the same
+    file to verify a tape's weight fingerprint (§十八-C1).
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _state_dict_hash(state_dict) -> str:
+    """Content hash of a state_dict's tensors (float32, CPU, sorted by name).
+
+    Independent of a live model instance — a persisted checkpoint's state_dict
+    (or a freshly-trained model's) hashes to the same value, so the offline
+    replay (§十八-C1) can re-derive the trained-parameter hash straight from a
+    saved ``fold_XXX_model.pt`` without rebuilding the architecture.
+    """
+    h = hashlib.sha1()
+    for name in sorted(state_dict.keys()):
+        h.update(name.encode("utf-8"))
+        h.update(b"=")
+        param = state_dict[name]
+        arr = param.detach().to("cpu", dtype=torch.float32).contiguous().view(-1)
+        h.update(arr.numpy().tobytes())
+        h.update(b";")
+    return h.hexdigest()[:16]
+
+
 def _weight_hash(model) -> str:
     """Content hash of a model's TRAINED parameters (float32, CPU).
 
@@ -890,14 +1113,7 @@ def _weight_hash(model) -> str:
     an OOS tape row / checkpoint can be tied to the exact weights that
     produced it, and two differently-trained folds get different digests.
     """
-    h = hashlib.sha1()
-    for name, param in sorted(model.state_dict().items()):
-        h.update(name.encode("utf-8"))
-        h.update(b"=")
-        arr = param.detach().to("cpu", dtype=torch.float32).contiguous().view(-1)
-        h.update(arr.numpy().tobytes())
-        h.update(b";")
-    return h.hexdigest()[:16]
+    return _state_dict_hash(model.state_dict())
 
 
 def _augment_sequence(
@@ -1151,6 +1367,76 @@ _EXPERIMENT_REGISTRY_PATH = str(
     get_project_root() / "reports" / "experiments" / "experiment_registry.json")
 
 
+# §二十: the lockbox is a SINGLE-USE resource — reserved for ONE final run once
+# the design freezes.  Opening it is recorded at a stable project-level marker,
+# and any subsequent FORMAL run that tries to open the lockbox again is refused
+# up front (a dev/exploratory run may pass --no-require-quality-gate or
+# --no-formal, or --lockbox-months 0, to proceed explicitly).  The marker lives
+# outside any single outdir so a second run into a NEW outdir is still caught.
+_LOCKBOX_MARKER_PATH = str(
+    get_project_root() / "reports" / "lockbox_used.json")
+
+
+def _read_lockbox_marker(path: str | None = None) -> dict | None:
+    """Prior lockbox-open record; None when never opened (or unreadable).
+
+    §二十: a corrupt/unreadable marker is treated as ABSENT (the run may
+    proceed and re-record its use) — refusing on a broken marker would brick
+    every future run with no recovery.
+    """
+    p = path or _LOCKBOX_MARKER_PATH
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — corrupt marker must not wedge the run
+        logger.warning("lockbox marker %s unreadable — treating as absent", p)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _mark_lockbox_used(path: str | None, info: dict) -> None:
+    """Persist that a formal run opened the lockbox (single-use gate §二十)."""
+    p = path or _LOCKBOX_MARKER_PATH
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2, ensure_ascii=False)
+
+
+def _require_single_use_lockbox(
+    lockbox_months: int,
+    *,
+    formal: bool,
+    marker_path: str | None = None,
+    info: dict | None = None,
+) -> None:
+    """§二十: enforce the single-open lockbox contract.
+
+    A FORMAL run that opens the lockbox (``lockbox_months > 0``) must be the
+    first — if a prior formal run already recorded its use, this run is refused
+    with the prior use's provenance.  The marker is written as the lockbox is
+    opened (before training), so even an aborted first run still consumes the
+    single use rather than allowing a silent re-open.  Non-formal runs and
+    ``--lockbox-months 0`` never touch the marker.
+    """
+    if lockbox_months <= 0 or not formal:
+        return
+    p = marker_path or _LOCKBOX_MARKER_PATH
+    prior = _read_lockbox_marker(p)
+    if prior is not None:
+        raise SystemExit(
+            "lockbox 只允许单次开启 — a previous formal run already opened the "
+            f"lockbox (recorded in {p}: opened_at={prior.get('opened_at', '?')}, "
+            f"universe={prior.get('universe', '?')}, lockbox="
+            f"{prior.get('lockbox_months')}).  The lockbox is reserved for a "
+            "single final run once the design freezes; to proceed explicitly "
+            "re-run with --lockbox-months 0 or delete the marker."
+        )
+    _mark_lockbox_used(p, dict(info or {}, opened_at=datetime.now().isoformat(
+        timespec="seconds")))
+
+
 # §十一.3 architecture-ablation switchboard.  Each entry maps a human name to
 # PanelConfig field overrides that switch OFF one component of the production
 # architecture, isolating where the model's edge comes from.  All default to
@@ -1198,7 +1484,10 @@ def _experiment_signature(version: dict, config: PanelConfig,
                           model_key: str | None = None,
                           *,
                           augmentation: bool | None = None,
-                          seq_features: bool | None = None) -> str:
+                          seq_features: bool | None = None,
+                          baseline_hyperparameter_hash: str | None = None,
+                          baseline_input_recipe_hash: str | None = None,
+                          training_sample_policy_hash: str | None = None) -> str:
     """Content signature of a research trial: the keys the DSR multiplicity must
     NOT conflate.  Two runs sharing a signature ARE the same experiment (a
     re-run); differing on any key is a NEW trial (§十二.6).  `model_key` lets a
@@ -1213,6 +1502,12 @@ def _experiment_signature(version: dict, config: PanelConfig,
     model_hash).  `augmentation`/`seq_features` are the caller's flags (the
     deep run's --augment, the baselines' --with-seq-features); each defaults to
     'none' so the signature stays meaningful for callers that lack the switch.
+
+    §十七: the baseline-run signature additionally binds the input-recipe, the
+    model hyperparameters and the training-sample policy — a baseline re-run
+    that flips --with-seq-features, changes a hyperparameter, or caps training
+    rows differently is a NEW trial.  Each defaults to 'none' so non-baseline
+    callers are unaffected.
     """
     h = hashlib.sha1()
     for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
@@ -1246,6 +1541,16 @@ def _experiment_signature(version: dict, config: PanelConfig,
              .encode("utf-8"))
     h.update(f"seq_features={seq_features if seq_features is not None else 'none'};"
              .encode("utf-8"))
+    # §十七: baseline identity levers — input recipe (with_seq + seq_len +
+    # construction version), model hyperparameters, and the training-sample
+    # policy (max_train_rows / sampling strategy) are all part of what a
+    # baseline trial IS; changing any of them is a new experiment.
+    h.update(f"baseline_hyperparameter_hash="
+             f"{baseline_hyperparameter_hash or 'none'};".encode("utf-8"))
+    h.update(f"baseline_input_recipe_hash="
+             f"{baseline_input_recipe_hash or 'none'};".encode("utf-8"))
+    h.update(f"training_sample_policy_hash="
+             f"{training_sample_policy_hash or 'none'};".encode("utf-8"))
     h.update(f"code_tree={version.get('git_commit') or 'unknown'};".encode("utf-8"))
     return h.hexdigest()[:16]
 
@@ -1440,6 +1745,69 @@ def _predict_outer(model, outer_data, config, device) -> np.ndarray | None:
     return preds.reshape(n_stocks, val_ds.n_windows).numpy()
 
 
+def _verify_tape_weight_hash(rec: dict, oos_dir: str,
+                             model_name: str | None) -> None:
+    """§十八-C1: tie a tape's recorded weight_hash to its retained checkpoint.
+
+    ``rec["path"]`` is the tape file (fold_NNN.npz for the deep model,
+    fold_NNN_<model>.npz for a baseline).  For the deep model the counterpart is
+    fold_NNN_model.pt: the recorded weight_hash is re-derived from the saved
+    state_dict (via ``_state_dict_hash``) and compared to the tape's value, and
+    the checkpoint's own stored weight_hash is checked too.  For a baseline the
+    counterpart is fold_NNN_<model>.pkl whose byte SHA-256 is the tape's
+    weight_hash (train_baselines_panel._file_sha256).  Any mismatch fails the
+    replay; a tape that predates weight_hash, or whose checkpoint is absent, is
+    flagged with a warning (legacy tolerance) rather than silently trusted.
+    """
+    wh = rec.get("weight_hash")
+    if wh is None:
+        return  # legacy tape predates the weight hash — tolerated
+    stem = os.path.basename(rec["path"])
+    m = re.match(r"fold_(\d+)", stem)
+    if not m:
+        return  # unexpected tape name — nothing to bind
+    fold_n = int(m.group(1))
+    if model_name is not None:
+        ckpt = os.path.join(oos_dir, f"fold_{fold_n:03d}_{model_name}.pkl")
+        if not os.path.isfile(ckpt):
+            logger.warning(
+                "§十八-C1: tape %s records weight_hash but its retained pickle "
+                "%s is absent — weight-verification skipped", rec["path"], ckpt)
+            return
+        got = _file_sha256(ckpt)
+        if got != wh:
+            raise ValueError(
+                "§十八-C1: fold tape weight_hash does not match its retained "
+                f"pickle ({ckpt}): tape={wh!r} file={got[:16]!r} — the tape "
+                "does not describe the fitted weights on disk")
+        return
+    ckpt = os.path.join(oos_dir, f"fold_{fold_n:03d}_model.pt")
+    if not os.path.isfile(ckpt):
+        logger.warning(
+            "§十八-C1: tape %s records weight_hash but its checkpoint %s is "
+            "absent — weight-verification skipped", rec["path"], ckpt)
+        return
+    try:
+        ckpt_obj = torch.load(ckpt, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            "§十八-C1: could not load checkpoint "
+            f"{ckpt} to verify tape weight_hash: {exc}") from exc
+    recorded = str(ckpt_obj.get("weight_hash", ""))
+    if recorded and recorded != wh:
+        raise ValueError(
+            "§十八-C1: fold tape weight_hash does not match its checkpoint's "
+            f"recorded weight_hash ({ckpt}): tape={wh!r} ckpt={recorded!r}")
+    sd = ckpt_obj.get("state_dict")
+    if sd is not None:
+        recomputed = _state_dict_hash(sd)
+        if recomputed != wh:
+            raise ValueError(
+                "§十八-C1: fold tape weight_hash does not match the state_dict "
+                f"of its checkpoint ({ckpt}): tape={wh!r} "
+                f"recomputed={recomputed!r}")
+
+
 def _replay_continuous_oos(
     oos_dir: str,
     n_trials: int | None = None,
@@ -1529,6 +1897,7 @@ def _replay_continuous_oos(
             return [x.decode() if isinstance(x, bytes) else str(x) for x in a]
 
         recs.append({
+            "path": p,
             "stocks": _strs(z["stocks"]),
             "dates": _strs(z["dates"]),
             "price_dates": _strs(z["price_dates"]),
@@ -1569,6 +1938,11 @@ def _replay_continuous_oos(
                                   if "model_config_hash" in z.files else None),
             "feature_schema_hash": (str(z["feature_schema_hash"])
                                     if "feature_schema_hash" in z.files else None),
+            # §十八-C1: the trained-parameter hash recorded on the tape — tied
+            # to the retained checkpoint (fold_NNN_model.pt / fold_NNN_<m>.pkl)
+            # below, so a tape's preds are verifiably the product of its weights.
+            "weight_hash": (str(z["weight_hash"])
+                            if "weight_hash" in z.files else None),
         })
     # fold index grows as val_start walks BACKWARD, so chronological order is
     # the reverse of the lexicographic tape order.
@@ -1633,9 +2007,11 @@ def _replay_continuous_oos(
     # two folds VSN+xLSTM, last three plain LSTM" switch (or a config / feature
     # schema edit between runs) is a model switch the continuous account must
     # never silently blend.  Architecture / config / schema hashes are required
-    # to be present AND equal in formal mode; `weight_hash` (the actual trained
-    # parameters) is deliberately allowed to differ per fold, so it is checked
-    # nowhere here.
+    # to be present AND equal in formal mode.  `weight_hash` (the actual trained
+    # parameters) is deliberately allowed to differ per fold — it is NOT checked
+    # for cross-fold equality; instead §十八-C1 ties EACH tape's weight_hash to
+    # the retained checkpoint that produced it, so a tape's preds are verifiably
+    # the product of its own weights.
     _consistent("model_source_hash", [r["model_source_hash"] for r in recs],
                 required=formal)
     _consistent("model_config_hash", [r["model_config_hash"] for r in recs],
@@ -1646,6 +2022,17 @@ def _replay_continuous_oos(
         raise ValueError(
             "formal continuous-OOS replay: tape missing required delist_day — "
             "refusing to blend a legacy tape (§十五-2)")
+
+    # §十八-C1: verify each tape's recorded weight_hash against the retained
+    # checkpoint.  The deep folds write weight_hash = _state_dict_hash(state_dict)
+    # into both fold_NNN.npz and fold_NNN_model.pt; a checkpoint regenerated with
+    # different weights, or a tape whose weight points at another checkpoint,
+    # fails the replay instead of blending preds of unverifiable provenance.
+    # Baseline tapes hash the retained .pkl bytes and are re-derived the same way.
+    # Tapes that predate weight_hash, or whose checkpoint is absent, are flagged
+    # (legacy tolerance) rather than silently trusted.
+    for _rec in recs:
+        _verify_tape_weight_hash(_rec, oos_dir, model_name)
 
     union_stocks: list[str] = []
     for r in recs:
@@ -1694,8 +2081,21 @@ def _replay_continuous_oos(
         close_glob[np.ix_(rows, pcols)] = r["close"]
         open_glob[np.ix_(rows, pcols)] = r["open"]
         # Signal columns sit at their true price positions; other columns keep
-        # NaN preds so no entry fires there.
+        # NaN preds so no entry fires there.  §十八-C2: a (stock, signal-day)
+        # cell must be owned by EXACTLY ONE fold — the folds' signal windows are
+        # strictly non-overlapping (step == val_len), so a second tape predicting
+        # the same cell is a data/overlap bug, not a case to silently overwrite.
         scols = np.array([pcol_of[d] for d in r["dates"]], dtype=int)
+        old_preds = preds_glob[np.ix_(rows, scols)]
+        new_preds = r["preds"]
+        both_preds = np.isfinite(old_preds) & np.isfinite(new_preds)
+        if np.any(both_preds):
+            ri, ci = np.nonzero(both_preds)
+            raise ValueError(
+                "§十八-C2: same stock + signal day predicted by two fold tapes "
+                f"— {r['stocks'][int(ri[0])]} on {r['dates'][int(ci[0])]}.  "
+                "Fold signal windows must be disjoint; an overlapping cell means "
+                "the folds' signal windows are not strictly non-overlapping.")
         preds_glob[np.ix_(rows, scols)] = r["preds"]
         pool_glob[np.ix_(rows, scols)] = r["pool"]
 
@@ -1904,6 +2304,12 @@ def main():
     parser.add_argument("--quality-gate-report", type=str, default=None,
                         help="Path to the quality-gate report to verify "
                              "(default: <repo>/reports/data_quality_gate.json)")
+    parser.add_argument("--allow-missing-universe", action="store_true",
+                        help="§八-2 escape hatch: proceed when the gate's "
+                             "universe reconciliation reports requested stocks "
+                             "missing from disk.  The missing list is still "
+                             "recorded (universe_missing.txt in the outdir) — "
+                             "the gap is surfaced, never silent.")
     parser.add_argument("--minute", action="store_true",
                         help="Use minute-frequency K-line data instead of daily")
     parser.add_argument("--minute-frequency", type=str, default="60",
@@ -1927,7 +2333,11 @@ def main():
         _report_path = args.quality_gate_report or str(
             get_project_root() / "reports" / "data_quality_gate.json"
         )
-        gate_report = _require_quality_gate(data_dir, args.prebuilt, _report_path)
+        gate_report = _require_quality_gate(
+            data_dir, args.prebuilt, _report_path,
+            universe_name=args.universe, requested=bool(args.stock_list),
+            allow_missing=args.allow_missing_universe,
+        )
         logger.info(
             "Quality-gate report verified: %s (scope=%s scanned=%s/%s "
             "manifest_contract_full_scan=%s)",
@@ -1937,6 +2347,13 @@ def main():
             gate_report.get("total_files"),
             gate_report.get("manifest_contract_full_scan"),
         )
+
+    # §七-P0: the full market cannot be feature-engineered in RAM.  `--universe
+    # all` must read prebuilt panel features (build_features.py --panel-mode)
+    # rather than live-engineering 5530 stocks (~225GB of feature arrays on a
+    # ~96GB host).  Without --prebuilt this is refused outright; with it the
+    # post-build memory estimate below still warns when the panel is too big.
+    _require_all_universe_prebuilt(args.universe, args.prebuilt)
 
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
@@ -1951,6 +2368,7 @@ def main():
         all_stocks = _discover_stocks(data_dir, None)
         stock_list, universe_desc = _resolve_universe(
             all_stocks, args.universe, args.stocks, args.seed, data_dir,
+            formal=not args.no_formal,
         )
 
     if not stock_list:
@@ -2121,6 +2539,15 @@ def main():
            f"PO={panel_data['past_observed'].shape[2]}"
     logger.info("Panel data: %d stocks × %d timesteps  dims: %s  horizon=%d",
                 n_stocks, n_timesteps, dims, args.horizon)
+    # §七-P0: --universe all already refused without --prebuilt; even with it, a
+    # full-market panel that won't fit in RAM is warned against before the fold
+    # loop (estimate = n_stocks × n_timesteps × n_features × 4B).
+    if args.universe == "all":
+        _warn_all_universe_memory(
+            n_stocks, n_timesteps,
+            static_dim + panel_data["past_known"].shape[2]
+            + panel_data["past_observed"].shape[2],
+        )
 
     config = PanelConfig(
         seq_len=seq_len,
@@ -2173,9 +2600,12 @@ def main():
     else:
         val_len = 126      # ~6 months daily
     # OOS folds are NON-OVERLAPPING — step == val_len, so
-    # adjacent folds evaluate disjoint test windows.  The old step < val_len
-    # made every fold share test days with its neighbours, inflating fold
-    # count and letting mean±std masquerade as independent dispersion.
+    # adjacent folds evaluate disjoint SIGNAL windows (strictly non-overlapping
+    # signal/entry days; a sleeve's exit may extend past a fold boundary, which
+    # is why the fold_note says "signal windows", never "return windows").  The
+    # old step < val_len made every fold share test days with its neighbours,
+    # inflating fold count and letting mean±std masquerade as independent
+    # dispersion.
     step = val_len
     purge = config.seq_len
     all_sharpes = []
@@ -2198,11 +2628,44 @@ def main():
                 _fmt_date(global_dates, lockbox_start),
                 _fmt_date(global_dates, n_timesteps - 1))
 
+    # §二十: the lockbox is a SINGLE-USE resource.  A formal run that opens it
+    # must be the first; the marker is written here (as the lockbox is opened)
+    # so even an aborted first run consumes the single use, and a second formal
+    # run — into any outdir — is refused instead of re-opening the untouched
+    # period.  Exploratory runs (--no-require-quality-gate / --no-formal) and
+    # --lockbox-months 0 are never blocked.
+    _require_single_use_lockbox(
+        args.lockbox_months,
+        formal=not args.no_require_quality_gate and not args.no_formal,
+        info={
+            "lockbox_months": args.lockbox_months,
+            "universe": universe_desc,
+            "lockbox_start": _fmt_date(global_dates, lockbox_start),
+            "lockbox_end": _fmt_date(global_dates, n_timesteps - 1),
+            "outdir": args.outdir or None,
+        },
+    )
+
     outdir = args.outdir or os.path.join(
         "reports", "experiments", datetime.now().strftime("%Y%m%d_%H%M%S"),
     )
     oos_dir = os.path.join(outdir, "oos_preds")
     os.makedirs(oos_dir, exist_ok=True)
+    # §八-2: the --allow-missing-universe escape proceeded despite requested
+    # stocks missing from disk — record the gap in the experiment artifacts so
+    # the run's universe is never "silently whatever is on disk".
+    if args.allow_missing_universe and not args.no_require_quality_gate:
+        recon = (gate_report.get("universe_reconciliation") or {})
+        missing = sorted(str(c) for c in (recon.get("missing_codes") or []))
+        if missing:
+            missing_path = os.path.join(outdir, "universe_missing.txt")
+            with open(missing_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(missing) + "\n")
+            logger.warning(
+                "--allow-missing-universe: %d requested stocks missing from "
+                "disk, recorded in %s (§八-2)",
+                len(missing), missing_path,
+            )
     # §十五-1 / §十二.6: this run is one more DISTINCT experiment in the
     # project-wide registry — the DSR deflation N counts distinct experiments
     # iterated so far, not runs and not the strategies inside one report.  A
@@ -2800,12 +3263,15 @@ def main():
             "universe_status_hash": universe_hashes["universe_status_hash"],
             "membership_hash": universe_hashes["membership_hash"],
             # Non-overlapping folds (step == val_len) — each
-            # fold's test days are disjoint, so mean±std is the dispersion of
-            # disjoint OOS return windows.
+            # fold's SIGNAL windows are strictly non-overlapping (the last
+            # batch's position exits may extend past a fold boundary), so
+            # mean±std is the dispersion of disjoint signal windows.
             "folds_overlap": False,
             "fold_note": (
-                "disjoint OOS return windows (step == val_len); per-fold metrics "
-                "come from separate trainings, not repeated experiments on one model"
+                "disjoint signal windows (step == val_len; strictly "
+                "non-overlapping signal/entry days — the last batch's exits may "
+                "extend past a fold boundary); per-fold metrics come from "
+                "separate trainings, not repeated experiments on one model"
             ),
             "lockbox": {
                 "months": args.lockbox_months,

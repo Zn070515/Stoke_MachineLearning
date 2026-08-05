@@ -27,7 +27,10 @@ Checks:
                      / --universe-codes), every requested code is checked for a
                      present parquet + valid manifest + not-degraded coverage,
                      and the gate fails on any missing/degraded stock beyond the
-                     tolerated ratios.  Never runs unless a universe is supplied.
+                     tolerated ratios.  A download run manifest source also
+                     enriches the report's universe_reconciliation with the
+                     run's own completion status (§八-2).  Never runs unless a
+                     universe is supplied.
 
 Any read error or missing column FAILS its check — a problem recorded in the
 report must also flip the gate.
@@ -914,6 +917,23 @@ def _requested_from_manifest(data: dict) -> dict:
         "codes": codes,
         "requested_start": data.get("start_date"),
         "requested_end": end,
+        # §八-2: carry the run-level download status so the gate report's
+        # universe_reconciliation exposes the run's OWN completion claim
+        # (status / counts / failed / missing / all_complete) next to the
+        # on-disk reconciliation.  Only a download run manifest source can
+        # enrich the report this way.
+        "run_manifest": {
+            "status": data.get("status"),
+            "requested_count": data.get("requested_count"),
+            "complete_count": data.get("complete_count"),
+            "failed_count": data.get("failed_count"),
+            "missing_count": data.get("missing_count"),
+            "all_complete": data.get("all_complete"),
+            "effective_end": data.get("effective_end"),
+            "latest_available_end": data.get("latest_available_end"),
+            "failed": data.get("failed") or [],
+            "missing": data.get("missing") or [],
+        },
     }
 
 
@@ -1113,6 +1133,14 @@ def check_universe(sample: int) -> CheckResult:
         max_missing_ratio=req.get("max_missing_ratio", 0.0),
         max_degraded_ratio=req.get("max_degraded_ratio", 0.0),
     )
+    # §八-2: a download run manifest source enriches the reconciliation with
+    # the run's OWN completion claim (status / counts / failed / missing) —
+    # the gate report then records BOTH what the run claimed and what actually
+    # landed on disk.  A plain code-list source has no run_manifest and the
+    # report shape stays unchanged.
+    rm = req.get("run_manifest")
+    if rm is not None:
+        report["run_manifest"] = rm
     res.details = report
     res.files_scanned = report["requested_count"]
     res.issues = [(c, "missing") for c in report["missing_codes"]]
@@ -1146,6 +1174,26 @@ RUN_CHECKS = dict(CHECKS)
 RUN_CHECKS["universe"] = check_universe
 
 
+def _manifest_contract_full_scan(results, total_daily) -> bool:
+    """True only when the manifest + contract_schema full-coverage floor is
+    really met (v14 §八-1).
+
+    Both full-scan checks must have actually run, both must have passed, both
+    must have scanned every daily parquet, and neither may report an unreadable
+    file.  A run scoped to ``--check manifest`` (contract_schema never joined
+    ``results``) returns False — closing the old ``bool(full_audit) and
+    files_scanned == total`` bypass that ignored ``passed``/``unreadable_files``
+    and the absent partner check.
+    """
+    audit = {r.name: r for r in results if r.name in ("manifest", "contract_schema")}
+    if set(audit) != {"manifest", "contract_schema"}:
+        return False
+    return all(
+        r.passed and r.files_scanned == total_daily and r.unreadable_files == 0
+        for r in audit.values()
+    )
+
+
 def _build_universe_request(args) -> dict | None:
     """Assemble the §P1-7 universe request from CLI args, or None if none given.
 
@@ -1158,18 +1206,21 @@ def _build_universe_request(args) -> dict | None:
     """
     codes: list[str] = []
     requested_start = requested_end = None
+    run_manifest: dict | None = None
     sources: list[str] = []
     if args.requested_universe:
         info = _read_requested_file(args.requested_universe)
         codes += info["codes"]
         requested_start = requested_start or info["requested_start"]
         requested_end = requested_end or info["requested_end"]
+        run_manifest = run_manifest or info.get("run_manifest")
         sources.append(args.requested_universe)
     if args.request_manifest:
         info = _read_requested_file(args.request_manifest, require_manifest=True)
         codes += info["codes"]
         requested_start = requested_start or info["requested_start"]
         requested_end = requested_end or info["requested_end"]
+        run_manifest = run_manifest or info.get("run_manifest")
         sources.append(args.request_manifest)
     if args.universe_codes:
         codes += [
@@ -1181,6 +1232,11 @@ def _build_universe_request(args) -> dict | None:
         return None
     seen: set[str] = set()
     uniq = [c for c in codes if not (c in seen or seen.add(c))]
+    if not uniq:
+        raise ValueError(
+            "requested universe resolved to no usable codes (empty / all "
+            "unusable entries)"
+        )
     return {
         "codes": uniq,
         "requested_start": requested_start,
@@ -1190,6 +1246,7 @@ def _build_universe_request(args) -> dict | None:
         "max_missing_ratio": args.max_universe_missing_ratio,
         "max_degraded_ratio": args.max_universe_degraded_ratio,
         "sources": sources,
+        "run_manifest": run_manifest,
     }
 
 
@@ -1296,10 +1353,17 @@ def main():
         DAILY_DIR = A_SHARES / "daily"
         FEAT_DIR = root / "features"
 
-    # §P1-7: build the optional requested-universe reconciliation.  The check
-    # only joins the run when a universe source is supplied (additive); without
-    # one, the run is identical to before.
-    _UNIVERSE_REQUEST = _build_universe_request(args)
+    # §P1-7/§八-2: build the optional requested-universe reconciliation.  The
+    # check only joins the run when a universe source is supplied (additive);
+    # without one, the run is identical to before.  A missing --request-manifest
+    # (or one that resolves to no usable codes) FAILS cleanly instead of
+    # tracebacking — §八-2 formal mode refuses to silently resolve to whatever
+    # happens to be on disk.
+    try:
+        _UNIVERSE_REQUEST = _build_universe_request(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"requested-universe ERROR: {exc}", file=sys.stderr)
+        return 1
 
     names = (args.check.split(",") if args.check else list(CHECKS))
     if _UNIVERSE_REQUEST is not None and "universe" not in names:
@@ -1331,10 +1395,11 @@ def main():
     # manifest/contract + sampled deep feature audit" floor.  A consumer reads
     # manifest_contract_full_scan to prove that half before trusting a sample.
     total_daily = len(glob.glob(str(DAILY_DIR / "*.parquet")))
-    full_audit = [r for r in results if r.name in ("manifest", "contract_schema")]
-    manifest_contract_full_scan = bool(full_audit) and all(
-        r.files_scanned == total_daily for r in full_audit
-    )
+    # v14 §八-1: manifest_contract_full_scan is true only when BOTH the manifest
+    # and contract_schema checks actually ran, both passed, both covered every
+    # daily file and neither reported an unreadable file.  A `--check manifest`
+    #-only run leaves contract_schema unproven and must NOT satisfy the floor.
+    manifest_contract_full_scan = _manifest_contract_full_scan(results, total_daily)
     # §六-2: a consuming run (train_panel) must be able to verify this report
     # really covers the data it reads — gate version, data root, calendar +
     # contract fingerprints, the required-dataset list and the run-level

@@ -454,15 +454,33 @@ def test_signature_changes_with_research_choices(tp):
             != base_sig)
 
 
-# ── _require_quality_gate (§九.1 custom-prebuilt binding) ─────────────
+# ── _require_quality_gate (§九.1 custom-prebuilt binding / §八-2 universe) ──
+
+_VALID_RECON = {
+    "ok": True, "requested_count": 2, "present_count": 2,
+    "missing_count": 0, "degraded_count": 0,
+    "missing_codes": [], "degraded_codes": [],
+}
+
 
 def _gate_report(tp, data_dir, required, dataset_paths=None, passed=True,
                  scope="full", manifest_contract_full_scan=True,
-                 fingerprint=None):
+                 fingerprint=None, universe_reconciliation=_VALID_RECON,
+                 checks=None):
     """Build a report that would PASS every §六-2 check except the ones the
-    caller intentionally varies, so a test isolates the §九.1 behavior."""
+    caller intentionally varies, so a test isolates the §九.1/§八-2 behavior.
+
+    Defaults to a full-scope PASS: a checks array with ``manifest`` and
+    ``contract_schema`` both passed (the §八-2 full-scope floor), and a valid
+    ``universe_reconciliation`` — §八-2 requires reconciliation for EVERY
+    enforced run, so the happy path carries one."""
     d = os.path.realpath(str(data_dir))
     req = sorted(required)
+    if checks is None:
+        checks = [
+            {"name": "manifest", "passed": True},
+            {"name": "contract_schema", "passed": True},
+        ]
     return {
         "passed": passed,
         "quality_gate_version": tp.QUALITY_GATE_VERSION,
@@ -474,6 +492,8 @@ def _gate_report(tp, data_dir, required, dataset_paths=None, passed=True,
         "scope": scope,
         "manifest_contract_full_scan": manifest_contract_full_scan,
         "data_manifest_hash": fingerprint or tp.dataset_fingerprint(d, req),
+        "checks": checks,
+        "universe_reconciliation": universe_reconciliation,
     }
 
 
@@ -521,3 +541,102 @@ def test_require_quality_gate_refuses_path_mismatch(tp, tmp_path):
     report_path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(SystemExit):
         tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+
+
+# ── §八-2: requested-universe reconciliation is REQUIRED ──────────────
+
+def _recon_with_missing(*missing, requested=3, present=1, degraded=()):
+    return {
+        "ok": not missing and not degraded,
+        "requested_count": requested, "present_count": present,
+        "missing_count": len(missing), "degraded_count": len(degraded),
+        "missing_codes": list(missing), "degraded_codes": list(degraded),
+    }
+
+
+def _universe_report(tp, tmp_path, *, recon, checks):
+    """A full-scope report whose ONLY problem is the universe reconciliation."""
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel"
+    report_path = tmp_path / "gate.json"
+    report = _gate_report(
+        tp, data_dir, ["daily", "features_panel"],
+        universe_reconciliation=recon,
+        passed=all(c["passed"] for c in checks),
+        checks=checks,
+        dataset_paths={
+            "daily": str((data_dir / "a_shares" / "daily").resolve()),
+            "features_panel": str(prebuilt.resolve()),
+        },
+    )
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return data_dir, prebuilt, report_path
+
+
+def test_require_quality_gate_refuses_report_without_reconciliation(tp, tmp_path):
+    """§八-2: EVERY enforced run (not just csi*/requested) requires the gate
+    report to carry a universe_reconciliation — a report that never accounted
+    for the requested universe cannot vouch for training on it."""
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel"
+    report_path = tmp_path / "gate.json"
+    report = _gate_report(tp, data_dir, ["daily", "features_panel"],
+                          universe_reconciliation=None,
+                          dataset_paths={
+                              "daily": str((data_dir / "a_shares" / "daily").resolve()),
+                              "features_panel": str(prebuilt.resolve()),
+                          })
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+    assert "universe reconciliation missing" in str(ei.value)
+
+
+def test_require_quality_gate_refuses_missing_stocks_lists_codes(tp, tmp_path):
+    """§八-2: missing requested stocks are refused, and the missing codes are
+    listed explicitly (never silently dropped)."""
+    recon = _recon_with_missing("300750", "600519")
+    checks = [
+        {"name": "manifest", "passed": True},
+        {"name": "contract_schema", "passed": True},
+        {"name": "universe", "passed": False},
+    ]
+    data_dir, prebuilt, report_path = _universe_report(tp, tmp_path, recon=recon, checks=checks)
+    with pytest.raises(SystemExit) as ei:
+        tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+    msg = str(ei.value)
+    assert "300750" in msg and "600519" in msg
+    assert "missing stocks" in msg
+
+
+def test_allow_missing_universe_escape_proceeds_and_surfaces_missing(tp, tmp_path):
+    """§八-2: --allow-missing-universe is the explicit escape — a report that
+    FAILED purely on the universe check (missing stocks, nothing degraded) is
+    accepted, and the missing list is surfaced for the caller to record."""
+    recon = _recon_with_missing("300750", "600519")
+    checks = [
+        {"name": "manifest", "passed": True},
+        {"name": "contract_schema", "passed": True},
+        {"name": "universe", "passed": False},
+    ]
+    data_dir, prebuilt, report_path = _universe_report(tp, tmp_path, recon=recon, checks=checks)
+    out = tp._require_quality_gate(
+        str(data_dir), str(prebuilt), str(report_path), allow_missing=True)
+    assert out["passed"] is False            # the report stays honest
+    assert out["universe_reconciliation"]["missing_codes"] == ["300750", "600519"]
+
+
+def test_allow_missing_does_not_escape_degraded_stocks(tp, tmp_path):
+    """§八-2: the escape is scoped to MISSING stocks — a report that also flags
+    present-but-degraded stocks is still refused (degraded is never escapable)."""
+    recon = _recon_with_missing("600519", degraded=[{"code": "000002", "reason": "manifest_invalid"}])
+    checks = [
+        {"name": "manifest", "passed": True},
+        {"name": "contract_schema", "passed": True},
+        {"name": "universe", "passed": False},
+    ]
+    data_dir, prebuilt, report_path = _universe_report(tp, tmp_path, recon=recon, checks=checks)
+    with pytest.raises(SystemExit) as ei:
+        tp._require_quality_gate(
+            str(data_dir), str(prebuilt), str(report_path), allow_missing=True)
+    assert "degraded stocks" in str(ei.value)
