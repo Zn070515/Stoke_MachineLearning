@@ -107,7 +107,7 @@ def read_generation(data_dir: str, rel: str) -> pd.DataFrame | None:
     if not (
         gen_name.startswith("gen_")
         and len(gen_name) == 12
-        and gen_name[5:].isdigit()
+        and gen_name[4:].isdigit()
     ):
         raise GenerationStoreError(
             f"CURRENT does not name a valid generation (expected gen_XXXXXXXX): "

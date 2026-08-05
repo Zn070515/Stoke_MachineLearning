@@ -117,6 +117,18 @@ def test_torn_invalid_current_raises(tmp_path):
         read_generation(data_dir, REL)
 
 
+def test_torn_current_non_digit_suffix_raises(tmp_path):
+    """Regression: 'gen_' is 4 chars, so the 8-digit suffix must start at index
+    4 — a non-digit at index 4 (e.g. 'gen_a00000001') must be rejected as an
+    invalid name, not slip through to the missing-dir check."""
+    data_dir = str(tmp_path)
+    os.makedirs(_gen_root(data_dir), exist_ok=True)
+    with open(os.path.join(_gen_root(data_dir), "CURRENT"), "w", encoding="utf-8") as f:
+        f.write("gen_a00000001")
+    with pytest.raises(GenerationStoreError):
+        read_generation(data_dir, REL)
+
+
 def test_torn_current_missing_gen_dir_raises(tmp_path):
     data_dir = str(tmp_path)
     os.makedirs(_gen_root(data_dir), exist_ok=True)
