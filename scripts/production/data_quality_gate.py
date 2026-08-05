@@ -76,6 +76,7 @@ from stoke_ml.data.calendar import (
     most_recent_completed_trading_day,
 )
 from stoke_ml.data.codes import normalize_stock_code
+from stoke_ml.data.channel_vintage import CHANNEL_VINTAGE
 from stoke_ml.data.contract import get_contract, validate_contract
 from stoke_ml.data.download_manifest import load_manifest
 from stoke_ml.config import get_project_root
@@ -1569,6 +1570,14 @@ def main():
     universe_res = next((r for r in results if r.name == "universe"), None)
     if universe_res is not None and universe_res.details is not None:
         report["universe_reconciliation"] = universe_res.details
+    # §十五: informational channel→vintage declaration.  Which channels are truly
+    # vintage-safe and which are only "latest-revised history aligned to their
+    # publication date" is REPORTED here, never silently hidden — the audit's
+    # minimum.  Informational only: it must NOT influence `passed` above.
+    report["channel_vintage"] = [
+        {"channel": e.channel, "status": e.status, "rationale": e.rationale}
+        for e in CHANNEL_VINTAGE
+    ]
     out_path = os.path.join(args.output, "data_quality_gate.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)

@@ -1053,6 +1053,42 @@ class TestUniverseReconciliationFormalReport:
         assert rc == 1
 
 
+class TestChannelVintageFormalReport:
+    """v14 §十五: the FORMAL report must surface the channel→vintage declaration
+    as an informational section — present in every run regardless of profile,
+    each entry carrying exactly channel/status/rationale — and lock the
+    documented revision-leakage sources (fundamental, macro) as
+    latest_revised_aligned."""
+
+    def test_report_carries_channel_vintage_declaration(self, tmp_path, monkeypatch):
+        root = tmp_path / "data"
+        daily_dir = root / "a_shares" / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        rc = _run_gate([
+            "data_quality_gate.py",
+            "--data-dir", str(root),
+            "--check", "datasets",
+            "--min-span-days", "0",
+            "--max-stale-days", "10000",
+            "--output", str(tmp_path / "report"),
+        ], monkeypatch)
+        # The report is written regardless of `passed`; span/freshness are
+        # relaxed so the run is deterministic, but we do not depend on rc.
+        assert rc in (0, 1)
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        section = report["channel_vintage"]
+        assert isinstance(section, list) and len(section) > 0
+        for entry in section:
+            assert set(entry) == {"channel", "status", "rationale"}
+            assert entry["status"] in {"vintage_safe", "latest_revised_aligned"}
+        by_name = {e["channel"]: e for e in section}
+        assert by_name["fundamental"]["status"] == "latest_revised_aligned"
+        assert by_name["macro"]["status"] == "latest_revised_aligned"
+
+
 class TestCalendarArtifactAndFreshness:
     """v14 §九: the gate must (1) load the frozen calendar artifact for the
     data-dir being validated — never a module-import singleton, (2) record the
