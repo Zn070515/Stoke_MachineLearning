@@ -60,7 +60,6 @@ SNAPSHOT_FILES = {
 # values, so they are covered by the fold-level universe/membership hash
 # (train_panel FoldResearchContext), not the per-stock feature manifest.
 SHARED_FILES = {
-    "macro": ("a_shares", "macro", "macro_daily.parquet"),
     # P1-10: the market-env lineage path must match where the channel is actually
     # READ/WRITTEN — aux_aligner._merge_market_env reads
     # a_shares/market_breadth/market_env_daily.parquet (written by
@@ -74,8 +73,12 @@ SHARED_FILES = {
 }
 
 # Shared DIRECTORY inputs — hashed as a whole (any file change invalidates).
+# macro lives under a generation root (a_shares/macro/macro_daily_gen/) since
+# §十三-2 — the legacy flat file froze, so fingerprinting the directory (not the
+# flat file) is what keeps a macro update from silently reusing a stale cache.
 SHARED_DIRS = {
     "etf_flow": ("a_shares", "etf_flow"),
+    "macro": ("a_shares", "macro", "macro_daily_gen"),
 }
 
 _SHARED_NAMES = frozenset((*SHARED_FILES, *SHARED_DIRS))

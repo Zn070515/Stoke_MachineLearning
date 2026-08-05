@@ -5,14 +5,14 @@ Usage:
 """
 import argparse
 import logging
-import os
-import sys
+from datetime import datetime
 
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.sources.a_shares.macro_source import MacroSource
 from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.generation_store import write_generation
+from stoke_ml.data.sources.a_shares.macro_source import MacroSource
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -24,23 +24,29 @@ def main():
     parser = argparse.ArgumentParser(description="Download macro-economic indicators")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to config YAML (default: auto)")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output path (default: data/a_shares/macro/macro_daily.parquet)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     data_dir = cfg.project.data_dir
-
-    output_path = args.output or os.path.join(data_dir, "a_shares", "macro", "macro_daily.parquet")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     logger.info("Fetching macro indicators...")
     try:
         ms = MacroSource()
         df = ms.fetch_all()
 
-        logger.info("Saving %d rows × %d columns to %s", len(df), len(df.columns), output_path)
-        df.to_parquet(output_path)
+        gen_name = write_generation(
+            data_dir, "a_shares/macro/macro_daily", df,
+            manifest={
+                "dataset": "macro_daily",
+                "rows": len(df),
+                "columns": list(df.columns),
+                "date_min": str(df.index.min().date()),
+                "date_max": str(df.index.max().date()),
+                "source": "akshare",
+                "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            },
+        )
+        logger.info("Wrote macro generation %s", gen_name)
 
         done = {"macro_daily"}
         failed: list[str] = []

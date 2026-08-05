@@ -11,6 +11,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from stoke_ml.data.generation_store import write_generation
 from stoke_ml.features import cache_manifest
 
 
@@ -29,6 +30,17 @@ def _make_data_dir(tmp_path, code="000001"):
     daily = os.path.join(data_dir, "a_shares", "daily", f"{code}.parquet")
     _write_parquet(daily)
     return data_dir
+
+
+def _write_macro_gen(data_dir, rows=10):
+    """Write a valid macro generation (§十三-2): the shared macro input is the
+    generation root dir, not a single flat parquet anymore."""
+    idx = pd.date_range("2024-01-01", periods=rows)
+    df = pd.DataFrame({"date": idx, "value": [float(i) for i in range(rows)]}).set_index("date")
+    write_generation(
+        data_dir, "a_shares/macro/macro_daily", df,
+        {"dataset": "macro_daily", "rows": len(df), "columns": list(df.columns)},
+    )
 
 
 def _base_config(**over):
@@ -284,8 +296,7 @@ class TestManifest:
         # Changing any shared input's content flips the aggregate.  Shared
         # fingerprints are memoized per path (shared data is frozen during a
         # build), so the test clears the memo to simulate a fresh build.
-        macro = os.path.join(data_dir, "a_shares", "macro", "macro_daily.parquet")
-        _write_parquet(macro)
+        _write_macro_gen(data_dir)
         cache_manifest._shared_fingerprint.cache_clear()
         assert cache_manifest.shared_inputs_hash(data_dir) != payload["shared_inputs_hash"]
 
@@ -398,9 +409,10 @@ class TestPaths:
         assert paths["earnings_forecasts"] == os.path.join(
             str(tmp_path), "a_shares", "earnings", "forecasts.parquet"
         )
-        # Shared market-wide inputs are also exposed (same for every code).
+        # Shared market-wide inputs are also exposed (same for every code);
+        # macro is the generation root dir since §十三-2.
         assert paths["macro"] == os.path.join(
-            str(tmp_path), "a_shares", "macro", "macro_daily.parquet"
+            str(tmp_path), "a_shares", "macro", "macro_daily_gen"
         )
         assert paths["calendar"] == os.path.join(
             str(tmp_path), "exchange_calendar", "a_shares.parquet"
@@ -475,8 +487,7 @@ class TestManifestDetailed:
 
     def test_shared_input_change_reports_shared_input_changed(self, tmp_path):
         data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
-        macro = os.path.join(data_dir, "a_shares", "macro", "macro_daily.parquet")
-        _write_parquet(macro)
+        _write_macro_gen(data_dir)
         cache_manifest._shared_fingerprint.cache_clear()
         # Manifest recorded macro as None (absent); now it exists → mismatch.
         ok, reasons = cache_manifest.manifest_matches_detailed(
@@ -535,7 +546,7 @@ class TestSharedInputs:
 
     def test_manifest_records_shared_inputs(self, tmp_path):
         data_dir = _make_data_dir(tmp_path, "000001")
-        self._write_shared(data_dir, ("a_shares", "macro", "macro_daily.parquet"))
+        _write_macro_gen(data_dir)
         self._write_shared(data_dir, ("exchange_calendar", "a_shares.parquet"))
         feature = os.path.join(str(tmp_path / "out"), "000001.parquet")
         _write_parquet(feature, cols=("date", "f1"))
@@ -560,17 +571,18 @@ class TestSharedInputs:
 
     def test_shared_input_change_invalidates(self, tmp_path):
         data_dir, feature, mpath, cfg = self._built(tmp_path)
-        self._write_shared(data_dir, ("a_shares", "macro", "macro_daily.parquet"))
+        _write_macro_gen(data_dir)
         cache_manifest._shared_fingerprint.cache_clear()
         cfg_hash = cache_manifest.config_hash(cfg)
-        # Rebuild manifest WITH the macro file present.
+        # Rebuild manifest WITH the macro generation present.
         cache_manifest.write_manifest(
             cache_manifest.make_manifest(
                 "000001", cfg, feature, data_dir, "c1", cfg_hash), mpath)
         assert cache_manifest.manifest_matches(mpath, "000001", cfg, feature, data_dir, "c1", cfg_hash)
-        # Macro content changes -> same manifest must now FAIL (fresh process
-        # semantics: the memo is per-process, so clear it to simulate a rerun).
-        self._write_shared(data_dir, ("a_shares", "macro", "macro_daily.parquet"), rows=99)
+        # Macro content changes (a new generation) -> same manifest must now
+        # FAIL (fresh process semantics: the memo is per-process, so clear it
+        # to simulate a rerun).
+        _write_macro_gen(data_dir, rows=99)
         cache_manifest._shared_fingerprint.cache_clear()
         assert not cache_manifest.manifest_matches(mpath, "000001", cfg, feature, data_dir, "c1", cfg_hash)
 

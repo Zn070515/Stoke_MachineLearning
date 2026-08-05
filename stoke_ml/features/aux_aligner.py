@@ -11,6 +11,7 @@ market-env / industry).
 temporal-feature assembly.
 """
 import logging
+import os
 
 import numpy as np
 import pandas as pd
@@ -327,6 +328,21 @@ def _aggregate_concept_long(concept_df: pd.DataFrame) -> pd.DataFrame:
         .agg(**agg_spec)
         .reset_index(drop=True)
     )
+
+
+def _load_macro_features(data_dir: str) -> pd.DataFrame | None:
+    """Load macro features: generation layout first, legacy flat fallback.
+
+    Raises GenerationStoreError on a torn generation layout (§十三-2).
+    """
+    from stoke_ml.data.generation_store import read_generation
+    df = read_generation(data_dir, "a_shares/macro/macro_daily")
+    if df is not None:
+        return df
+    legacy = os.path.join(data_dir, "a_shares", "macro", "macro_daily.parquet")
+    if os.path.exists(legacy):
+        return pd.read_parquet(legacy)
+    return None
 
 
 class AuxAligner:
@@ -834,14 +850,11 @@ class AuxAligner:
         if macro_df is None:
             macro_df = getattr(self, '_macro_cache', None)
             if macro_df is None:
-                import os
                 from stoke_ml.config import load_config
-                cfg = load_config()
-                path = os.path.join(cfg.project.data_dir, "a_shares", "macro", "macro_daily.parquet")
-                if not os.path.exists(path):
+                macro_df = _load_macro_features(load_config().project.data_dir)
+                if macro_df is None:
                     self._warn_if_missing("macro")
                     return df
-                macro_df = pd.read_parquet(path)
                 self._macro_cache = macro_df
         if macro_df.empty:
             return df
