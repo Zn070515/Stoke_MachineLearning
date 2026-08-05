@@ -22,7 +22,6 @@ from stoke_ml.features.fundamental import FundamentalRefiner
 from stoke_ml.features.panel_helpers import (
     _min_vol_nobs,
     _PIT_STATIC_COLS,
-    fold_dead_feature_columns,
     _trailing_mean,
     _not_long_suspended,
     _manifest_check_config,
