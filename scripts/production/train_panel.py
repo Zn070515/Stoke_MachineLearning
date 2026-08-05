@@ -488,25 +488,79 @@ def _require_all_universe_prebuilt(universe: str, prebuilt: str | None) -> None:
         )
 
 
-def _warn_all_universe_memory(
-    n_stocks: int, n_timesteps: int, n_features: int, threshold_gb: float = 48.0,
-) -> None:
-    """§七-P0: warn when ``--universe all`` puts an impractical panel in RAM.
+# §七-P0 universe memory guard thresholds (GB).  --universe all is refused
+# above the safety line by default; csi800 warns at the same line and is
+# refused only above the hard ceiling (or when the estimate exceeds the host's
+# actual available memory, when that is introspectable).
+_UNIVERSE_MEMORY_WARN_GB = 48.0
+_UNIVERSE_MEMORY_REFUSE_GB = 48.0
+_UNIVERSE_MEMORY_HARD_GB = 96.0
 
-    Estimate = n_stocks × n_timesteps × n_features × 4 bytes (float32), the
-    dominant resident memory of the loaded panel arrays.  Above the threshold
-    the run will very likely OOM the host, so warn prominently and let the user
-    re-scope instead of watching a swap-death mid-fold.
+
+def _panel_memory_gb(n_stocks: int, n_timesteps: int, n_features: int) -> float:
+    """§七-P0: dominant resident panel memory estimate in GB (float32 arrays)."""
+    return int(n_stocks) * int(n_timesteps) * int(n_features) * 4 / (1024 ** 3)
+
+
+def _enforce_universe_memory(
+    universe: str,
+    n_stocks: int,
+    n_timesteps: int,
+    n_features: int,
+    *,
+    allow_override: bool = False,
+    available_gb: float | None = None,
+) -> tuple[float, str]:
+    """§七-P0: refuse / warn when a universe's panel cannot realistically fit in RAM.
+
+    Returns ``(est_gb, action)`` where ``action`` is the UN-overridden verdict:
+    "refuse" / "warn" / "ok".
+
+    Verdict rules:
+      * universe == "all": est > _UNIVERSE_MEMORY_REFUSE_GB → "refuse".
+      * universe == "csi800": est > _UNIVERSE_MEMORY_HARD_GB → "refuse";
+        est > _UNIVERSE_MEMORY_WARN_GB → "warn".
+      * any other universe: "ok".
+      * if ``available_gb`` is known and est > available_gb → "refuse" (the
+        estimate alone already guarantees the panel will not fit on THIS host).
+
+    Side effect: when the verdict is "refuse" and ``allow_override`` is False,
+    raises SystemExit with a message that names the estimate, the available
+    memory (when known), the threshold, and the ``--allow-high-risk-universe``
+    escape hatch.  When the verdict is "warn", OR "refuse" with
+    ``allow_override=True``, logs a prominent WARNING instead.
     """
-    est_gb = int(n_stocks) * int(n_timesteps) * int(n_features) * 4 / (1024 ** 3)
-    if est_gb > threshold_gb:
-        logger.warning(
-            "universe=all: panel memory estimate %.1f GB (n_stocks=%d x "
-            "n_timesteps=%d x n_features=%d x 4B) exceeds %.0f GB — the feature "
-            "panel will very likely OOM this host (§七-P0).  Re-scope with a "
-            "smaller --stocks cap or load prebuilt features per-fold.",
-            est_gb, n_stocks, n_timesteps, n_features, threshold_gb,
+    est_gb = _panel_memory_gb(n_stocks, n_timesteps, n_features)
+    action = "ok"
+    if universe == "all" and est_gb > _UNIVERSE_MEMORY_REFUSE_GB:
+        action = "refuse"
+    elif universe == "csi800":
+        if est_gb > _UNIVERSE_MEMORY_HARD_GB:
+            action = "refuse"
+        elif est_gb > _UNIVERSE_MEMORY_WARN_GB:
+            action = "warn"
+    if available_gb is not None and est_gb > available_gb and action != "refuse":
+        action = "refuse"
+    if action == "refuse" and not allow_override:
+        avail = f"vs available {available_gb:.1f} GB" if available_gb is not None else \
+            "vs host available memory (unknown — psutil not installed)"
+        raise SystemExit(
+            f"universe={universe}: panel memory estimate {est_gb:.1f} GB "
+            f"(n_stocks={n_stocks} x n_timesteps={n_timesteps} x "
+            f"n_features={n_features} x 4B) {avail} exceeds the §七-P0 safety "
+            f"threshold — this panel will very likely OOM the host.  Re-scope "
+            f"with a smaller --stocks cap (default 500 is safe) or pass "
+            f"--allow-high-risk-universe to run it anyway."
         )
+    if action in ("warn", "refuse"):
+        logger.warning(
+            "universe=%s: panel memory estimate %.1f GB (n_stocks=%d x "
+            "n_timesteps=%d x n_features=%d x 4B) — §七-P0 risk, the feature "
+            "panel may not fit in RAM.  Re-scope or pass "
+            "--allow-high-risk-universe.",
+            universe, est_gb, n_stocks, n_timesteps, n_features,
+        )
+    return est_gb, action
 
 
 # Channel coverage manifest: every aux channel is loaded
@@ -2262,6 +2316,12 @@ def main():
                                  "csi300", "csi500", "csi800"],
                         help="Stock universe selection (default: random; "
                              "csi* = index constituents, PIT ever-held union)")
+    parser.add_argument("--allow-high-risk-universe", action="store_true",
+                        help="§七-P0 escape hatch: an explicit override for the "
+                             "universe memory guard — a high-memory universe "
+                             "(all / large csi800) proceeds with a prominent "
+                             "warning instead of being refused.  Default: "
+                             "refused.")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for universe sampling and data "
                              "augmentation (default: 42)")
@@ -2588,15 +2648,25 @@ def main():
            f"PO={panel_data['past_observed'].shape[2]}"
     logger.info("Panel data: %d stocks × %d timesteps  dims: %s  horizon=%d",
                 n_stocks, n_timesteps, dims, args.horizon)
-    # §七-P0: --universe all already refused without --prebuilt; even with it, a
-    # full-market panel that won't fit in RAM is warned against before the fold
-    # loop (estimate = n_stocks × n_timesteps × n_features × 4B).
-    if args.universe == "all":
-        _warn_all_universe_memory(
-            n_stocks, n_timesteps,
-            static_dim + panel_data["past_known"].shape[2]
-            + panel_data["past_observed"].shape[2],
-        )
+    # §七-P0: refuse/warn when this universe's panel cannot realistically fit in
+    # RAM.  --universe all (5530 stocks ~= 225 GB) is refused by default unless
+    # --allow-high-risk-universe; csi800 (historical member union) warns and is
+    # refused above the hard ceiling or when it exceeds host available memory.
+    n_features = (
+        static_dim + panel_data["past_known"].shape[2]
+        + panel_data["past_observed"].shape[2]
+    )
+    available_gb = None
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        available_gb = None  # psutil optional — the static thresholds still guard
+    _enforce_universe_memory(
+        args.universe, n_stocks, n_timesteps, n_features,
+        allow_override=args.allow_high_risk_universe,
+        available_gb=available_gb,
+    )
 
     config = PanelConfig(
         seq_len=seq_len,

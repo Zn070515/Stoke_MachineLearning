@@ -229,6 +229,8 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --stock-li
 PYTHONPATH=. ./.venv/Scripts/python scripts/production/train_panel.py --no-aux
 ```
 
+> **§七 内存边界**：`--universe all`（全市场 5530 只）特征面板估计 ~225GB，远超 96GB 主机，默认**拒绝**；需要 `--prebuilt data/features_panel` 且显式 `--allow-high-risk-universe` 才可强行运行。`csi800`（历史成员并集 ~1000 只）已接近风险区，内存估计过高时告警/拒绝。默认 `--stocks 500` 安全。
+
 Panel (VSN + xLSTM) 配置:
 - **输入**: Static + PastKnown + PastObserved × seq_len=60 (维度由特征面板自动推导)
 - **架构**: Variable Selection Network (VSN) + xLSTM backbone (sLSTM + mLSTM)

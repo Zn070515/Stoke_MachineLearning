@@ -737,3 +737,83 @@ def test_lockbox_open_refuses_second_formal_use(tp, tmp_path):
             12, formal=True, marker_path=marker,
             info={"universe": "sneak", "lockbox_months": 12})
     assert "单次开启" in str(ei.value) or "single" in str(ei.value).lower()
+
+
+# ── §七-P0 universe memory guard ─────────────────────────────────────
+
+def test_require_all_universe_prebuilt_refuses_without_prebuilt(tp):
+    """--universe all without --prebuilt is refused outright — the full market
+    cannot be feature-engineered in RAM (§七-P0)."""
+    with pytest.raises(SystemExit):
+        tp._require_all_universe_prebuilt("all", None)
+
+
+def test_require_all_universe_prebuilt_allows_prebuilt(tp):
+    """--universe all WITH --prebuilt proceeds; a non-all universe needs no
+    prebuilt at all."""
+    tp._require_all_universe_prebuilt("all", "data/features_panel")
+    tp._require_all_universe_prebuilt("random", None)
+
+
+def test_panel_memory_gb_formula(tp):
+    """§七-P0 estimate = n_stocks × n_timesteps × n_features × 4B ÷ 1024³.
+
+    (The full-market 5530×5000×8000 float32 panel is ~824 GB — well past the
+    96 GB ceiling; the check pins the function to the documented formula.)"""
+    expected = 5530 * 5000 * 8000 * 4 / (1024 ** 3)
+    assert tp._panel_memory_gb(5530, 5000, 8000) == pytest.approx(expected, abs=0.5)
+
+
+def test_enforce_all_universe_refuses_by_default(tp):
+    """--universe all above the 48 GB refuse line is refused by default, with
+    an estimate, the host-memory caveat, and the escape hatch named."""
+    with pytest.raises(SystemExit) as ei:
+        tp._enforce_universe_memory("all", 5530, 5000, 8000)
+    msg = str(ei.value)
+    assert "universe=all" in msg
+    assert "GB" in msg
+    assert "--allow-high-risk-universe" in msg
+
+
+def test_enforce_all_universe_small_panel_ok(tp):
+    """A small --universe all cap (est ≪ 48 GB) is 'ok' and never raises."""
+    est, action = tp._enforce_universe_memory("all", 50, 1000, 100)
+    assert action == "ok"
+    assert est == pytest.approx(50 * 1000 * 100 * 4 / (1024 ** 3), abs=0.5)
+
+
+def test_enforce_csi800_above_hard_ceiling_refuses(tp):
+    """csi800 above the 96 GB hard ceiling is refused (est ≈ 111.8 GB)."""
+    with pytest.raises(SystemExit) as ei:
+        tp._enforce_universe_memory("csi800", 3000, 5000, 2000)
+    assert "universe=csi800" in str(ei.value)
+    assert "--allow-high-risk-universe" in str(ei.value)
+
+
+def test_enforce_csi800_warn_band_warns(tp):
+    """csi800 in the warn band (48 < est < 96 GB) warns and does NOT raise."""
+    est, action = tp._enforce_universe_memory("csi800", 1500, 5000, 2000)
+    assert action == "warn"
+    assert 48.0 < est < 96.0
+
+
+def test_enforce_override_downgrades_refuse_to_warning(tp, caplog):
+    """--allow-high-risk-universe downgrades the refusal to a prominent
+    WARNING; the UN-overridden verdict is still reported as 'refuse'."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        est, action = tp._enforce_universe_memory(
+            "all", 5530, 5000, 8000, allow_override=True)
+    assert action == "refuse"   # the un-overridden verdict stays "refuse"
+    assert any("§七-P0 risk" in m for m in caplog.messages)
+    assert any("--allow-high-risk-universe" in m for m in caplog.messages)
+
+
+def test_enforce_available_gb_precheck_refuses(tp):
+    """When host available memory is known and est > available, the panel
+    cannot fit THIS host — refused even though est is below the 48 GB line."""
+    with pytest.raises(SystemExit) as ei:
+        tp._enforce_universe_memory("all", 300, 2000, 1000, available_gb=2.0)
+    msg = str(ei.value)
+    assert "universe=all" in msg
+    assert "available" in msg
