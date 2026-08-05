@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies (pyproject = single source of truth)
         run: |
           pip install --upgrade pip
-          pip install -e ".[ml,nlp,online,analysis,dev]"
+          pip install -e ".[ml,nlp,online,analysis,dev,data-adapters]"
 
       - name: compileall
         run: python -m compileall -q stoke_ml scripts tests

@@ -26,7 +26,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 在线数据适配器 — 离线复现/测试可省略，仅真实下载需要
+# 在线数据适配器 — 仅真实下载需要；但 CI 安装它（tests/data/test_download_data.py
+# 打桩 dd.ak 需要 akshare 可导入，见 §十六-2）
 data-adapters = [
     "akshare>=1.12",
     "efinance>=0.4",
@@ -39,6 +40,8 @@ online = [
     "curl-cffi>=0.6",
     "browserforge>=1.0",
     "playwright>=1.40",
+    # HTML 解析（guba/news 源，与 curl_cffi 同属在线抓取栈）
+    "beautifulsoup4>=4.12",
 ]
 # ML/DL — 模型训练
 ml = [
