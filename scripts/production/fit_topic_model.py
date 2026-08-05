@@ -53,9 +53,25 @@ def _discover_stocks(data_dir: str, source: str) -> list[str]:
 
 
 def _collect_silver(data_dir: str, source: str, codes: list[str], cutoff: str):
-    """Load + combine silver text up to *cutoff* (PIT) for the given stocks."""
+    """Load + combine silver text up to *cutoff* (PIT) for the given stocks.
+
+    Returns ``(df, loaded_codes, failed_codes)``:
+      * ``df`` — the combined posts (only rows at/before *cutoff*), each row
+        tagged with its ``stock_code``.
+      * ``loaded_codes`` — requested codes whose silver file read succeeded,
+        in request order.  A code that loaded but had no posts up to *cutoff*
+        is still counted as loaded (it did not FAIL to load).
+      * ``failed_codes`` — requested codes whose load raised an exception.
+
+    ``aligned_date`` is a REQUIRED silver column (PIT cutoff discipline,
+    §二十一 A2): the corpus must never be truncated by a column that is
+    silently absent.  A silver schema drift that drops ``aligned_date`` raises
+    instead of fitting the topic model on the full (un-truncated) history.
+    """
     calendar = get_research_calendar(strict=True)
     frames = []
+    loaded_codes = []
+    failed_codes = []
     for code in codes:
         try:
             if source == "news":
@@ -64,17 +80,30 @@ def _collect_silver(data_dir: str, source: str, codes: list[str], cutoff: str):
             else:
                 storage = GubaStorage(data_dir, calendar)
                 df = storage.load_silver(code)
-            if df is not None and not df.empty:
-                if "aligned_date" in df.columns:
-                    df["aligned_date"] = pd.to_datetime(df["aligned_date"])
-                    if cutoff is not None:
-                        df = df[df["aligned_date"] <= pd.Timestamp(cutoff)]
-                frames.append(df.assign(stock_code=code))
         except Exception as exc:
+            failed_codes.append(code)
             logger.warning("Failed to load %s for %s: %s", source, code, exc)
+            continue
+        if df is None or df.empty:
+            loaded_codes.append(code)  # no posts — not a load failure
+            continue
+        # A2: aligned_date is required for the PIT cutoff — a schema that
+        # dropped it must fail loudly rather than silently fit on full history.
+        if "aligned_date" not in df.columns:
+            raise ValueError(
+                "Silver %s for %s is missing the required PIT column "
+                "'aligned_date' (silver schema drift). Found columns: %s"
+                % (source, code, sorted(df.columns))
+            )
+        df["aligned_date"] = pd.to_datetime(df["aligned_date"])
+        if cutoff is not None:
+            df = df[df["aligned_date"] <= pd.Timestamp(cutoff)]
+        loaded_codes.append(code)
+        if not df.empty:
+            frames.append(df.assign(stock_code=code))
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(), loaded_codes, failed_codes
+    return pd.concat(frames, ignore_index=True), loaded_codes, failed_codes
 
 
 def _corpus_file_info(data_dir: str, source: str, codes: list[str]) -> tuple:
@@ -168,6 +197,12 @@ def main():
         help="Random seed for the UMAP step (deterministic reproducibility, "
              "recorded in the manifest §十三).",
     )
+    parser.add_argument(
+        "--min-coverage", type=float, default=0.9,
+        help="Minimum fraction of requested stocks that must load "
+             "(0.0–1.0).  Below this the run manifest records "
+             "status=DEGRADED and the process exits non-zero (§二十一 A3).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -188,7 +223,9 @@ def main():
         args.source, args.cutoff, len(codes), len(all_codes),
     )
 
-    all_silver = _collect_silver(data_dir, args.source, codes, args.cutoff)
+    all_silver, loaded_codes, failed_codes = _collect_silver(
+        data_dir, args.source, codes, args.cutoff
+    )
     if all_silver.empty:
         logger.error("No %s posts up to %s", args.source, args.cutoff)
         sys.exit(1)
@@ -196,6 +233,32 @@ def main():
         "Loaded %d posts from %d stocks",
         len(all_silver), all_silver["stock_code"].nunique(),
     )
+
+    # §二十一 A3: coverage accounting — requested vs loaded vs failed stocks.
+    # A load failure used to be a silent skip; now the manifest records the
+    # exact sets + coverage, and a run below --min-coverage is an explicit
+    # failure (status=DEGRADED + non-zero exit) instead of a quiet success.
+    requested_stocks = list(codes)
+    loaded_stocks = sorted(set(loaded_codes) & set(requested_stocks))
+    failed_stocks = sorted(set(requested_stocks) - set(loaded_stocks))
+    coverage = (
+        len(loaded_stocks) / len(requested_stocks) if requested_stocks else 0.0
+    )
+    if coverage < args.min_coverage:
+        status = "DEGRADED"
+        logger.error(
+            "Coverage %.1f%% (loaded %d/%d requested stocks) below "
+            "--min-coverage %.2f — refusing a degraded topic model. "
+            "failed_stocks=%s",
+            coverage * 100, len(loaded_stocks), len(requested_stocks),
+            args.min_coverage, failed_stocks,
+        )
+    else:
+        status = "COMPLETE"
+        logger.info(
+            "Coverage %.1f%% (loaded %d/%d requested stocks)",
+            coverage * 100, len(loaded_stocks), len(requested_stocks),
+        )
 
     pp_cfg = cfg.get("preprocessing", {})
     pp = PreprocessingPipeline.from_config(pp_cfg)
@@ -281,10 +344,26 @@ def main():
         "stock_codes": list(codes),
         "config_hash": _config_hash(cfg),
         "calendar_hash": _calendar_hash(data_dir),
+        # §二十一 A3: coverage / load-outcome accounting.  Additive — older
+        # manifests without these keys remain valid.
+        "requested_stocks": requested_stocks,
+        "loaded_stocks": loaded_stocks,
+        "failed_stocks": failed_stocks,
+        "coverage": round(coverage, 4),
+        "min_coverage": args.min_coverage,
+        "status": status,
     }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     logger.info("Run manifest written to %s", manifest_path)
+    if status == "DEGRADED":
+        logger.error(
+            "Topic fit DEGRADED (coverage %.1f%% < --min-coverage %.2f). "
+            "Manifest written to %s with status=DEGRADED; exiting non-zero so "
+            "the training pipeline treats this model as unusable.",
+            coverage * 100, args.min_coverage, manifest_path,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

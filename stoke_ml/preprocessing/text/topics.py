@@ -272,7 +272,7 @@ class TopicModeler(PreprocessingStep):
 
         return self
 
-    def transform(self, df, *, source="default", **kwargs):
+    def transform(self, df, *, source="default", formal: bool = False, **kwargs):
         """Assign topic_id and topic_probability columns.
 
         Production transform needs a fitted model.  When none is loaded yet
@@ -281,6 +281,15 @@ class TopicModeler(PreprocessingStep):
         instead of silently dropping the topic features — the old behavior
         meant the topic columns could be absent from production data with no
         error at all (§十-2).
+
+        ``formal`` selects failure semantics for the per-post assignment step:
+
+          * ``formal=False`` (default, offline/research) — a transform failure
+            is logged and the topic columns degrade to ``topic_id=-1`` /
+            ``topic_probability=0`` so downstream processing keeps running.
+          * ``formal=True`` — a transform failure RAISES instead of silently
+            degrading the whole channel to a constant ``-1``/``0``, which the
+            old behavior hid as if the model had worked (§二十一 A4).
         """
         if df.empty or not self._enabled:
             return df
@@ -314,6 +323,8 @@ class TopicModeler(PreprocessingStep):
             df["topic_id"] = np.asarray(topics, dtype="int16")
             df["topic_probability"] = np.asarray(probs, dtype=np.float32)
         except Exception as e:
+            if formal:
+                raise
             logger.warning(
                 "Topic transform failed (category=%s): %s",
                 classify_error(e).value, e,

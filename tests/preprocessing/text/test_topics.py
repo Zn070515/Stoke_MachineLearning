@@ -295,6 +295,45 @@ def test_transform_auto_loads_pinned_cache(
     assert tm._model is not None
 
 
+def _pinned_tm(tmp_path, monkeypatch):
+    """A TopicModeler with a pinned cutoff whose cached model is on disk."""
+    monkeypatch.setattr(joblib, "load", lambda path: _FakeBERTopic())
+    cache = tmp_path / "bertopic_news_cutoff_2024-01-31.pkl"
+    cache.write_bytes(b"dummy")
+    # make approximate_predict importable; the fake BERTopic has no
+    # umap_model/hdbscan_model so a failure is forced via _get_embeddings=None.
+    monkeypatch.setitem(
+        sys.modules,
+        "hdbscan.prediction",
+        types.SimpleNamespace(approximate_predict=lambda *a, **k: None),
+    )
+    tm = _make_topic_modeler(tmp_path, monkeypatch, corpus_cutoff="2024-01-31")
+    return tm
+
+
+def test_transform_formal_re_raises_transform_failure(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """§二十一 A4: with formal=True a transform failure raises instead of
+    silently degrading the channel to topic_id=-1 / topic_probability=0."""
+    tm = _pinned_tm(tmp_path, monkeypatch)
+    monkeypatch.setattr(tm, "_get_embeddings", lambda texts: None)  # force failure
+    with pytest.raises(RuntimeError, match="Failed to produce embeddings"):
+        tm.transform(posts.copy(), source="news", formal=True)
+
+
+def test_transform_default_degrades_on_failure(
+    fake_topic_deps, tmp_path, monkeypatch, posts
+):
+    """§二十一 A4: without formal=True the legacy -1/0 degradation is kept for
+    research/offline callers."""
+    tm = _pinned_tm(tmp_path, monkeypatch)
+    monkeypatch.setattr(tm, "_get_embeddings", lambda texts: None)  # force failure
+    out = tm.transform(posts.copy(), source="news")
+    assert out["topic_id"].iloc[0] == -1
+    assert out["topic_probability"].iloc[0] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # §十三: reproducibility provenance in the cache metadata
 # ---------------------------------------------------------------------------
