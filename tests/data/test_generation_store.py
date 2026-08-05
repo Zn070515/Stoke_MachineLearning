@@ -119,13 +119,19 @@ def test_torn_invalid_current_raises(tmp_path):
 
 def test_torn_current_non_digit_suffix_raises(tmp_path):
     """Regression: 'gen_' is 4 chars, so the 8-digit suffix must start at index
-    4 — a non-digit at index 4 (e.g. 'gen_a00000001') must be rejected as an
-    invalid name, not slip through to the missing-dir check."""
+    4.  A 12-char name whose digit-suffix starts with a non-digit, e.g.
+    'gen_a0000000', is rejected by the name check only under gen_name[4:]
+    validation — the OLD gen_name[5:] slice saw chars 5-11 (all digits) and let
+    it slip through to the missing-dir check.  Pinned here so the slice cannot
+    regress."""
     data_dir = str(tmp_path)
     os.makedirs(_gen_root(data_dir), exist_ok=True)
     with open(os.path.join(_gen_root(data_dir), "CURRENT"), "w", encoding="utf-8") as f:
-        f.write("gen_a00000001")
-    with pytest.raises(GenerationStoreError):
+        f.write("gen_a0000000")
+    # Assert the invalid-name path specifically: under the OLD gen_name[5:]
+    # slice this input fell through to the missing-dir error, which would make
+    # the match= below fail — so the slice cannot regress.
+    with pytest.raises(GenerationStoreError, match="does not name a valid generation"):
         read_generation(data_dir, REL)
 
 
