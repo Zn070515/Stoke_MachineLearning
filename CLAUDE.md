@@ -71,6 +71,15 @@ excluded from the default smoke run (pyproject.toml addopts) — the default
 
 Docs drift is guarded by `scripts/production/check_docs_consistency.py` (see Commands).
 
+## Workflow (mandatory)
+
+**需求明确并创建 Task 后，必须 fan out SubAgent 完成（保证工程质量）。**
+
+- 一旦需求澄清、Task 已建好，就用 `Agent` 工具把每个 Task 派给独立的 subagent 执行（优先 `superpowers:subagent-driven-development` 流程），**禁止**在主会话里逐个内联实现。
+- 每个 Task 的标准流程：dispatch implementer subagent → spec 合规审查 → 代码质量审查 → 两轮都通过后标记完成；审查发现问题就回 implementer 修复再复审，直到通过。
+- 目的：每个 subagent 用全新上下文执行（不继承主会话、不互相污染），强制双阶段审查，质量不过关不放行。
+- 唯一例外：被明确判定为「简单到不需要 fan out」的任务（单行修复、纯读/纯查询）才允许内联；拿不准时**默认 fan out**。
+
 ## Architecture
 
 ### Three-Phase Design
