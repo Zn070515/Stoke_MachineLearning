@@ -2,7 +2,12 @@ import pytest
 import torch
 import numpy as np
 import pandas as pd
+from torch.utils.data import DataLoader
+from stoke_ml.models.panel.config import PanelConfig
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateSampler
+from stoke_ml.models.panel.model import PanelModel
+from stoke_ml.models.panel.panel_store import load_panel_memmap, save_panel_memmap
+from test_panel_store import _storeable_panel
 
 
 def make_synthetic_data(n_stocks=10, n_days=100, seq_len=60):
@@ -178,6 +183,87 @@ class TestPanelDataset:
         *_, stock_indices = ds[0]
         # All 5 stocks should be valid (random labels, all valid for simple data)
         assert stock_indices.numel() == 5
+
+
+class TestMemmapDataset:
+    """§十六: a dataset built from np.memmap arrays (lazy window gather) must
+    behave IDENTICALLY to one built from dense ndarrays (eager tensors).
+
+    The big per-timestep arrays stay memmap references in the lazy path and
+    are sliced+converted per window inside __getitem__; masks / date_indices
+    are always eager.  Both paths must yield elementwise-equal windows, equal
+    valid/eval masks, and equal per-window stock lists.
+    """
+
+    def _pair(self, tmp_path, seq_len=60, seed=5):
+        panel = _storeable_panel(n_stocks=12, n_days=100, seq_len=seq_len,
+                                 seed=seed)
+        save_panel_memmap(panel, tmp_path)
+        memmap_data = load_panel_memmap(tmp_path)
+        ds_dense = PanelDataset(panel, seq_len=seq_len, min_history=50)
+        ds_mem = PanelDataset(memmap_data, seq_len=seq_len, min_history=50)
+        return ds_dense, ds_mem
+
+    def test_dense_vs_memmap_equal_masks_and_stocks(self, tmp_path):
+        """valid/eval masks and the per-window stock lists are identical."""
+        ds_dense, ds_mem = self._pair(tmp_path)
+        assert len(ds_dense) == len(ds_mem)
+        assert torch.equal(ds_dense.valid_mask, ds_mem.valid_mask), (
+            "valid_mask differs between dense and memmap datasets")
+        assert torch.equal(ds_dense.eval_mask, ds_mem.eval_mask), (
+            "eval_mask differs between dense and memmap datasets")
+        for w, (a, b) in enumerate(
+                zip(ds_dense._date_to_stocks, ds_mem._date_to_stocks)):
+            assert torch.equal(a, b), f"_date_to_stocks[window {w}] differs"
+
+    def test_dense_vs_memmap_equal_windows(self, tmp_path):
+        """__getitem__ returns elementwise-equal, dtype-equal 11-tuples."""
+        ds_dense, ds_mem = self._pair(tmp_path, seed=7)
+        for w in (0, 1, 5, 17, len(ds_dense) - 1):
+            dense_win = ds_dense[w]
+            mem_win = ds_mem[w]
+            for i in range(11):
+                assert dense_win[i].dtype == mem_win[i].dtype, (
+                    f"window {w} element {i} dtype mismatch")
+                assert torch.equal(dense_win[i], mem_win[i]), (
+                    f"window {w} element {i} values differ")
+
+    def test_end_to_end_dataloader_matches_dense(self, tmp_path):
+        """A DataLoader over the memmap dataset yields the same batches as the
+        dense one (collate concatenates dates; tensors are fully materialized)."""
+        ds_dense, ds_mem = self._pair(tmp_path, seed=11)
+        dl_dense = DataLoader(ds_dense, batch_size=3, shuffle=False,
+                              collate_fn=panel_collate)
+        dl_mem = DataLoader(ds_mem, batch_size=3, shuffle=False,
+                            collate_fn=panel_collate)
+        for bi, (b_dense, b_mem) in enumerate(zip(dl_dense, dl_mem)):
+            for i in range(11):
+                assert torch.equal(b_dense[i], b_mem[i]), (
+                    f"batch {bi} element {i} differs")
+
+    def test_memmap_batch_is_model_consumable(self, tmp_path):
+        """A memmap-derived batch feeds the model forward — proves the lazy
+        tensors are fully materialized and contiguous enough for inference."""
+        _, ds_mem = self._pair(tmp_path, seed=13)
+        config = PanelConfig(
+            static_dim=4, past_known_dim=12, past_observed_dim=6,
+            hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
+            grn_layers=1, seq_len=60, dropout=0.0, compile_model=False,
+        )
+        model = PanelModel(config).eval()
+        loader = DataLoader(ds_mem, batch_size=4, shuffle=False,
+                            collate_fn=panel_collate)
+        seen = 0
+        with torch.no_grad():
+            for static, pk, po, *_rest in loader:
+                d, r, v = model(static, pk, po)
+                assert not torch.isnan(r).any()
+                assert not torch.isnan(d).any()
+                assert not torch.isnan(v).any()
+                seen += 1
+                if seen >= 3:
+                    break
+        assert seen >= 1
 
 
 class TestDateSampler:

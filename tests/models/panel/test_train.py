@@ -14,7 +14,9 @@ from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
 from stoke_ml.models.panel.loss import AdjMSELoss, UncertaintyLoss
 from stoke_ml.models.panel.model import PanelModel
+from stoke_ml.models.panel.panel_store import load_panel_memmap, save_panel_memmap
 from stoke_ml.models.panel.train import train_panel, _compute_val_loss
+from test_panel_store import _storeable_panel
 
 
 def _make_masked_panel(n_stocks=12, n_timesteps=120, seq_len=60, horizon=5, seed=0):
@@ -297,6 +299,54 @@ class TestOffsetSlicedFoldValLoss:
         nan_frac = float(np.isnan(preds.numpy())[eval_mask].mean())
         assert nan_frac < 0.01, (
             f"{nan_frac:.1%} of eval-eligible cells unpredicted on offset slice")
+
+
+class TestMemmapSlicePanel:
+    """§十六: _slice_panel on a memmap-backed panel (loaded from a store)
+    must slice exactly like the dense panel.  The result is a mixed bag —
+    basic-sliced arrays (static/pk/po/y_direction/masks) stay lazy memmap
+    views, .copy() arrays (y_return/y_volatility/realized_return/date_indices)
+    materialize — and must feed a PanelDataset with elementwise-equal windows.
+    This is the exact shape the --panel-store training path consumes."""
+
+    SEQ_LEN = 60
+
+    def _sliced_pair(self, tmp_path):
+        from scripts.production.train_panel import _slice_panel
+
+        panel = _storeable_panel(n_stocks=12, n_days=150,
+                                 seq_len=self.SEQ_LEN, seed=6)
+        save_panel_memmap(panel, tmp_path)
+        memmap_data = load_panel_memmap(tmp_path)
+        dense_sliced = _slice_panel(panel, slice(30, 120))
+        mem_sliced = _slice_panel(memmap_data, slice(30, 120))
+        return dense_sliced, mem_sliced
+
+    def test_slice_values_equal(self, tmp_path):
+        """Every sliced array (memmap-view and .copy() alike) matches the
+        dense slice elementwise."""
+        dense_sliced, mem_sliced = self._sliced_pair(tmp_path)
+        assert set(mem_sliced) == set(dense_sliced)
+        for key in dense_sliced:
+            np.testing.assert_array_equal(np.asarray(mem_sliced[key]),
+                                          np.asarray(dense_sliced[key]),
+                                          err_msg=key)
+
+    def test_sliced_memmap_feeds_dataset(self, tmp_path):
+        """PanelDataset over the memmap-sliced panel yields the same windows as
+        over the dense slice — the mixed lazy/eager panel is fully usable."""
+        dense_sliced, mem_sliced = self._sliced_pair(tmp_path)
+        ds_dense = PanelDataset(dense_sliced, seq_len=self.SEQ_LEN,
+                                min_history=50, training=False)
+        ds_mem = PanelDataset(mem_sliced, seq_len=self.SEQ_LEN,
+                              min_history=50, training=False)
+        assert len(ds_dense) == len(ds_mem)
+        assert torch.equal(ds_dense.valid_mask, ds_mem.valid_mask)
+        assert torch.equal(ds_dense.eval_mask, ds_mem.eval_mask)
+        for w in (0, 1, 10, len(ds_dense) - 1):
+            for i in range(11):
+                assert torch.equal(ds_dense[w][i], ds_mem[w][i]), (
+                    f"window {w} element {i} differs after memmap slice")
 
 
 class TestAblationTraining:

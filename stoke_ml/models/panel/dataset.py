@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
@@ -29,8 +30,16 @@ class PanelDataset(Dataset):
     no intra-date pairs lost to batch boundaries — and eliminates the
     materialized (n_stocks × n_windows) flat-index grid.
 
-    All numpy inputs are converted to tensors once in __init__ so that
-    __getitem__ is indexing + sampling — no per-sample conversion overhead.
+    §十六 lazy storage: the big per-timestep arrays (``static_features`` when
+    3D, ``past_known``, ``past_observed`` and the three target grids) are kept
+    as array references — dense ``np.ndarray`` / ``torch.Tensor`` inputs are
+    eagerly converted to tensors as before, but ``np.memmap`` inputs are left
+    lazy and sliced+converted per-window inside ``__getitem__`` (a "lazy
+    window gather" that page-faults only the rows/columns actually read).  A
+    memmap-backed dataset therefore never holds the whole dense (N, T, D)
+    grid in RAM, and produces outputs elementwise-identical to the dense one.
+    The masks and ``date_indices`` are always eager tensors (they are small
+    bool/int grids needed at init to build the valid/eval masks).
 
     Parameters
     ----------
@@ -66,14 +75,22 @@ class PanelDataset(Dataset):
         def _to_tensor(arr, dtype):
             if isinstance(arr, torch.Tensor):
                 return arr.clone().detach().to(dtype)
+            # A read-only source (e.g. a memmap view) must be copied — torch
+            # can't wrap a non-writable numpy buffer without undefined-behavior
+            # writes.  Writable dense arrays keep the zero-copy from_numpy path.
+            if not arr.flags.writeable:
+                arr = arr.copy()
             return torch.from_numpy(arr).to(dtype)
 
-        self.static_features = _to_tensor(data["static_features"], torch.float32)
-        self.past_known = _to_tensor(data["past_known"], torch.float32)
-        self.past_observed = _to_tensor(data["past_observed"], torch.float32)
-        self.y_direction = _to_tensor(data["y_direction"], torch.long)
-        self.y_return = _to_tensor(data["y_return"], torch.float32)
-        self.y_volatility = _to_tensor(data["y_volatility"], torch.float32)
+        # §十六: the big per-timestep arrays stay lazy when fed as np.memmap
+        # (sliced+converted per window in __getitem__); dense ndarray/tensor
+        # inputs keep the eager conversion so the default path is unchanged.
+        self.static_features = self._init_big_array(data["static_features"], torch.float32)
+        self.past_known = self._init_big_array(data["past_known"], torch.float32)
+        self.past_observed = self._init_big_array(data["past_observed"], torch.float32)
+        self.y_direction = self._init_big_array(data["y_direction"], torch.long)
+        self.y_return = self._init_big_array(data["y_return"], torch.float32)
+        self.y_volatility = self._init_big_array(data["y_volatility"], torch.float32)
 
         # Per-task target masks: each loss applies its own mask
         # instead of one y_direction != -100 ruling all tasks.  Optional for
@@ -109,7 +126,9 @@ class PanelDataset(Dataset):
             # entry-eligible, the input window holds >= min_history real
             # observations (new listings with mostly zero-padded history are
             # excluded), and at least one target mask is set.
-            target_any = (self.y_direction[:, self.seq_len:] != -100)
+            # _row_slice_tensor handles a lazy (memmap) y_direction so
+            # target_any stays a tensor for the eager-mask AND/OR below.
+            target_any = (self._row_slice_tensor(self.y_direction, self.seq_len) != -100)
             if self.ret_target is not None:
                 target_any = target_any | self.ret_target[:, self.seq_len:]
             if self.vol_target is not None:
@@ -154,7 +173,11 @@ class PanelDataset(Dataset):
                 self.eval_mask = (hist_count >= self.min_history) & decision
         else:
             # Backward-compat fallback: target-day label validity only.
-            self.valid_mask = (self.y_direction[:, self.seq_len:] != -100)
+            # Kept a tensor even for a lazy (memmap) y_direction so valid_mask /
+            # eval_mask stay tensor consumers' contract (DateSampler, _rank_pool_stats).
+            self.valid_mask = (
+                self._row_slice_tensor(self.y_direction, self.seq_len) != -100
+            )
             self.eval_mask = self.valid_mask
 
         # date_idx[t] = t for each window position — used by PairwiseRankingLoss
@@ -186,6 +209,48 @@ class PanelDataset(Dataset):
             valid_stocks = torch.where(_mask[:, w])[0]
             self._date_to_stocks.append(valid_stocks)
 
+    @staticmethod
+    def _init_big_array(arr, dtype):
+        """Keep an np.memmap input lazy; eagerly tensorize a dense input.
+
+        The lazy path (memmap, §十六) keeps the array reference and gathers
+        per-window rows inside __getitem__, so a full (N, T, D) grid is never
+        materialized as a tensor up front.  Dense ndarray / torch.Tensor
+        inputs keep the original eager conversion — behaviour identical to
+        the pre-§十六 dataset.
+        """
+        if isinstance(arr, np.memmap):
+            return arr
+        if isinstance(arr, torch.Tensor):
+            return arr.clone().detach().to(dtype)
+        return torch.from_numpy(arr).to(dtype)
+
+    @staticmethod
+    def _row_slice_tensor(arr, start):
+        """torch tensor of ``arr[:, start:]`` — works for tensor / ndarray /
+        memmap.  Used for the (N, T-seq_len) columns needed to build the
+        valid/eval masks at init, where the result must stay a tensor even
+        when the source is a lazy memmap."""
+        if isinstance(arr, torch.Tensor):
+            return arr[:, start:]
+        out = np.asarray(arr[:, start:])
+        if not out.flags.writeable:
+            out = out.copy()
+        return torch.from_numpy(out)
+
+    @staticmethod
+    def _lazy_slice(arr, idx, dtype):
+        """Slice ``arr[idx]`` and return a tensor.
+
+        Eager tensors index directly (zero conversion); lazy memmap references
+        are gathered (advanced-index read of just the needed rows/columns —
+        page-faulting only what the window touches) then converted.  Both paths
+        yield elementwise-identical values.
+        """
+        if isinstance(arr, torch.Tensor):
+            return arr[idx]
+        return torch.from_numpy(np.asarray(arr[idx])).to(dtype)
+
     def __len__(self) -> int:
         """Number of date-windows (primary index)."""
         return self.n_windows
@@ -216,35 +281,41 @@ class PanelDataset(Dataset):
         # Static context: 2D (N, D) for backward-compat synthetic data, or
         # 3D (N, T, D) PIT.  For 3D take the DECISION column
         # end-1 (the last feature day — known before entering at open[end]).
-        if self.static_features.dim() == 3:
-            static = self.static_features[stock_indices, end - 1]
+        # (.ndim works for both the eager tensor and the lazy memmap path.)
+        if self.static_features.ndim == 3:
+            static = self._lazy_slice(
+                self.static_features, (stock_indices, end - 1), torch.float32)
         else:
-            static = self.static_features[stock_indices]
+            static = self._lazy_slice(
+                self.static_features, (stock_indices,), torch.float32)
 
-        # Feature windows: (M, seq_len, D)
-        pk = self.past_known[stock_indices, start:end]
-        po = self.past_observed[stock_indices, start:end]
+        # Feature windows: (M, seq_len, D) — lazy memmap rows are gathered
+        # here (only the window's rows/columns page-fault in, §十六).
+        pk = self._lazy_slice(
+            self.past_known, (stock_indices, slice(start, end)), torch.float32)
+        po = self._lazy_slice(
+            self.past_observed, (stock_indices, slice(start, end)), torch.float32)
 
         # Targets: (M,)
-        y_dir = self.y_direction[stock_indices, end]
-        y_ret = self.y_return[stock_indices, end]
-        y_vol = self.y_volatility[stock_indices, end]
+        y_dir = self._lazy_slice(self.y_direction, (stock_indices, end), torch.long)
+        y_ret = self._lazy_slice(self.y_return, (stock_indices, end), torch.float32)
+        y_vol = self._lazy_slice(self.y_volatility, (stock_indices, end), torch.float32)
 
         # Date index: (M,) — all stocks share the same target date for this
         # window.  PairwiseRankingLoss groups by this value; with date-centric
         # batches it always gets exactly one date per batch.
         if self.date_indices is not None:
-            date_idx = self.date_indices[stock_indices, end]
+            date_idx = self._lazy_slice(self.date_indices, (stock_indices, end), torch.long)
         else:
             date_idx = torch.full((n_valid,), end, dtype=torch.long)
 
         # Per-task target masks: each loss applies its own mask.
         # Same semantics as before — y_direction validity for dir, per-channel
         # masks for ret/vol — but now returned as (M,) tensors.
-        dir_mask = (self.y_direction[stock_indices, end] != -100)
-        ret_mask = (self.ret_target[stock_indices, end]
+        dir_mask = (y_dir != -100)
+        ret_mask = (self._lazy_slice(self.ret_target, (stock_indices, end), torch.bool)
                     if self.ret_target is not None else dir_mask)
-        vol_mask = (self.vol_target[stock_indices, end]
+        vol_mask = (self._lazy_slice(self.vol_target, (stock_indices, end), torch.bool)
                     if self.vol_target is not None else dir_mask)
 
         return (

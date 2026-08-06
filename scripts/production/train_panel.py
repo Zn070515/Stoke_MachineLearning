@@ -42,6 +42,11 @@ from stoke_ml.features.pipeline import (
 )
 from stoke_ml.models.panel import PanelConfig
 from stoke_ml.models.panel.dataset import PanelDataset, panel_collate
+from stoke_ml.models.panel.panel_store import (
+    load_panel_memmap,
+    panel_store_complete,
+    save_panel_memmap,
+)
 from stoke_ml.models.panel.train import train_panel
 from stoke_ml.models.panel.evaluate import (
     _run_sleeve_sim,  # noqa: F401  re-exported for import-compat
@@ -1496,6 +1501,16 @@ def main():
                              "instead of warning). Default: on. Use "
                              "--no-require-feature-manifest for legacy prebuilt "
                              "dirs built without manifests (§十一-1)")
+    parser.add_argument("--panel-store", type=str, default=None,
+                        help="§十六 memmap lazy-storage dir for the built panel. "
+                             "When DIR already holds a complete store it is loaded "
+                             "instead of re-stacking the panel, so a large-universe "
+                             "re-run never materializes the whole dense (N,T,D) "
+                             "feature grid in RAM (arrays are mmap'd and read "
+                             "lazily by PanelDataset / _slice_panel).  Otherwise "
+                             "the panel built this run is persisted there for "
+                             "future runs.  Default: off — build in memory as "
+                             "always.")
     parser.add_argument("--no-require-quality-gate", action="store_true",
                         help="Skip the required quality-gate report check "
                              "(dev smoke only; §六-2 wants a matching report "
@@ -1632,11 +1647,22 @@ def main():
     panel = pd.concat(frames, ignore_index=True)
     logger.info("Panel shape: %s", panel.shape)
 
-    # Load auxiliary data (unless --no-aux or --prebuilt)
+    # §十六: --panel-store is a persistent cache of the post-build panel.  A
+    # complete store skips re-stacking the dense (N,T,D) grid on re-run — the
+    # arrays are mmap'd and read lazily downstream.  When the store is fresh
+    # (or absent), the panel is built in memory as always and persisted for
+    # future runs.
+    _store_load = bool(args.panel_store) and panel_store_complete(args.panel_store)
+    if _store_load:
+        logger.info("Loading panel memmap store from %s (skipping feature build)",
+                    args.panel_store)
+
+    # Load auxiliary data (unless --no-aux / --prebuilt / a complete store is
+    # loaded — the stored panel already has every aux channel baked in).
     required_set = {c.strip() for c in (args.require_aux_channels or "").split(",") if c.strip()}
     aux_data = None
     channel_manifest: dict = {}
-    if not args.no_aux and not args.prebuilt:
+    if not args.no_aux and not args.prebuilt and not _store_load:
         logger.info("Loading auxiliary data...")
         t_aux = time.time()
         aux_data, channel_manifest = load_aux_data(
@@ -1659,10 +1685,16 @@ def main():
         use_valuation=True,
         use_board=False, use_sector=False, use_concept=False,
     )
-    panel_data = fp.build_panel_features(
-        panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
-        require_feature_manifest=args.require_feature_manifest,
-    )
+    if _store_load:
+        panel_data = load_panel_memmap(args.panel_store)
+    else:
+        panel_data = fp.build_panel_features(
+            panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
+            require_feature_manifest=args.require_feature_manifest,
+        )
+        if args.panel_store:
+            save_panel_memmap(panel_data, args.panel_store)
+            logger.info("Saved panel memmap store to %s", args.panel_store)
     # §v12-P0: panel row identity — stock_codes comes from the pipeline's
     # valid_codes (only stocks whose features survived cleaning), NEVER
     # re-derived from the raw panel: a stock whose features were cleaned out
@@ -1676,10 +1708,10 @@ def main():
     assert len(set(panel_stocks)) == len(panel_stocks), (
         "duplicate stock codes in panel (row identity broken)")
 
-    if args.prebuilt:
-        # Live per-channel loading is skipped in prebuilt mode; probe the panel's
-        # has_* flags instead so the experiment still records what actually got
-        # in.
+    if args.prebuilt or _store_load:
+        # Live per-channel loading is skipped in prebuilt / store mode; probe the
+        # panel's has_* flags instead so the experiment still records what
+        # actually got in.
         channel_manifest = _prebuilt_channel_coverage(panel_data)
 
     # Required-channel gate: a required channel with ZERO
