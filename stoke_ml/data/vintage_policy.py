@@ -43,6 +43,8 @@ def channel_allowed(
     the mandatory deny-by-default.  ``raw_vintage_safe`` / ``derived_versioned``
     are always allowed; ``latest_revised_aligned`` only under ``ALLOW_REVISED``.
     """
+    if not isinstance(policy, VintagePolicy):
+        policy = VintagePolicy(policy)
     status = _cv.status_of(channel, vintage_by_name=vintage_by_name)
     if status == "unknown_vintage":
         return False
@@ -99,6 +101,8 @@ def vintage_report(
     Returns ``{"vintage_policy", "channels": [{channel,status,rationale,
     allowed}...], "missing_channels", "daily_qfq_allowed"}``.
     """
+    if not isinstance(policy, VintagePolicy):
+        policy = VintagePolicy(policy)
     if declaration is None:
         declaration = _cv.CHANNEL_VINTAGE
     if documented_dims is None:

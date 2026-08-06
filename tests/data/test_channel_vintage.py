@@ -59,12 +59,14 @@ def test_derived_price_channel_is_derived_versioned():
     assert by_name["sentiment"].status == "raw_vintage_safe"
 
 
-def test_known_statuses_contains_all_four_states():
-    """§T2: KNOWN_STATUSES is the full vocabulary — the 3 declared states plus
-    the reserved unknown_vintage deny-by-default fallback."""
-    assert {"raw_vintage_safe", "derived_versioned", "latest_revised_aligned",
-            "unknown_vintage"} <= cv.KNOWN_STATUSES
-    assert cv.KNOWN_STATUSES >= VALID_STATUSES | {"unknown_vintage"}
+def test_known_statuses_is_exactly_all_four_states():
+    """§T2: KNOWN_STATUSES is EXACTLY the 3 declared states plus the reserved
+    unknown_vintage deny-by-default fallback — a stray 5th status added to the
+    vocabulary must fail this equality, not slip through a superset check."""
+    assert set(cv.KNOWN_STATUSES) == {
+        "raw_vintage_safe", "derived_versioned", "latest_revised_aligned",
+        "unknown_vintage",
+    }
 
 
 def test_status_of_defaults_to_unknown_vintage():

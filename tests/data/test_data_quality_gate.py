@@ -1098,6 +1098,108 @@ class TestChannelVintageFormalReport:
         assert by_name["sentiment"]["allowed"] is True
         assert by_name["daily_qfq"]["allowed"] is True
 
+    # ── §T2 formal enforcement: reject branches ────────────────────────────
+    # The crafted tests in test_vintage_policy.py prove vintage_report COMPUTES
+    # the missing/denied flags; these prove main() turns them into a FAIL in
+    # formal mode (and never does in bootstrap).  vintage_report is patched on
+    # the RUN module object so main() picks up the fake; the fake returns a
+    # COMPLETE report dict because the report builder reads channels + policy.
+
+    @staticmethod
+    def _vintage_gate_argv(root, output, *, profile):
+        argv = [
+            "data_quality_gate.py",
+            "--data-dir", str(root),
+            "--check", "datasets",
+            "--min-files", "0",
+            "--min-stocks", "0",
+            "--min-rows", "0",
+            "--min-span-days", "0",
+            "--max-stale-days", "10000",
+            "--output", str(output),
+        ]
+        if profile:
+            argv.append("--profile")
+            argv.append(profile)
+        return argv
+
+    def _vintage_gate_root(self, tmp_path):
+        """A data root with one valid daily stock + the frozen calendar artifact,
+        so under formal the ONLY reason for rc==1 is the vintage enforcement."""
+        root = tmp_path / "data"
+        daily_dir = root / "a_shares" / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
+        save_calendar(root, "a_shares")
+        return root
+
+    def _patch_vintage_report(self, monkeypatch, fake):
+        monkeypatch.setattr(
+            "scripts.production.data_quality_gate_run.vintage_report",
+            lambda *a, **k: fake,
+        )
+
+    def test_formal_rejects_incomplete_vintage_declaration(self, tmp_path, monkeypatch):
+        """§T2: formal mode FAILs when a documented use_* channel carries no
+        vintage declaration (silently unknown_vintage/denied is a hard FAIL)."""
+        root = self._vintage_gate_root(tmp_path)
+        self._patch_vintage_report(monkeypatch, {
+            "vintage_policy": "safe-only",
+            "channels": [],
+            "missing_channels": ["fundamental"],
+            "daily_qfq_allowed": True,
+        })
+        rc = _run_gate(
+            self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
+            monkeypatch,
+        )
+        assert rc == 1
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is False
+        assert report["vintage_policy"] == "safe-only"
+
+    def test_formal_rejects_denied_price_channel(self, tmp_path, monkeypatch):
+        """§T2: formal mode FAILs when the policy denies daily_qfq — a model
+        cannot train without the price channel."""
+        root = self._vintage_gate_root(tmp_path)
+        self._patch_vintage_report(monkeypatch, {
+            "vintage_policy": "safe-only",
+            "channels": [],
+            "missing_channels": [],
+            "daily_qfq_allowed": False,
+        })
+        rc = _run_gate(
+            self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
+            monkeypatch,
+        )
+        assert rc == 1
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is False
+
+    def test_bootstrap_does_not_fail_on_incomplete_declaration(self, tmp_path, monkeypatch):
+        """§T2 control: bootstrap REPORTS an incomplete declaration but never
+        ENFORCES it — the same fake that fails formal leaves rc==0 here."""
+        root = self._vintage_gate_root(tmp_path)
+        self._patch_vintage_report(monkeypatch, {
+            "vintage_policy": "safe-only",
+            "channels": [],
+            "missing_channels": ["fundamental"],
+            "daily_qfq_allowed": True,
+        })
+        rc = _run_gate(
+            self._vintage_gate_argv(root, tmp_path / "report", profile=None),
+            monkeypatch,
+        )
+        assert rc == 0
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is True
+
 
 class TestCalendarArtifactAndFreshness:
     """v14 §九: the gate must (1) load the frozen calendar artifact for the
