@@ -1104,6 +1104,15 @@ class TestChannelVintageFormalReport:
     # formal mode (and never does in bootstrap).  vintage_report is patched on
     # the RUN module object so main() picks up the fake; the fake returns a
     # COMPLETE report dict because the report builder reads channels + policy.
+    #
+    # The FORMAL_PROFILE relaxation below is REQUIRED: under --profile formal,
+    # main() OVERRIDES the CLI span/stale flags with the frozen research floors
+    # (5y span / 4 trading-day staleness), which the 5-day test dataset can
+    # never satisfy.  Without relaxing those floors the datasets check alone
+    # would force rc==1 and the reject tests would be tautological.  With the
+    # floors relaxed (plus save_calendar for the calendar check), the vintage
+    # enforcement is the SOLE remaining failure driver — proven by the clean
+    # negative control below.
 
     @staticmethod
     def _vintage_gate_argv(root, output, *, profile):
@@ -1124,14 +1133,22 @@ class TestChannelVintageFormalReport:
         return argv
 
     def _vintage_gate_root(self, tmp_path):
-        """A data root with one valid daily stock + the frozen calendar artifact,
-        so under formal the ONLY reason for rc==1 is the vintage enforcement."""
+        """A data root with one valid daily stock + the frozen calendar artifact.
+        Formal runs must ALSO relax gate_mod.FORMAL_PROFILE (span/stale) so the
+        vintage enforcement is the only possible reason for rc==1."""
         root = tmp_path / "data"
         daily_dir = root / "a_shares" / "daily"
         daily_dir.mkdir(parents=True, exist_ok=True)
         _write_daily_full(daily_dir, "000001", _daily(TRADE_DATES, [10.0] * 5))
         save_calendar(root, "a_shares")
         return root
+
+    def _relax_formal_profile(self, monkeypatch):
+        """Lower the frozen formal span/stale floors so the 5-day test dataset's
+        datasets check PASSES under --profile formal — isolating the vintage
+        enforcement as the only remaining failure driver."""
+        monkeypatch.setitem(gate_mod.FORMAL_PROFILE, "min_span_days", 0)
+        monkeypatch.setitem(gate_mod.FORMAL_PROFILE, "max_stale_days", 10000)
 
     def _patch_vintage_report(self, monkeypatch, fake):
         monkeypatch.setattr(
@@ -1143,6 +1160,7 @@ class TestChannelVintageFormalReport:
         """§T2: formal mode FAILs when a documented use_* channel carries no
         vintage declaration (silently unknown_vintage/denied is a hard FAIL)."""
         root = self._vintage_gate_root(tmp_path)
+        self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
             "vintage_policy": "safe-only",
             "channels": [],
@@ -1159,11 +1177,13 @@ class TestChannelVintageFormalReport:
         )
         assert report["passed"] is False
         assert report["vintage_policy"] == "safe-only"
+        assert report["channel_vintage"] == []  # the fake was consumed
 
     def test_formal_rejects_denied_price_channel(self, tmp_path, monkeypatch):
         """§T2: formal mode FAILs when the policy denies daily_qfq — a model
         cannot train without the price channel."""
         root = self._vintage_gate_root(tmp_path)
+        self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
             "vintage_policy": "safe-only",
             "channels": [],
@@ -1179,6 +1199,31 @@ class TestChannelVintageFormalReport:
             (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
         )
         assert report["passed"] is False
+        assert report["channel_vintage"] == []  # the fake was consumed
+
+    def test_formal_passes_when_vintage_declaration_clean(self, tmp_path, monkeypatch):
+        """§T2 negative control: the SAME relaxed formal run with a CLEAN fake
+        (no missing channels, price channel allowed) passes — proving the two
+        reject tests' rc==1 is driven by the vintage enforcement, not by the
+        datasets/calendar checks."""
+        root = self._vintage_gate_root(tmp_path)
+        self._relax_formal_profile(monkeypatch)
+        self._patch_vintage_report(monkeypatch, {
+            "vintage_policy": "safe-only",
+            "channels": [],
+            "missing_channels": [],
+            "daily_qfq_allowed": True,
+        })
+        rc = _run_gate(
+            self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
+            monkeypatch,
+        )
+        assert rc == 0
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is True
+        assert report["channel_vintage"] == []  # the fake was consumed
 
     def test_bootstrap_does_not_fail_on_incomplete_declaration(self, tmp_path, monkeypatch):
         """§T2 control: bootstrap REPORTS an incomplete declaration but never
@@ -1199,6 +1244,7 @@ class TestChannelVintageFormalReport:
             (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
         )
         assert report["passed"] is True
+        assert report["channel_vintage"] == []  # the fake was consumed
 
 
 class TestCalendarArtifactAndFreshness:
