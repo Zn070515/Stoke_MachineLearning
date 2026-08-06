@@ -121,6 +121,24 @@ def _exchange_group(stock_code: str) -> str:
     return "BJ"
 
 
+def _is_csi_universe(universe: str) -> bool:
+    """§T6 decision 2: the universe is one of the strict-CSI index universes."""
+    return universe in ("csi300", "csi500", "csi800")
+
+
+def _strict_index_training_effective(cli_value: bool | None, universe: str) -> bool:
+    """§T6 decision 2: resolve the strict inner-train membership gate.
+
+    ``None`` (the new default) means "decide from the universe": ON for the
+    strict-CSI universes (csi300/csi500/csi800), OFF otherwise.  An explicit
+    ``--strict-index-training`` / ``--no-strict-index-training`` forces the
+    value regardless of universe.
+    """
+    if cli_value is not None:
+        return bool(cli_value)
+    return _is_csi_universe(universe)
+
+
 def _load_index_universe(data_dir: str, index_codes: set[str]) -> list[str]:
     """Stocks ever in the given indices (PIT in_date/out_date union).
 
@@ -591,6 +609,16 @@ def _panel_store_meta(
       mismatch warns-and-proceeds (each is re-derivable by rebuilding the
       store).
     """
+    # §T6 decision 2: CSI universes bake the daily-member cross-section
+    # normalization into the panel arrays, so the store fingerprint must record
+    # it (as a pseudo-switch) — otherwise a stale store built for the all-stock
+    # z-norm would silently pass the staleness guard.  Copy the dict; never
+    # mutate the kwargs cache.  `universe` is a separate meta key, but the
+    # pseudo-switch makes the *normalization semantics* explicit and survives a
+    # universe re-map.
+    _switches = _panel_pipeline_kwargs(args, seq_len)
+    if _is_csi_universe(args.universe):
+        _switches = {**_switches, "daily_membership_norm": True}
     meta = {
         "horizon": args.horizon,
         "seq_len": seq_len,
@@ -598,7 +626,7 @@ def _panel_store_meta(
         "end": args.end,
         "universe": args.universe,
         "n_stocks": len(stock_list) if stock_list is not None else None,
-        "feature_switches": _panel_pipeline_kwargs(args, seq_len),
+        "feature_switches": _switches,
         "config_hash": current_config_hash(),
         "git_commit": git_head(),
     }
@@ -717,10 +745,30 @@ def _resolve_panel(
         )
         logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
 
+    # §T6 decision 2 (strict CSI): CSI universes restrict the per-date
+    # cross-section STATISTICAL SET to that day's index members (half-open
+    # in_date <= date < out_date).  Non-members are still z-scored but do NOT
+    # contribute to the mean/std.  Missing membership.parquet degrades to the
+    # all-stock z-norm (daily_membership=None) with a WARNING — the stock pool
+    # gate already refuses csi universes without the artifact, so this is a
+    # belt-and-suspenders guard, not a silent fallback.
+    daily_membership = None
+    if _is_csi_universe(args.universe):
+        _idx = {"csi300": {"000300"}, "csi500": {"000905"},
+                "csi800": {"000300", "000905"}}[args.universe]
+        _mem = load_index_membership(data_dir, sorted(_idx))
+        if _mem.empty:
+            logger.warning(
+                "CSI universe %s: index membership is empty/missing — falling "
+                "back to the all-stock cross-section z-norm (no daily-member "
+                "normalization; §T6 decision 2)", args.universe)
+        else:
+            daily_membership = _mem
     fp = FeaturePipeline(**_panel_pipeline_kwargs(args, seq_len))
     panel_data = fp.build_panel_features(
         panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
         require_feature_manifest=args.require_feature_manifest,
+        daily_membership=daily_membership,
     )
     if args.panel_store:
         save_panel_memmap(
@@ -1858,14 +1906,18 @@ def main():
                              "prominent warning, instead of refusing to start "
                              "(§P0-7; formal is the default)")
     parser.add_argument("--strict-index-training",
-                        action=argparse.BooleanOptionalAction, default=False,
-                        help="§八.3: gate the inner-TRAIN loss by per-day index "
-                             "membership for csi300/csi500/csi800.  Default: "
-                             "off — inner_train learns from the broad "
-                             "historical-member union and only the RANKED "
-                             "candidate pools (inner_val/outer_test) are "
-                             "membership-gated.  Only meaningful when the "
-                             "universe consumes membership.parquet")
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="§八.3 + §T6 decision 2: gate the inner-TRAIN loss "
+                             "by per-day index membership for csi300/csi500/"
+                             "csi800.  Default: None = decide from the universe "
+                             "— ON for the strict-CSI universes "
+                             "(csi300/csi500/csi800), OFF otherwise.  An "
+                             "explicit --strict-index-training / "
+                             "--no-strict-index-training forces the value "
+                             "regardless of universe.  When OFF, inner_train "
+                             "learns from the broad historical-member union and "
+                             "only the RANKED candidate pools "
+                             "(inner_val/outer_test) are membership-gated.")
     parser.add_argument("--vintage-policy", type=str, default="safe-only",
                         choices=["safe-only", "allow-revised"],
                         help="§T2: vintage-admission policy for the feature set.  "
@@ -1906,6 +1958,11 @@ def main():
 
     if args.end is None:
         args.end = datetime.now().strftime("%Y-%m-%d")
+
+    # §T6 decision 2: the strict inner-train membership gate defaults ON for
+    # the strict-CSI universes, OFF otherwise — an explicit CLI flag wins.
+    args.strict_index_training = _strict_index_training_effective(
+        args.strict_index_training, args.universe)
 
     # §十六: decide the store-load path up front — BEFORE universe resolution
     # and the K-line load — so a complete-store re-run never reads the

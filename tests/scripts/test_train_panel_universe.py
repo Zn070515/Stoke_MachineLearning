@@ -1081,3 +1081,117 @@ def test_allow_fundamental_ablation_missing_flag_defaults_off(tp):
     must not crash — the defensive read defaults the flag to off."""
     kw = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
     assert kw["use_fundamental"] is False
+
+
+# ── §T6 decision 2: strict-CSI daily-member normalization + strict training ──
+
+def test_is_csi_universe(tp):
+    """csi300/csi500/csi800 are the strict-CSI universes; everything else
+    (including the historical-member-universe modes) is not."""
+    for u in ("csi300", "csi500", "csi800"):
+        assert tp._is_csi_universe(u) is True, u
+    for u in ("random", "all", "first", "stratified"):
+        assert tp._is_csi_universe(u) is False, u
+
+
+def test_strict_index_training_effective(tp):
+    """§T6 decision 2: the default (None) decides from the universe — ON for
+    the strict-CSI universes, OFF otherwise; an explicit flag always wins."""
+    assert tp._strict_index_training_effective(None, "csi300") is True
+    assert tp._strict_index_training_effective(None, "csi800") is True
+    assert tp._strict_index_training_effective(None, "random") is False
+    assert tp._strict_index_training_effective(None, "all") is False
+    assert tp._strict_index_training_effective(True, "random") is True
+    assert tp._strict_index_training_effective(False, "csi300") is False
+
+
+def test_panel_store_meta_csi_marks_daily_membership_norm(tp):
+    """§T6: a CSI universe bakes daily-member cross-section normalization into
+    the panel arrays, so the store fingerprint records the pseudo-switch — a
+    stale store built for the all-stock z-norm must refuse to mix.  Non-CSI
+    universes never carry the key."""
+    csi = tp._panel_store_meta(
+        _panel_args("safe-only", universe="csi300"),
+        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    assert csi["feature_switches"].get("daily_membership_norm") is True
+    # The pseudo-switch is ADDED to the real switch set, never replacing it.
+    assert csi["feature_switches"]["seq_len"] == 60
+    assert csi["feature_switches"]["use_sentiment"] is True
+    non_csi = tp._panel_store_meta(
+        _panel_args("safe-only", universe="random"),
+        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    assert "daily_membership_norm" not in non_csi["feature_switches"]
+
+
+def _fake_storage():
+    """DataStorage replacement whose load_daily yields one tiny row per stock —
+    enough for _resolve_panel's K-line concat without reading real disk data."""
+    class _FakeStorage:
+        def __init__(self, data_dir):
+            self.data_dir = data_dir
+
+        def load_daily(self, code, start, end, require_valid_manifest=True):
+            return pd.DataFrame({
+                "date": pd.to_datetime(["2022-01-04"]),
+                "open": [1.0], "high": [1.1], "low": [0.9],
+                "close": [1.0], "volume": [100], "amount": [100.0],
+            })
+    return _FakeStorage
+
+
+def _capture_pipeline():
+    """FeaturePipeline replacement that records build_panel_features kwargs."""
+    calls = []
+    class _FakePipeline:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+        def build_panel_features(self, panel, **kw):
+            calls.append({"panel": panel, **kw})
+            return {"__dummy": True}
+    return _FakePipeline, calls
+
+
+def test_resolve_panel_passes_membership_for_csi(tp, monkeypatch, caplog):
+    """§T6 decision 2 wiring: for a CSI universe, _resolve_panel loads the
+    index-membership intervals and hands them to build_panel_features as
+    daily_membership (so the cross-section z-norm is member-limited)."""
+    import stoke_ml.data.storage as storage_mod
+    fake_pipe, calls = _capture_pipeline()
+    monkeypatch.setattr(tp, "FeaturePipeline", fake_pipe)
+    monkeypatch.setattr(storage_mod, "DataStorage", _fake_storage())
+    mem = pd.DataFrame({
+        "stock_code": ["600000"],
+        "index_code": ["000300"],
+        "in_date": pd.to_datetime(["2022-01-01"]),
+        "out_date": pd.to_datetime([pd.NaT]),
+    })
+    monkeypatch.setattr(
+        tp, "load_index_membership", lambda data_dir, indices: mem)
+    args = _panel_args("safe-only", universe="csi300", no_aux=True)
+    args.panel_store = None
+    args.require_feature_manifest = False
+    panel_data, channel_manifest = tp._resolve_panel(
+        args, ["600000"], 60, "data", {"sentiment"}, _store_load=False)
+    assert panel_data == {"__dummy": True}
+    assert len(calls) == 1
+    assert calls[0]["daily_membership"] is mem
+
+
+def test_resolve_panel_empty_membership_warns_and_degrades(tp, monkeypatch, caplog):
+    """§T6: an EMPTY/missing membership for a CSI universe must not crash — it
+    warns and degrades to daily_membership=None (the all-stock z-norm)."""
+    import stoke_ml.data.storage as storage_mod
+    fake_pipe, calls = _capture_pipeline()
+    monkeypatch.setattr(tp, "FeaturePipeline", fake_pipe)
+    monkeypatch.setattr(storage_mod, "DataStorage", _fake_storage())
+    empty = pd.DataFrame(columns=["stock_code", "index_code", "in_date", "out_date"])
+    monkeypatch.setattr(
+        tp, "load_index_membership", lambda data_dir, indices: empty)
+    args = _panel_args("safe-only", universe="csi800", no_aux=True)
+    args.panel_store = None
+    args.require_feature_manifest = False
+    with caplog.at_level("WARNING"):
+        tp._resolve_panel(
+            args, ["600000"], 60, "data", {"sentiment"}, _store_load=False)
+    assert "empty/missing" in caplog.text
+    assert calls[0]["daily_membership"] is None

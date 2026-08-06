@@ -17,6 +17,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.codes import normalize_stock_code_series
 from stoke_ml.features import cache_manifest
 from stoke_ml.features.aux_cols import FUNDAMENTAL_COLS
 from stoke_ml.features.fundamental import FundamentalRefiner
@@ -36,6 +37,78 @@ from stoke_ml.features.temporal import add_calendar_features
 logger = logging.getLogger(__name__)
 
 
+def _daily_member_flag(
+    all_feat: pd.DataFrame, membership: pd.DataFrame,
+) -> pd.Series:
+    """Row-level per-stock index-membership flag for each row's date.
+
+    ``all_feat`` carries ``date`` + ``stock_code``; ``membership`` is the
+    long-form ``(stock_code, in_date, out_date)`` frame (already filtered to the
+    run's indices).  A row is a member iff ``in_date <= date < out_date``
+    (half-open; ``out_date`` NaT = still a member).  Returns a bool Series
+    aligned to ``all_feat``'s index.
+
+    Vectorized: row positions are grouped by code ONCE via a hash (O(rows)),
+    then each member code's rows get a sorted-interval lookup via
+    ``numpy.searchsorted`` after a per-code interval merge — NOT an
+    O(rows x intervals) loop.  The full market panel is ~33M rows.  The merge
+    keeps "any covering interval" exact even when a stock's intervals overlap
+    across the indices of a csi800 universe (000300 + 000905 windows can
+    overlap with different out_dates).
+    """
+    n = len(all_feat)
+    is_member = np.zeros(n, dtype=bool)
+    if membership is None or membership.empty or n == 0:
+        return pd.Series(is_member, index=all_feat.index)
+    mem = pd.DataFrame({
+        "code": normalize_stock_code_series(membership["stock_code"]),
+        "in": pd.to_datetime(membership["in_date"], errors="coerce"),
+        "out": pd.to_datetime(membership["out_date"], errors="coerce"),
+    })
+    mem = mem.dropna(subset=["code", "in"])
+    if mem.empty:
+        return pd.Series(is_member, index=all_feat.index)
+    row_codes = normalize_stock_code_series(all_feat["stock_code"])
+    pos_by_code = row_codes.groupby(row_codes).indices
+    row_dates = pd.to_datetime(all_feat["date"]).to_numpy(dtype="datetime64[ns]")
+    for code, sub in mem.groupby("code", sort=True):
+        rows = pos_by_code.get(code)
+        if rows is None or rows.size == 0:
+            continue
+        in_i = sub["in"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+        out_i = np.where(
+            np.isnat(sub["out"].to_numpy(dtype="datetime64[ns]")),
+            np.iinfo(np.int64).max,
+            sub["out"].to_numpy(dtype="datetime64[ns]").astype(np.int64),
+        )
+        # Merge overlapping intervals so searchsorted on the last-starting
+        # interval answers "any interval covers" exactly.
+        order = np.argsort(in_i, kind="mergesort")
+        starts: list[int] = []
+        ends: list[int] = []
+        cur_in = int(in_i[order[0]])
+        cur_out = int(out_i[order[0]])
+        for j in order[1:]:
+            a, b = int(in_i[j]), int(out_i[j])
+            if a <= cur_out:
+                cur_out = max(cur_out, b)
+            else:
+                starts.append(cur_in)
+                ends.append(cur_out)
+                cur_in, cur_out = a, b
+        starts.append(cur_in)
+        ends.append(cur_out)
+        s_arr = np.asarray(starts, dtype=np.int64)
+        e_arr = np.asarray(ends, dtype=np.int64)
+        rd = row_dates[rows].astype(np.int64)
+        pos = np.searchsorted(s_arr, rd, side="right") - 1
+        good = pos >= 0
+        covered = np.zeros(rows.size, dtype=bool)
+        covered[good] = rd[good] < e_arr[np.clip(pos[good], 0, e_arr.size - 1)]
+        is_member[rows] |= covered
+    return pd.Series(is_member, index=all_feat.index)
+
+
 def build_panel_features(
     pipeline,
     panel: pd.DataFrame,
@@ -46,6 +119,7 @@ def build_panel_features(
     min_history: int | None = None,
     require_feature_manifest: bool = False,
     data_dir: str | None = None,
+    daily_membership: pd.DataFrame | None = None,
 ) -> dict:
     """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -83,6 +157,16 @@ def build_panel_features(
                   Defaults to the active config's ``project.data_dir``; pass
                   an explicit path in tests so the fake source files and the
                   manifest both resolve under the same temp root.
+        daily_membership: optional long-form index-membership frame
+                  ``(stock_code, in_date, out_date)`` (as returned by
+                  ``stoke_ml.data.universe.load_index_membership``), ALREADY
+                  filtered to the run's indices.  When set and non-empty, it
+                  restricts the per-date cross-section STATISTICAL SET to only
+                  those stocks that are members on that date (half-open
+                  ``in_date <= date < out_date``; ``out_date`` NaT = still a
+                  member).  Non-member stocks still get z-scored, but they do
+                  NOT contribute to the mean/std (§T6 decision 2).  Default
+                  None = the EXACT current all-stock behavior.
 
     Returns:
         dict with numpy arrays: static_features, past_known, past_observed,
@@ -707,13 +791,30 @@ def build_panel_features(
     # a feature's value is expressed relative to the cross-section that
     # day.  This avoids pooling future dates' statistics into today's
     # normalized value and is the standard panel-finance treatment.
+    # §T6 decision 2: when daily_membership is set, the STATISTICAL SET for
+    # each date is restricted to that day's index members (half-open
+    # in_date <= date < out_date); non-member stocks are still z-scored but do
+    # NOT contribute to the mean/std.  None/empty = the EXACT current all-stock
+    # behavior (byte-for-byte for the default path).
     norm_cols = [c for c in pk_cols_available + po_cols_available
                  if c not in _CS_NORM_SKIP_COLS]
-    all_feat = pd.concat([
-        df[["date"] + norm_cols]
-        for df in all_feat_dfs
-        if len(df) > 0
-    ], ignore_index=True)
+    membership_active = (
+        daily_membership is not None and not daily_membership.empty
+    )
+    if membership_active:
+        all_feat = pd.concat([
+            df[["date", "stock_code"] + norm_cols]
+            for df in all_feat_dfs
+            if len(df) > 0
+        ], ignore_index=True)
+        is_member = _daily_member_flag(all_feat, daily_membership)
+    else:
+        all_feat = pd.concat([
+            df[["date"] + norm_cols]
+            for df in all_feat_dfs
+            if len(df) > 0
+        ], ignore_index=True)
+        is_member = None
     # Strip non-finite BEFORE any cross-sectional statistic.
     # A single inf (e.g. a near-zero divisor in a factor) pollutes the
     # groupby mean/std, corrupting the whole date's z-score before the
@@ -733,7 +834,8 @@ def build_panel_features(
     for col in norm_cols:
         if col not in all_feat.columns:
             continue
-        stats = all_feat.groupby("date")[col].agg(["mean", "std", "count"])
+        stat_feat = all_feat if is_member is None else all_feat[is_member]
+        stats = stat_feat.groupby("date")[col].agg(["mean", "std", "count"])
         stats["std"] = stats["std"].fillna(1.0).clip(lower=1e-8)
         # Dates with very few listed stocks (the 2000-2015 backfill has
         # 1-5 stocks/day) give a degenerate cross-section: std→0 inflates
@@ -747,7 +849,7 @@ def build_panel_features(
             # cross-section avoids).  Use expanding moments over dates <=
             # the sparse date — strictly point-in-time.  Cumulative sums
             # give O(dates) per column instead of O(dates^2).
-            sdf = all_feat[["date", col]].sort_values("date")
+            sdf = stat_feat[["date", col]].sort_values("date")
             col_vals = sdf[col].to_numpy(dtype=np.float64)
             # Treat inf as invalid too (np.nanmean/np.nanstd choke on it
             # and would leak NaN through the z-score).
@@ -771,6 +873,18 @@ def build_panel_features(
             stats.loc[sparse, "mean"] = mean.astype(stats["mean"].dtype)
             stats.loc[sparse, "std"] = std.astype(stats["std"].dtype)
         date_stats[col] = stats
+        if is_member is not None:
+            # §T6: a date present in the panel but with ZERO member rows must
+            # still receive stats — otherwise the .map below yields NaN and the
+            # post-processing nan_to_num zeroes the WHOLE date's features.  Fall
+            # back to the all-stock groupby stats (the current behavior computed
+            # over the full cross-section) for exactly those dates.  Also covers
+            # a member subset with no entry for the date (sparse-fallback edges).
+            all_stats = all_feat.groupby("date")[col].agg(["mean", "std", "count"])
+            all_stats["std"] = all_stats["std"].fillna(1.0).clip(lower=1e-8)
+            missing = all_stats.index.difference(stats.index)
+            if len(missing):
+                date_stats[col] = pd.concat([stats, all_stats.loc[missing]])
 
     for df in all_feat_dfs:
         for col in norm_cols:

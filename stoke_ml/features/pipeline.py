@@ -1012,6 +1012,7 @@ class FeaturePipeline:
         min_history: int | None = None,
         require_feature_manifest: bool = False,
         data_dir: str | None = None,
+        daily_membership: pd.DataFrame | None = None,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training.
 
@@ -1029,4 +1030,5 @@ class FeaturePipeline:
             min_history=min_history,
             require_feature_manifest=require_feature_manifest,
             data_dir=data_dir,
+            daily_membership=daily_membership,
         )
