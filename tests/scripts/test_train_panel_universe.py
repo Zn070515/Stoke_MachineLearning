@@ -272,7 +272,11 @@ def test_calendar_freeze_sensitive_to_holiday_change(tp, tmp_path, monkeypatch):
         df.loc[df.index[0], "is_open"] = not bool(df.iloc[0]["is_open"])
         return df
 
-    monkeypatch.setattr(tp, "build_calendar_frame", fake_build)
+    # _calendar_freeze was split into train_panel_registry (§二十一); it
+    # resolves build_calendar_frame from THAT module's namespace, so the
+    # holiday-flip monkeypatch must land there, not on the train_panel shell.
+    import scripts.production.train_panel_registry as registry
+    monkeypatch.setattr(registry, "build_calendar_frame", fake_build)
     changed = tp._calendar_freeze(str(tmp_path))
     assert changed["calendar_artifact_hash"] != base["calendar_artifact_hash"]
     assert changed["verified_until"] == base["verified_until"]
