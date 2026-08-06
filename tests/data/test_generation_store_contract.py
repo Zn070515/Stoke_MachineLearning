@@ -134,3 +134,41 @@ def test_legacy_unhashed_manifest_proceeds(tmp_path, caplog):
         out = read_generation(data_dir, REL)
     pd.testing.assert_frame_equal(out, df)
     assert any("schema_hash" in r.getMessage() for r in caplog.records)
+
+
+def test_tampered_index_detected_when_name_collides(tmp_path):
+    """Regression: when the index name collides with a column name, the index
+    values must STILL be hashed.  The pre-review fallback (hash without the
+    index on reset_index ValueError) let a tampered index pass validation —
+    exactly the guarantee T10 exists to give."""
+    data_dir = str(tmp_path)
+    dates = pd.to_datetime(["2024-01-01", "2024-01-02"])
+    df = pd.DataFrame(
+        {"date": pd.to_datetime(["2024-01-03", "2024-01-04"])},
+        index=pd.Index(dates, name="date"),  # index name collides with column
+    )
+    write_generation(data_dir, REL, df, {"dataset": "macro_daily", "rows": 2})
+    # Tamper ONLY the index values (shift the dates), leave the column intact.
+    tampered = df.copy()
+    tampered.index = pd.to_datetime(["2024-02-01", "2024-02-02"])
+    tampered.to_parquet(os.path.join(_active_gen_dir(data_dir), "data.parquet"))
+    with pytest.raises(GenerationStoreError, match="schema_hash"):
+        read_generation(data_dir, REL)
+
+
+def test_refused_first_write_leaves_no_gen_dir(tmp_path):
+    """A refused first write must not leave a ``..._gen/`` dir behind — that
+    would flip read_generation from None (legacy fallback) to a CURRENT-missing
+    GenerationStoreError for aux_helpers._load_macro_features."""
+    data_dir = str(tmp_path)
+    gen_root = _gen_root(data_dir)
+    os.makedirs(os.path.dirname(gen_root), exist_ok=True)  # only the PARENT
+    lock_dir = acquire_lock(gen_root)
+    try:
+        with pytest.raises(GenerationStoreError, match="lock"):
+            write_generation(data_dir, REL, _macro_df(), _manifest(), lock_timeout=0.2)
+        # gen_root itself must not exist → read_generation still returns None.
+        assert not os.path.isdir(gen_root)
+        assert read_generation(data_dir, REL) is None
+    finally:
+        release_lock(lock_dir)

@@ -21,11 +21,12 @@ Layout::
         CURRENT            # file whose content is the active generation name
 
 Writes are serialized by a single-writer lock on the generation root
-(``file_lock``, §十三): generation numbering, parquet, manifest and the CURRENT
-flip all run under it, so a concurrent writer is REFUSED with
-:class:`GenerationStoreError` rather than interleaved.  Readers need no lock —
-CURRENT is flipped atomically and old generations are never deleted.  Old
-generations are retained (no pruning) — retention is a separate concern.
+(``asset_contract.acquire_lock``, §十三): generation numbering, parquet,
+manifest and the CURRENT flip all run under it, so a concurrent writer is
+REFUSED with :class:`GenerationStoreError` rather than interleaved.  Readers
+need no lock — CURRENT is flipped atomically and old generations are never
+deleted.  Old generations are retained (no pruning) — retention is a separate
+concern.
 
 Each write stamps a ``schema_hash`` over the FULL content (including the index,
 via ``reset_index()``) into the manifest; read_generation recomputes it and
@@ -43,7 +44,12 @@ import os
 
 import pandas as pd
 
-from stoke_ml.data.asset_contract import AtomicCommit, file_lock, schema_hash
+from stoke_ml.data.asset_contract import (
+    AtomicCommit,
+    acquire_lock,
+    release_lock,
+    schema_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +66,17 @@ def _generation_schema_hash(df: pd.DataFrame) -> str:
     DatetimeIndex named "date" is the primary-key content, and
     ``asset_contract.schema_hash`` only covers ``df.columns``.
 
-    ``reset_index()`` turns the index into a column so the hash covers its
-    values; the parquet round-trip preserves the index, so read_generation
-    applies the same canonicalization and recomputes an identical hash.
+    The index is renamed to a name that does NOT collide with any column, then
+    ``reset_index()`` turns it into a column so the hash always covers its
+    values — even when the index name equals a column name.  The parquet
+    round-trip preserves the index (name included), so read_generation applies
+    the same canonicalization and recomputes an identical hash.
     """
-    try:
-        canonical = df.reset_index()
-    except ValueError:
-        # Index name collides with an existing column (degenerate layout) —
-        # fall back to hashing the frame as-is; read_generation hits the same
-        # path, so the hash is still recomputable.
-        canonical = df
+    index_name = df.index.name or "__index__"
+    name = index_name
+    while name in df.columns:
+        name = "_" + name
+    canonical = df.rename_axis(name).reset_index()
     return schema_hash(canonical)
 
 
@@ -112,40 +118,50 @@ def write_generation(
     write is REFUSED with :class:`GenerationStoreError` — no partial write.
     """
     gen_root = os.path.join(data_dir, rel + GEN_SUFFIX)
-    # Create the generation root (and its parents) before taking the lock — the
-    # lock dir lives NEXT to the root, so its parent must exist for os.mkdir.
-    os.makedirs(gen_root, exist_ok=True)
+    # The lock dir lives NEXT to the generation root, so only its parent must
+    # exist for the lock's os.mkdir.  Deliberately do NOT create the root here:
+    # a refused/timed-out first write must leave no ``..._gen/`` dir behind,
+    # otherwise read_generation would flip from None (legacy flat fallback in
+    # aux_helpers) to a CURRENT-missing GenerationStoreError.
+    os.makedirs(os.path.dirname(gen_root) or ".", exist_ok=True)
     try:
-        with file_lock(gen_root, timeout=lock_timeout):
-            existing = [
-                int(name[len("gen_"):])
-                for name in os.listdir(gen_root)
-                if name.startswith("gen_") and name[len("gen_"):].isdigit()
-            ]
-            next_n = max(existing, default=0) + 1
-            gen_name = f"gen_{next_n:08d}"
-            gen_dir = os.path.join(gen_root, gen_name)
-            os.makedirs(gen_dir, exist_ok=True)
-
-            stamped = _stamp_manifest(manifest, df, gen_name)
-            data_path = os.path.join(gen_dir, "data.parquet")
-            with AtomicCommit(data_path) as ac:
-                df.to_parquet(ac.tmp_path)
-            manifest_path = os.path.join(gen_dir, "manifest.json")
-            with AtomicCommit(manifest_path) as ac:
-                with open(ac.tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(stamped, f, indent=2, ensure_ascii=False)
-
-            current_path = os.path.join(gen_root, CURRENT_NAME)
-            with AtomicCommit(current_path) as ac:
-                with open(ac.tmp_path, "w", encoding="utf-8") as f:
-                    f.write(gen_name)
-            return gen_name
+        lock_dir = acquire_lock(gen_root, timeout=lock_timeout)
     except TimeoutError as exc:
+        # Scope the wrap to the lock ENTER only — a builtin TimeoutError raised
+        # later by e.g. pandas inside the locked body must not be mislabeled as
+        # lock contention.
         raise GenerationStoreError(
             f"could not acquire single-writer lock on {gen_root} within "
             f"{lock_timeout}s — another writer in progress"
         ) from exc
+    try:
+        os.makedirs(gen_root, exist_ok=True)
+        existing = [
+            int(name[len("gen_"):])
+            for name in os.listdir(gen_root)
+            if name.startswith("gen_") and name[len("gen_"):].isdigit()
+        ]
+        next_n = max(existing, default=0) + 1
+        gen_name = f"gen_{next_n:08d}"
+        gen_dir = os.path.join(gen_root, gen_name)
+        os.makedirs(gen_dir, exist_ok=True)
+
+        stamped = _stamp_manifest(manifest, df, gen_name)
+        data_path = os.path.join(gen_dir, "data.parquet")
+        with AtomicCommit(data_path) as ac:
+            df.to_parquet(ac.tmp_path)
+        manifest_path = os.path.join(gen_dir, "manifest.json")
+        with AtomicCommit(manifest_path) as ac:
+            with open(ac.tmp_path, "w", encoding="utf-8") as f:
+                json.dump(stamped, f, indent=2, ensure_ascii=False)
+
+        current_path = os.path.join(gen_root, CURRENT_NAME)
+        with AtomicCommit(current_path) as ac:
+            with open(ac.tmp_path, "w", encoding="utf-8") as f:
+                f.write(gen_name)
+        return gen_name
+    finally:
+        release_lock(lock_dir)
 
 
 def read_generation(data_dir: str, rel: str) -> pd.DataFrame | None:

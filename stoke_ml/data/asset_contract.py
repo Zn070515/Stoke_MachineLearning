@@ -116,7 +116,14 @@ _LOCK_STALE = 900.0
 
 
 def acquire_lock(target: str, timeout: float = _LOCK_TIMEOUT) -> str:
-    """Exclusive per-target lock via atomic mkdir. Returns the lock dir path."""
+    """Exclusive per-target lock via atomic mkdir. Returns the lock dir path.
+
+    Stale-lock steal: a lock dir older than ``_LOCK_STALE`` (900s) is assumed
+    to be a crashed writer's leftover and is stolen, so a LIVE writer holding
+    the lock that long would be displaced — the trade is crash recovery over
+    long-write safety.  generation_store holds the lock only for the sub-second
+    write body, so this is not a practical hazard there.
+    """
     lock_dir = target + ".lock"
     deadline = time.monotonic() + timeout
     while True:
