@@ -538,7 +538,9 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
     pipeline construction AND the panel-store meta fingerprint, so a change to
     the switches OR the vintage policy is caught by the store staleness guard.
     ``--vintage-policy`` is applied as an AND-filter over each channel's base
-    preference (the policy can only turn channels OFF, never force one ON).
+    preference (the policy can only turn channels OFF, never force one ON);
+    ``--allow-fundamental-ablation`` is the one exception, forcing the
+    fundamental channel ON (only that channel) regardless of policy.
     """
     policy = VintagePolicy(args.vintage_policy)
     kwargs = {
