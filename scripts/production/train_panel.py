@@ -1194,8 +1194,6 @@ def _fmt_date(global_dates, idx):
     return str(np.datetime_as_string(global_dates[idx], unit="D"))
 
 
-
-
 def _weight_hash(model) -> str:
     """Content hash of a model's TRAINED parameters (float32, CPU).
 
@@ -1274,8 +1272,6 @@ def _augment_sequence(
     return pk_aug, po_aug
 
 
-
-
 # §十一.3 architecture-ablation switchboard.  Each entry maps a human name to
 # PanelConfig field overrides that switch OFF one component of the production
 # architecture, isolating where the model's edge comes from.  All default to
@@ -1291,8 +1287,6 @@ _ABLATIONS: dict[str, dict] = {
     "no_ranking": {"use_ranking_loss": False},
     "no_pit_static": {"use_pit_static": False},
 }
-
-
 
 
 def _save_artifacts(
@@ -1373,8 +1367,6 @@ def _predict_outer(model, outer_data, config, device) -> np.ndarray | None:
     preds = torch.cat(preds_parts)
     n_stocks = outer_data["static_features"].shape[0]
     return preds.reshape(n_stocks, val_ds.n_windows).numpy()
-
-
 
 
 def _best_eval_metrics(history: dict) -> tuple[dict, int]:

@@ -9,7 +9,8 @@ working for every pre-split ``X``.
   * ``evaluate_metrics``   — pure risk/return metrics (Sharpe / Sortino / ...)
   * ``evaluate_ic``        — per-day Spearman IC, clean-IC, candidate pool
   * ``evaluate_account``   — chronological sleeve-account simulation + ledger
-  * ``evaluate_portfolio`` — ``evaluate_portfolio`` / ``evaluate_sharpe`` + co
+  * ``evaluate_portfolio`` — the portfolio module (``evaluate_portfolio`` /
+    ``evaluate_sharpe`` + helpers)
 """
 # ruff: noqa: F401  (pure re-export layer — every name below is a re-export)
 import logging
