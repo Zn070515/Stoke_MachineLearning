@@ -52,7 +52,7 @@ class TestIntegration:
 
         model.train()
         for epoch in range(2):
-            for static, pk, po, y_dir, y_ret, y_vol, _date_idx, _dm, _rm, _vm in loader:
+            for static, pk, po, y_dir, y_ret, y_vol, _date_idx, _dm, _rm, _vm, _si in loader:
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
                 l_ce = ce(pred_dir, y_dir)
                 l_ret = mse(pred_ret.squeeze(-1), y_ret.squeeze(-1))
