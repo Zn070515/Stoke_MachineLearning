@@ -16,8 +16,10 @@ feature cross-section at column ``e-1`` — the last feature day before buying a
 column and ``pk/po`` windows whose last column is that same day, so a fitted
 baseline can extract its feature vector straight from the batch (stateless,
 robust to any batching).  The naive momentum baseline has no fit; its grid is
-built from prices outside the model and replayed through a position-tracking
-adapter that mirrors the evaluator DataLoader's stock-major order.
+built from prices outside the model and handed to ``evaluate_portfolio``
+directly via ``precomputed_preds`` — never replayed through a sequential
+adapter, whose flat-grid alignment breaks when a sparse eval_mask leaves a
+window with fewer than N stocks.
 """
 import numpy as np
 import torch
@@ -61,8 +63,8 @@ class FittedScoreAdapter(nn.Module):
         self.with_seq = with_seq
 
     def reset(self):
-        """Stateless adapter: no replay position to clear (API parity with
-        ``PrecomputedScoreAdapter`` so the benchmark loop can reset() both)."""
+        """Stateless adapter: no replay position to clear (the benchmark loop
+        calls reset() uniformly before each evaluation)."""
         return self
 
     def forward(self, static, pk, po):
@@ -75,55 +77,6 @@ class FittedScoreAdapter(nn.Module):
             torch.from_numpy(score).unsqueeze(-1),
             torch.zeros(B, 1),
         )
-
-
-class PrecomputedScoreAdapter(nn.Module):
-    """Replay a precomputed (N, n_windows) score grid through the evaluator.
-
-    §七/§十六 date-centric: the evaluator iterates windows sequentially
-    (shuffle=False) and for each window returns all eval-eligible stocks in
-    ascending index order.  The flat grid is therefore stored in
-    **window-major** order (window 0 stock 0..N-1, window 1 stock 0..N-1, …)
-    so that sequential calls to ``forward`` consume the correct per-window
-    chunks.  ``reset()`` must be called before each evaluation; the position
-    buffer makes the alignment explicit and assertable instead of silently
-    depending on iteration order.
-    """
-
-    def __init__(self, grid: np.ndarray):
-        super().__init__()
-        # grid is (N, W).  Transpose to (W, N) → flatten yields window-major
-        # order: [w0_s0, w0_s1, …, w0_sN-1, w1_s0, …] — matches date-centric
-        # sequential iteration where each fwd call receives one window's stocks
-        # in ascending index order.
-        grid_np = np.asarray(grid, dtype=np.float32)
-        if grid_np.ndim != 2:
-            raise ValueError(
-                f"PrecomputedScoreAdapter expects 2D (N, W) grid, "
-                f"got shape {grid_np.shape}"
-            )
-        flat = np.ascontiguousarray(grid_np.T).reshape(-1)
-        self.register_buffer("_grid", torch.from_numpy(flat))
-        self.register_buffer("_pos", torch.zeros((), dtype=torch.long))
-
-    def forward(self, static, pk, po):
-        B = static.shape[0]
-        pos = int(self._pos.item())
-        if pos + B > self._grid.shape[0]:
-            raise RuntimeError(
-                f"PrecomputedScoreAdapter ran past its grid "
-                f"({pos}+{B} > {self._grid.shape[0]}); call reset() per eval"
-            )
-        chunk = self._grid[pos:pos + B].unsqueeze(-1)
-        self._pos += B
-        return (
-            torch.zeros(B, 1),
-            chunk,
-            torch.zeros(B, 1),
-        )
-
-    def reset(self):
-        self._pos.zero_()
 
 
 class ScaledPredictor:

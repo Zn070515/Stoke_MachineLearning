@@ -200,6 +200,105 @@ class TestValLossBatchSizeInvariant:
         assert max(rankics) - min(rankics) < 1e-12, rankics
 
 
+class TestOffsetSlicedFoldValLoss:
+    """§七 date-centric grid placement on offset-sliced folds.
+
+    panel_builder emits GLOBAL date_indices (0..max_T-1); ``_slice_panel``
+    REBASES them to LOCAL column space (start → 0).  Date-centric consumers
+    place predictions at ``window_idx = date_idx - seq_len``, which is only
+    in-bounds for the (N, n_windows) grid when the slice is rebased.  Without
+    the rebase, every inner-val/outer-test slice with ``start > 0`` yields
+    ``window_idx = start + window >= n_windows`` → IndexError in
+    ``_compute_val_loss`` / ``evaluate_portfolio`` / ``_predict_outer``.  The
+    fast fixtures build date_indices from 0, so only an offset slice exercises
+    this path (the offset folds are slow-deselected tests).
+    """
+
+    SEQ_LEN = 60
+
+    def _sliced_panel(self):
+        from scripts.production.train_panel import _slice_panel
+
+        data = _make_masked_panel(n_stocks=12, n_timesteps=150, seq_len=self.SEQ_LEN,
+                                  horizon=5, seed=3)
+        # _slice_panel requires history_eligible_mask — inject one built from
+        # the observation mask (full-window real rule, like panel_builder).
+        obs = data["observation_mask"]
+        n, t = obs.shape
+        cum = np.concatenate(
+            [np.zeros((n, 1), dtype=np.int64), np.cumsum(obs, axis=1)], axis=1)
+        hist = np.zeros((n, t), dtype=bool)
+        for tt in range(self.SEQ_LEN, t):
+            hist[:, tt] = (cum[:, tt] - cum[:, tt - self.SEQ_LEN]) >= self.SEQ_LEN
+        data["history_eligible_mask"] = hist
+        # Offset slice with start > 0 — the inner-val/outer-test shape.
+        return _slice_panel(data, slice(30, 120))
+
+    def test_offset_sliced_val_loss_no_indexerror(self):
+        sliced = self._sliced_panel()
+        config = PanelConfig(
+            static_dim=4, past_known_dim=12, past_observed_dim=6,
+            hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
+            grn_layers=1, seq_len=self.SEQ_LEN, dropout=0.0,
+            compile_model=False, batch_size=128, num_workers=0,
+            max_epochs=1, horizon=5, rank_loss_weight=0.1,
+            min_stocks_per_day=5,
+        )
+        model = PanelModel(config)
+        ret_loss = AdjMSELoss()
+        loss_fn = UncertaintyLoss(num_tasks=3)
+        ds = PanelDataset(sliced, seq_len=config.seq_len,
+                          min_history=config.min_history, training=False)
+        loader = DataLoader(ds, batch_size=1, shuffle=False,
+                            collate_fn=panel_collate, num_workers=0)
+        # Must NOT raise IndexError on an offset slice, and must return a
+        # computable return loss / RankIC.
+        _, _, v_ret, _, v_rankic = _compute_val_loss(
+            model, loader, sliced, config, ret_loss, loss_fn,
+            torch.device("cpu"), use_amp=False, vol_enabled=True,
+        )
+        assert np.isfinite(v_ret), f"offset-slice val return loss not finite: {v_ret}"
+        assert np.isfinite(v_rankic), (
+            "offset-slice RankIC not computable — preds likely landed out of "
+            f"bounds or all-NaN: {v_rankic}")
+
+    def test_offset_sliced_preds_land_in_bounds(self):
+        sliced = self._sliced_panel()
+        config = PanelConfig(
+            static_dim=4, past_known_dim=12, past_observed_dim=6,
+            hidden_dim=32, xlstm_num_blocks=1, xlstm_num_heads=2,
+            grn_layers=1, seq_len=self.SEQ_LEN, dropout=0.0,
+            compile_model=False, batch_size=128, num_workers=0,
+            max_epochs=1, horizon=5, rank_loss_weight=0.1,
+            min_stocks_per_day=5,
+        )
+        model = PanelModel(config).eval()
+        ds = PanelDataset(sliced, seq_len=config.seq_len,
+                          min_history=config.min_history, training=False)
+        loader = DataLoader(ds, batch_size=1, shuffle=False,
+                            collate_fn=panel_collate, num_workers=0)
+        n_stocks = sliced["static_features"].shape[0]
+        preds = torch.full((n_stocks, ds.n_windows), float("nan"))
+        with torch.no_grad():
+            for batch in loader:
+                static, pk, po, *_y, date_idx, _dm, _rm, _vm, stock_idx = batch
+                if stock_idx.numel() == 0:
+                    continue
+                window_idx = date_idx - config.seq_len
+                assert (window_idx >= 0).all() and (window_idx < ds.n_windows).all(), (
+                    f"grid placement out of bounds: window_idx in "
+                    f"[{window_idx.min()}, {window_idx.max()}) for "
+                    f"n_windows={ds.n_windows}")
+                _, pred_ret, _ = model(static, pk, po)
+                preds[stock_idx, window_idx] = pred_ret.squeeze(-1)
+        # Every eval-eligible cell must be predicted — not all-NaN where the
+        # mask says eligible.
+        eval_mask = ds.eval_mask.numpy()
+        nan_frac = float(np.isnan(preds.numpy())[eval_mask].mean())
+        assert nan_frac < 0.01, (
+            f"{nan_frac:.1%} of eval-eligible cells unpredicted on offset slice")
+
+
 class TestAblationTraining:
     """§十一.3: every architecture ablation must survive the full train loop
     on the masked synthetic panel — no NaN, history populated."""

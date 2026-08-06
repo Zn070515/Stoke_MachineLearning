@@ -82,11 +82,15 @@ def _rank_pool_stats(ds: PanelDataset) -> tuple[list[int], int]:
     """Per-date rank-eligible stock counts + total possible same-date pairs.
 
     PairwiseRankingLoss can only form pairs between stocks that share a target
-    date AND both carry a valid return target.  When one date's eligible stock
-    count exceeds batch_size the DateGroupedSampler splits it across sub-batches
-    and pairs between sub-batches are never compared — so the true coverage is
-    the ratio of pairs actually formed to the C(n,2) theoretical total below.
+    date AND both carry a valid return target.  With date-centric batching
+    (§七/§十六) each batch is ONE date, so no date is split across sub-batches;
+    but when a date's eligible stock count exceeds ``max_stocks_per_date`` the
+    dataset samples a capped subset and only those stocks participate.  The
+    theoretical pair total is therefore C(min(n, cap), 2) — ``pair_coverage``
+    is pairs actually formed over that capped space, so a capped dataset can
+    reach 1.0.
     """
+    cap = ds.max_stocks_per_date
     if ds.ret_target is None:
         pool = ds.valid_mask
     else:
@@ -95,7 +99,10 @@ def _rank_pool_stats(ds: PanelDataset) -> tuple[list[int], int]:
         pool = ds.valid_mask & ds.ret_target[:, ds.seq_len:]
     per_date = pool.sum(dim=0).tolist()
     stocks_per_date = [n for n in per_date if n > 0]
-    possible_pairs = sum(n * (n - 1) // 2 for n in per_date)
+    possible_pairs = 0
+    for n in per_date:
+        capped = min(n, cap) if cap is not None else n
+        possible_pairs += capped * (capped - 1) // 2
     return stocks_per_date, possible_pairs
 
 
@@ -372,8 +379,9 @@ def train_panel(
     # §十二-5: a seed alone does not give CUDA bitwise reproducibility — set
     # the determinism knobs explicitly and DECLARE the level achieved.
     reproducibility = _configure_reproducibility(config)
-    # Worker processes re-seed from this generator, so multi-worker DataLoader
-    # order is reproducible for the same seed.
+    # Seeded generator consumed explicitly by the DateSampler (its per-epoch
+    # randperm) AND by DataLoader worker re-seeding when num_workers > 0 —
+    # both are deterministic for the same seed.
     loader_generator = (
         torch.Generator().manual_seed(config.seed)
         if config.seed is not None else None
@@ -424,7 +432,7 @@ def train_panel(
         train_data, seq_len=config.seq_len, min_history=config.min_history,
         max_stocks_per_date=config.max_stocks_per_date, training=True,
     )
-    train_sampler = DateSampler(train_ds.valid_mask)
+    train_sampler = DateSampler(train_ds.valid_mask, generator=loader_generator)
     train_loader = DataLoader(
         train_ds, batch_size=1,
         sampler=train_sampler, collate_fn=panel_collate,
@@ -444,8 +452,9 @@ def train_panel(
     )
 
     # §十二-3: theoretical ranking pool — per-date eligible stock counts and
-    # the C(n,2) pair total they imply.  Fixed for the dataset, so computed
-    # once here and reused as the coverage denominator every epoch.
+    # the C(min(n, max_stocks_per_date), 2) pair total they imply.  Fixed for
+    # the dataset, so computed once here and reused as the coverage denominator
+    # every epoch.
     rank_pool_sizes, rank_possible_pairs = _rank_pool_stats(train_ds)
 
     warmup = LinearLR(
@@ -673,10 +682,10 @@ def train_panel(
         rank_divisor = max(epoch_rank_batches, 1)
 
         # §十二-3: ranking-loss coverage for the epoch.  When a date's eligible
-        # stock count exceeds batch_size the sampler splits it across
-        # sub-batches and pairs are never formed across sub-batches — record how
-        # much of the theoretical C(n,2) pair space the epoch actually covered
-        # so a silently degraded ranking signal is visible in history.
+        # stock count exceeds max_stocks_per_date the dataset samples a capped
+        # subset, so pairs are only ever formed among that subset — record how
+        # much of the capped C(min(n, cap), 2) pair space the epoch actually
+        # covered so a silently degraded ranking signal is visible in history.
         rank_active_rate = epoch_rank_batches / max(len(train_loader), 1)
         pair_coverage = epoch_rank_pairs / max(rank_possible_pairs, 1)
         history.setdefault("rank_coverage", []).append({

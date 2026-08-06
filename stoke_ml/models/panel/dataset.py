@@ -139,10 +139,19 @@ class PanelDataset(Dataset):
                 _to_tensor(data["history_eligible_mask"], torch.bool)[:, self.seq_len:]
                 if "history_eligible_mask" in data else None
             )
-            history_mask = (
-                history_eligible if history_eligible is not None else True
-            )
-            self.eval_mask = (hist_count >= self.min_history) & decision & history_mask
+            # §: eval_mask must agree with the downstream _candidate_pool
+            # (evaluate_ic.py), which uses ONLY the panel-builder's
+            # history_eligible_mask (decision & history).  When that mask is
+            # present it already encodes the builder's min_history window rule,
+            # so re-applying ``hist_count >= self.min_history`` here would
+            # DIVERGE whenever config.min_history differs from the builder's —
+            # pool-eligible stocks would get NaN preds and silently drop out of
+            # IC.  hist_count stays as the fallback for legacy data that has no
+            # history_eligible_mask.
+            if history_eligible is not None:
+                self.eval_mask = decision & history_eligible
+            else:
+                self.eval_mask = (hist_count >= self.min_history) & decision
         else:
             # Backward-compat fallback: target-day label validity only.
             self.valid_mask = (self.y_direction[:, self.seq_len:] != -100)
@@ -270,8 +279,10 @@ class DateSampler(Sampler):
     reproducibility.
     """
 
-    def __init__(self, valid_mask: torch.Tensor):
+    def __init__(self, valid_mask: torch.Tensor,
+                 generator: torch.Generator | None = None):
         self.valid_mask = valid_mask.bool()
+        self.generator = generator
         self.n_stocks, self.n_windows = self.valid_mask.shape
         # Per-date valid stock count (n_windows,)
         self._date_counts = valid_mask.sum(dim=0)
@@ -280,8 +291,10 @@ class DateSampler(Sampler):
         return int((self._date_counts > 0).sum().item())
 
     def __iter__(self):
-        # One randperm call per epoch — deterministic for the global RNG state.
-        date_order = torch.randperm(self.n_windows).tolist()
+        # One randperm call per epoch — deterministic for the supplied
+        # generator (falls back to the global RNG when None).
+        date_order = torch.randperm(
+            self.n_windows, generator=self.generator).tolist()
         for w in date_order:
             if self._date_counts[w] > 0:
                 yield w

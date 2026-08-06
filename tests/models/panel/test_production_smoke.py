@@ -80,7 +80,9 @@ def _slice_time(panel_data: dict, start: int, stop: int, price_pad: int = 0) -> 
         "return_target_mask": panel_data["return_target_mask"][:, start:stop],
         "vol_target_mask": panel_data["vol_target_mask"][:, start:stop],
         "realized_return": panel_data["realized_return"][:, start:stop].copy(),
-        "date_indices": panel_data["date_indices"][:, start:stop].copy(),
+        # REBASE to local column space, mirroring _slice_panel: date-centric
+        # consumers place preds at window_idx = date_idx - seq_len.
+        "date_indices": panel_data["date_indices"][:, start:stop].copy() - start,
         "decision_eligible_mask": panel_data["decision_eligible_mask"][:, start:stop],
         "history_eligible_mask": panel_data["history_eligible_mask"][:, start:stop],
     }

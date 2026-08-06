@@ -70,7 +70,7 @@ def evaluate_sharpe(
 
 
 def evaluate_portfolio(
-    model: nn.Module,
+    model: nn.Module | None,
     val_data: dict,
     config: PanelConfig,
     device: torch.device,
@@ -82,12 +82,23 @@ def evaluate_portfolio(
     return_ledger: bool = False,
     delist_day: np.ndarray | None = None,
     n_trials: int | None = None,
+    precomputed_preds: np.ndarray | None = None,
 ) -> dict:
     """Multi-angle portfolio evaluation.
 
     Candidate pool = DECISION & HISTORY eligible stocks (close[t-1] real, input
     window covered).  Fills then gate on real open[t]; a
     selected stock with no real open stays unfilled (cash), never backfilled.
+
+    ``precomputed_preds``: an (N, n_windows) cross-sectional score grid to
+    evaluate WITHOUT running the model (e.g. a naive momentum baseline whose
+    grid is built from prices outside the model).  When provided the model
+    forward pass is skipped entirely and the grid is used directly as the
+    prediction matrix — the existing NaN guards (torch.isfinite filters,
+    _candidate_pool masking, fill gates) handle NaN-padded grids.  This is the
+    date-centric-safe replacement for replaying a grid through a sequential
+    adapter, which misaligns whenever a sparse eval_mask leaves a window with
+    fewer than N stocks.
 
     Exec P&L (when close_price/open_price are present) is a chronological
     sleeve account: every calendar day enters a new top-K
@@ -117,37 +128,54 @@ def evaluate_portfolio(
       — selected-universe equal-weight proxy: selected_universe_ew_sharpe
       — Metadata: n_periods, n_stocks, n_days
     """
-    model.eval()
+    if model is None and precomputed_preds is None:
+        raise TypeError(
+            "evaluate_portfolio requires model or precomputed_preds")
+
     n_stocks = val_data["static_features"].shape[0]
-    val_ds = PanelDataset(
-        val_data, seq_len=config.seq_len, min_history=config.min_history,
-        max_stocks_per_date=None, training=False,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=1,
-        shuffle=False, collate_fn=panel_collate,
-        num_workers=0, pin_memory=False,
-    )
-
-    n_windows = val_ds.n_windows
-    seq_len = val_ds.seq_len
-    preds = torch.full((n_stocks, n_windows), float("nan"))
-    with torch.no_grad():
-        for batch in val_loader:
-            static, pk, po, *_y, date_idx_t, _dm, _rm, _vm, stock_indices = batch
-            if stock_indices.numel() == 0:
-                continue
-            # Per-stock window indices (supports mixed-date batches).
-            window_idx = date_idx_t - seq_len
-            static = static.to(device)
-            pk = pk.to(device)
-            po = po.to(device)
-            _, pred_ret, _ = model(static, pk, po)
-            preds[stock_indices, window_idx] = pred_ret.cpu().squeeze(-1)
-
-    if torch.isnan(preds).all():
-        return _empty_result()
-    preds_np = preds.numpy()
+    seq_len = config.seq_len
+    if precomputed_preds is not None:
+        # §: precomputed grid path — skip the model forward loop entirely.
+        # The (N, n_windows) grid IS the prediction matrix; NaN cells for
+        # ineligible stocks/windows are already handled by the downstream
+        # torch.isfinite filters, _candidate_pool masking and fill gates.
+        preds_np = np.asarray(precomputed_preds, dtype=np.float32)
+        if preds_np.ndim != 2 or preds_np.shape[0] != n_stocks:
+            raise ValueError(
+                f"precomputed_preds must be (n_stocks={n_stocks}, n_windows), "
+                f"got {preds_np.shape}")
+        n_windows = preds_np.shape[1]
+        preds = torch.from_numpy(preds_np)
+        if torch.isnan(preds).all():
+            return _empty_result()
+    else:
+        model.eval()
+        val_ds = PanelDataset(
+            val_data, seq_len=config.seq_len, min_history=config.min_history,
+            max_stocks_per_date=None, training=False,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=1,
+            shuffle=False, collate_fn=panel_collate,
+            num_workers=0, pin_memory=False,
+        )
+        n_windows = val_ds.n_windows
+        preds = torch.full((n_stocks, n_windows), float("nan"))
+        with torch.no_grad():
+            for batch in val_loader:
+                static, pk, po, *_y, date_idx_t, _dm, _rm, _vm, stock_indices = batch
+                if stock_indices.numel() == 0:
+                    continue
+                # Per-stock window indices (supports mixed-date batches).
+                window_idx = date_idx_t - seq_len
+                static = static.to(device)
+                pk = pk.to(device)
+                po = po.to(device)
+                _, pred_ret, _ = model(static, pk, po)
+                preds[stock_indices, window_idx] = pred_ret.cpu().squeeze(-1)
+        if torch.isnan(preds).all():
+            return _empty_result()
+        preds_np = preds.numpy()
 
     # Selection pool: decision & history, with entry/future-label
     # fallbacks for synthetic/legacy data.

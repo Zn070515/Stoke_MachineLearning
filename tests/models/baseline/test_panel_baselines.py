@@ -7,9 +7,10 @@ xLSTM panel model:
   (the decision day before entry at ``open[e]``) and the target at column ``e``,
   filtered by the label + eligibility gates at ``e``.
 - ``build_momentum_grid`` scores an entry day with ONLY data before it.
-- ``PrecomputedScoreAdapter`` replays its flat grid in the evaluator's
-  stock-major batch order, so a precomputed (N, n_windows) grid lines up with
-  the DataLoader.
+- A precomputed (N, n_windows) grid is handed to ``evaluate_portfolio`` via
+  ``precomputed_preds`` and consumed directly — no sequential flat-grid adapter,
+  which would misalign on a sparse eval_mask (suspended stocks leave a window
+  with fewer than N stocks).
 - ``FittedScoreAdapter`` exposes a ``reset()`` so the benchmark loop can treat
   every adapter uniformly, and returns the (dir, ret, vol) triple the evaluator
   consumes.
@@ -21,7 +22,6 @@ from sklearn.linear_model import Ridge
 
 from stoke_ml.models.baseline.panel_baselines import (
     FittedScoreAdapter,
-    PrecomputedScoreAdapter,
     _stratified_quotas,
     build_flat_samples,
     build_momentum_grid,
@@ -241,33 +241,79 @@ class TestFittedScoreAdapter:
         assert adapter.reset() is adapter  # stateless — API parity only
 
 
-class TestPrecomputedScoreAdapter:
-    def test_grid_replays_in_batch_order_and_resets(self):
-        # §七/§十六 date-centric: adapter stores in window-major order
-        # (grid.T.reshape(-1)).  grid = 3 stocks × 4 windows:
-        #   [[0,1,2,3], [4,5,6,7], [8,9,10,11]]
-        # window-major flat: [0,4,8, 1,5,9, 2,6,10, 3,7,11]
-        grid = np.arange(12, dtype=np.float32).reshape(3, 4)
-        adapter = PrecomputedScoreAdapter(grid)
-        flat_wm = np.ascontiguousarray(grid.T).reshape(-1)
-        batch = torch.zeros(2, 1, 1)
-        first = adapter.forward(batch, batch, batch)[1]
-        np.testing.assert_allclose(first.numpy().reshape(-1), flat_wm[:2])
-        second = adapter.forward(batch, batch, batch)[1]
-        np.testing.assert_allclose(second.numpy().reshape(-1), flat_wm[2:4])
-        # reset() rewinds to the start.
-        adapter.reset()
-        again = adapter.forward(batch, batch, batch)[1]
-        np.testing.assert_allclose(again.numpy().reshape(-1), flat_wm[:2])
+def _make_sparse_marker_panel(n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
+                              up_stocks=(1,), down_stocks=(2,), seed=0,
+                              suspend_stock=1, suspend_len=80,
+                              suspend_start=None):
+    """Priced marker panel with a mid-panel suspension (sparse eval_mask).
 
-    def test_runs_past_grid_raises(self):
-        grid = np.arange(12, dtype=np.float32).reshape(3, 4)
-        adapter = PrecomputedScoreAdapter(grid)
-        batch = torch.zeros(5, 1, 1)
-        adapter.forward(batch, batch, batch)  # pos 0 → 5
-        adapter.forward(batch, batch, batch)  # pos 5 → 10
-        with pytest.raises(RuntimeError, match="ran past"):
-            adapter.forward(batch, batch, batch)  # 10+5 > 12
+    Same construction as ``_make_3d_marker_panel`` but NaN's out one stock's
+    open/close over a contiguous mid-panel range.  That flips its
+    decision/entry masks False inside the range (close[t-1] / open[t] no longer
+    real), so the evaluator's candidate pool loses that stock for a stretch of
+    windows — exactly the sparse eval_mask that a sequential flat-grid adapter
+    cannot replay without drifting alignment.  The strongest-signal stock
+    (default ``suspend_stock=1``, marker=2.0) is the one suspended, so a
+    scrambled grid collapses the IC.
+    """
+    rng = np.random.RandomState(seed)
+    drift = np.zeros(n_stocks)
+    marker = np.zeros(n_stocks)
+    for i in up_stocks:
+        drift[i] = 0.008
+        marker[i] = 2.0
+    for i in down_stocks:
+        drift[i] = -0.008
+        marker[i] = -2.0
+    rets = rng.randn(n_stocks, n_timesteps) * 0.01 + drift[:, None]
+    close = 10.0 * np.exp(np.cumsum(rets, axis=1))
+    open_ = close * (1.0 + 0.001 * rng.randn(n_stocks, n_timesteps))
+
+    if suspend_start is None:
+        # Inside the eval window grid, not touching the price sleeve pad.
+        suspend_start = seq_len + 30
+    if suspend_len and suspend_len > 0:
+        close[suspend_stock, suspend_start:suspend_start + suspend_len] = np.nan
+        open_[suspend_stock, suspend_start:suspend_start + suspend_len] = np.nan
+
+    ret_fwd = np.full((n_stocks, n_timesteps), np.nan, dtype=np.float32)
+    ret_tgt = np.zeros((n_stocks, n_timesteps), dtype=bool)
+    if n_timesteps > horizon:
+        both = np.isfinite(open_[:, :-horizon]) & np.isfinite(open_[:, horizon:])
+        ret_fwd[:, :n_timesteps - horizon][both] = (
+            open_[:, horizon:][both] / open_[:, :-horizon][both] - 1.0)
+        ret_tgt[:, :n_timesteps - horizon] = both
+    y_ret = np.nan_to_num(ret_fwd, nan=0.0).astype(np.float32)
+    y_dir = np.full((n_stocks, n_timesteps), -100, dtype=np.int64)
+    y_dir[ret_tgt] = np.where(ret_fwd[ret_tgt] > 0, 2,
+                              np.where(ret_fwd[ret_tgt] < 0, 0, 1))
+
+    obs = np.isfinite(close)
+    entry = np.isfinite(open_)
+    decision = np.zeros((n_stocks, n_timesteps), dtype=bool)
+    decision[:, 1:] = obs[:, :-1]
+    history = np.ones((n_stocks, n_timesteps), dtype=bool)
+
+    static = np.zeros((n_stocks, n_timesteps, 1), dtype=np.float32)
+    static[:, :, 0] = marker[:, None]
+
+    return {
+        "static_features": static,
+        "past_known": rng.randn(n_stocks, n_timesteps, 12).astype(np.float32),
+        "past_observed": rng.randn(n_stocks, n_timesteps, 10).astype(np.float32),
+        "y_direction": y_dir,
+        "y_return": y_ret,
+        "y_volatility": np.abs(y_ret).astype(np.float32),
+        "date_indices": np.tile(np.arange(n_timesteps), (n_stocks, 1)),
+        "observation_mask": obs,
+        "entry_eligible_mask": entry,
+        "return_target_mask": ret_tgt,
+        "vol_target_mask": ret_tgt,
+        "close_price": close.astype(np.float32),
+        "open_price": open_.astype(np.float32),
+        "decision_eligible_mask": decision,
+        "history_eligible_mask": history,
+    }
 
 
 def _make_3d_marker_panel(n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
@@ -329,11 +375,10 @@ def _make_3d_marker_panel(n_stocks=12, n_timesteps=320, seq_len=60, horizon=5,
 
 
 class TestBaselineThroughEvaluator:
-    """End-to-end: a baseline adapter scored by the REAL evaluate_portfolio
-    DataLoader must rank correctly.  Locks PrecomputedScoreAdapter's flat grid
-    to the evaluator's stock-major batch order (idx = stock*n_windows + window,
-    shuffle=False) and FittedScoreAdapter to the PIT feature contract — a
-    misalignment scrambles the scores and collapses the IC to ~0."""
+    """End-to-end: a baseline scored by the REAL evaluate_portfolio must rank
+    correctly.  A precomputed grid is consumed via ``precomputed_preds`` (no
+    sequential adapter), and FittedScoreAdapter must satisfy the PIT feature
+    contract — a misalignment scrambles the scores and collapses the IC to ~0."""
 
     SEQ_LEN, HORIZON = 60, 5
 
@@ -341,14 +386,31 @@ class TestBaselineThroughEvaluator:
         panel = _make_3d_marker_panel()
         n_windows = 320 - self.SEQ_LEN
         grid = np.tile(panel["static_features"][:, -1, :], (1, n_windows))
-        adapter = PrecomputedScoreAdapter(grid)
-        adapter.reset()
         cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
                           min_stocks_per_day=5)  # 12-stock panel
-        m = evaluate_portfolio(adapter, panel, cfg, torch.device("cpu"),
-                               horizon=self.HORIZON)
+        m = evaluate_portfolio(None, panel, cfg, torch.device("cpu"),
+                               horizon=self.HORIZON, precomputed_preds=grid)
         assert m["ic_mean"] > 0.3, (
-            f"grid misaligned to evaluator order: IC={m['ic_mean']:.3f}")
+            f"precomputed grid misaligned to evaluator order: IC={m['ic_mean']:.3f}")
+
+    def test_precomputed_grid_survives_sparse_eval_mask(self):
+        # Suspension-style sparse pool: the strongest-signal stock (marker=2.0)
+        # is NaN-priced for ~1/3 of the window grid, so the candidate pool has
+        # fewer than N stocks there.  A sequential flat-grid replay drifts on
+        # the first sparse window and reads every later window's scores off the
+        # wrong stocks (empirically IC 0.53 → 0.084).  precomputed_preds skips
+        # replay entirely: the (N, W) grid is consumed directly, so the marker
+        # signal must survive the sparse pool.
+        panel = _make_sparse_marker_panel(suspend_stock=1, suspend_len=80)
+        n_windows = 320 - self.SEQ_LEN
+        grid = np.tile(panel["static_features"][:, -1, :], (1, n_windows))
+        cfg = PanelConfig(seq_len=self.SEQ_LEN, horizon=self.HORIZON,
+                          min_stocks_per_day=5, min_history=1)  # 12-stock panel
+        m = evaluate_portfolio(None, panel, cfg, torch.device("cpu"),
+                               horizon=self.HORIZON, precomputed_preds=grid)
+        assert m["ic_mean"] > 0.3, (
+            f"sparse eval_mask scrambled precomputed grid scores: "
+            f"IC={m['ic_mean']:.3f}")
 
     def test_fitted_baseline_ranks_via_clean_ic(self):
         panel = _make_3d_marker_panel()

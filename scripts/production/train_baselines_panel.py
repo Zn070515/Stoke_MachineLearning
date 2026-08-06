@@ -42,7 +42,6 @@ from stoke_ml.config import get_project_root, load_config
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.baseline.panel_baselines import (
     FittedScoreAdapter,
-    PrecomputedScoreAdapter,
     ScaledPredictor,
     build_flat_samples,
     build_momentum_grid,
@@ -597,11 +596,19 @@ def main():
 
         for model_name in models:
             t0 = time.time()
+            precomputed_grid = None
             if model_name == "momentum":
-                grid = build_momentum_grid(
+                # §: the momentum floor is a price-rule grid — hand it to the
+                # evaluator directly via precomputed_preds instead of replaying
+                # it through a sequential adapter.  A flat-grid adapter
+                # misaligns whenever a sparse eval_mask (suspended stocks)
+                # leaves a window with fewer than N stocks: the first sparse
+                # window shifts every subsequent chunk onto the wrong stocks'
+                # scores, scrambling IC/Sharpe.
+                precomputed_grid = build_momentum_grid(
                     outer_test_data, config.seq_len, config.seq_len + n_windows,
                     config.seq_len)
-                adapter = PrecomputedScoreAdapter(grid)
+                adapter = None
                 n_train = 0
             else:
                 # PIT label gate: y_return[:, e] is realized at open[e+horizon],
@@ -644,7 +651,8 @@ def main():
                 adapter = FittedScoreAdapter(
                     ScaledPredictor(model, scaler),
                     with_seq=args.with_seq_features)
-            adapter.reset()
+            if adapter is not None:
+                adapter.reset()
             # §P0-6: force-sell delist-day grid in THIS fold's sim column space
             # (same mapping as train_panel.py) so a baseline tape replays the
             # delisting force-sell exactly as the sleeve account executed it.
@@ -660,6 +668,7 @@ def main():
                 return_ledger=True,
                 delist_day=delist_day,
                 n_trials=n_trials,
+                precomputed_preds=precomputed_grid,
             )
             elapsed = time.time() - t0
             # §P0-5: persist the fitted baseline (ridge/lgbm/mlp) alongside the
@@ -672,29 +681,35 @@ def main():
             # so a serialization hiccup must not kill a fold — but in formal
             # mode an unhashable tape aborts the run instead of silently saving
             # a weight whose provenance is unverifiable.
+            # The momentum floor has no fitted weights — skip the pickle (the
+            # tape's model_hash falls back to the "baseline-momentum" label).
             weight_hash = None
-            try:
-                model_path = os.path.join(
-                    oos_dir, f"fold_{fold:03d}_{model_name}.pkl")
-                with open(model_path, "wb") as f:
-                    pickle.dump(adapter, f)
-                weight_hash = _file_sha256(model_path)
-            except Exception as exc:  # noqa: BLE001
-                if not args.no_formal:
-                    logger.error(
-                        "  Fold %d %s: model pickle FAILED (%s) — formal mode "
-                        "aborts rather than save a tape whose weight hash is "
-                        "unverifiable", fold, model_name, exc)
-                    raise
-                logger.warning("  Fold %d %s: model pickle failed (%s) — "
-                               "tape saved without weights", fold, model_name, exc)
+            if adapter is not None:
+                try:
+                    model_path = os.path.join(
+                        oos_dir, f"fold_{fold:03d}_{model_name}.pkl")
+                    with open(model_path, "wb") as f:
+                        pickle.dump(adapter, f)
+                    weight_hash = _file_sha256(model_path)
+                except Exception as exc:  # noqa: BLE001
+                    if not args.no_formal:
+                        logger.error(
+                            "  Fold %d %s: model pickle FAILED (%s) — formal mode "
+                            "aborts rather than save a tape whose weight hash is "
+                            "unverifiable", fold, model_name, exc)
+                        raise
+                    logger.warning("  Fold %d %s: model pickle failed (%s) — "
+                                   "tape saved without weights", fold, model_name, exc)
             # §P0-5: per-fold OOS prediction tape, same layout/contract as the
             # deep model's fold_XXX.npz — a baseline number must be
-            # offline-replayable through the same sleeve account.  The adapter's
-            # replay grid was consumed by evaluate_portfolio, so reset before
-            # re-running for the tape.
-            adapter.reset()
-            oos_preds = _predict_outer(adapter, outer_test_data, config, device)
+            # offline-replayable through the same sleeve account.  The fitted
+            # adapters re-run the evaluator DataLoader (reset first); momentum
+            # replays its price-rule grid directly.
+            if adapter is not None:
+                adapter.reset()
+                oos_preds = _predict_outer(adapter, outer_test_data, config, device)
+            else:
+                oos_preds = precomputed_grid
             if oos_preds is not None:
                 n_w = oos_preds.shape[1]
                 p0 = config.seq_len

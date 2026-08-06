@@ -1173,7 +1173,15 @@ def _slice_panel(panel_data: dict, tslice: slice, price_pad: int = 0) -> dict:
         "return_target_mask": panel_data["return_target_mask"][:, tslice],
         "vol_target_mask": panel_data["vol_target_mask"][:, tslice],
         "realized_return": panel_data["realized_return"][:, tslice].copy(),
-        "date_indices": panel_data["date_indices"][:, tslice].copy(),
+        # REBASE date_indices to LOCAL column space.  panel_builder emits the
+        # GLOBAL calendar position (0..max_T-1); a fold slice with start > 0
+        # must restart at 0 so date-centric consumers' window placement
+        # ``window_idx = date_idx - seq_len`` stays inside the (N, n_windows)
+        # grid.  Same-date stocks keep equal local indices within a dataset,
+        # so PairwiseRankingLoss grouping is unchanged.
+        "date_indices": (
+            panel_data["date_indices"][:, tslice].copy() - (tslice.start or 0)
+        ),
         "decision_eligible_mask": panel_data["decision_eligible_mask"][:, tslice],
         "history_eligible_mask": panel_data["history_eligible_mask"][:, tslice],
     }
