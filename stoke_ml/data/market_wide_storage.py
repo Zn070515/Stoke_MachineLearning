@@ -2,14 +2,14 @@
 
 Partitions: data/a_shares/{data_type}/{year}/{month}/{stock_code}.parquet
 """
-import json
 import logging
 import os
-import tempfile
 import time
 from datetime import datetime, timezone
 
 import pandas as pd
+
+from stoke_ml.data.asset_contract import AtomicCommit, atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -181,17 +181,9 @@ class MarketWideStorage:
                 new_rows = new_rows.drop_duplicates(keep="last")
                 new_rows = new_rows.sort_values("date")
                 if decision == "accepted":
-                    fd, tmp_path = tempfile.mkstemp(
-                        suffix=".parquet", dir=base, prefix=f".tmp_{code}_",
-                    )
-                    os.close(fd)
-                    try:
-                        new_rows.to_parquet(tmp_path, index=False, compression='lz4')
-                        os.replace(tmp_path, out_path)
-                    except Exception:
-                        if os.path.isfile(tmp_path):
-                            os.unlink(tmp_path)
-                        raise
+                    with AtomicCommit(out_path) as ac:
+                        new_rows.to_parquet(ac.tmp_path, index=False,
+                                            compression='lz4')
                 if provenance is not None:
                     self._write_manifest(code, provenance, report, decision, new_rows)
             finally:
@@ -267,15 +259,7 @@ class MarketWideStorage:
             "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         path = os.path.join(manifest_dir, f"{code}.json")
-        tmp = f"{path}.tmp.{os.getpid()}"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except Exception:
-            if os.path.isfile(tmp):
-                os.unlink(tmp)
-            raise
+        atomic_write_json(path, payload)
 
     def load(
         self, stock_code: str, start_date: str, end_date: str

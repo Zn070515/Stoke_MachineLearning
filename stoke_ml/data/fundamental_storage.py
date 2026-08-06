@@ -8,10 +8,23 @@ import os
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.asset_contract import (
+    AtomicCommit,
+    DataAssetContract,
+    check_asset_read,
+    write_asset_manifest,
+)
 from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
 from stoke_ml.data.codes import normalize_stock_code
 
 logger = logging.getLogger(__name__)
+
+FUNDAMENTAL_ASSET = DataAssetContract(
+    data_type="fundamentals",
+    partition="year/quarter/stock_code",
+    extent_column="report_date",
+    column_contract="fundamentals",
+)
 
 
 class FundamentalStorage:
@@ -44,15 +57,21 @@ class FundamentalStorage:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{code}.parquet")
             save_df = group.drop(columns=["year", "quarter"])
-            save_df.to_parquet(out_path, index=False, compression='lz4')
+            with AtomicCommit(out_path) as ac:
+                save_df.to_parquet(ac.tmp_path, index=False, compression='lz4')
+            write_asset_manifest(out_path, FUNDAMENTAL_ASSET, save_df, entity=code)
 
     def load(
-        self, stock_code: str, start_date: str, end_date: str
+        self, stock_code: str, start_date: str, end_date: str,
+        *, require_valid_manifest: bool = False,
     ) -> pd.DataFrame:
         """Load fundamental data for a stock in a date range.
 
         Returns raw quarterly data (no forward-fill). Prefers consolidated
-        flat file; falls back to year/quarter partitions.
+        flat file; falls back to year/quarter partitions.  Every file read is
+        cross-checked against its asset manifest (``check_asset_read``); pass
+        ``require_valid_manifest=True`` to raise instead of read when the
+        manifest is missing or mismatched.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -65,6 +84,8 @@ class FundamentalStorage:
         flat_path = os.path.join(base, f"{stock_code}.parquet")
         if os.path.isfile(flat_path):
             df = pd.read_parquet(flat_path)
+            check_asset_read(flat_path, FUNDAMENTAL_ASSET, df,
+                             require_valid_manifest=require_valid_manifest)
             if "report_date" not in df.columns:
                 return pd.DataFrame()
             df["report_date"] = pd.to_datetime(df["report_date"])
@@ -83,6 +104,8 @@ class FundamentalStorage:
                 if not os.path.exists(file_path):
                     continue
                 df = pd.read_parquet(file_path)
+                check_asset_read(file_path, FUNDAMENTAL_ASSET, df,
+                                 require_valid_manifest=require_valid_manifest)
                 if "report_date" not in df.columns:
                     continue
                 df["report_date"] = pd.to_datetime(df["report_date"])

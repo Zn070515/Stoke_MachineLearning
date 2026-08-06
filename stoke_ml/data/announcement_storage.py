@@ -8,9 +8,27 @@ import os
 
 import pandas as pd
 
+from stoke_ml.data.asset_contract import (
+    AtomicCommit,
+    DataAssetContract,
+    check_asset_read,
+    write_asset_manifest,
+)
 from stoke_ml.data.calendar import get_research_calendar
 
 logger = logging.getLogger(__name__)
+
+ANNOUNCEMENT_ASSET = DataAssetContract(
+    data_type="announcements",
+    partition="stock_code",
+    extent_column="date",
+)
+
+ANNOUNCEMENT_SENTIMENT_ASSET = DataAssetContract(
+    data_type="announcement_sentiment",
+    partition="stock_code",
+    extent_column="date",
+)
 
 _COLS = ["sentiment_mean", "sentiment_std", "announce_count",
          "positive_ratio", "negative_ratio", "has_announce"]
@@ -29,15 +47,26 @@ class AnnouncementStorage:
     def save_raw(self, stock_code: str, df: pd.DataFrame) -> str:
         """Save raw announcements to {code}.parquet."""
         path = os.path.join(self._base, f"{stock_code}.parquet")
-        df.to_parquet(path, index=False, compression='lz4')
+        with AtomicCommit(path) as ac:
+            df.to_parquet(ac.tmp_path, index=False, compression='lz4')
+        write_asset_manifest(path, ANNOUNCEMENT_ASSET, df, entity=stock_code)
         return path
 
-    def load_raw(self, stock_code: str) -> pd.DataFrame:
-        """Load raw announcements for a stock."""
+    def load_raw(
+        self, stock_code: str, *, require_valid_manifest: bool = False,
+    ) -> pd.DataFrame:
+        """Load raw announcements for a stock.
+
+        The file is cross-checked against its asset manifest
+        (``check_asset_read``); pass ``require_valid_manifest=True`` to raise
+        instead of read when the manifest is missing or mismatched.
+        """
         path = os.path.join(self._base, f"{stock_code}.parquet")
         if not os.path.isfile(path):
             return pd.DataFrame()
         df = pd.read_parquet(path)
+        check_asset_read(path, ANNOUNCEMENT_ASSET, df,
+                         require_valid_manifest=require_valid_manifest)
         df["date"] = pd.to_datetime(df["date"])
         return df.sort_values("date").reset_index(drop=True)
 
@@ -77,20 +106,32 @@ class AnnouncementStorage:
             out_dir = os.path.join(self._base, "sentiment")
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{stock_code}.parquet")
-            daily.to_parquet(out_path, index=False, compression='lz4')
+            with AtomicCommit(out_path) as ac:
+                daily.to_parquet(ac.tmp_path, index=False, compression='lz4')
+            write_asset_manifest(
+                out_path, ANNOUNCEMENT_SENTIMENT_ASSET, daily, entity=stock_code,
+            )
 
         return daily
 
     def load_daily_sentiment(
         self, stock_code: str, start_date: str | None = None,
         end_date: str | None = None,
+        *, require_valid_manifest: bool = False,
     ) -> pd.DataFrame:
-        """Load precomputed daily announcement sentiment."""
+        """Load precomputed daily announcement sentiment.
+
+        The file is cross-checked against its asset manifest
+        (``check_asset_read``); pass ``require_valid_manifest=True`` to raise
+        instead of read when the manifest is missing or mismatched.
+        """
         path = os.path.join(self._base, "sentiment", f"{stock_code}.parquet")
         if not os.path.isfile(path):
             return pd.DataFrame(columns=["date"] + _COLS)
 
         df = pd.read_parquet(path)
+        check_asset_read(path, ANNOUNCEMENT_SENTIMENT_ASSET, df,
+                         require_valid_manifest=require_valid_manifest)
         df["date"] = pd.to_datetime(df["date"])
         if start_date:
             df = df[df["date"] >= pd.Timestamp(start_date)]

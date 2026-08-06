@@ -7,7 +7,20 @@ import os
 
 import pandas as pd
 
+from stoke_ml.data.asset_contract import (
+    AtomicCommit,
+    DataAssetContract,
+    check_asset_read,
+    write_asset_manifest,
+)
+
 logger = logging.getLogger(__name__)
+
+ETF_FLOW_ASSET = DataAssetContract(
+    data_type="etf_flow",
+    partition="year/month/sector_name",
+    extent_column="date",
+)
 
 
 class ETFStorage:
@@ -38,14 +51,20 @@ class ETFStorage:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"sector_{sector}.parquet")
             save_df = group.drop(columns=["year", "month"])
-            save_df.to_parquet(out_path, index=False, compression='lz4')
+            with AtomicCommit(out_path) as ac:
+                save_df.to_parquet(ac.tmp_path, index=False, compression='lz4')
+            write_asset_manifest(out_path, ETF_FLOW_ASSET, save_df, entity=sector)
 
     def load_sector_flow(
-        self, sector_name: str, start_date: str, end_date: str
+        self, sector_name: str, start_date: str, end_date: str,
+        *, require_valid_manifest: bool = False,
     ) -> pd.DataFrame:
         """Load sector flow data for a date range.
 
         Prefers consolidated flat file; falls back to year/month partitions.
+        Every file read is cross-checked against its asset manifest
+        (``check_asset_read``); pass ``require_valid_manifest=True`` to raise
+        instead of read when the manifest is missing or mismatched.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -58,6 +77,8 @@ class ETFStorage:
         flat_path = os.path.join(base, f"sector_{sector_name}.parquet")
         if os.path.isfile(flat_path):
             df = pd.read_parquet(flat_path)
+            check_asset_read(flat_path, ETF_FLOW_ASSET, df,
+                             require_valid_manifest=require_valid_manifest)
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"])
                 mask = (df["date"] >= start) & (df["date"] <= end)
@@ -80,6 +101,8 @@ class ETFStorage:
                 if not os.path.exists(file_path):
                     continue
                 df = pd.read_parquet(file_path)
+                check_asset_read(file_path, ETF_FLOW_ASSET, df,
+                                 require_valid_manifest=require_valid_manifest)
                 if "date" in df.columns:
                     df["date"] = pd.to_datetime(df["date"])
                     mask = (df["date"] >= start) & (df["date"] <= end)
