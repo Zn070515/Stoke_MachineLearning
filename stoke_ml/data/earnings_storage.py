@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.data.codes import normalize_stock_code_series
+from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class EarningsStorage:
         if self._snap is not None:
             return self._snap
         frames = []
+        summary = ErrorSummary()
         for name in SNAPSHOT_FILES:
             p = os.path.join(self._dir, name)
             if not os.path.isfile(p):
@@ -71,12 +73,15 @@ class EarningsStorage:
                 df = pd.read_parquet(p)
             except Exception as e:
                 logger.warning("earnings snapshot %s unreadable: %s", name, e)
+                summary.record_exc(e, "earnings_snapshot")
                 continue
             if df.empty:
                 continue
             norm = self._normalize(df)
             if not norm.empty:
                 frames.append(norm)
+        if summary:
+            log_summary(summary, logger, "EarningsStorage._load_snapshot")
         self._snap = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         return self._snap
 

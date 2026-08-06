@@ -28,6 +28,7 @@ from stoke_ml.preprocessing.pipeline import (
     PreprocessingPipeline,
     PreprocessingQualityError,
 )
+from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -59,7 +60,7 @@ def _build_provenance(cfg) -> dict:
             ["git", "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         pass
     config_hash = "unknown"
     try:
@@ -261,6 +262,7 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
     total = 0
     blocked = 0
     rejected = 0
+    summary = ErrorSummary()
     for code in stock_list:
         try:
             raw = source.load(code, args.start, args.end)
@@ -311,8 +313,9 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
                 "(staging output retained, nothing persisted)",
                 dtype, code, exc,
             )
-        except Exception:
+        except Exception as exc:
             logger.warning("%s preprocessing failed for %s", dtype, code, exc_info=True)
+            summary.record_exc(exc, f"preprocess:{dtype}")
 
     if blocked:
         logger.warning(
@@ -325,6 +328,8 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
             "(old files preserved)", dtype, rejected,
         )
     logger.info("  %s: %d rows saved (%.1fs)", dtype, total, time.time() - t0)
+    if summary:
+        log_summary(summary, logger, f"preprocess:{dtype}")
 
 
 def _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
@@ -398,6 +403,7 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
     total = 0
     blocked = 0
     rejected = 0
+    summary = ErrorSummary()
     for code in stock_list:
         try:
             base = ds.load_daily(code, args.start, args.end,
@@ -423,8 +429,9 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
                 "board: quality gate blocked %s: %s "
                 "(staging output retained, nothing persisted)", code, exc,
             )
-        except Exception:
+        except Exception as exc:
             logger.warning("board preprocessing failed for %s", code, exc_info=True)
+            summary.record_exc(exc, "preprocess:board")
 
     if blocked:
         logger.warning(
@@ -436,6 +443,8 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
             "(old files preserved)", rejected,
         )
     logger.info("  board: %d rows saved (%.1fs)", total, time.time() - t0)
+    if summary:
+        log_summary(summary, logger, "preprocess:board")
 
 
 def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
@@ -570,6 +579,7 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
     blocked = 0
     rejected = 0
     unknown_sector_rows = 0
+    summary = ErrorSummary()
     for i, code in enumerate(stock_list):
         try:
             base = ds.load_daily(code, args.start, args.end,
@@ -621,8 +631,9 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
                 "sector: quality gate blocked %s: %s "
                 "(staging output retained, nothing persisted)", code, exc,
             )
-        except Exception:
+        except Exception as exc:
             logger.warning("sector preprocessing failed for %s", code, exc_info=True)
+            summary.record_exc(exc, "preprocess:sector")
 
     if blocked:
         logger.warning(
@@ -640,6 +651,8 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
             unknown_sector_rows, sector_map_valid_from,
         )
     logger.info("  sector: %d rows saved (%.1fs)", total, time.time() - t0)
+    if summary:
+        log_summary(summary, logger, "preprocess:sector")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from stoke_ml.data.asset_contract import (
     atomic_write_json,
     release_lock as _release_lock,
 )
+from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,7 @@ class MarketWideStorage:
         if not os.path.isdir(part_dir):
             return None
         frames = []
+        summary = ErrorSummary()
         for f in os.listdir(part_dir):
             if not f.endswith(".parquet"):
                 continue
@@ -304,9 +306,12 @@ class MarketWideStorage:
                 matched = df[mask]
                 if not matched.empty:
                     frames.append(matched)
-            except Exception:
+            except Exception as exc:
                 logger.debug("Failed to read %s/%s for date %s",
                              self._data_type, f, date_str)
+                summary.record_exc(exc, f"load_date:{self._data_type}")
+        if summary:
+            log_summary(summary, logger, "MarketWideStorage.load_date")
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)

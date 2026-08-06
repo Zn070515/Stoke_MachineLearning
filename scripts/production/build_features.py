@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # storage_key -> True once a channel has emitted a one-time load-failure warning
 _reported_load_fail: set[str] = set()
 
+# Per-load skip accumulator: a corrupt aux parquet / channel load failure
+# degrades a stock's feature set without failing the stock, so it must not be
+# silently dropped — main() merges this into the run summary and reports it.
+_load_summary = ErrorSummary()
+
 
 def available_stocks(storage: DataStorage, market: str = "a_shares") -> list[str]:
     base = os.path.join(storage._root, market, "daily")
@@ -66,11 +71,12 @@ def _load_stock_parquet(directory: str, code: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return pd.read_parquet(path)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         logger.warning(
             "Corrupted parquet, skipping (category=%s): %s",
             classify_error(exc).value, path,
         )
+        _load_summary.record_exc(exc, "stock_parquet")
         return pd.DataFrame()
 
 
@@ -90,6 +96,7 @@ def _load_opt(args: dict, storage_key: str, method: str, code: str):
                 storage_key, code, classify_error(exc).value,
             )
             _reported_load_fail.add(storage_key)
+        _load_summary.record_exc(exc, f"channel:{storage_key}")
         return None
 
 
@@ -105,6 +112,7 @@ def _load_etf(args: dict, code: str):
             "etf flow load failed for %s (category=%s)",
             code, classify_error(exc).value,
         )
+        _load_summary.record_exc(exc, "etf_flow")
         return None
 
 
@@ -382,6 +390,7 @@ def main():
     counts = Counter(s for _, s, _ in results)
     logger.info("Done: %s (out of %d stocks)", dict(counts), len(codes))
     summary = ErrorSummary()
+    summary.merge(_load_summary)
     for _code, status, cat in results:
         if status == "failed":
             summary.record(cat or "UNKNOWN", "build_features")

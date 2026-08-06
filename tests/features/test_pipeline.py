@@ -1184,3 +1184,42 @@ class TestFoldDeadFeatureColumns:
         pk_idx, po_idx = fold_dead_feature_columns(self._train_data(pk, po, obs), cols, cols)
         assert pk_idx == [1]
         assert po_idx == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# §T18: _build_preprocessing narrows the OmegaConf conversion catch
+# ---------------------------------------------------------------------------
+
+class TestBuildPreprocessingNarrow:
+    def test_omegaconf_failure_falls_back(self, monkeypatch):
+        """An OmegaConfBaseException (e.g. a failed interpolation resolve) is
+        handled: the config degrades to {} and an empty pipeline is built."""
+        from omegaconf import OmegaConf
+        from omegaconf.errors import InterpolationResolutionError
+        pipe = FeaturePipeline(
+            preprocessing_config=OmegaConf.create({"preprocessing": {}}),
+            use_new_preprocessing=False,
+        )
+
+        def _raise(cfg, **kw):
+            raise InterpolationResolutionError("unresolved interpolation")
+
+        monkeypatch.setattr(OmegaConf, "to_container", _raise)
+        out = pipe._build_preprocessing()
+        assert out is not None  # built from the fallback {} config
+
+    def test_non_omegaconf_error_propagates(self, monkeypatch):
+        """§T18: a failure outside (ValueError, TypeError, OmegaConfBaseException)
+        must propagate instead of being silently swallowed."""
+        from omegaconf import OmegaConf
+        pipe = FeaturePipeline(
+            preprocessing_config=OmegaConf.create({"preprocessing": {}}),
+            use_new_preprocessing=False,
+        )
+
+        def _raise(cfg, **kw):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(OmegaConf, "to_container", _raise)
+        with pytest.raises(RuntimeError, match="unexpected"):
+            pipe._build_preprocessing()

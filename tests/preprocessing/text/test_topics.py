@@ -403,3 +403,72 @@ def test_dependency_versions_returns_unknown_for_missing_dists(monkeypatch):
     assert versions["bertopic"] == "unknown"
     assert "python" in versions
     assert versions["python"]  # non-empty interpreter version
+
+
+# ---------------------------------------------------------------------------
+# §T18: narrow the meta-file exception handlers (OSError, JSONDecodeError)
+# ---------------------------------------------------------------------------
+
+def _bare_tm(tmp_path, **kwargs):
+    """A TopicModeler without any dependency stubbing — _read_meta /
+    _restore_embedder only touch model_cache_dir + embedding_model."""
+    from stoke_ml.preprocessing.text.topics import TopicModeler
+    return TopicModeler(enabled=False, model_cache_dir=str(tmp_path), **kwargs)
+
+
+def test_read_meta_missing_file_returns_empty(tmp_path):
+    tm = _bare_tm(tmp_path)
+    assert tm._read_meta("news", "2024-01-31") == {}
+
+
+def test_read_meta_corrupt_json_returns_empty(tmp_path):
+    """A corrupt meta JSON must degrade to {} (JSONDecodeError), not raise."""
+    tm = _bare_tm(tmp_path)
+    (tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    assert tm._read_meta("news", "2024-01-31") == {}
+
+
+def test_read_meta_narrows_exception_type(tmp_path, monkeypatch):
+    """§T18: a non-(OSError, JSONDecodeError) failure must propagate, not be
+    silently swallowed by a broad except."""
+    import json
+    tm = _bare_tm(tmp_path)
+    (tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    def _raise(_f):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(json, "load", _raise)
+    with pytest.raises(RuntimeError, match="boom"):
+        tm._read_meta("news", "2024-01-31")
+
+
+def test_restore_embedder_corrupt_meta_falls_back(tmp_path):
+    """A corrupt meta JSON must not raise; the embedding stays at the default
+    (tfidf — never touches the FinBERT network path)."""
+    tm = _bare_tm(tmp_path, embedding_model="tfidf")
+    (tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    tm._restore_embedder("news", "2024-01-31")  # must not raise
+    assert tm._finbert_model is None
+
+
+def test_restore_embedder_narrows_exception_type(tmp_path, monkeypatch):
+    """§T18: a non-(OSError, JSONDecodeError) meta failure must propagate."""
+    import json
+    tm = _bare_tm(tmp_path, embedding_model="tfidf")
+    (tmp_path / "bertopic_news_cutoff_2024-01-31_meta.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    def _raise(_f):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(json, "load", _raise)
+    with pytest.raises(RuntimeError, match="boom"):
+        tm._restore_embedder("news", "2024-01-31")

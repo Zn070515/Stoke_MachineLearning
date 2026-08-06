@@ -156,6 +156,47 @@ class TestSparsityNaNCoverage:
         res = check_sparsity(0)
         assert res.passed is True
 
+    def test_sparsity_counts_corrupt_files_unreadable(self, tmp_path, monkeypatch):
+        """§T18: a corrupt feature parquet is counted via unreadable_files (the
+        gate's existing §六-3 idiom), not silently dropped by a bare continue."""
+        feat_dir = tmp_path / "feat"
+        feat_dir.mkdir()
+        (feat_dir / "000001.parquet").write_bytes(b"not a parquet")
+        monkeypatch.setattr("scripts.production.data_quality_gate.FEAT_DIR", feat_dir)
+        res = check_sparsity(0)
+        assert res.unreadable_files == 1
+        assert res.passed is True  # sparsity itself stays informational
+
+
+class TestLoadDailyNarrow:
+    """§T18: _load_daily narrows its corrupt-parquet catch to (OSError, ValueError)."""
+
+    def test_corrupt_daily_returns_none(self, tmp_path, monkeypatch):
+        daily_dir = tmp_path / "daily"
+        daily_dir.mkdir()
+        (daily_dir / "000003.parquet").write_bytes(b"not a parquet")
+        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily_dir)
+        # fail-closed semantics preserved: a corrupt file → None, not a crash.
+        assert gate_mod._load_daily("000003", ["date", "close"]) is None
+
+    def test_non_read_error_propagates(self, tmp_path, monkeypatch):
+        """§T18: a failure outside (OSError, ValueError) must propagate instead
+        of being silently turned into a fail-closed None."""
+        daily_dir = tmp_path / "daily"
+        daily_dir.mkdir()
+        pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02"]),
+            "close": [1.0],
+        }).to_parquet(daily_dir / "000004.parquet", index=False)
+        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily_dir)
+
+        def _raise(*a, **k):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr("scripts.production.data_quality_gate.pd.read_parquet", _raise)
+        with pytest.raises(RuntimeError, match="unexpected"):
+            gate_mod._load_daily("000004", ["date", "close"])
+
 
 class TestFailOnReadError:
     def test_corrupt_daily_fails_daily_internal(self, tmp_path, monkeypatch):

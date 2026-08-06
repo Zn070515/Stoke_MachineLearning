@@ -284,6 +284,7 @@ def check_sparsity(sample: int) -> _g.CheckResult:
         try:
             df = pd.read_parquet(fp)
         except Exception:
+            res.unreadable_files += 1  # §六-3: corrupt files are always counted
             continue
         for c in df.columns:
             if not pd.api.types.is_numeric_dtype(df[c]):

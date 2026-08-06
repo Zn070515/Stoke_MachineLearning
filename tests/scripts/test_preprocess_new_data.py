@@ -131,3 +131,85 @@ class TestFormalStrictWiring:
         """--no-formal (dev path): quality failures degrade silently."""
         saved = _run_process(_args(no_formal=True))
         assert len(saved) == 1
+
+
+class TestBuildProvenanceNarrow:
+    """§T18: the git rev-parse provenance catch narrows to
+    (OSError, subprocess.CalledProcessError)."""
+
+    def test_git_failure_falls_back_to_unknown(self, monkeypatch):
+        def _fail(*a, **k):
+            raise mod.subprocess.CalledProcessError(
+                128, ["git", "rev-parse", "HEAD"]
+            )
+
+        monkeypatch.setattr(mod.subprocess, "run", _fail)
+        prov = mod._build_provenance({"a": 1})
+        assert prov["git_commit"] == "unknown"
+        assert prov["config_hash"] != "unknown"
+
+    def test_git_non_oserror_calledprocesserror_propagates(self, monkeypatch):
+        def _raise(*a, **k):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(mod.subprocess, "run", _raise)
+        with pytest.raises(RuntimeError, match="unexpected"):
+            mod._build_provenance({"a": 1})
+
+
+class TestErrorSummaryAggregation:
+    """§T18: the per-stock preprocess loops keep their broad catch but count
+    every failure through an ErrorSummary (reported via log_summary)."""
+
+    def test_process_standard_records_failure(self, monkeypatch, caplog):
+        def _raise(*a, **k):
+            raise RuntimeError("load boom")
+
+        monkeypatch.setattr(_FakeStorageFactory, "load", _raise)
+        with caplog.at_level("WARNING", logger="preprocess_new_data_mod"):
+            _run_process(_args(allow_degraded=True))
+        assert any("Error summary" in r.getMessage() for r in caplog.records)
+        assert any("preprocess:block_trade" in r.getMessage() for r in caplog.records)
+
+    def test_process_board_records_failure(self, tmp_path, monkeypatch, caplog):
+        def _raise(*a, **k):
+            raise RuntimeError("board boom")
+
+        monkeypatch.setattr(_FakeDS, "load_daily", _raise)
+        args = _args()
+        with caplog.at_level("WARNING", logger="preprocess_new_data_mod"):
+            mod._process_board(
+                _quality_pipeline(), "board", ["000001"], str(tmp_path), args,
+                {"run_id": "r1"}, strict=_effective_strict(args),
+            )
+        assert any("Error summary" in r.getMessage() for r in caplog.records)
+        assert any("preprocess:board" in r.getMessage() for r in caplog.records)
+
+    def test_process_sector_records_failure(self, tmp_path, monkeypatch, caplog):
+        a_shares = tmp_path / "a_shares"
+        a_shares.mkdir()
+        # A minimal industry_ranking: sector_code present so the broadcaster's
+        # drop_duplicates subset is satisfiable, no change_pct so it early-returns
+        # without heavy cross-sectional math + a snapshot cache.
+        pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02"]),
+            "sector_code": ["01"],
+        }).to_parquet(a_shares / "industry_ranking.parquet", index=False)
+        pd.DataFrame({"stock_code": ["000001"], "sector": ["银行"]}).to_csv(
+            a_shares / "stock_sector_cache.csv", index=False)
+
+        def _raise(*a, **k):
+            raise RuntimeError("sector boom")
+
+        monkeypatch.setattr(_FakeDS, "load_daily", _raise)
+        pp = PreprocessingPipeline()
+        pp.register_chain("sector", PreprocessingChain([], name="sector"))
+        pp._quality_monitor = QualityMonitor(missing_error_threshold=0.5)
+        args = _args(sector_snapshot_asof=None)
+        with caplog.at_level("WARNING", logger="preprocess_new_data_mod"):
+            mod._process_sector(
+                pp, "sector", ["000001"], str(tmp_path), args,
+                {"run_id": "r1"}, strict=_effective_strict(args),
+            )
+        assert any("Error summary" in r.getMessage() for r in caplog.records)
+        assert any("preprocess:sector" in r.getMessage() for r in caplog.records)

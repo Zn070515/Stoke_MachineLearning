@@ -247,8 +247,9 @@ class FeaturePipeline:
         if cfg is not None and not isinstance(cfg, dict):
             try:
                 from omegaconf import OmegaConf
+                from omegaconf.errors import OmegaConfBaseException
                 cfg = OmegaConf.to_container(cfg, resolve=True)
-            except Exception as exc:
+            except (ValueError, TypeError, OmegaConfBaseException) as exc:
                 from stoke_ml.utils.error_summary import classify_error
                 logger.warning(
                     "OmegaConf conversion failed (category=%s), using raw cfg",

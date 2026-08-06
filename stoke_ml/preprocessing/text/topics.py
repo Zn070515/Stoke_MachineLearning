@@ -391,7 +391,7 @@ class TopicModeler(PreprocessingStep):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             logger.warning(
                 "Cannot read BERTopic meta %s (category=%s)",
                 meta_path, classify_error(exc).value,
@@ -583,7 +583,7 @@ class TopicModeler(PreprocessingStep):
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                 used_embedding = meta.get("embedding_model", self.embedding_model)
-            except Exception as exc:
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 logger.warning(
                     "Cannot read BERTopic meta %s (category=%s)",
                     meta_path, classify_error(exc).value,

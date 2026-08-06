@@ -7,6 +7,7 @@ manifests record every accepted/rejected write for later auditing.
 """
 import json
 import os
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -173,3 +174,31 @@ class TestReplaceRangeManifest:
         assert not os.path.exists(os.path.join(
             str(tmp_path), "a_shares", "margin", ".manifests", "000001.json"
         ))
+
+
+class TestLoadDateErrorReporting:
+    """§T18: a corrupt partition must be dropped but ALSO aggregated/reported,
+    not silently swallowed by the load_date loop."""
+
+    def _corrupt_partition(self, tmp_path):
+        part = os.path.join(str(tmp_path), "a_shares", "margin", "2024", "01")
+        os.makedirs(part, exist_ok=True)
+        (Path(part) / "corrupt.parquet").write_bytes(b"not a parquet")
+        return part
+
+    def test_load_date_reports_unreadable_partitions(self, tmp_path, caplog):
+        s = _storage(tmp_path)
+        part = self._corrupt_partition(tmp_path)
+        pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "stock_code": ["000001", "000001"],
+        }).to_parquet(os.path.join(part, "000001.parquet"), index=False)
+
+        with caplog.at_level("WARNING", logger="stoke_ml.data.market_wide_storage"):
+            out = s.load_date("2024-01-02")
+        # Drop semantics preserved: the valid partition still loads.
+        assert len(out) == 1
+        assert out["stock_code"].iloc[0] == "000001"
+        # §T18: the corrupt partition is aggregated + reported, not silently dropped.
+        assert any("Error summary" in r.getMessage() for r in caplog.records)
+        assert any("load_date:margin" in r.getMessage() for r in caplog.records)

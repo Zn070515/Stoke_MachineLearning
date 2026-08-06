@@ -234,7 +234,7 @@ def _load_daily(code: str, cols: list[str]) -> pd.DataFrame | None:
             return None
         try:
             d = pd.read_parquet(p, columns=list(_DAILY_CACHE_COLS))
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             # Distinguish a corrupt parquet from a missing file: missing is a
             # normal no-data state (None, callers fail closed), corruption is
             # a data-integrity signal that must be visible, not swallowed.
