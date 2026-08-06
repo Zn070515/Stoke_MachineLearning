@@ -4,17 +4,18 @@ Partitions: data/a_shares/{data_type}/{year}/{month}/{stock_code}.parquet
 """
 import logging
 import os
-import time
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from stoke_ml.data.asset_contract import AtomicCommit, atomic_write_json
+from stoke_ml.data.asset_contract import (
+    AtomicCommit,
+    acquire_lock as _acquire_lock,
+    atomic_write_json,
+    release_lock as _release_lock,
+)
 
 logger = logging.getLogger(__name__)
-
-_LOCK_TIMEOUT = 600.0
-_LOCK_STALE = 900.0
 
 # Destructive window replacement must reject if the new output would drop too
 # many previously-present dates, or silently remove columns that downstream
@@ -22,32 +23,6 @@ _LOCK_STALE = 900.0
 DEFAULT_DEGRADE_THRESHOLD = 0.2
 _SCHEMA_RESERVED = frozenset({"date", "stock_code"})
 
-
-def _acquire_lock(target: str, timeout: float = _LOCK_TIMEOUT) -> str:
-    """Exclusive per-file lock via atomic mkdir. Returns the lock dir path."""
-    lock_dir = target + ".lock"
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            os.mkdir(lock_dir)
-            return lock_dir
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock_dir) > _LOCK_STALE:
-                    os.rmdir(lock_dir)  # steal stale lock from a crashed process
-                    continue
-            except OSError:
-                pass
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"could not acquire lock: {lock_dir}")
-            time.sleep(0.05)
-
-
-def _release_lock(lock_dir: str) -> None:
-    try:
-        os.rmdir(lock_dir)
-    except OSError:
-        pass
 
 MARKET_DATA_TYPES = [
     "dragon_tiger", "margin", "northbound",

@@ -10,12 +10,17 @@ silently trusted.
 
 ``asset_contract.py`` abstracts the FILE-LEVEL piece of that governance into a
 small reusable layer, leaving the column-schema contract (``contract.py``), the
-per-file lock + content-validation layer (``generation_store.py``, §十三-2) and
-the daily store itself untouched:
+content-validation layer (``generation_store.py``, §十三-2) and the daily store
+itself untouched:
 
 * :class:`AtomicCommit` — write a file via temp + ``os.replace``, removing the
   temp on failure, so a reader never observes a torn file and a failed write
   leaves the prior file untouched.
+* :func:`acquire_lock` / :func:`release_lock` / :func:`file_lock` — the shared
+  single-writer lock (atomic ``os.mkdir`` of ``<target>.lock``, blocking with
+  timeout + stale-lock steal) that serializes read-modify-write on the same
+  target across processes.  Used by ``generation_store`` and
+  ``market_wide_storage``.
 * :class:`DataAssetContract` — frozen description of one file-level asset: its
   ``data_type``, partition scheme, optional ``column_contract`` name, and the
   column whose values bound the manifest's ``start``/``end`` extent.
@@ -39,6 +44,8 @@ import hashlib
 import json
 import logging
 import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -93,6 +100,61 @@ def atomic_write_json(path: str, payload: dict) -> None:
     with AtomicCommit(path) as ac:
         with open(ac.tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+# ── Single-writer lock ─────────────────────────────────────────────────────
+# A read-modify-write on the same target from two processes (parallel macro
+# downloads, parallel market-wide backfills) must be exclusive.  Atomic rename
+# alone only protects readers from torn files, not concurrent writers from
+# interleaving their updates.  The lock is an atomic ``os.mkdir`` of
+# ``<target>.lock`` — exactly one process wins the mkdir, the rest block up to
+# ``timeout`` and then raise :class:`TimeoutError`.  A lock dir whose mtime is
+# older than ``_LOCK_STALE`` is assumed to be a crashed process's leftover and
+# is stolen (``os.rmdir``) so writers can never deadlock on a stale lock.
+_LOCK_TIMEOUT = 600.0
+_LOCK_STALE = 900.0
+
+
+def acquire_lock(target: str, timeout: float = _LOCK_TIMEOUT) -> str:
+    """Exclusive per-target lock via atomic mkdir. Returns the lock dir path."""
+    lock_dir = target + ".lock"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return lock_dir
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_dir) > _LOCK_STALE:
+                    os.rmdir(lock_dir)  # steal stale lock from a crashed process
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"could not acquire lock: {lock_dir}")
+            time.sleep(0.05)
+
+
+def release_lock(lock_dir: str) -> None:
+    try:
+        os.rmdir(lock_dir)
+    except OSError:
+        pass
+
+
+@contextmanager
+def file_lock(target: str, timeout: float = _LOCK_TIMEOUT):
+    """Blocking exclusive lock on ``target`` as a context manager.
+
+    Acquires ``<target>.lock`` on entry and releases it on exit (even on
+    exception).  Raises :class:`TimeoutError` if the lock cannot be acquired
+    within ``timeout`` seconds.
+    """
+    lock_dir = acquire_lock(target, timeout=timeout)
+    try:
+        yield lock_dir
+    finally:
+        release_lock(lock_dir)
 
 
 @dataclass(frozen=True)
