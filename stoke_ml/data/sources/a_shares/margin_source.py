@@ -24,8 +24,14 @@ class MarginTradingSource:
 
     def __init__(self, calendar_dir=None):
         # Data root whose frozen exchange_calendar artifact is authoritative for
-        # trading-day enumeration (§九).  None keeps the code-builtin calendar.
+        # trading-day enumeration (§九).  When provided the calendar is built
+        # once here (the artifact read is the expensive part); None keeps the
+        # code-builtin calendar, lazily constructed per call (old behavior).
         self._calendar_dir = calendar_dir
+        self._calendar = (
+            TradingCalendar("a_shares", calendar_dir=calendar_dir)
+            if calendar_dir is not None else None
+        )
 
     def fetch_daily(
         self, start_date: str, end_date: str, sleep: float = 0.3,
@@ -45,7 +51,7 @@ class MarginTradingSource:
             return pd.DataFrame()
 
         if dates is None:
-            calendar = TradingCalendar("a_shares", calendar_dir=self._calendar_dir)
+            calendar = self._calendar or TradingCalendar("a_shares")
             dates = calendar.get_trading_days(start_date, end_date)
         all_frames = []
 

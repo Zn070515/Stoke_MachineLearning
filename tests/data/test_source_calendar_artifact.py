@@ -12,7 +12,6 @@ actually read, instead of silently passing because both calendars agree.
 """
 import datetime as dt
 import sys
-import types
 
 import pandas as pd
 import pytest
@@ -187,3 +186,49 @@ class TestDragonTigerSource:
         src = DragonTigerSource()
         src.fetch_by_stock("600519", START, END, sleep=0)
         assert "20260811" in fake_akshare
+
+
+# ── Artifact is loaded once at construction, not per enumeration ────────
+
+def _counting_calendar(monkeypatch):
+    """Wrap ``load_calendar`` so each artifact read is observable."""
+    import stoke_ml.data.calendar as cal_mod
+
+    real = cal_mod.load_calendar
+    calls = {"n": 0}
+
+    def counting(data_dir, market="a_shares"):
+        calls["n"] += 1
+        return real(data_dir, market)
+
+    monkeypatch.setattr(cal_mod, "load_calendar", counting)
+    return calls
+
+
+class TestCalendarCachedOnce:
+    """A source constructed with ``calendar_dir`` reads the frozen artifact
+    exactly once — at construction — never again per trading-day enumeration
+    call (a full-market dragon-tiger run would otherwise re-read the parquet
+    5530 times, once per stock)."""
+
+    def test_industry_ranking_loads_artifact_once(self, frozen_dir, monkeypatch):
+        calls = _counting_calendar(monkeypatch)
+        src = IndustryRankingSource(calendar_dir=frozen_dir)
+        assert calls["n"] == 1  # built once at construction
+
+        def fake_fetch(self, date=None):
+            return pd.DataFrame(columns=INDUSTRY_RANKING_COLS)
+
+        monkeypatch.setattr(IndustryRankingSource, "fetch", fake_fetch)
+        src.fetch_batch(START, END)
+        src.fetch_batch(START, END)
+        assert calls["n"] == 1  # enumeration reuses the cached calendar
+
+    def test_dragon_tiger_loads_artifact_once(self, frozen_dir, fake_akshare, monkeypatch):
+        calls = _counting_calendar(monkeypatch)
+        src = DragonTigerSource(calendar_dir=frozen_dir)
+        assert calls["n"] == 1
+
+        src.fetch_by_stock("600519", START, END, sleep=0)
+        src.fetch_by_stock("600519", START, END, sleep=0)
+        assert calls["n"] == 1

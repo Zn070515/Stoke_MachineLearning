@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 
 from stoke_ml.crawler.eastmoney import EastMoneyClient
+from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.codes import (
     UnsupportedMarketError,
     market_of_code,
@@ -87,7 +88,15 @@ class IndustryRankingSource:
 
     def __init__(self, min_interval: float = 2.5, calendar_dir=None):
         self._min_interval = min_interval
+        # Data root whose frozen exchange_calendar artifact is authoritative for
+        # trading-day enumeration (§九).  When provided the calendar is built
+        # once here (the artifact read is the expensive part); None keeps the
+        # code-builtin calendar, lazily constructed per call (old behavior).
         self._calendar_dir = calendar_dir
+        self._calendar = (
+            TradingCalendar("a_shares", calendar_dir=calendar_dir)
+            if calendar_dir is not None else None
+        )
         self._last_call: float = 0.0
         self._session = requests.Session()
         self._session.headers.update({
@@ -174,8 +183,7 @@ class IndustryRankingSource:
         ``calendar_dir`` the frozen exchange_calendar artifact is authoritative
         (same source of truth as the formal research flows, §九).
         """
-        from stoke_ml.data.calendar import TradingCalendar
-        calendar = TradingCalendar("a_shares", calendar_dir=self._calendar_dir)
+        calendar = self._calendar or TradingCalendar("a_shares")
         dates = calendar.get_trading_days(start_date, end_date)
 
         frames = []

@@ -129,8 +129,14 @@ class LimitUpSource:
     def __init__(self, min_interval: float = 1.2, calendar_dir=None):
         self._client = EastMoneyClient(min_interval=min_interval)
         # Data root whose frozen exchange_calendar artifact is authoritative for
-        # trading-day enumeration (§九).  None keeps the code-builtin calendar.
+        # trading-day enumeration (§九).  When provided the calendar is built
+        # once here (the artifact read is the expensive part); None keeps the
+        # code-builtin calendar, lazily constructed per call (old behavior).
         self._calendar_dir = calendar_dir
+        self._calendar = (
+            TradingCalendar("a_shares", calendar_dir=calendar_dir)
+            if calendar_dir is not None else None
+        )
 
     # ── EastMoney push2ex pools ──────────────────────────────────────────
 
@@ -347,7 +353,7 @@ class LimitUpSource:
 
         Returns dict mapping pool name -> concatenated DataFrame.
         """
-        calendar = TradingCalendar("a_shares", calendar_dir=self._calendar_dir)
+        calendar = self._calendar or TradingCalendar("a_shares")
         dates = calendar.get_trading_days(start_date, end_date)
         results: dict[str, list[pd.DataFrame]] = {p: [] for p in pools}
 
@@ -372,7 +378,7 @@ class LimitUpSource:
         self, start_date: str, end_date: str,
     ) -> pd.DataFrame:
         """Fetch daily sentiment summary over a date range."""
-        calendar = TradingCalendar("a_shares", calendar_dir=self._calendar_dir)
+        calendar = self._calendar or TradingCalendar("a_shares")
         dates = calendar.get_trading_days(start_date, end_date)
         rows = []
         for d in dates:
