@@ -575,11 +575,11 @@ def _panel_store_meta(
     instead of silently training on wrong targets — mirrors cache_manifest's
     config_hash + range staleness logic.  Carries the T4 §八 binding keys:
 
-    * ``stock_order_hash`` — of the REQUESTED candidate-pool ``stock_list``.
-      At save time ``save_panel_memmap`` overwrites it with the panel's OWN
-      surviving stock_codes (build_panel_features writes valid_codes, a
-      SUBSET of the request), which is the authoritative row-identity binding
-      recomputed against the store's own arrays/lists at load.
+    * ``n_stocks`` — derived from ``len(stock_list)``, the REQUESTED candidate
+      pool.  The store itself additionally records its own surviving-codes
+      ``stock_order_hash`` / ``feature_schema_hash`` via ``save_panel_memmap``'s
+      self-fingerprint merge (the authoritative row-identity binding recomputed
+      against the store's own arrays/lists at load — panel_store).
 
     * ``_WARN_META_KEYS`` external-artifact hashes — data manifest, calendar,
       universe status/delist, index membership, prebuilt feature manifest.
@@ -599,10 +599,6 @@ def _panel_store_meta(
         "config_hash": current_config_hash(),
         "git_commit": git_head(),
     }
-    if stock_list is not None:
-        meta["stock_order_hash"] = hashlib.sha1(
-            "\n".join(str(c) for c in stock_list).encode("utf-8")
-        ).hexdigest()[:16]
     if data_dir is not None:
         meta["data_manifest_hash"] = dataset_fingerprint(data_dir, ["daily"])
         try:

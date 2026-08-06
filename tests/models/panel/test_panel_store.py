@@ -249,11 +249,29 @@ class TestPanelStoreSelfBinding:
         """save_panel_memmap merges stock_order_hash + feature_schema_hash into
         meta.json, recomputed from the ACTUAL panel_data (authoritative), not
         inherited from the caller's expected_meta."""
-        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
         with open(tmp_path / _META_FILE, encoding="utf-8") as fh:
             recorded = json.load(fh)
-        assert "stock_order_hash" in recorded
-        assert "feature_schema_hash" in recorded
+        # Pin the RECORDED values to the recompute-from-panel, not just presence:
+        # the recorded fingerprint must be exactly what the panel itself yields.
+        assert recorded["stock_order_hash"] == panel_store._stock_order_hash(panel)
+        assert recorded["feature_schema_hash"] == panel_store._feature_schema_hash(panel)
+
+    def test_save_skips_fingerprints_panel_lacks_identity(self, tmp_path):
+        """A panel missing the optional identity keys (stock_codes / *_cols /
+        feature arrays) saves WITHOUT KeyError, and meta drops the keys its
+        panel cannot recompute — every self-consistency recompute must be
+        None-safe (never raise), since save iterates the same recompute table."""
+        panel = _storeable_panel()
+        for key in ("stock_codes", "past_known_cols", "past_observed_cols",
+                    "past_known", "past_observed", "static_features"):
+            panel.pop(key, None)
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        with open(tmp_path / _META_FILE, encoding="utf-8") as fh:
+            recorded = json.load(fh)
+        assert "stock_order_hash" not in recorded
+        assert "feature_schema_hash" not in recorded
 
     def test_clean_store_with_matching_meta_loads(self, tmp_path):
         """Regression: a store saved with self-fingerprints and loaded with a
@@ -288,6 +306,17 @@ class TestPanelStoreSelfBinding:
         cols[-1] = "pk_tampered"
         (tmp_path / "past_known_cols.json").write_text(
             json.dumps(cols), encoding="utf-8")
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path, expected_meta=_meta())
+        assert "feature_schema_hash" in str(ei.value)
+
+    def test_tampered_feature_dtype_refuses(self, tmp_path):
+        """A dtype change on disk (float32 → int16) flips the recomputed
+        feature_schema_hash via the _array_dtype path — hard-fail refused."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        arr = np.load(tmp_path / "past_known.npy")
+        np.save(tmp_path / "past_known.npy", arr.astype(np.int16))
         with pytest.raises(RuntimeError) as ei:
             load_panel_memmap(tmp_path, expected_meta=_meta())
         assert "feature_schema_hash" in str(ei.value)

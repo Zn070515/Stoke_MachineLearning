@@ -90,22 +90,6 @@ _WARN_META_KEYS: tuple[str, ...] = (
     "membership_hash", "prebuilt_feature_manifest_hash",
 )
 
-# Hard-fail keys validated by SELF-CONSISTENCY, not by the expected-vs-recorded
-# loop above (T4 §八).  ``save_panel_memmap`` recomputes these from the ACTUAL
-# ``panel_data`` and ``load_panel_memmap`` re-derives them from the store's own
-# arrays/lists, so a tampered stock_codes.json / past_known_cols.json /
-# past_observed_cols.json / feature dtype is refused instead of silently
-# training the WRONG stocks: ``PanelDataset.__getitem__``'s
-# ``max_stocks_per_date`` randperm samples rows by position (dataset.py), so a
-# misaligned stock_codes would train the wrong codes with no error.  The
-# current run's expected_meta CANNOT carry these — a store-backed re-run never
-# rebuilds to discover the schema, and ``build_panel_features`` writes
-# stock_codes = valid_codes (stocks that SURVIVED cleaning), a SUBSET of the
-# requested universe — so they live outside the expected-vs-recorded loop.
-_SELF_CONSISTENCY_META_KEYS: tuple[str, ...] = (
-    "feature_schema_hash", "stock_order_hash",
-)
-
 
 def _atomic_npy(out: Path, name: str, arr: np.ndarray) -> None:
     """Write ``arr`` to ``{name}.npy`` atomically (temp file + os.replace)."""
@@ -149,13 +133,15 @@ def _stock_order_hash(panel_data: dict) -> str | None:
 
 
 def _array_dtype(value) -> str:
-    """dtype of an array-like WITHOUT materializing a memmap into RAM.
+    """dtype of an array-like, reading it DIRECTLY off ndarray objects.
 
-    ``np.asarray`` on an ``np.memmap`` reads the whole backing file into memory
-    — catastrophic for a full-universe panel (hundreds of GB) at load time.  A
-    memmap is an ndarray subclass, so its ``.dtype`` is read directly off the
-    object; only non-array inputs (lists/tuples from tests) fall back to
-    ``np.asarray``.
+    A loaded store's feature arrays are ``np.memmap`` (an ndarray subclass), and
+    ``.dtype`` is a header property — no file bytes are touched, so reading it
+    off the object keeps the lazy-memmap path clean.  ``np.asarray(value).dtype``
+    would give the same result but routes through ``asarray``'s
+    copy/view-conversion semantics for no benefit here; only genuinely
+    non-array inputs (lists/tuples from tests) need the ``np.asarray`` fallback,
+    which materializes a tiny array.
     """
     if isinstance(value, np.ndarray):
         return str(value.dtype)
@@ -192,14 +178,35 @@ def _feature_schema_hash(panel_data: dict) -> str | None:
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
 
 
-# §八 (T4): each self-consistency key is recomputed from the loaded store's own
-# arrays/lists at load and compared to the recorded meta.json value.  A
-# recorded hash the store can no longer recompute (source keys missing) is also
-# refused — the record claims a binding the store cannot vouch for.
+# §八 (T4): SINGLE SOURCE OF TRUTH for the self-consistency bindings.  Hard-fail
+# keys validated by SELF-CONSISTENCY (not by the expected-vs-recorded loop
+# above): ``save_panel_memmap`` recomputes them from the ACTUAL ``panel_data``
+# and ``load_panel_memmap`` re-derives them from the store's own arrays/lists,
+# so a tampered stock_codes.json / past_known_cols.json / past_observed_cols.json
+# / feature dtype is refused instead of silently training the WRONG stocks:
+# ``PanelDataset.__getitem__``'s ``max_stocks_per_date`` randperm samples rows by
+# position (dataset.py), so a misaligned stock_codes would train the wrong codes
+# with no error.  The current run's expected_meta CANNOT carry these — a
+# store-backed re-run never rebuilds to discover the schema, and
+# ``build_panel_features`` writes stock_codes = valid_codes (stocks that SURVIVED
+# cleaning), a SUBSET of the requested universe — so they live outside the
+# expected-vs-recorded loop.  A recorded hash the store can no longer recompute
+# (source keys missing) is also refused — the record claims a binding the store
+# cannot vouch for.  Every key here must have a recompute that NEVER raises and
+# returns None (skip) when the panel lacks the source keys — the save path
+# iterates the same table, so an unimplemented/raising recompute would fail the
+# save, not silently record a bogus binding.
 _SELF_CONSISTENCY_RECOMPUTE: dict[str, callable] = {
     "feature_schema_hash": _feature_schema_hash,
     "stock_order_hash": _stock_order_hash,
 }
+
+# Derived from the recompute table so the set of RECORDED keys can never drift
+# from the set of VALIDATED keys: adding a binding means implementing its
+# recompute here, and every recompute key is then automatically both recorded at
+# save and validated at load (adding to one table only would otherwise either
+# record-never-validate or KeyError at runtime).
+_SELF_CONSISTENCY_META_KEYS: tuple[str, ...] = tuple(_SELF_CONSISTENCY_RECOMPUTE)
 
 
 def _merge_self_fingerprints(meta: dict, panel_data: dict) -> None:
@@ -300,7 +307,9 @@ def _load_meta(out: Path) -> dict | None:
         return json.load(fh)
 
 
-def _validate_meta(out: Path, expected_meta: dict) -> None:
+def _validate_meta(
+    out: Path, expected_meta: dict, recorded: dict | None = None,
+) -> None:
     """Refuse a store whose meta fingerprint disagrees with the current build.
 
     Research-critical fields (``_CRITICAL_META_KEYS``) must match or the load
@@ -314,8 +323,13 @@ def _validate_meta(out: Path, expected_meta: dict) -> None:
     is compared only when BOTH sides have it (None means config could not
     load).  A store with no meta.json at all cannot vouch for its config and
     is refused rather than trusted.
+
+    ``recorded`` is the already-loaded meta.json dict when the caller has it
+    (load_panel_memmap reads the file once and threads it through to both
+    validators); when None it is read here.
     """
-    recorded = _load_meta(out)
+    if recorded is None:
+        recorded = _load_meta(out)
     if recorded is None:
         raise RuntimeError(
             f"panel store at {out} has no {_META_FILE} — cannot verify the "
@@ -360,7 +374,9 @@ def _validate_meta(out: Path, expected_meta: dict) -> None:
         )
 
 
-def _validate_self_consistency(data: dict, out: Path) -> None:
+def _validate_self_consistency(
+    data: dict, out: Path, recorded: dict | None = None,
+) -> None:
     """Recompute the store's self-consistency fingerprints from its OWN arrays
     /lists and refuse a store that can no longer recompute a recorded binding.
 
@@ -381,9 +397,12 @@ def _validate_self_consistency(data: dict, out: Path) -> None:
 
     Runs whenever the store has a meta.json (the saved fingerprints live
     there), regardless of whether ``expected_meta`` was given for the
-    expected-vs-recorded loop.
+    expected-vs-recorded loop.  ``recorded`` is the already-loaded meta.json
+    dict when the caller has it (load_panel_memmap reads the file once and
+    threads it through); when None it is read here.
     """
-    recorded = _load_meta(out)
+    if recorded is None:
+        recorded = _load_meta(out)
     if recorded is None:
         return
     violated: list[str] = []
@@ -454,9 +473,13 @@ def load_panel_memmap(
             continue
         with open(path, encoding="utf-8") as fh:
             data[path.name[:-5]] = json.load(fh)
+    # Read meta.json ONCE and thread the same dict through both validators
+    # (the expected-vs-recorded guard and the self-consistency guard), so a
+    # load never re-reads the file a second time.
+    recorded = _load_meta(out)
     if expected_meta is not None:
-        _validate_meta(out, expected_meta)
-    _validate_self_consistency(data, out)
+        _validate_meta(out, expected_meta, recorded=recorded)
+    _validate_self_consistency(data, out, recorded=recorded)
     return data
 
 
