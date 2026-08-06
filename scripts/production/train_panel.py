@@ -39,7 +39,9 @@ from stoke_ml.data.universe import (
     not_delisted_mask,
 )
 from stoke_ml.data.vintage_policy import VintagePolicy, channel_allowed
-from stoke_ml.features.cache_manifest import current_config_hash, git_head
+from stoke_ml.features.cache_manifest import (
+    _dir_content_hash, current_config_hash, git_head,
+)
 from stoke_ml.features.pipeline import (
     FeaturePipeline, _PIT_STATIC_COLS, fold_dead_feature_columns,
 )
@@ -68,7 +70,7 @@ from scripts.production.train_panel_oos import (
     _replay_continuous_oos,
 )
 from scripts.production.train_panel_registry import (
-    _calendar_freeze,  # noqa: F401  re-exported for import-compat
+    _calendar_freeze,
     _experiment_version,
     _EXPERIMENT_REGISTRY_PATH,
     _LOCKBOX_MARKER_PATH,  # noqa: F401  re-exported for import-compat
@@ -562,25 +564,63 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
     return kwargs
 
 
-def _panel_store_meta(args, seq_len: int, n_stocks: int | None = None) -> dict:
+def _panel_store_meta(
+    args, seq_len: int, stock_list: list[str] | None = None,
+    data_dir: str | None = None, prebuilt_dir: str | None = None,
+) -> dict:
     """Build-time fingerprint persisted in a panel store's meta.json.
 
     Re-checked by load_panel_memmap on a store-backed re-run so a stale store
     (different horizon / universe / feature switches / date window) is refused
     instead of silently training on wrong targets — mirrors cache_manifest's
-    config_hash + range staleness logic.
+    config_hash + range staleness logic.  Carries the T4 §八 binding keys:
+
+    * ``stock_order_hash`` — of the REQUESTED candidate-pool ``stock_list``.
+      At save time ``save_panel_memmap`` overwrites it with the panel's OWN
+      surviving stock_codes (build_panel_features writes valid_codes, a
+      SUBSET of the request), which is the authoritative row-identity binding
+      recomputed against the store's own arrays/lists at load.
+
+    * ``_WARN_META_KEYS`` external-artifact hashes — data manifest, calendar,
+      universe status/delist, index membership, prebuilt feature manifest.
+      Each is computed only when the corresponding artifact is readable (None
+      otherwise, skipped at load — mirrors the config_hash None-skip), and a
+      mismatch warns-and-proceeds (each is re-derivable by rebuilding the
+      store).
     """
-    return {
+    meta = {
         "horizon": args.horizon,
         "seq_len": seq_len,
         "start": args.start,
         "end": args.end,
         "universe": args.universe,
-        "n_stocks": n_stocks,
+        "n_stocks": len(stock_list) if stock_list is not None else None,
         "feature_switches": _panel_pipeline_kwargs(args, seq_len),
         "config_hash": current_config_hash(),
         "git_commit": git_head(),
     }
+    if stock_list is not None:
+        meta["stock_order_hash"] = hashlib.sha1(
+            "\n".join(str(c) for c in stock_list).encode("utf-8")
+        ).hexdigest()[:16]
+    if data_dir is not None:
+        meta["data_manifest_hash"] = dataset_fingerprint(data_dir, ["daily"])
+        try:
+            meta["calendar_hash"] = _calendar_freeze(
+                data_dir)["calendar_artifact_hash"]
+        except Exception:
+            # calendar could not be materialized (neither artifact nor code
+            # frame) — record nothing so the load-side comparison skips.
+            meta["calendar_hash"] = None
+        universe_status = load_universe_status(data_dir)
+        universe_hashes = _universe_artifact_hashes(
+            universe_status, data_dir, args.universe)
+        meta["universe_status_hash"] = universe_hashes["universe_status_hash"]
+        meta["membership_hash"] = universe_hashes["membership_hash"]
+    if prebuilt_dir:
+        meta["prebuilt_feature_manifest_hash"] = _dir_content_hash(
+            os.path.join(prebuilt_dir, ".manifests"))
+    return meta
 
 
 def _validate_panel_store_path(path: str) -> None:
@@ -624,7 +664,8 @@ def _resolve_panel(
                     "+ feature build)", args.panel_store)
         panel_data = load_panel_memmap(
             args.panel_store,
-            expected_meta=_panel_store_meta(args, seq_len, len(stock_list)))
+            expected_meta=_panel_store_meta(
+                args, seq_len, stock_list, data_dir, args.prebuilt))
         channel_manifest = _prebuilt_channel_coverage(panel_data)
         return panel_data, channel_manifest
 
@@ -685,7 +726,8 @@ def _resolve_panel(
     if args.panel_store:
         save_panel_memmap(
             panel_data, args.panel_store,
-            meta=_panel_store_meta(args, seq_len, len(stock_list)))
+            meta=_panel_store_meta(
+                args, seq_len, stock_list, data_dir, args.prebuilt))
         logger.info("Saved panel memmap store to %s", args.panel_store)
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the

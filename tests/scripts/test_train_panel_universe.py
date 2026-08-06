@@ -905,8 +905,8 @@ def test_announcement_switch_key_special_case(tp):
 def test_panel_store_meta_fingerprints_vintage_policy(tp):
     """§T2: the vintage policy enters the panel-store meta fingerprint via
     feature_switches, so a policy change auto-invalidates a stale store."""
-    allow = tp._panel_store_meta(_panel_args("allow-revised"), seq_len=60, n_stocks=100)
-    safe = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, n_stocks=100)
+    allow = tp._panel_store_meta(_panel_args("allow-revised"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    safe = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert allow["feature_switches"] != safe["feature_switches"]
     assert allow["feature_switches"]["use_fundamental"] is True
     assert safe["feature_switches"]["use_fundamental"] is False
@@ -930,10 +930,10 @@ def test_allow_fundamental_ablation_changes_store_fingerprint(tp):
     """T3: the ablation flag must change the panel-store meta fingerprint — an
     ablation store must never be reused by a non-ablation run (nor vice-versa),
     exactly as a policy change does."""
-    base = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, n_stocks=100)
+    base = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     ablated = tp._panel_store_meta(
         _panel_args("safe-only", allow_fundamental_ablation=True),
-        seq_len=60, n_stocks=100)
+        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert base["feature_switches"] != ablated["feature_switches"]
     assert base["feature_switches"]["use_fundamental"] is False
     assert ablated["feature_switches"]["use_fundamental"] is True

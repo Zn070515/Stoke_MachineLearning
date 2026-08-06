@@ -9,6 +9,7 @@ missing required file is reported by name, and the meta.json config guard
 refuses a stale store (wrong horizon/universe/feature switches) instead of
 silently training on wrong targets.
 """
+import json
 import logging
 from types import SimpleNamespace
 
@@ -236,6 +237,120 @@ class TestPanelStoreMetaGuard:
         assert loaded["stock_codes"] == _storeable_panel()["stock_codes"]
 
 
+class TestPanelStoreSelfBinding:
+    """§八 (T4): the store binds to ITSELF — feature schema + stock order are
+    recomputed from the store's own arrays/lists at load, so a tampered
+    stock_codes.json / past_known_cols.json / feature dtype is refused instead
+    of silently training the WRONG stocks (the dataset's max_stocks_per_date
+    randperm samples rows by position, so a misaligned stock_codes trains the
+    wrong codes with no error)."""
+
+    def test_save_records_self_fingerprints(self, tmp_path):
+        """save_panel_memmap merges stock_order_hash + feature_schema_hash into
+        meta.json, recomputed from the ACTUAL panel_data (authoritative), not
+        inherited from the caller's expected_meta."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        with open(tmp_path / _META_FILE, encoding="utf-8") as fh:
+            recorded = json.load(fh)
+        assert "stock_order_hash" in recorded
+        assert "feature_schema_hash" in recorded
+
+    def test_clean_store_with_matching_meta_loads(self, tmp_path):
+        """Regression: a store saved with self-fingerprints and loaded with a
+        matching expected_meta passes BOTH the expected-vs-recorded guard and
+        the self-consistency check."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        loaded = load_panel_memmap(tmp_path, expected_meta=_meta())
+        assert loaded["stock_codes"] == panel["stock_codes"]
+        assert list(loaded["past_known_cols"]) == panel["past_known_cols"]
+
+    def test_tampered_stock_order_refuses(self, tmp_path):
+        """Swapping two codes in stock_codes.json desynchronizes row identity
+        from the arrays — hard-fail refused, never silently trained."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        codes = json.loads((tmp_path / "stock_codes.json").read_text(encoding="utf-8"))
+        codes[0], codes[1] = codes[1], codes[0]
+        (tmp_path / "stock_codes.json").write_text(
+            json.dumps(codes), encoding="utf-8")
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path, expected_meta=_meta())
+        assert "stock_order_hash" in str(ei.value)
+
+    def test_tampered_feature_schema_refuses(self, tmp_path):
+        """Renaming a past_known column desynchronizes the col list from the
+        array's feature axis — hard-fail refused."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        cols = json.loads(
+            (tmp_path / "past_known_cols.json").read_text(encoding="utf-8"))
+        cols[-1] = "pk_tampered"
+        (tmp_path / "past_known_cols.json").write_text(
+            json.dumps(cols), encoding="utf-8")
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path, expected_meta=_meta())
+        assert "feature_schema_hash" in str(ei.value)
+
+    def test_self_check_runs_without_expected_meta(self, tmp_path):
+        """The self-consistency guard is NOT gated on expected_meta — a store
+        loaded bare still refuses a tampered row order."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        codes = json.loads((tmp_path / "stock_codes.json").read_text(encoding="utf-8"))
+        codes.reverse()
+        (tmp_path / "stock_codes.json").write_text(
+            json.dumps(codes), encoding="utf-8")
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path)
+        assert "stock_order_hash" in str(ei.value)
+
+
+class TestPanelStoreWarnBinding:
+    """§八 (T4): warn-and-proceed bindings to the external data artifacts the
+    store was built from — a drift warns loudly but proceeds (re-derivable by
+    rebuilding), and a side missing a key is skipped (mirrors config_hash)."""
+
+    def _bound_meta(self):
+        return _meta(
+            data_manifest_hash="manifest-abc",
+            calendar_hash="cal-abc",
+            universe_status_hash="uni-abc",
+            membership_hash="mem-abc",
+            prebuilt_feature_manifest_hash="pre-abc",
+        )
+
+    def test_warn_key_mismatch_proceeds(self, tmp_path, caplog):
+        """A drifted external artifact hash warns loudly but proceeds."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=self._bound_meta())
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(
+                tmp_path, expected_meta=_meta(data_manifest_hash="manifest-CHANGED"))
+        assert loaded["stock_codes"] == panel["stock_codes"]
+        assert any("data_manifest_hash" in r.message for r in caplog.records)
+
+    def test_warn_keys_skipped_when_absent(self, tmp_path, caplog):
+        """A meta with no warn keys (legacy / unbinding caller) loads without a
+        warning — None on either side skips the comparison."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())  # no warn keys
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(tmp_path, expected_meta=_meta())
+        assert loaded["stock_codes"] == panel["stock_codes"]
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_warn_key_mismatch_expected_missing_skips(self, tmp_path, caplog):
+        """Recorded carries a warn key but the current expected_meta does not —
+        skipped, no warning (a side missing the key = skip)."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=self._bound_meta())
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(tmp_path, expected_meta=_meta())
+        assert loaded["stock_codes"] == panel["stock_codes"]
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
 class TestPanelStoreSaveEdgeCases:
     def test_save_to_existing_file_raises(self, tmp_path):
         """--panel-store pointing at an existing FILE is a clear error."""
@@ -278,7 +393,8 @@ class TestResolvePanelStoreSkip:
         store_path = str(tmp_path / "store")
         args = self._args(store_path)
         save_panel_memmap(panel, store_path,
-                          meta=_panel_store_meta(args, seq_len, len(stock_list)))
+                          meta=_panel_store_meta(args, seq_len, stock_list,
+                                                 str(tmp_path), args.prebuilt))
 
         # Any touch of the live K-line / aux pipeline is a regression: the
         # store path must return before DataStorage.load_daily or load_aux_data

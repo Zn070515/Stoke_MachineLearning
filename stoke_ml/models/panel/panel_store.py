@@ -27,6 +27,7 @@ be garbage-collected before removing / re-creating a store.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -77,6 +78,34 @@ _CRITICAL_META_KEYS: tuple[str, ...] = (
     "feature_switches", "config_hash",
 )
 
+# Warn-and-proceed keys (T4 §八): bind the store to the EXTERNAL data
+# artifacts it was built from — data manifest, calendar, universe
+# status/delist, index membership, prebuilt feature manifest.  A mismatch
+# warns loudly but proceeds (each is re-derivable by rebuilding the store), so
+# stale is suspicious, not fatal.  Compared recorded-meta-vs-expected ONLY
+# when BOTH sides carry a value (None on either side = skip), mirroring
+# config_hash.
+_WARN_META_KEYS: tuple[str, ...] = (
+    "data_manifest_hash", "calendar_hash", "universe_status_hash",
+    "membership_hash", "prebuilt_feature_manifest_hash",
+)
+
+# Hard-fail keys validated by SELF-CONSISTENCY, not by the expected-vs-recorded
+# loop above (T4 §八).  ``save_panel_memmap`` recomputes these from the ACTUAL
+# ``panel_data`` and ``load_panel_memmap`` re-derives them from the store's own
+# arrays/lists, so a tampered stock_codes.json / past_known_cols.json /
+# past_observed_cols.json / feature dtype is refused instead of silently
+# training the WRONG stocks: ``PanelDataset.__getitem__``'s
+# ``max_stocks_per_date`` randperm samples rows by position (dataset.py), so a
+# misaligned stock_codes would train the wrong codes with no error.  The
+# current run's expected_meta CANNOT carry these — a store-backed re-run never
+# rebuilds to discover the schema, and ``build_panel_features`` writes
+# stock_codes = valid_codes (stocks that SURVIVED cleaning), a SUBSET of the
+# requested universe — so they live outside the expected-vs-recorded loop.
+_SELF_CONSISTENCY_META_KEYS: tuple[str, ...] = (
+    "feature_schema_hash", "stock_order_hash",
+)
+
 
 def _atomic_npy(out: Path, name: str, arr: np.ndarray) -> None:
     """Write ``arr`` to ``{name}.npy`` atomically (temp file + os.replace)."""
@@ -94,6 +123,102 @@ def _atomic_json(out: Path, name: str, value) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(value, fh, ensure_ascii=False)
     os.replace(tmp, out / f"{name}.json")
+
+
+def _hash_sha1(text: str) -> str:
+    """16-hex-char content digest, matching the codebase's hash convention."""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _stock_order_hash(panel_data: dict) -> str | None:
+    """Canonical hash of the panel's STOCK ROW ORDER, self-derived.
+
+    ``build_panel_features`` writes stock_codes = valid_codes (stocks that
+    survived cleaning), which may be a SUBSET of the requested universe.  So the
+    meaningful binding is the store's OWN stock_codes order: tamper
+    stock_codes.json and this recompute diverges from the recorded value,
+    refusing a store whose row identity no longer matches its arrays (a
+    misaligned stock_codes silently trains the WRONG stocks via the dataset's
+    positional randperm).  None when the panel lacks stock_codes (callers
+    defensively skip the binding).
+    """
+    codes = panel_data.get("stock_codes")
+    if codes is None:
+        return None
+    return _hash_sha1("\n".join(str(c) for c in codes))
+
+
+def _array_dtype(value) -> str:
+    """dtype of an array-like WITHOUT materializing a memmap into RAM.
+
+    ``np.asarray`` on an ``np.memmap`` reads the whole backing file into memory
+    — catastrophic for a full-universe panel (hundreds of GB) at load time.  A
+    memmap is an ndarray subclass, so its ``.dtype`` is read directly off the
+    object; only non-array inputs (lists/tuples from tests) fall back to
+    ``np.asarray``.
+    """
+    if isinstance(value, np.ndarray):
+        return str(value.dtype)
+    return str(np.asarray(value).dtype)
+
+
+def _feature_schema_hash(panel_data: dict) -> str | None:
+    """Canonical hash of the panel's FEATURE SCHEMA (cols + array dtypes).
+
+    Covers the ordered ``past_known_cols`` / ``past_observed_cols`` lists plus
+    the dtypes of the three feature arrays, so a tampered col list (a renamed /
+    removed column) or a dtype change on disk is refused at load instead of
+    silently feeding a mismatched schema.  None when any required key is missing
+    (callers defensively skip the binding).
+    """
+    cols_ok = (
+        panel_data.get("past_known_cols") is not None
+        and panel_data.get("past_observed_cols") is not None
+    )
+    arrays_ok = all(
+        panel_data.get(k) is not None
+        for k in ("past_known", "past_observed", "static_features")
+    )
+    if not cols_ok or not arrays_ok:
+        return None
+    payload = {
+        "past_known_cols": list(panel_data["past_known_cols"]),
+        "past_observed_cols": list(panel_data["past_observed_cols"]),
+        "past_known_dtype": _array_dtype(panel_data["past_known"]),
+        "past_observed_dtype": _array_dtype(panel_data["past_observed"]),
+        "static_features_dtype": _array_dtype(panel_data["static_features"]),
+    }
+    return _hash_sha1(json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+
+
+# §八 (T4): each self-consistency key is recomputed from the loaded store's own
+# arrays/lists at load and compared to the recorded meta.json value.  A
+# recorded hash the store can no longer recompute (source keys missing) is also
+# refused — the record claims a binding the store cannot vouch for.
+_SELF_CONSISTENCY_RECOMPUTE: dict[str, callable] = {
+    "feature_schema_hash": _feature_schema_hash,
+    "stock_order_hash": _stock_order_hash,
+}
+
+
+def _merge_self_fingerprints(meta: dict, panel_data: dict) -> None:
+    """Overwrite ``meta``'s self-fingerprints with values recomputed from the ACTUAL
+    ``panel_data`` (authoritative), dropping a key the panel cannot recompute.
+
+    The caller's meta wins for every OTHER key; these two can only be verified
+    at load by recomputing from the store's own arrays/lists, so the recorded
+    value must derive from the panel actually written — never from the caller's
+    request side (which may describe a universe that got trimmed by cleaning).
+    A key the panel lacks is dropped rather than inherited, so a stale caller
+    value can never masquerade as a binding the store cannot vouch for.
+    """
+    for key, recompute in _SELF_CONSISTENCY_RECOMPUTE.items():
+        value = recompute(panel_data)
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
 
 
 def save_panel_memmap(
@@ -149,8 +274,17 @@ def save_panel_memmap(
             )
     # meta.json first (so a store is never complete without it), then the
     # completeness marker — both via the same atomic temp+os.replace path as
-    # every other file, so a crash can't leave a truncated file.
+    # every other file, so a crash can't leave a truncated file.  Before
+    # writing, the caller-supplied meta is merged with the panel's OWN
+    # self-consistency fingerprints (feature schema + stock order), recomputed
+    # from the ACTUAL panel_data being written — those two can only be
+    # verified at load by recomputing from the store's own arrays/lists, so
+    # they must derive from the panel actually written, never from the
+    # caller's request side (which may describe a universe trimmed by
+    # cleaning).
     if meta is not None:
+        meta = dict(meta)
+        _merge_self_fingerprints(meta, panel_data)
         _atomic_json(out, "meta", meta)
         written.append(_META_FILE)
     _atomic_json(out, "complete", {"complete": True})
@@ -171,7 +305,11 @@ def _validate_meta(out: Path, expected_meta: dict) -> None:
 
     Research-critical fields (``_CRITICAL_META_KEYS``) must match or the load
     is refused — the stored panel's targets / column set / calendar would be
-    stale.  Non-critical fields (git_commit) drift with a loud warning and a
+    stale.  ``_WARN_META_KEYS`` (external-artifact hashes: data manifest,
+    calendar, universe status/delist, membership, prebuilt feature manifest)
+    warn-and-proceed on mismatch, compared only when BOTH sides carry a value
+    (each is re-derivable by rebuilding the store, so stale is suspicious, not
+    fatal).  Non-critical fields (git_commit) drift with a loud warning and a
     proceed, mirroring cache_manifest's stale-manifest logic.  ``config_hash``
     is compared only when BOTH sides have it (None means config could not
     load).  A store with no meta.json at all cannot vouch for its config and
@@ -200,6 +338,18 @@ def _validate_meta(out: Path, expected_meta: dict) -> None:
             ".  Rebuild the store for this configuration "
             "(--panel-store DIR with the current flags)."
         )
+    for key in _WARN_META_KEYS:
+        rec = recorded.get(key)
+        exp = expected_meta.get(key)
+        if rec is None or exp is None:
+            continue  # either side lacks the binding — nothing to compare
+        if rec != exp:
+            logger.warning(
+                "panel store %s: %s differs (stored=%r requested=%r) — "
+                "proceeding since it is re-derivable by rebuilding the store; "
+                "a persistent mismatch is suspicious and worth investigating",
+                out, key, rec, exp,
+            )
     exp_git = expected_meta.get("git_commit")
     rec_git = recorded.get("git_commit")
     if exp_git and rec_git and exp_git != rec_git:
@@ -207,6 +357,52 @@ def _validate_meta(out: Path, expected_meta: dict) -> None:
             "panel store %s was built at git commit %s (current %s) — "
             "proceeding since model-layer code does not change feature values; "
             "rebuild if you changed feature/preprocessing code", out, rec_git, exp_git,
+        )
+
+
+def _validate_self_consistency(data: dict, out: Path) -> None:
+    """Recompute the store's self-consistency fingerprints from its OWN arrays
+    /lists and refuse a store that can no longer recompute a recorded binding.
+
+    ``stock_order_hash`` / ``feature_schema_hash`` are recorded at save time
+    from the ACTUAL ``panel_data`` (see :func:`_merge_self_fingerprints`).
+    They are NOT compared against the current run's expected_meta — a
+    store-backed re-run never rebuilds to discover the schema, and
+    ``build_panel_features`` writes stock_codes = valid_codes, a SUBSET of the
+    requested universe — so the only meaningful check is recorded-vs-recompute
+    from the loaded store's own arrays/lists.  A tampered stock_codes.json /
+    past_known_cols.json / past_observed_cols.json / feature dtype is refused
+    instead of silently training the WRONG stocks:
+    ``PanelDataset.__getitem__``'s ``max_stocks_per_date`` randperm samples
+    rows by position (dataset.py), so a misaligned stock_codes would train
+    wrong codes with no error.  A recorded hash the store can no longer
+    recompute (source keys missing) is also refused — the record claims a
+    binding the store cannot vouch for.
+
+    Runs whenever the store has a meta.json (the saved fingerprints live
+    there), regardless of whether ``expected_meta`` was given for the
+    expected-vs-recorded loop.
+    """
+    recorded = _load_meta(out)
+    if recorded is None:
+        return
+    violated: list[str] = []
+    for key in _SELF_CONSISTENCY_META_KEYS:
+        rec = recorded.get(key)
+        if rec is None:
+            continue  # legacy store saved before the binding existed
+        recompute = _SELF_CONSISTENCY_RECOMPUTE[key]
+        recomputed = recompute(data)
+        if recomputed is None or recomputed != rec:
+            violated.append(
+                f"{key}: recorded={rec!r} recomputed={recomputed!r}"
+            )
+    if violated:
+        raise RuntimeError(
+            f"panel store at {out} fails self-consistency check — the store's "
+            "own metadata no longer matches its arrays/lists: "
+            + "; ".join(violated) + ".  Rebuild the store for this "
+            "configuration (--panel-store DIR with the current flags)."
         )
 
 
@@ -227,7 +423,14 @@ def load_panel_memmap(
     store's ``meta.json`` is validated against it first — a mismatch on any
     research-critical field (horizon, seq_len, start/end, universe, feature
     switches, config_hash) raises RuntimeError naming the mismatch, so a stale
-    store can never silently feed wrong targets.  git_commit drift only warns.
+    store can never silently feed wrong targets.  git_commit drift only warns,
+    and ``_WARN_META_KEYS`` (external-artifact hashes) drift with a loud
+    warning and a proceed (each is re-derivable by rebuilding the store).
+    Independently of ``expected_meta``, the store's self-consistency
+    fingerprints (feature schema + stock order, see
+    :func:`_validate_self_consistency`) are recomputed from the store's own
+    arrays/lists whenever a meta.json exists — a tampered identity file is
+    refused rather than silently training the wrong stocks.
 
     Raises FileNotFoundError naming every required file that is missing.
     """
@@ -253,6 +456,7 @@ def load_panel_memmap(
             data[path.name[:-5]] = json.load(fh)
     if expected_meta is not None:
         _validate_meta(out, expected_meta)
+    _validate_self_consistency(data, out)
     return data
 
 
