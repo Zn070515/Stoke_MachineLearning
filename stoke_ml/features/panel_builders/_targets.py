@@ -5,10 +5,17 @@ direction/return/volatility targets, observation/entry masks, raw PIT-static
 inputs, and fill-probability accumulators.  It writes directly into a
 ``PanelArrays`` container (T8 memmap seam).
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 
 from stoke_ml.features.panel_helpers import _min_vol_nobs, _trailing_mean
+
+if TYPE_CHECKING:
+    from stoke_ml.features.panel_builders._arrays import PanelArrays
 
 
 class TargetBuilder:
@@ -35,7 +42,7 @@ class TargetBuilder:
         valid_codes: list,
         max_T: int,
         date_to_pos: dict,
-        arrays,  # PanelArrays
+        arrays: PanelArrays,
     ):
         """Run the per-stock target loop, writing into *arrays*.
 

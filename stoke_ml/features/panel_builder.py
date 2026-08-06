@@ -13,7 +13,7 @@ The five builder concerns were extracted into ``stoke_ml.features.panel_builders
 (§二十一 refactor):
   - ``_targets.py``        — TargetBuilder: per-stock labels / masks / PIT-static raw inputs
   - ``_eligibility.py``    — EligibilityBuilder: decision / history / universe-eligibility masks
-  - ``_normalizer.py``     — CrossSectionNormalizer: per-date z-score + _daily_member_flag
+  - ``_normalizer.py``     — DateWiseZScoreNormalizer: per-date z-score + _daily_member_flag
   - ``_arrays.py``         — PanelArrays: allocation + sanitization + dict assembly (T8 seam)
   - ``_static_context.py`` — StaticContextBuilder: static / pk / po grid population + quantile ranks
 """
@@ -31,7 +31,7 @@ from stoke_ml.features.fundamental import FundamentalRefiner
 from stoke_ml.features.panel_builders._arrays import PanelArrays
 from stoke_ml.features.panel_builders._eligibility import EligibilityBuilder
 from stoke_ml.features.panel_builders._normalizer import (
-    CrossSectionNormalizer, _daily_member_flag,  # noqa: F401  re-exported for import-compat
+    DateWiseZScoreNormalizer, _daily_member_flag,  # noqa: F401  re-exported for import-compat
 )
 from stoke_ml.features.panel_builders._static_context import StaticContextBuilder
 from stoke_ml.features.panel_builders._targets import TargetBuilder
@@ -386,7 +386,7 @@ def build_panel_features(
 
     N_stocks = len(all_feat_dfs)
 
-    # ── 1. TargetBuilder: per-stock labels / masks / PIT-static raw inputs ──
+    # ── Targets & masks (per-stock labels / PIT-static raw inputs) ──
     arrays = PanelArrays(N_stocks, max_T)
     target_builder = TargetBuilder(horizon, target_col)
     target_builder.compute(all_feat_dfs, valid_codes, max_T, date_to_pos, arrays)
@@ -509,13 +509,13 @@ def build_panel_features(
     # the grids; train_panel drops dead columns per-fold using only its own
     # training window (fold_dead_feature_columns).
 
-    # ── 2. CrossSectionNormalizer: per-date z-score normalization ──
-    normalizer = CrossSectionNormalizer(daily_membership)
+    # ── Cross-section z-norm (per-date z-score + member-set restriction) ──
+    normalizer = DateWiseZScoreNormalizer(daily_membership)
     norm_cols, date_stats = normalizer.normalize(
-        all_feat_dfs, valid_codes, pk_cols_available, po_cols_available,
+        all_feat_dfs, pk_cols_available, po_cols_available,
     )
 
-    # ── 3. StaticContextBuilder: feature grid population + quantile ranks ──
+    # ── Feature grids (static / pk / po) + quantile ranks ──
     arrays.alloc_features(
         len(static_cols_available), len(pk_cols_available), len(po_cols_available),
     )
@@ -526,13 +526,13 @@ def build_panel_features(
         arrays,
     )
 
-    # ── 4. EligibilityBuilder: decision / history / universe masks ──
+    # ── Eligibility masks (decision / history / universe) ──
     elig_builder = EligibilityBuilder(pipeline.seq_len, min_history)
     decision_arr, history_arr, universe_eligible_arr = elig_builder.compute(
         arrays.obs, arrays.first_col, arrays.amt60_raw, arrays.has_amount,
     )
 
-    # ── 5. PanelArrays: sanitize + final assembly ──
+    # ── Sanitize + final assembly ──
     arrays.sanitize()
 
     return arrays.assemble(

@@ -5,6 +5,10 @@
 then computes per-date cross-sectional trailing-mean quantile ranks for the
 ``*_60d_q`` PIT-static columns.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 
 from stoke_ml.features.panel_helpers import (
@@ -12,6 +16,9 @@ from stoke_ml.features.panel_helpers import (
     _PIT_STATIC_COLS,
     _board_index,
 )
+
+if TYPE_CHECKING:
+    from stoke_ml.features.panel_builders._arrays import PanelArrays
 
 
 class StaticContextBuilder:
@@ -27,7 +34,7 @@ class StaticContextBuilder:
         static_cols: list,
         pk_cols: list,
         po_cols: list,
-        arrays,  # PanelArrays
+        arrays: PanelArrays,
     ):
         """Scatter per-stock features into arrays.static / .pk / .po.
 
@@ -42,6 +49,14 @@ class StaticContextBuilder:
         static_cols_available = list(static_cols)
         pk_cols_available = list(pk_cols)
         po_cols_available = list(po_cols)
+
+        # stock_pos is written by TargetBuilder.compute(); a None here means
+        # the builder was skipped — fail loudly instead of silently indexing an
+        # empty list (which would scatter features onto wrong rows).
+        assert arrays.stock_pos is not None, (
+            "PanelArrays.stock_pos not initialized — TargetBuilder.compute() "
+            "must run before StaticContextBuilder.build()"
+        )
 
         for i, df in enumerate(all_feat_dfs):
             if len(df) == 0:
@@ -87,8 +102,6 @@ class StaticContextBuilder:
         # through close t, and the within-column rank is itself known at t.
         for qname in static_cols_available:
             if not qname.endswith("_60d_q"):
-                continue
-            if qname not in static_cols_available:
                 continue
             qk = static_cols_available.index(qname)
             qcol = arrays.static[:, :, qk]

@@ -47,8 +47,11 @@ class PanelArrays:
         self.amt60_raw = np.zeros((N, T), dtype=np.float32)
         self.first_col = np.full(N, -1, dtype=np.int32)
         self.has_amount = np.ones(N, dtype=bool)
-        # Per-stock position map + per-stock row count
-        self.stock_pos: list = []
+        # Per-stock position map + per-stock row count.  stock_pos is written
+        # by TargetBuilder.compute() (which pre-sizes it) — leave it unset here
+        # so a read before the target loop fails loudly rather than silently
+        # indexing an empty list.
+        self.stock_pos: list | None = None
         self.stock_T = np.zeros(N, dtype=np.int32)
 
     def alloc_features(self, static_dim: int, pk_dim: int, po_dim: int):

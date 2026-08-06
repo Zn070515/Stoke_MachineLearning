@@ -1,9 +1,11 @@
-"""Cross-section normalizer + member-flag helpers extracted from panel_builder.py.
+"""Date-wise z-score normalizer + member-flag helpers extracted from panel_builder.py.
 
 ``_daily_member_flag`` and ``_cross_section_stats`` moved here from
 ``panel_builder.py`` (they are re-exported there for import-compat).
-``CrossSectionNormalizer`` encapsulates the per-date z-score normalization
-including the member-mask statistical-set restriction (§T6 decision 2).
+``DateWiseZScoreNormalizer`` encapsulates the per-date cross-sectional z-score
+normalization including the member-mask statistical-set restriction (§T6
+decision 2).  Named distinctly from the unrelated preprocessing
+``stoke_ml.preprocessing.numeric.cross_section.CrossSectionNormalizer``.
 """
 import numpy as np
 import pandas as pd
@@ -133,14 +135,16 @@ def _cross_section_stats(feat: pd.DataFrame, col: str) -> pd.DataFrame:
     return stats
 
 
-# ── CrossSectionNormalizer ──────────────────────────────────────────────
+# ── DateWiseZScoreNormalizer ────────────────────────────────────────────
 
-class CrossSectionNormalizer:
+class DateWiseZScoreNormalizer:
     """Per-date cross-sectional z-score normalization (§T6 decision 2).
 
-    When ``daily_membership`` is set and non-empty, the statistical set for
-    each date is restricted to that day's index members; non-member stocks are
-    still z-scored but do NOT contribute to the mean/std.
+    For each date, each feature is re-expressed relative to that date's
+    cross-section (mean/std).  When ``daily_membership`` is set and non-empty,
+    the statistical set for each date is restricted to that day's index
+    members; non-member stocks are still z-scored but do NOT contribute to the
+    mean/std.
 
     Parameters
     ----------
@@ -160,7 +164,6 @@ class CrossSectionNormalizer:
     def normalize(
         self,
         all_feat_dfs: list,
-        valid_codes: list,
         pk_cols: list,
         po_cols: list,
     ) -> tuple[list, dict]:
