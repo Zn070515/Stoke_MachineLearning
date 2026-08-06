@@ -988,7 +988,7 @@ def main():
         f.write("\n".join(universe_resolved))
         f.write("\n")
 
-    logger.info("=== Baseline Summary (%d folds, disjoint OOS windows) ===",
+    logger.info("=== Baseline Summary (%d folds, disjoint signal windows) ===",
                 summary["n_folds"])
     header = (f"{'model':<10} {'LS_sharpe':>10} {'IC':>8} {'long_sharpe':>12} "
               f"{'q5mq1(bp)':>10} {'OOS_cont':>10}")
