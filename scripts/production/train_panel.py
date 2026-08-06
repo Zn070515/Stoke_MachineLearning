@@ -2960,8 +2960,10 @@ def main():
             "strict_index_training": bool(args.strict_index_training),
             # §十四: the frozen feature profile whose required-channel /
             # minimum-coverage gates this run enforced (T19 hashes it into the
-            # experiment signature).
-            "feature_profile": args.feature_profile,
+            # experiment signature).  profile_name is the RESOLVED value ("none"
+            # when the gate is inactive), so a no-formal/no-gate run does not
+            # claim a gate it never enforced.
+            "feature_profile": profile_name,
             "train_gate": train_gate_desc,
             "eval_gate": eval_gate_desc,
             # §P0-6: content hashes of the universe records the whole-run gates
