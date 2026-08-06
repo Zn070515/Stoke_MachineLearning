@@ -984,6 +984,11 @@ def _panel_args(vintage_policy, **overrides):
         "seq_len": None,
         "allow_high_risk_universe": False,
         "allow_fundamental_ablation": False,
+        # §十四 (T7) feature-profile gate fields.
+        "no_formal": False,
+        "no_require_quality_gate": False,
+        "feature_profile": None,
+        "require_aux_channels": "",
     }
     base.update(overrides)
     return types.SimpleNamespace(**base)
@@ -1195,3 +1200,132 @@ def test_resolve_panel_empty_membership_warns_and_degrades(tp, monkeypatch, capl
             args, ["600000"], 60, "data", {"sentiment"}, _store_load=False)
     assert "empty/missing" in caplog.text
     assert calls[0]["daily_membership"] is None
+
+
+# ── §十四 (T7): feature-profile required channels + min-coverage gate ────
+
+def _manifest_entry(loaded, coverage):
+    return {"requested": True, "required": True, "loaded_stocks": loaded,
+            "coverage": coverage, "errors": 0, "status": "OK"}
+
+
+def test_resolve_required_set_profile_adds_channels(tp):
+    """A formal, gate-enforced run with a named profile unions the profile's
+    required_channels into the explicit --require-aux-channels set and carries
+    the profile's minimum-coverage thresholds."""
+    from stoke_ml.config.feature_profile import FEATURE_PROFILES
+    args = _panel_args("safe-only", feature_profile="headline_v1",
+                       require_aux_channels="sentiment,extra_ch")
+    required_set, min_cov, name = tp._resolve_required_set(args)
+    assert name == "headline_v1"
+    assert required_set == (
+        set(FEATURE_PROFILES["headline_v1"].required_channels) | {"extra_ch"})
+    assert min_cov == FEATURE_PROFILES["headline_v1"].minimum_coverage
+
+
+def test_resolve_required_set_cli_default_activates_headline_v1(tp):
+    """The CLI default --feature-profile headline_v1 (a formal, gate-enforced
+    run) activates the profile — no explicit flag needed."""
+    args = _panel_args("safe-only", feature_profile="headline_v1")
+    required_set, min_cov, name = tp._resolve_required_set(args)
+    assert name == "headline_v1"
+    assert min_cov == {"sentiment": 0.90, "guba": 0.90, "comment": 0.90,
+                       "announcement": 0.70, "margin": 0.95, "northbound": 0.90,
+                       "capital_flow": 0.90, "etf_flow": 0.80, "block_trade": 0.30,
+                       "lockup": 0.30, "dividend": 0.30, "industry": 0.95,
+                       "market_env": 0.95}
+    assert "margin" in required_set
+
+
+def test_resolve_required_set_none_disables_profile(tp):
+    args = _panel_args("safe-only", feature_profile="none",
+                       require_aux_channels="guba")
+    required_set, min_cov, name = tp._resolve_required_set(args)
+    assert name == "none"
+    assert required_set == {"guba"}
+    assert min_cov == {}
+
+
+def test_resolve_required_set_no_formal_skips_profile(tp):
+    """--no-formal (exploratory) never activates the profile — the set is just
+    the explicit channels, even when a profile is named."""
+    args = _panel_args("safe-only", feature_profile="headline_v1",
+                       no_formal=True, require_aux_channels="guba")
+    required_set, min_cov, name = tp._resolve_required_set(args)
+    assert name == "none"
+    assert required_set == {"guba"}
+    assert min_cov == {}
+
+
+def test_resolve_required_set_no_gate_skips_profile(tp):
+    """--no-require-quality-gate (dev smoke) also never activates the profile."""
+    args = _panel_args("safe-only", feature_profile="headline_v1",
+                       no_require_quality_gate=True, require_aux_channels="guba")
+    required_set, min_cov, name = tp._resolve_required_set(args)
+    assert name == "none"
+    assert required_set == {"guba"}
+    assert min_cov == {}
+
+
+def test_resolve_required_set_unknown_profile_aborts(tp):
+    """A TYPO'd profile name on an active gate must abort loudly, not silently
+    skip the coverage gate."""
+    args = _panel_args("safe-only", feature_profile="bogus")
+    with pytest.raises(SystemExit) as ei:
+        tp._resolve_required_set(args)
+    assert "unknown feature profile" in str(ei.value)
+
+
+def test_enforce_channel_coverage_aborts_below_minimum(tp, caplog):
+    """A probeable required channel below its profile minimum aborts the run."""
+    import logging
+    manifest = {"sentiment": _manifest_entry(100, 0.50)}
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage({"sentiment"}, manifest,
+                                         {"sentiment": 0.90})
+    assert ei.value.code == 1
+    assert any("coverage 0.5000 < minimum 0.9000" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_meets_minimum_passes(tp):
+    manifest = {"sentiment": _manifest_entry(100, 0.95)}
+    # Must NOT raise.
+    tp._enforce_channel_coverage({"sentiment"}, manifest, {"sentiment": 0.90})
+
+
+def test_enforce_channel_coverage_absent_channel_warns_not_abort(tp, caplog):
+    """A required/min-cov channel with NO manifest entry (prebuilt panel without
+    a has_* flag, e.g. margin/northbound/capital_flow) warns — coverage cannot
+    be verified — but NEVER aborts.  Without this scope the default
+    headline_v1 profile would refuse every prebuilt run."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        tp._enforce_channel_coverage({"margin"}, {}, {"margin": 0.95})
+    assert any("margin" in m for m in caplog.messages)
+    assert any("no coverage probe" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_zero_coverage_aborts(tp, caplog):
+    """A required channel that IS probed but has ZERO coverage aborts instead of
+    silently training on air."""
+    import logging
+    manifest = {"sentiment": _manifest_entry(0, 0.0)}
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage({"sentiment"}, manifest)
+    assert ei.value.code == 1
+    assert any("ZERO coverage" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_non_numeric_coverage_skipped(tp):
+    """coverage=None (an entry that is not coverage-probeable) must NOT be
+    compared as a numeric 0 — it is skipped, never a min-coverage abort."""
+    manifest = {"sentiment": {"loaded_stocks": 100, "coverage": None}}
+    tp._enforce_channel_coverage({"sentiment"}, manifest, {"sentiment": 0.90})
+
+
+def test_enforce_channel_coverage_unrequested_channel_ignored(tp):
+    """A channel in the manifest but NOT in required_set is not gated at all."""
+    manifest = {"sentiment": _manifest_entry(0, 0.0)}
+    tp._enforce_channel_coverage({"guba"}, manifest, {})  # must not abort

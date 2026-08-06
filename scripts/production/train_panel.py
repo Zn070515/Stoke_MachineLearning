@@ -29,6 +29,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from stoke_ml.config import get_project_root, load_config
+from stoke_ml.config.feature_profile import (
+    FEATURE_PROFILES,
+    profile_for,
+)
 from stoke_ml.data.calendar import (
     TradingCalendar,
     get_research_calendar,
@@ -226,6 +230,96 @@ def _formal_mode(args) -> bool:
     so it combines ``_gate_enforced`` AND ``_formal_mode``.
     """
     return not args.no_formal
+
+
+def _resolve_required_set(args) -> tuple[set[str], dict, str]:
+    """Resolve the required-channel set + minimum-coverage map (§十四).
+
+    ``--require-aux-channels`` always feeds the set (existing behavior); the
+    frozen feature profile (feature_profile.py) ADDS its ``required_channels``
+    when the gate is active — a FORMAL, gate-enforced run with a named profile
+    (default ``headline_v1``).  ``--feature-profile none``, ``--no-formal`` and
+    ``--no-require-quality-gate`` each make the profile contribution empty, so
+    ``required_set`` is just the explicit channels and ``min_cov`` is empty.
+
+    Returns ``(required_set, min_cov, profile_name)``; ``profile_name`` is
+    ``"none"`` when no profile is active.  An UNKNOWN named profile on an
+    active gate aborts loudly (a typo must not silently skip the coverage
+    gate).
+    """
+    extra = {
+        c.strip() for c in (args.require_aux_channels or "").split(",")
+        if c.strip()
+    }
+    profile_name = getattr(args, "feature_profile", None)
+    active = (
+        _gate_enforced(args) and _formal_mode(args)
+        and profile_name not in (None, "", "none")
+    )
+    if not active:
+        return extra, {}, "none"
+    profile = profile_for(profile_name)
+    if profile is None:
+        raise SystemExit(
+            f"unknown feature profile {profile_name!r} — --feature-profile "
+            f"must be one of {sorted(FEATURE_PROFILES)} or 'none'")
+    required_set = set(profile.required_channels) | extra
+    return required_set, dict(profile.minimum_coverage), profile_name
+
+
+def _enforce_channel_coverage(
+    required_set: set[str],
+    channel_manifest: dict,
+    min_cov: dict[str, float] | None = None,
+) -> None:
+    """§十四 required-channel + minimum-coverage gate.
+
+    (1) A REQUIRED channel that IS probed with ZERO coverage (manifest entry
+    present, loaded 0, coverage 0) aborts the experiment instead of silently
+    training on air.  (2) A required channel with NO coverage probe in this
+    mode (prebuilt panel without a has_* flag, e.g. margin/northbound/
+    capital_flow) warns — coverage cannot be verified.  (3) A channel with a
+    ``min_cov`` threshold that IS probeable (manifest entry present with a
+    finite float ``coverage``) must meet its threshold or the experiment
+    aborts; a ``min_cov`` channel that is NOT probeable falls through to the
+    required warn loop above (a ``min_cov`` channel is always also in
+    ``required_set`` for the shipped profiles).
+
+    Note the "IS probed" scope on (1): an ABSENT channel is not "zero
+    coverage", it is not decodable in this mode — requiring e.g. margin on the
+    prebuilt path (no has_* flag) must warn, not abort, or the default
+    headline_v1 profile would refuse every prebuilt run.
+    """
+    missing_required = sorted(
+        ch for ch in required_set
+        if ch in channel_manifest
+        and channel_manifest[ch].get("loaded_stocks", 0) == 0
+        and channel_manifest[ch].get("coverage", 0.0) == 0
+    )
+    if missing_required:
+        logger.error("Required aux channels have ZERO coverage: %s — aborting",
+                     ", ".join(missing_required))
+        sys.exit(1)
+    for ch in sorted(required_set):
+        if ch not in channel_manifest:
+            logger.warning("Required aux channel '%s' has no coverage probe in "
+                           "this mode (prebuilt panel without has_* flag) — "
+                           "coverage cannot be verified", ch)
+    for ch in sorted(min_cov or {}):
+        entry = channel_manifest.get(ch)
+        if entry is None:
+            continue  # not probeable → covered by the required warn loop above
+        cov = entry.get("coverage")
+        if not isinstance(cov, (int, float)) or isinstance(cov, bool):
+            continue  # null / non-numeric coverage = not probeable
+        if not np.isfinite(float(cov)):
+            continue
+        if float(cov) < min_cov[ch]:
+            logger.error(
+                "Required aux channel '%s' coverage %.4f < minimum %.4f "
+                "(--feature-profile) — aborting",
+                ch, float(cov), min_cov[ch])
+            sys.exit(1)
 
 
 def _require_quality_gate(
@@ -1868,6 +1962,14 @@ def main():
                         help="Comma-separated aux channels that must have "
                              "loaded_stocks>0; experiment "
                              "FAILS otherwise. Default: none required")
+    parser.add_argument("--feature-profile", type=str, default="headline_v1",
+                        help="Frozen feature profile (stoke_ml/config/"
+                             "feature_profile.py).  A FORMAL, gate-enforced run "
+                             "adds the profile's required_channels to "
+                             "--require-aux-channels and enforces its "
+                             "minimum-coverage thresholds on probeable "
+                             "channels.  'none' disables the required-channel "
+                             "coverage gate (§十四). Default: headline_v1")
     parser.add_argument("--prebuilt", type=str, default=None,
                         help="Load panel-mode prebuilt features from this dir "
                              "(built via build_features.py --panel-mode). "
@@ -2048,7 +2150,15 @@ def main():
     # re-run never reads 5530 stocks' OHLCV only to discard it); _resolve_panel
     # loads the store under its meta.json config guard, or else engineers the
     # panel live (and persists it when --panel-store is set).
-    required_set = {c.strip() for c in (args.require_aux_channels or "").split(",") if c.strip()}
+    # §十四: resolved required set = explicit --require-aux-channels ∪ the
+    # active frozen feature profile's required_channels (formal + gate-enforced
+    # + named profile); min_cov carries the profile's per-channel coverage
+    # minimums ({} when the profile is inactive / 'none').
+    required_set, min_cov, profile_name = _resolve_required_set(args)
+    logger.info(
+        "Feature profile: %s (required=%s, min_coverage=%s)",
+        profile_name, sorted(required_set), sorted(min_cov),
+    )
     seq_len = args.seq_len or (64 if args.minute else 60)
 
     panel_data, channel_manifest = _resolve_panel(
@@ -2067,22 +2177,10 @@ def main():
     assert len(set(panel_stocks)) == len(panel_stocks), (
         "duplicate stock codes in panel (row identity broken)")
 
-    # Required-channel gate: a required channel with ZERO
-    # coverage aborts the experiment instead of silently training on air.
-    missing_required = sorted(
-        ch for ch in required_set
-        if channel_manifest.get(ch, {}).get("loaded_stocks", 0) == 0
-        and channel_manifest.get(ch, {}).get("coverage", 0.0) == 0
-    )
-    if missing_required:
-        logger.error("Required aux channels have ZERO coverage: %s — aborting",
-                     ", ".join(missing_required))
-        sys.exit(1)
-    for ch in sorted(required_set):
-        if ch not in channel_manifest:
-            logger.warning("Required aux channel '%s' has no coverage probe in "
-                           "this mode (prebuilt panel without has_* flag) — "
-                           "coverage cannot be verified", ch)
+    # §十四 required-channel + minimum-coverage gate: a required channel with
+    # ZERO coverage, or a probeable required channel below its profile minimum,
+    # aborts the experiment instead of silently training on air.
+    _enforce_channel_coverage(required_set, channel_manifest, min_cov)
     if channel_manifest:
         summary_bits = ", ".join(
             f"{k}={v.get('status')}({v.get('coverage')})"
@@ -2860,6 +2958,10 @@ def main():
             # by per-day membership so training matches the eval candidate
             # pool.
             "strict_index_training": bool(args.strict_index_training),
+            # §十四: the frozen feature profile whose required-channel /
+            # minimum-coverage gates this run enforced (T19 hashes it into the
+            # experiment signature).
+            "feature_profile": args.feature_profile,
             "train_gate": train_gate_desc,
             "eval_gate": eval_gate_desc,
             # §P0-6: content hashes of the universe records the whole-run gates

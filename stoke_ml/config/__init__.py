@@ -1,9 +1,18 @@
-"""Global configuration loader using Hydra/OmegaConf."""
+"""Global configuration loader using Hydra/OmegaConf.
+
+§T7: ``stoke_ml/config.py`` (a single module) became the ``stoke_ml/config/``
+package so the frozen feature profiles can live alongside the config loader.
+The legacy loader API (``load_config`` / ``get_project_root`` /
+``_resolve_path`` / ``_resolve_config_paths``) is re-exported from this package
+``__init__`` unchanged, so every ``from stoke_ml.config import ...`` call site
+keeps working.  ``_PROJECT_ROOT`` walks one level deeper now that the module
+lives in ``stoke_ml/config/`` (repo root is the package's parent's parent).
+"""
 import os
 from pathlib import Path
 from omegaconf import OmegaConf, DictConfig
 
-_PROJECT_ROOT = Path(__file__).parent.parent
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
 _DEFAULT_CONFIG = _PROJECT_ROOT / "config.yaml"
 
 

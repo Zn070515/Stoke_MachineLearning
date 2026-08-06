@@ -132,6 +132,9 @@ class FeaturePipeline:
         preprocessing_config: dict | str | None = None,
         # Feature engineering v2
         use_emotion_refine: bool = True,
+        # Coupled to use_fundamental: without the fundamental channel there is
+        # nothing to refine, so use_fundamental=False forces use_fundamental_refine
+        # off as well (§T7) — see the __init__ body.
         use_fundamental_refine: bool = True,
         use_temporal_stats: bool = True,
         drop_dead_features: bool = True,
@@ -161,6 +164,14 @@ class FeaturePipeline:
         self.use_northbound = use_northbound
         self.use_dragon_tiger = use_dragon_tiger
         self.use_fundamental = use_fundamental
+        # §T7: fundamental_refine is COUPLED to the fundamental channel — without
+        # the channel there is nothing to refine, so turning fundamental off
+        # silently turns the refiner off too.  This is what makes the safe-only
+        # vintage switch set (which turns use_fundamental off) also drop the
+        # fundamental_refine columns on the prebuilt scrub path, instead of the
+        # refiner running anyway on columns that were never requested (§T3 leak).
+        if not use_fundamental:
+            use_fundamental_refine = False
         self.use_earnings = use_earnings
         self.use_valuation = use_valuation
         self.use_etf_flow = use_etf_flow

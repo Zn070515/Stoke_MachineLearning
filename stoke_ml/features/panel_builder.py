@@ -17,9 +17,9 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 
+from stoke_ml.config.feature_profile import CHANNEL_COLUMNS
 from stoke_ml.data.codes import normalize_stock_code_series
 from stoke_ml.features import cache_manifest
-from stoke_ml.features.aux_cols import FUNDAMENTAL_COLS
 from stoke_ml.features.fundamental import FundamentalRefiner
 from stoke_ml.features.panel_helpers import (
     _min_vol_nobs,
@@ -371,21 +371,31 @@ def build_panel_features(
             # the non-PIT representation into a default training run.
             if not pipeline.use_topic:
                 feats = pipeline._drop_topic_columns(feats)
-            # T3 research decision #1: fundamental is denied under safe-only
-            # (latest_revised_aligned) and may enter ONLY via an explicit
-            # ablation.  build_features.py --panel-mode bakes ALL channels in
-            # with all-True defaults, so a safe-only --prebuilt run would
-            # otherwise silently consume the revised channel.  Mirror the
-            # topic_* drop: scrub FUNDAMENTAL_COLS from the loaded parquet
-            # whenever the run's pipeline does not request fundamental.  A
-            # deliberate per-channel scrub (NOT a generic 8-channel filter) —
-            # cross-channel column-name overlap (market_env vs
-            # market_env_refine, etc.) makes a generic filter risky; the other
-            # policy-denied channels' prebuilt leak is tracked separately.
-            if not pipeline.use_fundamental:
-                present = [c for c in FUNDAMENTAL_COLS if c in feats.columns]
-                if present:
-                    feats = feats.drop(columns=present)
+            # §T7/§十四: generic per-channel scrub.  build_features.py
+            # --panel-mode bakes ALL channels in with all-True defaults, so a
+            # restricted run (safe-only vintage / ablation) would otherwise
+            # silently consume channels its pipeline does not request.  Drop
+            # the EXACT CHANNEL_COLUMNS set of every channel whose use_* switch
+            # is OFF (map channel → switch attr; "announcement" is the one
+            # special-cased name).  Only the exact sets are used — NO
+            # name-prefix matching, which is exactly the market_env-vs-macd /
+            # market_env_refine collision trap.  fundamental_refine is coupled
+            # to fundamental (pipeline forces it off with fundamental), so a
+            # safe-only run drops its columns too.  topic_* is handled
+            # separately above (prefix drop, frozen non-PIT topic model); a
+            # prebuilt parquet built with use_topic=True is scrubbed there.
+            _channel_switch_attr = {"announcement": "use_announcements"}
+            _off_cols: list[str] = []
+            for _channel, _cols in CHANNEL_COLUMNS.items():
+                _switch = getattr(
+                    pipeline,
+                    _channel_switch_attr.get(_channel, f"use_{_channel}"),
+                    True,
+                )
+                if not _switch:
+                    _off_cols.extend(c for c in _cols if c in feats.columns)
+            if _off_cols:
+                feats = feats.drop(columns=_off_cols)
             # A stale/hand-built parquet may carry a
             # weekend/duplicate bar that would pollute the UNION date axis.
             feats = pipeline._clean_calendar_dates(feats, code)
