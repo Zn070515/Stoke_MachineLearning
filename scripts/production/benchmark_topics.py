@@ -17,7 +17,7 @@ import pandas as pd
 from stoke_ml.config import load_config
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.guba_storage import GubaStorage
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.features.news_nlp import NewsSentimentAnalyzer
 from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def _collect_silver(data_dir, source, stocks, date_start, date_end):
     """Load and combine silver data from multiple stocks."""
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     frames = []
     for code in stocks:
         try:

@@ -22,7 +22,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.guba_storage import GubaStorage
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.features.news_nlp import NewsSentimentAnalyzer
 from stoke_ml.preprocessing.pipeline import PreprocessingPipeline
 from stoke_ml.features.pipeline import FeaturePipeline
@@ -52,7 +52,7 @@ def main():
 
     cfg = load_config()
     data_dir = cfg.project.data_dir
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     analyzer = NewsSentimentAnalyzer(force_lexicon=True)
 
     pp_cfg = cfg.get("preprocessing", {})

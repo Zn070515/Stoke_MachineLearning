@@ -96,7 +96,14 @@ def main():
         t0 = time.time()
 
         try:
-            source = source_cls()
+            # Margin/dragon-tiger enumerate trading days internally — construct
+            # with the data root so the frozen exchange_calendar artifact is
+            # authoritative (§九).  Northbound never queries the calendar.
+            kwargs = (
+                {"calendar_dir": data_dir}
+                if label in ("margin", "dragon_tiger") else {}
+            )
+            source = source_cls(**kwargs)
         except Exception as e:
             logger.error("Failed to init %s source: %s", label, e)
             continue

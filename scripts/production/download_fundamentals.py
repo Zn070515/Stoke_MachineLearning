@@ -14,7 +14,7 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.fundamental_source import FundamentalSource
 from stoke_ml.data.fundamental_storage import FundamentalStorage
@@ -66,7 +66,7 @@ def main():
         logger.error("No stock codes found.")
         sys.exit(1)
 
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     source = FundamentalSource()
     storage = FundamentalStorage(data_dir, calendar)
 

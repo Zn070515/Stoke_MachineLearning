@@ -22,6 +22,11 @@ class DragonTigerSource:
 
     SOURCE_NAME = "akshare_lhb"
 
+    def __init__(self, calendar_dir=None):
+        # Data root whose frozen exchange_calendar artifact is authoritative for
+        # trading-day enumeration (§九).  None keeps the code-builtin calendar.
+        self._calendar_dir = calendar_dir
+
     def fetch_daily(
         self, start_date: str, end_date: str
     ) -> pd.DataFrame:
@@ -57,7 +62,7 @@ class DragonTigerSource:
         except ImportError:
             return pd.DataFrame()
 
-        calendar = TradingCalendar("a_shares")
+        calendar = TradingCalendar("a_shares", calendar_dir=self._calendar_dir)
         dates = calendar.get_trading_days(start_date, end_date)
         frames = []
         for d in dates:

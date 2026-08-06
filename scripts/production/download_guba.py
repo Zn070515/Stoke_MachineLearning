@@ -16,7 +16,7 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.download_resume import (
     evidence_says_complete,
@@ -109,7 +109,7 @@ def main():
     else:
         shard_label = ""
 
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     guba_storage = GubaStorage(data_dir, calendar)
     guba_source = GubaSource(sort=args.sort, page_delay=args.page_delay)
     analyzer = None if args.skip_sentiment else NewsSentimentAnalyzer(force_lexicon=True)

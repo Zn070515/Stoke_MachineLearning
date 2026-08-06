@@ -34,7 +34,7 @@ from datetime import datetime
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.data.download_manifest import write_run_manifest
@@ -398,7 +398,7 @@ def _download_limit_up_pool(pool, storage_key, data_dir, args) -> bool:
     logger.info("=== limit_up_%s: %s to %s ===", pool, args.start, args.end)
     t0 = time.time()
 
-    source = LimitUpSource(min_interval=args.sleep)
+    source = LimitUpSource(min_interval=args.sleep, calendar_dir=data_dir)
     storage = MarketWideStorage(data_dir, storage_key)
     fetch_fn = getattr(source, f"fetch_{pool}_pool")
 
@@ -418,7 +418,7 @@ def _download_limit_up_pool(pool, storage_key, data_dir, args) -> bool:
                     except Exception:
                         pass
 
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     all_dates = calendar.get_trading_days(args.start, args.end)
     dates_to_fetch = [
         d for d in all_dates
@@ -529,7 +529,7 @@ def _download_limit_up_sentiment(data_dir, args) -> bool:
                 except Exception:
                     pass
 
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     target_dates = {
         d.strftime("%Y-%m-%d")
         for d in calendar.get_trading_days(args.start, args.end)
@@ -587,7 +587,7 @@ def _download_industry_ranking(data_dir, args) -> bool:
     logger.info("=== industry_ranking: %s to %s ===", args.start, args.end)
     t0 = time.time()
 
-    source = IndustryRankingSource(min_interval=args.sleep)
+    source = IndustryRankingSource(min_interval=args.sleep, calendar_dir=data_dir)
     df = source.fetch_batch(args.start, args.end)
 
     saved = False

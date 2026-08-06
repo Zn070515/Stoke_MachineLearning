@@ -85,8 +85,9 @@ class IndustryRankingSource:
 
     SOURCE_NAME = "eastmoney_industry_ranking"
 
-    def __init__(self, min_interval: float = 2.5):
+    def __init__(self, min_interval: float = 2.5, calendar_dir=None):
         self._min_interval = min_interval
+        self._calendar_dir = calendar_dir
         self._last_call: float = 0.0
         self._session = requests.Session()
         self._session.headers.update({
@@ -169,10 +170,12 @@ class IndustryRankingSource:
         """Fetch industry rankings over a date range.
 
         Uses A-share trading calendar (not US freq='B') to avoid
-        hammering the API on non-trading days.
+        hammering the API on non-trading days.  When constructed with a
+        ``calendar_dir`` the frozen exchange_calendar artifact is authoritative
+        (same source of truth as the formal research flows, §九).
         """
         from stoke_ml.data.calendar import TradingCalendar
-        calendar = TradingCalendar("a_shares")
+        calendar = TradingCalendar("a_shares", calendar_dir=self._calendar_dir)
         dates = calendar.get_trading_days(start_date, end_date)
 
         frames = []

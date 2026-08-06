@@ -14,7 +14,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.news_storage import NewsStorage
-from stoke_ml.data.calendar import TradingCalendar
+from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.features.news_nlp import (
     NewsSentimentAnalyzer,
     compute_raw_sentiment,
@@ -51,7 +51,7 @@ def main():
 
     logger.info("Building Gold for %d stocks from Silver", len(silver_files))
 
-    calendar = TradingCalendar("a_shares")
+    calendar = get_research_calendar(data_dir=data_dir)
     storage = NewsStorage(data_dir, calendar)
     analyzer = NewsSentimentAnalyzer(force_lexicon=True)
 
