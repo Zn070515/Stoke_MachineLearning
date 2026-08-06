@@ -249,7 +249,10 @@ class PanelDataset(Dataset):
         """
         if isinstance(arr, torch.Tensor):
             return arr[idx]
-        return torch.from_numpy(np.asarray(arr[idx])).to(dtype)
+        out = np.asarray(arr[idx])
+        if not out.flags.writeable:
+            out = out.copy()
+        return torch.from_numpy(out).to(dtype)
 
     def __len__(self) -> int:
         """Number of date-windows (primary index)."""

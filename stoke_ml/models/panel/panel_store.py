@@ -104,7 +104,9 @@ def save_panel_memmap(panel_data: dict, out_dir: str | Path) -> list[str]:
         elif name in _PANEL_JSON_KEYS:
             _atomic_json(out, name, value)
             written.append(f"{name}.json")
-    marker.write_text(json.dumps({"complete": True}), encoding="utf-8")
+    # Written last, atomically via the same temp+os.replace path as every
+    # other file — a crash mid-write can't leave a truncated marker.
+    _atomic_json(out, "complete", {"complete": True})
     return sorted(written)
 
 
