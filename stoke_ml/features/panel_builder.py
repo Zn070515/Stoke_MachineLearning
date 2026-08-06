@@ -505,6 +505,12 @@ def build_panel_features(
     # it to weight/augment the vol loss with the label's true sample size.
     forward_vol_nobs = np.zeros((N_stocks, max_T), dtype=np.int32)
     stock_T = np.zeros(N_stocks, dtype=np.int32)
+    # §T13: per-date exit-fill counts — entry_counts[t] = # stocks open-valid at
+    # column t, filled_counts[t] = # of those that ALSO have a real exit open at
+    # t+horizon.  The per-date ratio (fill_prob_arr) is computed once after the
+    # loop so a study can quantify how much of each date's label set is carried.
+    entry_counts = np.zeros(max_T, dtype=np.int64)
+    filled_counts = np.zeros(max_T, dtype=np.int64)
 
     # ── Per-task target masks ──
     # One `y_direction != -100` cannot carry four distinct
@@ -512,7 +518,7 @@ def build_panel_features(
     # "portfolio P&L computable".  Split them:
     #   obs_arr        — real close at t (base observation / history count)
     #   entry_arr      — real open at t → can enter a position at open[t]
-    #   ret_tgt_arr    — clean forward return open[t+h]/open[t]-1 available
+    #   ret_tgt_arr    — clean or carried forward return available (open[t+h]/open[t]-1, else carry to the last real close in (t, min(t+h, T-1)])
     #   vol_tgt_arr    — vol window (t, t+h] holds >= _min_vol_nobs(horizon)
     #                    valid daily returns (max(1, ceil(horizon/2)), hard
     #                    floor >=2) — see forward_vol_nobs metadata below
@@ -583,6 +589,13 @@ def build_panel_features(
         entry_arr[i] = open_valid
         close_price_arr[i] = close_full.astype(np.float32)
         open_price_arr[i] = open_full.astype(np.float32)
+        # §T13 fill-probability accumulation — per-date counts of
+        # entry-eligible days (open_valid[t]) and of those with a real exit
+        # open at t+horizon; the ratio (fill_prob_arr) is computed after the loop.
+        entry_counts[np.nonzero(open_valid)[0]] += 1
+        if max_T > horizon:
+            filled_counts[np.nonzero(
+                open_valid[:-horizon] & open_valid[horizon:])[0]] += 1
 
         # PIT static raw inputs — trailing 60d means over the trading days
         # in each global-calendar window (NaNs from pre-listing/suspension
@@ -605,24 +618,30 @@ def build_panel_features(
         amt60_raw[i] = _trailing_mean(amt_full, 60).astype(np.float32)
         first_col[i] = int(pos[0]) if len(pos) else -1
 
-        # Clean forward return (training label): open[t] and open[t+h] both
-        # real.  Positions without one stay NaN → direction -100 / return 0
-        # with ret_tgt_arr False so training ignores them.
+        # Forward return (training label): clean open[t]->open[t+h] where a real
+        # exit open exists, else carry to the LAST real close in (t, t+h]
+        # (§T13 decision 3 — aligned with the evaluation realized path below).
+        # Positions with no usable exit (no exit open AND no real close in the
+        # window) stay NaN → direction -100 / return 0 with ret_tgt_arr False so
+        # training ignores them.
         # §十四-4 (ENTRY-FILL SELECTION BIAS — research design choice, not a
-        # bug): ``both`` requires open_valid[t] AND open_valid[t+h], i.e. a
-        # FUTURE entry open at t+h.  A stock that is decision-eligible at t
-        # but NOT fillable at the exit horizon (suspended/delisted before
-        # t+h) is EXCLUDED from the training label set.  So the learned
-        # function is "decision on stocks that will stay tradeable for h
-        # days", a subtly easier population than the full decision pool.
-        # Evaluation deliberately does NOT share this bias: evaluate.py
-        # ranks every decision-eligible stock then checks fill (a
-        # non-fillable pick is skipped/carried, never rewarded), so a model
-        # conditioned on future-fillability can look better than it plays.
-        # Mitigations (NOT applied here — leave for a controlled study):
-        #   1) decision-eligibility sampling — mask vol/ret labels by
-        #      decision_arr (no future open needed), imputing the missing
-        #      forward open via last-close carry for the return label;
+        # bug): the OLD ``both`` condition (open_valid[t] AND open_valid[t+h])
+        # required a FUTURE entry open at t+h, so a stock that is
+        # decision-eligible at t but NOT fillable at the exit horizon
+        # (suspended/delisted before t+h) was EXCLUDED from the training label
+        # set.  The learned function was therefore "decision on stocks that will
+        # stay tradeable for h days" — a subtly easier population than the full
+        # decision pool, which evaluation never conditioned on.
+        # §T13 decision 3 APPLIES mitigation #1: training now carries
+        # non-fillable exits to the last real close in (t, t+h] — EXACTLY the
+        # evaluation realized semantics — so a non-fillable pick is learned
+        # (rewarded with its carry value) instead of being masked out of the
+        # label population.  Label distribution shift vs the old clean-only
+        # labels is expected (decision 3).  ``fill_prob_arr`` (per-date fraction
+        # of entry-eligible stocks with a real open[t+h], computed after the
+        # loop) records the residual per-date fill rate so a study can quantify
+        # how much of each date's label set is carried.
+        # Mitigations still NOT applied (leave for a controlled study):
         #   2) a return mask returned alongside labels so the loss can
         #      down-weight partial-window / carried exits;
         #   3) an explicit entry-fill head predicting whether open[t+h]
@@ -631,7 +650,22 @@ def build_panel_features(
         if max_T > horizon:
             both = open_valid[:-horizon] & open_valid[horizon:]
             num = open_full[horizon:][both] - open_full[:-horizon][both]
-            ret_fwd[:max_T - horizon][both] = (num / (open_full[:-horizon][both] + 1e-8)).astype(np.float32)
+            ret_fwd[:max_T - horizon][both] = (
+                num / (open_full[:-horizon][both] + 1e-8)).astype(np.float32)
+        # Carry non-fillable exits: the last real close at-or-before the
+        # truncated window end hi = min(t+h, T-1), i.e. the last real close in
+        # (t, hi].  Forward-fill the valid-close indices; k > t selects a real
+        # close strictly after entry (in-window), k <= t means NO close in the
+        # window → no label (NaN).
+        last_close_idx = np.maximum.accumulate(
+            np.where(close_valid, np.arange(max_T), -1))
+        hi = np.minimum(np.arange(max_T) + horizon, max_T - 1)
+        k = last_close_idx[hi]
+        carry_ok = open_valid & (k > np.arange(max_T))
+        carried = np.full(max_T, np.nan, dtype=np.float64)
+        carried[carry_ok] = close_full[k[carry_ok]] / open_full[carry_ok] - 1.0
+        missing_clean = open_valid & ~np.isfinite(ret_fwd)
+        ret_fwd[missing_clean] = carried[missing_clean].astype(np.float32)
         ret_tgt_arr[i] = np.isfinite(ret_fwd)
         valid = ret_tgt_arr[i]
         y_dir_arr[i, valid] = np.where(
@@ -645,19 +679,12 @@ def build_panel_features(
         # depends on whether a future label exists:
         #   clean open[t]->open[t+h] where available; else carry to the last
         #   real close in (t, t+h] / open[t] - 1; else 0 (no exit → flat).
+        # §T13: ret_fwd now carries non-fillable exits with the SAME value as
+        # this path, so realized is just the finite part of ret_fwd, else 0 —
+        # guaranteed bit-identical to the training label for carried days.
         realized = np.zeros(max_T, dtype=np.float32)
-        for t in range(max_T):
-            if not (open_valid[t] and open_full[t] > 0):
-                continue
-            if t < max_T - horizon and np.isfinite(ret_fwd[t]):
-                realized[t] = ret_fwd[t]
-                continue
-            hi = min(t + horizon, max_T - 1)
-            later = np.nonzero(close_valid[t + 1:hi + 1])[0]
-            if later.size:
-                k = t + 1 + int(later[-1])
-                if close_full[k] > 0:
-                    realized[t] = float(close_full[k] / open_full[t] - 1.0)
+        finite_ret = open_valid & np.isfinite(ret_fwd)
+        realized[finite_ret] = ret_fwd[finite_ret]
         realized_arr[i] = realized
 
         # FORWARD-looking realized volatility: std of the daily returns
@@ -690,6 +717,22 @@ def build_panel_features(
                 continue
             y_vol_arr[i, t] = float(np.std(win))
             vol_tgt_arr[i, t] = True
+
+    # §T13: per-date exit-fill probability — the fraction of stocks
+    # entry-eligible at column t (open_valid[t]) that ALSO have a real exit
+    # open at open[t+horizon].  NaN where no stock is entry-eligible at t, and
+    # NaN for the tail columns (t+horizon >= max_T) where no exit window
+    # exists.  Records the residual fill rate now that carried exits enter the
+    # return label (see §十四-4 note above).
+    fill_prob_arr = np.full(max_T, np.nan, dtype=np.float64)
+    if max_T > horizon:
+        denom = entry_counts[:-horizon]
+        numer = filled_counts[:-horizon]
+        fill_prob_arr[:max_T - horizon] = np.divide(
+            numer, denom,
+            out=np.full(max_T - horizon, np.nan),
+            where=denom > 0,
+        )
 
     # ── Decision / history eligibility ──
     # decision_arr[t] = close[t-1] is real, so a signal computed after
@@ -1050,6 +1093,11 @@ def build_panel_features(
         # _min_vol_nobs(horizon)).
         "forward_vol_nobs": forward_vol_nobs,
         "realized_return": realized_arr,
+        # §T13: per-date exit-fill probability — fraction of entry-eligible
+        # stocks at column t that also have a real open[t+horizon] (NaN where
+        # none, or in the tail where no exit window exists).  Records the
+        # residual fill rate now that carried exits enter the return label.
+        "fill_prob": fill_prob_arr,
         "decision_eligible_mask": decision_arr,
         "history_eligible_mask": history_arr,
         # Data-derived research-universe gate (已上市 + 未长期停牌 +

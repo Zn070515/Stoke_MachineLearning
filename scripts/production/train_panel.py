@@ -721,6 +721,12 @@ def _panel_store_meta(
         "universe": args.universe,
         "n_stocks": len(stock_list) if stock_list is not None else None,
         "feature_switches": _switches,
+        # §T13 decision 3: the return label carries non-fillable exits to the
+        # last real close in (t, t+h] (aligned with evaluation realized).  A
+        # critical key so a pre-T13 store (clean-open-only labels) is REFUSED
+        # by the staleness guard instead of silently reused with different
+        # y_return semantics — the store must be rebuilt for current labels.
+        "label_policy": "carry_to_last_close_v1",
         "config_hash": current_config_hash(),
         "git_commit": git_head(),
     }

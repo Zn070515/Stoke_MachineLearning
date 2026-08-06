@@ -643,7 +643,8 @@ def train_panel(
 
                 # Pairwise ranking loss — directly optimises for cross-sectional
                 # ordering (the same signal IC and Sharpe evaluate on).  Ranks
-                # clean return targets only.  Computed every batch so the
+                # clean-or-carried return targets (carried = exit fills carried
+                # to the last in-window close).  Computed every batch so the
                 # monitoring trace stays populated even when the ablation drops
                 # it from the optimised loss.
                 batch_rank_stats: list[dict] = []

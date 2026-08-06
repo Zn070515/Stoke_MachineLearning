@@ -73,6 +73,7 @@ def _storeable_panel(n_stocks=10, n_days=100, seq_len=60, horizon=5, seed=0):
         "universe_eligible_mask": ones_bool,
         "forward_vol_nobs": np.full((n_stocks, n_days), horizon, dtype=np.int32),
         "realized_return": (rng.randn(n_stocks, n_days) * 0.02).astype(np.float32),
+        "fill_prob": np.full(n_days, np.nan, dtype=np.float64),  # §T13
         "close_price": np.full((n_stocks, n_days), 10.0, dtype=np.float32),
         "open_price": np.full((n_stocks, n_days), 10.0, dtype=np.float32),
         "stock_codes": stocks,
@@ -111,10 +112,12 @@ class TestPanelStoreRoundTrip:
                                       panel["global_dates"])
         assert loaded["stock_codes"] == panel["stock_codes"]
 
-        # Returned filename list matches what was written.
+        # Returned filename list matches what was written (fill_prob is an
+        # extra §T13 array persisted alongside the required keys).
         assert written == sorted(
             [f"{k}.npy" for k in _PANEL_ARRAY_KEYS]
-            + [f"{k}.json" for k in _PANEL_JSON_KEYS])
+            + [f"{k}.json" for k in _PANEL_JSON_KEYS]
+            + ["fill_prob.npy"])
         assert panel_store_complete(tmp_path) is True
 
     def test_complete_marker_absent_on_empty(self, tmp_path):
@@ -400,6 +403,62 @@ class TestPanelStoreSaveEdgeCases:
         assert panel_store_complete(tmp_path) is True
         # The stray key is not part of the store contract.
         assert "garbage_extra" not in load_panel_memmap(tmp_path)
+
+
+class TestPanelStoreFillProbAndLabelPolicy:
+    """§T13: fill_prob round-trips through the store; a legacy (pre-T13) store
+    WITHOUT fill_prob loads (warn + NaN, not hard-fail), and the label_policy
+    critical key refuses silently reusing a pre-T13 store for a new run."""
+
+    def test_roundtrip_carries_fill_prob(self, tmp_path):
+        """A store saved WITH fill_prob round-trips it elementwise."""
+        panel = _storeable_panel(seed=0)
+        n_days = panel["close_price"].shape[1]
+        fill = np.full(n_days, np.nan, dtype=np.float64)
+        fill[: n_days // 2] = 0.5
+        panel["fill_prob"] = fill
+        save_panel_memmap(panel, tmp_path)
+        loaded = load_panel_memmap(tmp_path)
+        np.testing.assert_array_equal(
+            np.asarray(loaded["fill_prob"]), fill, err_msg="fill_prob")
+
+    def test_legacy_store_without_fill_prob_warns_and_fills_nan(
+            self, tmp_path, caplog):
+        """A pre-T13 store (no fill_prob.npy) loads — warned, fill_prob filled
+        with NaN — instead of hard-failing."""
+        panel = _storeable_panel(seed=1)
+        panel.pop("fill_prob", None)  # simulate a pre-T13 store (no fill_prob)
+        save_panel_memmap(panel, tmp_path)
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(tmp_path)
+        n_days = panel["close_price"].shape[1]
+        assert loaded["fill_prob"].shape == (n_days,)
+        assert np.isnan(np.asarray(loaded["fill_prob"])).all()
+        assert any("fill_prob" in r.message for r in caplog.records)
+
+    def test_label_policy_mismatch_refuses(self, tmp_path):
+        """A pre-T13 store (meta records no label_policy) is refused by a
+        current run's expected_meta — its y_return labels carry different
+        semantics, so it must never be silently reused."""
+        save_panel_memmap(_storeable_panel(), tmp_path,
+                          meta=_meta())  # legacy meta: no label_policy
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(
+                tmp_path,
+                expected_meta=_meta(label_policy="carry_to_last_close_v1"))
+        assert "label_policy" in str(ei.value)
+
+    def test_label_policy_matching_loads(self, tmp_path):
+        """A store whose meta records the SAME label_policy loads cleanly."""
+        panel = _storeable_panel(seed=2)
+        panel["fill_prob"] = np.full(
+            panel["close_price"].shape[1], np.nan, dtype=np.float64)
+        save_panel_memmap(panel, tmp_path,
+                          meta=_meta(label_policy="carry_to_last_close_v1"))
+        loaded = load_panel_memmap(
+            tmp_path, expected_meta=_meta(label_policy="carry_to_last_close_v1"))
+        assert loaded["stock_codes"] == panel["stock_codes"]
+        assert "fill_prob" in loaded
 
 
 class TestResolvePanelStoreSkip:

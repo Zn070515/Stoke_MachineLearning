@@ -570,11 +570,14 @@ class TestPanelMasksAndCarry:
     with these semantics:
       - entry_eligible_mask ⊆ observation_mask (every open-valid day is a real
         day, but a real day may lack an open — e.g. a data gap);
-      - return_target_mask = a clean open[t+h]/open[t]-1 exists;
+      - return_target_mask = a usable forward return exists (§T13 decision 3):
+        clean open[t+h]/open[t]-1 where a real exit open exists, else carry to
+        the last real close in (t, t+h], else no label (NaN);
       - realized_return[t] = clean forward return where available, else carry
         to the last real close in (t, t+h], else flat 0 — defined for EVERY
         entry-eligible day so the candidate pool never conditions on a future
-        label existing.
+        label existing.  For carried days it is bit-identical to the training
+        label (return_target_mask True).
     """
 
     @staticmethod
@@ -604,9 +607,12 @@ class TestPanelMasksAndCarry:
 
     def test_carry_last_close_realized(self):
         """Realized = clean open-to-open where available, else the last real
-        close in (t, t+h], else 0 — never NaN, never label-conditioned."""
+        close in (t, t+h], else 0 — never NaN, never label-conditioned.  §T13:
+        the TRAINING label (y_return) now carries non-fillable exits with the
+        SAME value, so the tail becomes a label too (return_target_mask True)."""
         p = self._build()
         r = p["realized_return"][0]
+        y_ret = p["y_return"][0]
         ret = p["return_target_mask"][0]
         open_ = np.arange(10.0, 22.0)
         close = open_ + 0.5
@@ -615,12 +621,17 @@ class TestPanelMasksAndCarry:
         for t in range(9):
             assert ret[t], f"return target should be valid at t={t}"
             assert np.isclose(r[t], open_[t + 3] / open_[t] - 1), f"t={t}"
-        assert not ret[9:].any(), "tail has no forward open → not a return target"
 
-        # Carry to the last real close in (t, t+h] — NOT flat 0
-        assert np.isclose(r[9], close[11] / open_[9] - 1)
-        assert np.isclose(r[10], close[11] / open_[10] - 1)
-        # No later close at all → flat 0
+        # §T13 carried tail: last real close in (t, t+h] — training label and
+        # eval realized agree exactly.
+        for t in (9, 10):
+            assert ret[t], f"carried tail should be a label at t={t}"
+            expect = close[11] / open_[t] - 1
+            assert np.isclose(y_ret[t], expect), f"training label t={t}"
+            assert np.isclose(r[t], expect), f"realized t={t}"
+        # No close at all in the exit window → no label (NaN), realized flat 0
+        assert not ret[11], "no close in the exit window → not a return target"
+        assert y_ret[11] == 0.0
         assert r[11] == 0.0
 
     def test_masks_split(self):
@@ -634,12 +645,13 @@ class TestPanelMasksAndCarry:
         # Every open-valid day is also close-valid in synthetic K-line
         assert (entry & ~obs).sum() == 0
         assert obs.all() and entry.all()
-        # Return target: clean open-to-open, last `horizon` days excluded
-        assert ret[:9].all() and not ret[9:].any()
+        # Return target: clean open-to-open plus §T13 carried tail labels;
+        # only the final day (no close in its exit window) has no label.
+        assert ret[:11].all() and not ret[11]
         # Vol target: (t, t+h] holds >= 2 valid close returns → t < T-h
         assert vol[:9].all() and not vol[9:].any()
-        # All forward returns positive → every valid direction label is "up"
-        assert (p["y_direction"][0][:9] == 2).all()
+        # All forward returns (clean + carried) positive → "up" everywhere
+        assert (p["y_direction"][0][:11] == 2).all()
 
     def test_entry_subset_of_observation_calendar_aligned(self):
         """On the multi-stock calendar-aligned panel, a real open never appears
@@ -654,6 +666,134 @@ class TestPanelMasksAndCarry:
         entry = p["entry_eligible_mask"]
         obs = p["observation_mask"]
         assert (entry & ~obs).sum() == 0
+
+
+class TestPanelCarriedReturnLabel:
+    """§T13 decision 3: the training return label carries non-fillable exits to
+    the last real close in (t, t+h], aligned bit-identically with the evaluation
+    realized path, and the panel emits a per-date exit-fill probability
+    (fill_prob)."""
+
+    @staticmethod
+    def _exact_panel():
+        """12 days, open=10..21 (+1/day), close=open+0.5 — deterministic so the
+        carry math is asserted exactly.  Business days from 2020-01-02 (trading
+        days; §十二-1 calendar-clean drops nothing)."""
+        dates = pd.bdate_range("2020-01-02", periods=12)
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+        return pd.DataFrame({
+            "date": dates,
+            "stock_code": ["600000"] * 12,
+            "open": open_,
+            "high": np.maximum(open_, close) + 0.2,
+            "low": np.minimum(open_, close) - 0.2,
+            "close": close,
+            "volume": np.full(12, 1_000_000.0),
+            "amount": np.full(12, 1_000_000.0) * close,
+        })
+
+    def _build(self, panel):
+        return FeaturePipeline(seq_len=5).build_panel_features(
+            panel, aux_data={}, horizon=3)
+
+    def test_clean_exit_label_unchanged(self):
+        """A stock with a real open[t+h] keeps the clean open-to-open label."""
+        p = self._build(self._exact_panel())
+        ret = p["return_target_mask"][0]
+        y_ret = p["y_return"][0]
+        open_ = np.arange(10.0, 22.0)
+        for t in range(9):
+            assert ret[t], f"clean exit label missing at t={t}"
+            assert np.isclose(y_ret[t], open_[t + 3] / open_[t] - 1.0), f"t={t}"
+
+    def test_nonfillable_tail_carries_to_last_close(self):
+        """No open[t+h] (tail) but a real close in (t, t+h] → the training label
+        carries to the last real close, EXACTLY the evaluation realized value
+        (alignment guarantee)."""
+        p = self._build(self._exact_panel())
+        y_ret = p["y_return"][0]
+        r = p["realized_return"][0]
+        ret = p["return_target_mask"][0]
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+        # t=9: window (9, min(12, 11)] = (9, 11] → last real close = close[11].
+        expect = close[11] / open_[9] - 1.0
+        assert ret[9]
+        assert np.isclose(y_ret[9], expect)
+        assert np.isclose(r[9], expect)
+        # t=10: window (10, 11] → close[11].
+        expect = close[11] / open_[10] - 1.0
+        assert ret[10]
+        assert np.isclose(y_ret[10], expect)
+        assert np.isclose(r[10], expect)
+
+    def test_no_close_in_window_gives_no_label(self):
+        """No real close in the exit window → ret_fwd NaN / return_target False
+        (realized still flat 0, but the day is not a training label)."""
+        p = self._build(self._exact_panel())
+        y_ret = p["y_return"][0]
+        ret = p["return_target_mask"][0]
+        r = p["realized_return"][0]
+        assert not ret[11], "final day has no exit close → not a label"
+        assert y_ret[11] == 0.0, "no label → return zeroed"
+        assert r[11] == 0.0, "realized flat (no exit)"
+
+    def test_suspension_before_exit_carries_to_last_close(self):
+        """A mid-panel suspension (open missing at t+h) with closes continuing
+        in the window → carry to the last real close in (t, t+h]."""
+        df = self._exact_panel()
+        # Simulate a suspension: day 8 has no real open (the exit open for
+        # t=5) but keeps a close, so the carry window (5, 8] is non-empty.
+        df.loc[8, "open"] = 0.0
+        p = self._build(df)
+        y_ret = p["y_return"][0]
+        r = p["realized_return"][0]
+        ret = p["return_target_mask"][0]
+        entry = p["entry_eligible_mask"][0]
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+        # open[8]=0 → day 8 is not entry-eligible and not a valid exit open.
+        assert not entry[8]
+        # Entry t=5: open[8] missing → carry to last real close in (5, 8] = close[8].
+        expect = close[8] / open_[5] - 1.0
+        assert ret[5]
+        assert np.isclose(y_ret[5], expect)
+        assert np.isclose(r[5], expect)
+
+    def test_fill_prob_per_date_fraction(self):
+        """fill_prob[t] = fraction of entry-eligible stocks at t with a real
+        open[t+horizon]; NaN for the tail columns (no exit window)."""
+        dates = pd.bdate_range("2020-01-02", periods=12)
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+        base = pd.DataFrame({
+            "date": dates,
+            "open": open_,
+            "high": np.maximum(open_, close) + 0.2,
+            "low": np.minimum(open_, close) - 0.2,
+            "close": close,
+            "volume": np.full(12, 1_000_000.0),
+            "amount": np.full(12, 1_000_000.0) * close,
+        })
+        A = base.copy(); A["stock_code"] = "600001"
+        B = base.copy(); B["stock_code"] = "600002"
+        B.loc[4, "open"] = 0.0  # B suspended at day 4 (horizon=2 exit for t=2)
+        p = FeaturePipeline(seq_len=5).build_panel_features(
+            pd.concat([A, B], ignore_index=True), aux_data={}, horizon=2)
+        fill = p["fill_prob"]
+        assert "fill_prob" in p, "fill_prob must be in the panel payload"
+        assert fill.shape == (12,)
+        # t=0,1: both open-valid AND open[t+2] valid → 2/2 = 1.0
+        assert np.isclose(fill[0], 1.0)
+        assert np.isclose(fill[1], 1.0)
+        # t=2: B's exit open[4] is missing → filled 1/2
+        assert np.isclose(fill[2], 0.5)
+        # t=3,4: both valid at t and t+2 → 1.0
+        assert np.isclose(fill[3], 1.0)
+        assert np.isclose(fill[4], 1.0)
+        # tail columns (t+horizon >= max_T) → NaN
+        assert np.isnan(fill[10]) and np.isnan(fill[11])
 
 
 class TestPanelTruncationInvariance:
