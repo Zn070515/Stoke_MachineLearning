@@ -1054,11 +1054,13 @@ class TestUniverseReconciliationFormalReport:
 
 
 class TestChannelVintageFormalReport:
-    """v14 §十五: the FORMAL report must surface the channel→vintage declaration
-    as an informational section — present in every run regardless of profile,
-    each entry carrying exactly channel/status/rationale — and lock the
+    """v15 §六/§十: the report surfaces the channel→vintage declaration under the
+    run's vintage-admission policy — present in every run regardless of profile,
+    each entry carrying exactly channel/status/rationale/allowed — and locks the
     documented revision-leakage sources (fundamental, macro) as
-    latest_revised_aligned."""
+    latest_revised_aligned.  Under the default safe-only policy the revised-
+    aligned channels are marked allowed=False while raw_vintage_safe /
+    derived_versioned (incl. the price channel) stay allowed=True."""
 
     def test_report_carries_channel_vintage_declaration(self, tmp_path, monkeypatch):
         root = tmp_path / "data"
@@ -1080,13 +1082,21 @@ class TestChannelVintageFormalReport:
             (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
         )
         section = report["channel_vintage"]
+        assert report["vintage_policy"] == "safe-only"
         assert isinstance(section, list) and len(section) > 0
         for entry in section:
-            assert set(entry) == {"channel", "status", "rationale"}
-            assert entry["status"] in {"vintage_safe", "latest_revised_aligned"}
+            assert set(entry) == {"channel", "status", "rationale", "allowed"}
+            assert entry["status"] in {
+                "raw_vintage_safe", "derived_versioned", "latest_revised_aligned"}
+            assert isinstance(entry["allowed"], bool)
         by_name = {e["channel"]: e for e in section}
         assert by_name["fundamental"]["status"] == "latest_revised_aligned"
         assert by_name["macro"]["status"] == "latest_revised_aligned"
+        # Default safe-only policy: revised-aligned denied, raw/derived admitted.
+        assert by_name["fundamental"]["allowed"] is False
+        assert by_name["macro"]["allowed"] is False
+        assert by_name["sentiment"]["allowed"] is True
+        assert by_name["daily_qfq"]["allowed"] is True
 
 
 class TestCalendarArtifactAndFreshness:

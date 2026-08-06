@@ -14,10 +14,13 @@ import dataclasses
 import importlib.util
 import json
 import os
+import types
 
 import numpy as np
 import pandas as pd
 import pytest
+
+import stoke_ml.data.channel_vintage as cv
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPT = os.path.join(ROOT, "scripts", "production", "train_panel.py")
@@ -831,3 +834,80 @@ def test_enforce_available_gb_precheck_skips_other_universes(tp):
         "random", 500, 5000, 8000, available_gb=1.0)
     assert action == "ok"      # est ~74.5 GB > 1.0 GB, but random is not prechecked
     assert est > 1.0
+
+
+# ── §T2: vintage-policy-driven feature switches ────────────────────────
+
+def _panel_args(vintage_policy, **overrides):
+    """A minimal train_panel args namespace for the switch/fingerprint tests."""
+    base = {
+        "vintage_policy": vintage_policy,
+        "minute": False,
+        "horizon": 1,
+        "start": "2020-01-01",
+        "end": "2024-12-31",
+        "universe": "random",
+    }
+    base.update(overrides)
+    return types.SimpleNamespace(**base)
+
+
+def test_allow_revised_reproduces_todays_switch_set(tp):
+    """allow-revised must reproduce the pre-T2 effective switch set EXACTLY:
+    every base-True dim on (incl. the revised-aligned ones), board/sector/
+    concept off, seq_len + minute_mode passthrough."""
+    kw = tp._panel_pipeline_kwargs(_panel_args("allow-revised"), seq_len=60)
+    assert kw["use_sentiment"] is True
+    assert kw["use_announcements"] is True
+    assert kw["use_fundamental"] is True
+    assert kw["use_earnings"] is True
+    assert kw["use_macro"] is True
+    assert kw["use_market_env_refine"] is True
+    assert kw["use_valuation"] is True
+    assert kw["use_board"] is False
+    assert kw["use_sector"] is False
+    assert kw["use_concept"] is False
+    assert kw["seq_len"] == 60
+    assert kw["minute_mode"] is False
+
+
+def test_safe_only_denies_revised_aligned_dims(tp):
+    """safe-only additionally turns OFF the base-True, latest_revised_aligned
+    dims (fundamental/macro/earnings/valuation/index_membership/
+    market_env_refine/pledge/shareholder) while keeping derived_versioned
+    (market_env/industry) and raw_vintage_safe (sentiment) ON."""
+    kw = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
+    for dim in ("fundamental", "macro", "earnings", "valuation",
+                "index_membership", "market_env_refine", "pledge", "shareholder"):
+        assert kw[f"use_{dim}"] is False, dim
+    assert kw["use_sentiment"] is True
+    assert kw["use_market_env"] is True
+    assert kw["use_industry"] is True
+    for dim in ("board", "sector", "concept", "limit_up", "topic"):
+        assert kw[f"use_{dim}"] is False, dim
+
+
+def test_base_dim_preference_matches_documented_dims(tp):
+    """Drift canary: _BASE_DIM_PREFERENCE is exactly the documented 27 use_*
+    dimension list — a new documented dimension must be added to both."""
+    assert set(tp._BASE_DIM_PREFERENCE) == set(cv.DOCUMENTED_USE_DIMS)
+
+
+def test_announcement_switch_key_special_case(tp):
+    """The announcement channel maps to the constructor kwarg use_announcements
+    (with an "s"); the bare use_announcement key must never be emitted (it is
+    not a FeaturePipeline constructor parameter)."""
+    kw = tp._panel_pipeline_kwargs(_panel_args("allow-revised"), seq_len=60)
+    assert "use_announcements" in kw
+    assert "use_announcement" not in kw
+
+
+def test_panel_store_meta_fingerprints_vintage_policy(tp):
+    """§T2: the vintage policy enters the panel-store meta fingerprint via
+    feature_switches, so a policy change auto-invalidates a stale store."""
+    allow = tp._panel_store_meta(_panel_args("allow-revised"), seq_len=60, n_stocks=100)
+    safe = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, n_stocks=100)
+    assert allow["feature_switches"] != safe["feature_switches"]
+    assert allow["feature_switches"]["use_fundamental"] is True
+    assert safe["feature_switches"]["use_fundamental"] is False
+    assert safe["feature_switches"]["use_sentiment"] is True

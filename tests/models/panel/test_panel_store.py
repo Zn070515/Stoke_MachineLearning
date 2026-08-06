@@ -268,6 +268,7 @@ class TestResolvePanelStoreSkip:
             start="2024-01-01", end="2024-12-31", universe="csi300", horizon=5,
             no_aux=False, prebuilt=None, require_feature_manifest=False,
             require_aux_channels=None,
+            vintage_policy="allow-revised",  # §T2: reproduces the pre-T2 switch set
         )
 
     def test_complete_store_skips_kline_load(self, tmp_path, monkeypatch):

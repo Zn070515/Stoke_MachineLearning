@@ -38,6 +38,7 @@ from stoke_ml.data.universe import (
     load_universe_status,
     not_delisted_mask,
 )
+from stoke_ml.data.vintage_policy import VintagePolicy, channel_allowed
 from stoke_ml.features.cache_manifest import current_config_hash, git_head
 from stoke_ml.features.pipeline import (
     FeaturePipeline, _PIT_STATIC_COLS, fold_dead_feature_columns,
@@ -510,25 +511,43 @@ def _require_all_universe_prebuilt(
         )
 
 
+# §T2: base preference for each documented use_* dimension — what the feature
+# set would include with an unrestricted vintage policy.  Exactly matches the
+# switches the pipeline used before this change: FeaturePipeline defaults every
+# use_* to True; board/sector/concept/limit_up/topic are OFF by default for
+# non-vintage engineering reasons (deferred / ablation-only / low density).
+_BASE_DIM_PREFERENCE = {
+    "sentiment": True, "guba": True, "comment": True, "announcement": True,
+    "margin": True, "northbound": True, "dragon_tiger": True,
+    "fundamental": True, "earnings": True, "valuation": True,
+    "etf_flow": True, "capital_flow": True, "block_trade": True,
+    "shareholder": True, "lockup": True, "dividend": True,
+    "industry": True, "macro": True, "pledge": True,
+    "index_membership": True, "market_env": True, "market_env_refine": True,
+    "board": False, "sector": False, "concept": False,
+    "limit_up": False, "topic": False,
+}
+# dim → FeaturePipeline kwarg name; only "announcement" differs (use_announcements).
+_SWITCH_KEY = {"announcement": "use_announcements"}
+
+
 def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
     """FeaturePipeline constructor kwargs for the panel build.
 
     Single source of truth for the ``use_*`` switch set — shared by the live
     pipeline construction AND the panel-store meta fingerprint, so a change to
-    the switches is caught by the store staleness guard.
+    the switches OR the vintage policy is caught by the store staleness guard.
+    ``--vintage-policy`` is applied as an AND-filter over each channel's base
+    preference (the policy can only turn channels OFF, never force one ON).
     """
-    return dict(
-        seq_len=seq_len,
-        minute_mode=args.minute,
-        use_sentiment=True, use_announcements=True,
-        use_guba=True, use_comment=True, use_margin=True,
-        use_northbound=True, use_dragon_tiger=True,
-        use_fundamental=True, use_etf_flow=True,
-        use_capital_flow=True, use_block_trade=True,
-        use_shareholder=True, use_lockup=True, use_dividend=True,
-        use_valuation=True,
-        use_board=False, use_sector=False, use_concept=False,
-    )
+    policy = VintagePolicy(args.vintage_policy)
+    kwargs = {
+        _SWITCH_KEY.get(dim, f"use_{dim}"): pref and channel_allowed(dim, policy)
+        for dim, pref in _BASE_DIM_PREFERENCE.items()
+    }
+    kwargs["seq_len"] = seq_len
+    kwargs["minute_mode"] = args.minute
+    return kwargs
 
 
 def _panel_store_meta(args, seq_len: int, n_stocks: int | None = None) -> dict:
@@ -1694,6 +1713,16 @@ def main():
                              "candidate pools (inner_val/outer_test) are "
                              "membership-gated.  Only meaningful when the "
                              "universe consumes membership.parquet")
+    parser.add_argument("--vintage-policy", type=str, default="safe-only",
+                        choices=["safe-only", "allow-revised"],
+                        help="§T2: vintage-admission policy for the feature set.  "
+                             "safe-only (default) admits raw_vintage_safe + "
+                             "derived_versioned channels and DENIES "
+                             "latest_revised_aligned ones (fundamental/macro/"
+                             "earnings/valuation/pledge/shareholder/"
+                             "index_membership/market_env_refine); allow-revised "
+                             "additionally admits latest_revised_aligned channels "
+                             "(legacy / ablation use).")
     parser.add_argument("--quality-gate-report", type=str, default=None,
                         help="Path to the quality-gate report to verify "
                              "(default: <repo>/reports/data_quality_gate.json)")

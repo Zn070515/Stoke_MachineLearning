@@ -1,25 +1,37 @@
-"""v14 §十五 channel-vintage declaration tests.
+"""v15 §六/§十 channel-vintage declaration tests.
 
 The module ``stoke_ml.data.channel_vintage`` is the curated governance
 declaration that the formal gate report surfaces.  Every declared channel must
-carry a valid two-status label and a non-empty rationale; the documented
-revision-leakage sources (fundamental, macro) must be locked as
-``latest_revised_aligned``; the declaration must stay deterministic and in sync
-with the CLAUDE.md ``use_*`` dimension list.
+carry one of the three DECLARED statuses (``raw_vintage_safe`` /
+``derived_versioned`` / ``latest_revised_aligned``) and a non-empty rationale;
+``unknown_vintage`` is the reserved deny-by-default fallback of ``status_of()``
+and is NEVER a declared label.  The documented revision-leakage sources
+(fundamental, macro) must be locked as ``latest_revised_aligned``; the derived
++ versioned price channel (daily_qfq) must be ``derived_versioned``; the
+declaration must stay deterministic and in sync with the CLAUDE.md ``use_*``
+dimension list.
 """
 import importlib
 
 import stoke_ml.data.channel_vintage as cv
 from stoke_ml.data.channel_vintage import CHANNEL_VINTAGE
 
-VALID_STATUSES = {"vintage_safe", "latest_revised_aligned"}
+VALID_STATUSES = {
+    "raw_vintage_safe",
+    "derived_versioned",
+    "latest_revised_aligned",
+}
 
 
 def test_all_entries_have_valid_status_and_nonempty_rationale():
-    """Every channel has a legal status and a concrete, non-empty rationale."""
+    """Every channel has a legal declared status and a concrete, non-empty
+    rationale."""
     assert len(CHANNEL_VINTAGE) > 0
     for e in CHANNEL_VINTAGE:
         assert e.status in VALID_STATUSES, f"{e.channel}: bad status {e.status!r}"
+        assert e.status != "unknown_vintage", (
+            f"{e.channel}: unknown_vintage is never a declared status"
+        )
         assert isinstance(e.rationale, str) and e.rationale.strip(), (
             f"{e.channel}: empty rationale"
         )
@@ -37,6 +49,29 @@ def test_core_revision_leakage_sources_are_latest_revised_aligned():
     by_name = cv.CHANNEL_VINTAGE_BY_NAME
     assert by_name["fundamental"].status == "latest_revised_aligned"
     assert by_name["macro"].status == "latest_revised_aligned"
+
+
+def test_derived_price_channel_is_derived_versioned():
+    """§T2: the qfq price channel is derived + versioned (not an immutable raw
+    snapshot), and the immutable-event sentiment channel is raw_vintage_safe."""
+    by_name = cv.CHANNEL_VINTAGE_BY_NAME
+    assert by_name["daily_qfq"].status == "derived_versioned"
+    assert by_name["sentiment"].status == "raw_vintage_safe"
+
+
+def test_known_statuses_contains_all_four_states():
+    """§T2: KNOWN_STATUSES is the full vocabulary — the 3 declared states plus
+    the reserved unknown_vintage deny-by-default fallback."""
+    assert {"raw_vintage_safe", "derived_versioned", "latest_revised_aligned",
+            "unknown_vintage"} <= cv.KNOWN_STATUSES
+    assert cv.KNOWN_STATUSES >= VALID_STATUSES | {"unknown_vintage"}
+
+
+def test_status_of_defaults_to_unknown_vintage():
+    """§T2: status_of() returns unknown_vintage for any undeclared channel (the
+    deny-by-default fallback) and the declared status for curated channels."""
+    assert cv.status_of("definitely_not_a_channel") == "unknown_vintage"
+    assert cv.status_of("sentiment") == "raw_vintage_safe"
 
 
 def test_declaration_is_deterministic_across_imports():

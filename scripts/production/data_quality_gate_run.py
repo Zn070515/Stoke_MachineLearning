@@ -25,7 +25,7 @@ from pathlib import Path
 import pandas as pd
 
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.channel_vintage import CHANNEL_VINTAGE
+from stoke_ml.data.vintage_policy import VintagePolicy, vintage_report
 # NOTE: the gate import sits BELOW ``def main()`` on purpose — importing the
 # gate module first would re-trigger the gate module's bottom ``from
 # data_quality_gate_run import main`` re-export while this module is still
@@ -82,6 +82,10 @@ def main():
                          "research run must clear: span >= 5y, stale <= 4 "
                          "trading days (behind the most recent completed "
                          "session), unreadable = 0, readable stocks >= 98%%")
+    ap.add_argument("--vintage-policy", type=str, default="safe-only",
+                    choices=["safe-only", "allow-revised"],
+                    help="§T2: vintage-admission policy recorded in the report and "
+                         "enforced in formal mode (default: safe-only).")
     # §P1-7: per-requested-stock reconciliation — OPT-IN; without one of these
     # the gate runs exactly as before (the universe check never joins the run).
     ap.add_argument("--requested-universe", default=None,
@@ -190,6 +194,33 @@ def main():
             f"this data root first.",
             file=sys.stderr,
         )
+    # §T2/§十五: the run's vintage-admission policy + per-channel allowed flags.
+    # Computed ONCE so the report and the formal enforcement share the same
+    # view.  Informational for bootstrap; formal mode ENFORCES it below.
+    vintage = vintage_report(VintagePolicy(args.vintage_policy))
+    # §T2: formal mode refuses an incomplete or self-contradictory vintage
+    # declaration.  An undeclared documented channel would be silently
+    # unknown_vintage (denied) — formal must surface that as a hard FAIL rather
+    # than let a consumer guess.  daily_qfq must always be admissible (no model
+    # trains without the price channel).
+    if args.profile == "formal":
+        if vintage["missing_channels"]:
+            passed = False
+            print(
+                f"ERROR: --profile formal requires every documented use_* channel "
+                f"to carry a vintage declaration; missing: "
+                f"{vintage['missing_channels']} — refusing an incomplete vintage "
+                f"declaration.",
+                file=sys.stderr,
+            )
+        if not vintage["daily_qfq_allowed"]:
+            passed = False
+            print(
+                f"ERROR: --profile formal vintage policy {args.vintage_policy} "
+                f"denies daily_qfq — a model cannot train without the price "
+                f"channel.",
+                file=sys.stderr,
+            )
     os.makedirs(args.output, exist_ok=True)
     # §七.2: record the run's audit scope so a consumer can tell a full scan
     # from a --quick sample.  manifest/contract_schema are always full-scan
@@ -261,14 +292,11 @@ def main():
     universe_res = next((r for r in results if r.name == "universe"), None)
     if universe_res is not None and universe_res.details is not None:
         report["universe_reconciliation"] = universe_res.details
-    # §十五: informational channel→vintage declaration.  Which channels are truly
-    # vintage-safe and which are only "latest-revised history aligned to their
-    # publication date" is REPORTED here, never silently hidden — the audit's
-    # minimum.  Informational only: it must NOT influence `passed` above.
-    report["channel_vintage"] = [
-        {"channel": e.channel, "status": e.status, "rationale": e.rationale}
-        for e in CHANNEL_VINTAGE
-    ]
+    # §T2/§十五: the report carries the run's vintage-admission policy and marks
+    # every declared channel as allowed/denied under it.  Informational for
+    # bootstrap; formal mode ENFORCES the declaration above.
+    report["vintage_policy"] = vintage["vintage_policy"]
+    report["channel_vintage"] = vintage["channels"]
     out_path = os.path.join(args.output, "data_quality_gate.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)
