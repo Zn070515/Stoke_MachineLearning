@@ -8,7 +8,7 @@ leave the feature grid unchanged.
 
 This test drives TechnicalIndicators and TrendScorer on a synthetic A-share
 series, rescales OHLC by k ∈ {0.5, 2, 10}, and asserts every price-derived
-column is bit-for-bit identical (modulo NaN placement).
+column is unchanged within float tolerance, with identical NaN placement.
 """
 import numpy as np
 import pandas as pd
@@ -75,6 +75,16 @@ def _scale_ohlc(df, k):
     return scl
 
 
+def _assert_same(a: np.ndarray, b: np.ndarray, col: str, k: float):
+    """Values match within tolerance AND NaN placement is identical."""
+    assert np.array_equal(np.isnan(a), np.isnan(b)), (
+        f"{col}: NaN placement changed under OHLC×{k}"
+    )
+    assert np.allclose(a, b, equal_nan=True, atol=1e-8), (
+        f"feature {col} changed under OHLC×{k}"
+    )
+
+
 class TestPriceDerivedFeaturesScaleInvariance:
 
     @pytest.mark.parametrize("k", _SCALES)
@@ -85,11 +95,8 @@ class TestPriceDerivedFeaturesScaleInvariance:
 
         for col in _FIXED:
             assert col in orig.columns, f"missing {col} in technical output"
-            a = orig[col].to_numpy(dtype=float)
-            b = scl[col].to_numpy(dtype=float)
-            assert np.allclose(a, b, equal_nan=True, atol=1e-8), (
-                f"feature {col} changed under OHLC×{k}"
-            )
+            _assert_same(orig[col].to_numpy(dtype=float),
+                         scl[col].to_numpy(dtype=float), col, k)
 
     @pytest.mark.parametrize("k", _SCALES)
     def test_amount_series_unchanged(self, k):
@@ -99,11 +106,8 @@ class TestPriceDerivedFeaturesScaleInvariance:
         scl = TechnicalIndicators().compute_all(_scale_ohlc(df, k))
 
         for col in ("amount", "amount_ma5", "amount_ratio"):
-            a = orig[col].to_numpy(dtype=float)
-            b = scl[col].to_numpy(dtype=float)
-            assert np.allclose(a, b, equal_nan=True), (
-                f"{col} changed although amount was not scaled"
-            )
+            _assert_same(orig[col].to_numpy(dtype=float),
+                         scl[col].to_numpy(dtype=float), col, k)
 
     @pytest.mark.parametrize("k", _SCALES)
     def test_trend_scorer_scale_invariant(self, k):
@@ -117,11 +121,8 @@ class TestPriceDerivedFeaturesScaleInvariance:
         for col in ("trend_level", "buy_signal",
                     "bias_ma5", "bias_ma10", "bias_ma20", "bias_ma60",
                     "volume_shrink", "volume_heavy"):
-            a = ro[col].to_numpy(dtype=float)
-            b = rs[col].to_numpy(dtype=float)
-            assert np.allclose(a, b, equal_nan=True), (
-                f"scoring feature {col} changed under OHLC×{k}"
-            )
+            _assert_same(ro[col].to_numpy(dtype=float),
+                         rs[col].to_numpy(dtype=float), col, k)
 
     def test_turnover_proxy_removed(self):
         """§五 P0: amount/qfq_close is not scale-invariant → column dropped."""
