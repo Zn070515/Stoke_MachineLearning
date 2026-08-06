@@ -146,7 +146,7 @@ def test_csi_drop_refuses_when_gate_enforced(tp, monkeypatch):
     the missing list — the requested index is never silently shrunk to whatever
     happens to be on disk."""
     monkeypatch.setattr(
-        tp, "_load_index_universe",
+        "scripts.production.train_panel_universe._load_index_universe",
         lambda data_dir, idx_codes: ["000001", "600519", "300750", "600999"])
     with pytest.raises(SystemExit) as ei:
         tp._resolve_universe(ALL, "csi300", None, 42, "data", formal=True)
@@ -162,7 +162,7 @@ def test_csi_drop_warns_and_records_when_not_enforced(tp, monkeypatch, caplog):
     but the artifact still exposes the gap."""
     import logging
     monkeypatch.setattr(
-        tp, "_load_index_universe",
+        "scripts.production.train_panel_universe._load_index_universe",
         lambda data_dir, idx_codes: ["000001", "600519", "300750", "600999"])
     with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
         r, desc = tp._resolve_universe(
@@ -1162,7 +1162,8 @@ def test_resolve_panel_passes_membership_for_csi(tp, monkeypatch, caplog):
     daily_membership (so the cross-section z-norm is member-limited)."""
     import stoke_ml.data.storage as storage_mod
     fake_pipe, calls = _capture_pipeline()
-    monkeypatch.setattr(tp, "FeaturePipeline", fake_pipe)
+    monkeypatch.setattr("scripts.production.train_panel_panel.FeaturePipeline",
+                        fake_pipe)
     monkeypatch.setattr(storage_mod, "DataStorage", _fake_storage())
     mem = pd.DataFrame({
         "stock_code": ["600000"],
@@ -1171,7 +1172,8 @@ def test_resolve_panel_passes_membership_for_csi(tp, monkeypatch, caplog):
         "out_date": pd.to_datetime([pd.NaT]),
     })
     monkeypatch.setattr(
-        tp, "load_index_membership", lambda data_dir, indices: mem)
+        "scripts.production.train_panel_panel.load_index_membership",
+        lambda data_dir, indices: mem)
     args = _panel_args("safe-only", universe="csi300", no_aux=True)
     args.panel_store = None
     args.require_feature_manifest = False
@@ -1187,11 +1189,13 @@ def test_resolve_panel_empty_membership_warns_and_degrades(tp, monkeypatch, capl
     warns and degrades to daily_membership=None (the all-stock z-norm)."""
     import stoke_ml.data.storage as storage_mod
     fake_pipe, calls = _capture_pipeline()
-    monkeypatch.setattr(tp, "FeaturePipeline", fake_pipe)
+    monkeypatch.setattr("scripts.production.train_panel_panel.FeaturePipeline",
+                        fake_pipe)
     monkeypatch.setattr(storage_mod, "DataStorage", _fake_storage())
     empty = pd.DataFrame(columns=["stock_code", "index_code", "in_date", "out_date"])
     monkeypatch.setattr(
-        tp, "load_index_membership", lambda data_dir, indices: empty)
+        "scripts.production.train_panel_panel.load_index_membership",
+        lambda data_dir, indices: empty)
     args = _panel_args("safe-only", universe="csi800", no_aux=True)
     args.panel_store = None
     args.require_feature_manifest = False

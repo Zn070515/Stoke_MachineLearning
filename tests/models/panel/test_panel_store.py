@@ -492,7 +492,7 @@ class TestResolvePanelStoreSkip:
 
         import stoke_ml.data.storage as storage_mod
         monkeypatch.setattr(storage_mod.DataStorage, "load_daily", _boom)
-        monkeypatch.setattr("scripts.production.train_panel.load_aux_data", _boom)
+        monkeypatch.setattr("scripts.production.train_panel_panel.load_aux_data", _boom)
 
         panel_data, channel_manifest = _resolve_panel(
             args, stock_list, seq_len, str(tmp_path), set(), _store_load=True)
@@ -530,10 +530,10 @@ class TestResolvePanelStoreSkip:
         # Skip aux loading and the real feature build — build_panel_features is
         # stubbed to return a full storeable panel so the save-with-meta path
         # is exercised, not the (already covered elsewhere) feature engine.
-        monkeypatch.setattr("scripts.production.train_panel.load_aux_data",
+        monkeypatch.setattr("scripts.production.train_panel_panel.load_aux_data",
                             lambda *a, **k: (None, {}))
         monkeypatch.setattr(
-            "scripts.production.train_panel.FeaturePipeline",
+            "scripts.production.train_panel_panel.FeaturePipeline",
             lambda **kw: SimpleNamespace(
                 build_panel_features=lambda _panel, **kw2: _storeable_panel()))
 
