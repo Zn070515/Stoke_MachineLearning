@@ -81,7 +81,7 @@ def main():
                          "bootstrap (default, dev) or formal — a 5530-stock "
                          "research run must clear: span >= 5y, stale <= 4 "
                          "trading days (behind the most recent completed "
-                         "session), unreadable = 0, readable stocks >= 98%")
+                         "session), unreadable = 0, readable stocks >= 98%%")
     # §P1-7: per-requested-stock reconciliation — OPT-IN; without one of these
     # the gate runs exactly as before (the universe check never joins the run).
     ap.add_argument("--requested-universe", default=None,
