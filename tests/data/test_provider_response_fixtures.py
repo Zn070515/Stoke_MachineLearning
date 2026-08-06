@@ -123,7 +123,7 @@ def _assert_canonical_shape(df: pd.DataFrame) -> None:
     assert list(df["date"]) == [
         dt.date(2024, 1, 2), dt.date(2024, 1, 3), dt.date(2024, 1, 4)
     ]
-    assert set(df["stock_code"]) == {"000001"}
+    assert (df["stock_code"] == "000001").all()
     assert validate_contract(df, RESEARCH_QFQ_DAILY) == []
 
 
@@ -134,7 +134,7 @@ def efinance_api(monkeypatch):
     """Patch ``curl_cffi.requests`` (read at call time by fetch_daily's local
     ``from curl_cffi import requests``).  The test sets ``.payload`` /
     ``.status_code``; ``.calls`` records every ``requests.get`` invocation."""
-    import curl_cffi
+    curl_cffi = pytest.importorskip("curl_cffi")
 
     class _FakeResponse:
         def __init__(self, payload, status_code):
@@ -198,7 +198,8 @@ def baostock_api(monkeypatch):
 
     def fake_login():
         state["logins"] += 1
-        return _Login(state["login_error_code"], "login failed")
+        msg = "login failed" if state["login_error_code"] != "0" else ""
+        return _Login(state["login_error_code"], msg)
 
     def fake_query(bs_code, fields, **kwargs):
         state["queries"].append((bs_code, fields, kwargs))
