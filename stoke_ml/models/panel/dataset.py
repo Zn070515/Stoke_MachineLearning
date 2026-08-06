@@ -19,14 +19,35 @@ def _window_history_counts(obs_mask: torch.Tensor, seq_len: int) -> torch.Tensor
 
 
 class PanelDataset(Dataset):
-    """Panel dataset for VSN+xLSTM model training.
+    """Date-centric panel dataset for VSN+xLSTM model training.
 
-    Pre-built tensor data organized as (N_stocks, T_total, D_features).
-    Each __getitem__ returns a single stock's sequence window.
+    §七/§十六 refactoring: the primary index is now DATE (window), not
+    stock×date.  ``__len__`` = n_windows; ``__getitem__(window_idx)`` returns
+    ALL (or a controlled sample of) valid stocks for that date.
+
+    This gives PairwiseRankingLoss a complete cross-section per batch —
+    no intra-date pairs lost to batch boundaries — and eliminates the
+    materialized (n_stocks × n_windows) flat-index grid.
 
     All numpy inputs are converted to tensors once in __init__ so that
-    __getitem__ is a pure indexing operation — no per-sample conversion
-    overhead.
+    __getitem__ is indexing + sampling — no per-sample conversion overhead.
+
+    Parameters
+    ----------
+    data : dict
+        Panel-format data from panel_builder.build_panel_features.
+    seq_len : int
+        Input window length in trading days.
+    min_history : int
+        Minimum real observations in the input window for a stock to be
+        trainable on that date.
+    max_stocks_per_date : int | None
+        Cap on stocks per date in __getitem__.  When a date has more valid
+        stocks, a random subset is sampled each call.  ``None`` = no cap
+        (use all valid stocks — val default).
+    training : bool
+        If True, sampling is applied (within max_stocks_per_date).
+        If False, all valid stocks are returned (used for val/eval).
     """
 
     def __init__(
@@ -34,9 +55,13 @@ class PanelDataset(Dataset):
         data: dict,
         seq_len: int = 60,
         min_history: int = 50,
+        max_stocks_per_date: int | None = None,
+        training: bool = True,
     ):
         self.seq_len = seq_len
         self.min_history = min_history
+        self.max_stocks_per_date = max_stocks_per_date
+        self.training = training
 
         def _to_tensor(arr, dtype):
             if isinstance(arr, torch.Tensor):
@@ -103,9 +128,25 @@ class PanelDataset(Dataset):
                 & target_any
                 & decision
             )
+            # §七 date-centric eval mask: broader than valid_mask — includes
+            # all decision- & history-eligible stocks so the evaluation pool
+            # (which does NOT require entry_eligible) is fully covered.
+            # Training only sees entry-eligible stocks (correct for loss);
+            # evaluation predicts for the full candidate pool and lets the
+            # sleeve-sim / IC filter downstream (matches old stock-centric
+            # behaviour where the model predicted for every stock).
+            history_eligible = (
+                _to_tensor(data["history_eligible_mask"], torch.bool)[:, self.seq_len:]
+                if "history_eligible_mask" in data else None
+            )
+            history_mask = (
+                history_eligible if history_eligible is not None else True
+            )
+            self.eval_mask = (hist_count >= self.min_history) & decision & history_mask
         else:
             # Backward-compat fallback: target-day label validity only.
             self.valid_mask = (self.y_direction[:, self.seq_len:] != -100)
+            self.eval_mask = self.valid_mask
 
         # date_idx[t] = t for each window position — used by PairwiseRankingLoss
         # to group samples from the same calendar date for cross-sectional ranking.
@@ -126,53 +167,127 @@ class PanelDataset(Dataset):
                 f"n_timesteps ({self.n_timesteps}) must be > seq_len ({seq_len})"
             )
 
+        # §七/§十六 date-centric index: for each window, pre-compute the list
+        # of stock indices.  Training uses valid_mask (entry-eligible only);
+        # evaluation uses eval_mask (broader: decision & history — matches the
+        # candidate pool so no pool-eligible stock goes unpredicted).
+        _mask = self.valid_mask if self.training else self.eval_mask
+        self._date_to_stocks: list[torch.Tensor] = []
+        for w in range(self.n_windows):
+            valid_stocks = torch.where(_mask[:, w])[0]
+            self._date_to_stocks.append(valid_stocks)
+
     def __len__(self) -> int:
-        return self.n_stocks * self.n_windows
+        """Number of date-windows (primary index)."""
+        return self.n_windows
 
-    def __getitem__(self, idx: int) -> tuple:
-        stock_idx = idx // self.n_windows
-        window_idx = idx % self.n_windows
+    def __getitem__(self, window_idx: int) -> tuple:
+        """Return all (or a controlled sample of) valid stocks for one date.
 
+        Returns an 11-tuple where each tensor's batch-dim = M (stocks in this
+        date), instead of the old per-stock scalars/vectors.  ``stock_indices``
+        (element 10) lets val/eval consumers reconstruct the (N, W) prediction
+        grid.
+        """
         start = window_idx
         end = start + self.seq_len
 
-        # Target is at `end` (the step after the window [start, end)), so the
-        # date used to group this sample cross-sectionally is the TARGET date,
-        # not the last feature date (`end - 1`).  Ranking pairs must compare
-        # stocks' outcomes on the SAME future day.  Under the open-entry
-        # convention `end` is the ENTRY date — buy at open[end],
-        # exit at open[end+horizon].
-        date_idx = (self.date_indices[stock_idx, end].item()
-                     if self.date_indices is not None else 0)
+        stock_indices = self._date_to_stocks[window_idx]
+        n_valid = stock_indices.numel()
 
-        # Per-task target masks: each loss applies its own mask.
-        dir_mask = (self.y_direction[stock_idx, end] != -100)
-        ret_mask = (self.ret_target[stock_idx, end]
-                    if self.ret_target is not None else dir_mask)
-        vol_mask = (self.vol_target[stock_idx, end]
-                    if self.vol_target is not None else dir_mask)
+        # Controlled sampling for training when a date has more valid stocks
+        # than max_stocks_per_date.  The RNG call order — randperm then index
+        # select — preserves seed reproducibility (global torch RNG state).
+        if (self.training and self.max_stocks_per_date is not None
+                and n_valid > self.max_stocks_per_date):
+            perm = torch.randperm(n_valid)[:self.max_stocks_per_date]
+            stock_indices = stock_indices[perm]
+            n_valid = stock_indices.numel()
 
         # Static context: 2D (N, D) for backward-compat synthetic data, or
         # 3D (N, T, D) PIT.  For 3D take the DECISION column
         # end-1 (the last feature day — known before entering at open[end]).
         if self.static_features.dim() == 3:
-            static = self.static_features[stock_idx, end - 1]
+            static = self.static_features[stock_indices, end - 1]
         else:
-            static = self.static_features[stock_idx]
+            static = self.static_features[stock_indices]
+
+        # Feature windows: (M, seq_len, D)
+        pk = self.past_known[stock_indices, start:end]
+        po = self.past_observed[stock_indices, start:end]
+
+        # Targets: (M,)
+        y_dir = self.y_direction[stock_indices, end]
+        y_ret = self.y_return[stock_indices, end]
+        y_vol = self.y_volatility[stock_indices, end]
+
+        # Date index: (M,) — all stocks share the same target date for this
+        # window.  PairwiseRankingLoss groups by this value; with date-centric
+        # batches it always gets exactly one date per batch.
+        if self.date_indices is not None:
+            date_idx = self.date_indices[stock_indices, end]
+        else:
+            date_idx = torch.full((n_valid,), end, dtype=torch.long)
+
+        # Per-task target masks: each loss applies its own mask.
+        # Same semantics as before — y_direction validity for dir, per-channel
+        # masks for ret/vol — but now returned as (M,) tensors.
+        dir_mask = (self.y_direction[stock_indices, end] != -100)
+        ret_mask = (self.ret_target[stock_indices, end]
+                    if self.ret_target is not None else dir_mask)
+        vol_mask = (self.vol_target[stock_indices, end]
+                    if self.vol_target is not None else dir_mask)
 
         return (
-            static,
-            self.past_known[stock_idx, start:end],
-            self.past_observed[stock_idx, start:end],
-            self.y_direction[stock_idx, end],
-            self.y_return[stock_idx, end],
-            self.y_volatility[stock_idx, end],
-            date_idx,
-            dir_mask,
-            ret_mask,
-            vol_mask,
+            static,          # 0: (M, D)
+            pk,              # 1: (M, seq_len, D_pk)
+            po,              # 2: (M, seq_len, D_po)
+            y_dir,           # 3: (M,)
+            y_ret,           # 4: (M,)
+            y_vol,           # 5: (M,)
+            date_idx,        # 6: (M,)
+            dir_mask,        # 7: (M,) bool
+            ret_mask,        # 8: (M,) bool
+            vol_mask,        # 9: (M,) bool
+            stock_indices,   # 10: (M,) long — for grid reconstruction
         )
 
+
+class DateSampler(Sampler):
+    """Streaming date-window sampler for date-centric training (§七/§十六).
+
+    Shuffles window indices each epoch, yielding one at a time.  The
+    PanelDataset then returns all (or a controlled sample of) valid stocks
+    for that window.  DataLoader ``batch_size=1`` gives one date cross-section
+    per batch.
+
+    Dates with zero valid stocks are skipped (they contribute nothing to
+    training and would produce empty batches).
+
+    This is a streaming generator — no materialized list of millions of
+    (stock, window) flat indices.  The RNG call order (one randperm call)
+    is deterministic for a given seed, preserving epoch-to-epoch
+    reproducibility.
+    """
+
+    def __init__(self, valid_mask: torch.Tensor):
+        self.valid_mask = valid_mask.bool()
+        self.n_stocks, self.n_windows = self.valid_mask.shape
+        # Per-date valid stock count (n_windows,)
+        self._date_counts = valid_mask.sum(dim=0)
+
+    def __len__(self) -> int:
+        return int((self._date_counts > 0).sum().item())
+
+    def __iter__(self):
+        # One randperm call per epoch — deterministic for the global RNG state.
+        date_order = torch.randperm(self.n_windows).tolist()
+        for w in date_order:
+            if self._date_counts[w] > 0:
+                yield w
+
+
+# ── Backward-compatible stock-centric classes (kept for reference / legacy) ──
 
 class DateGroupedSampler(Sampler):
     """Groups samples by calendar date so each batch has cross-sectional diversity.
@@ -187,6 +302,10 @@ class DateGroupedSampler(Sampler):
     Only (stock, window) pairs with a valid target are emitted — padded windows
     whose target is -100 (short listing history) are skipped, so batches never
     contain all-zero feature rows for the ranking loss to trip on.
+
+    .. deprecated::
+        Use ``DateSampler`` + date-centric ``PanelDataset`` instead (§七/§十六).
+        This class is retained for backward compatibility only.
 
     Args:
         valid_mask: (N_stocks, N_windows) bool tensor — True where the window's
@@ -216,16 +335,18 @@ class DateGroupedSampler(Sampler):
 
 
 def panel_collate(batch: list) -> tuple:
-    """Collate panel samples into batch tensors (includes date_idx + per-task masks)."""
-    return (
-        torch.stack([b[0] for b in batch]),
-        torch.stack([b[1] for b in batch]),
-        torch.stack([b[2] for b in batch]),
-        torch.stack([b[3] for b in batch]),
-        torch.stack([b[4] for b in batch]),
-        torch.stack([b[5] for b in batch]),
-        torch.tensor([b[6] for b in batch], dtype=torch.long),
-        torch.stack([b[7] for b in batch]),
-        torch.stack([b[8] for b in batch]),
-        torch.stack([b[9] for b in batch]),
-    )
+    """Collate date-centric panel samples into batch tensors.
+
+    In date-centric mode, each ``__getitem__`` already returns per-date
+    (M, ...) tensors.  ``batch_size=1`` means a single-element list — this
+    function passes it through unchanged.  ``batch_size>1`` concatenates
+    multiple dates along the stock (dim-0) axis so the model sees a mixed
+    batch.
+
+    The 11-element tuple matches ``PanelDataset.__getitem__``:
+    (static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask,
+     vol_mask, stock_indices).
+    """
+    if len(batch) == 1:
+        return batch[0]
+    return tuple(torch.cat([b[i] for b in batch], dim=0) for i in range(11))

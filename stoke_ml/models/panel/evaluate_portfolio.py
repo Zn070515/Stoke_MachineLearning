@@ -118,31 +118,35 @@ def evaluate_portfolio(
       — Metadata: n_periods, n_stocks, n_days
     """
     model.eval()
-    val_ds = PanelDataset(val_data, seq_len=config.seq_len,
-                          min_history=config.min_history)
+    n_stocks = val_data["static_features"].shape[0]
+    val_ds = PanelDataset(
+        val_data, seq_len=config.seq_len, min_history=config.min_history,
+        max_stocks_per_date=None, training=False,
+    )
     val_loader = DataLoader(
-        val_ds, batch_size=config.batch_size,
+        val_ds, batch_size=1,
         shuffle=False, collate_fn=panel_collate,
         num_workers=0, pin_memory=False,
     )
 
-    all_preds = []
+    n_windows = val_ds.n_windows
+    seq_len = val_ds.seq_len
+    preds = torch.full((n_stocks, n_windows), float("nan"))
     with torch.no_grad():
         for batch in val_loader:
-            static, pk, po, *_ = batch
+            static, pk, po, *_y, date_idx_t, _dm, _rm, _vm, stock_indices = batch
+            if stock_indices.numel() == 0:
+                continue
+            # Per-stock window indices (supports mixed-date batches).
+            window_idx = date_idx_t - seq_len
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
             _, pred_ret, _ = model(static, pk, po)
-            all_preds.append(pred_ret.cpu().squeeze(-1))
+            preds[stock_indices, window_idx] = pred_ret.cpu().squeeze(-1)
 
-    if not all_preds:
+    if torch.isnan(preds).all():
         return _empty_result()
-
-    preds = torch.cat(all_preds)
-    n_stocks = val_data["static_features"].shape[0]
-    n_windows = val_ds.n_windows
-    preds = preds.reshape(n_stocks, n_windows)
     preds_np = preds.numpy()
 
     # Selection pool: decision & history, with entry/future-label

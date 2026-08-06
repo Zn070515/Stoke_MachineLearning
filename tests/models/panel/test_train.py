@@ -182,7 +182,7 @@ class TestValLossBatchSizeInvariant:
         rankics = []
         for bs in (32, 64, 128):
             ds = PanelDataset(data, seq_len=config.seq_len,
-                              min_history=config.min_history)
+                              min_history=config.min_history, training=False)
             loader = DataLoader(ds, batch_size=bs, shuffle=False,
                                 collate_fn=panel_collate, num_workers=0)
             _, _, v_ret, _, v_rankic = _compute_val_loss(

@@ -243,18 +243,22 @@ class TestFittedScoreAdapter:
 
 class TestPrecomputedScoreAdapter:
     def test_grid_replays_in_batch_order_and_resets(self):
-        grid = np.arange(12, dtype=np.float32).reshape(3, 4)  # 3 stocks × 4 windows
+        # §七/§十六 date-centric: adapter stores in window-major order
+        # (grid.T.reshape(-1)).  grid = 3 stocks × 4 windows:
+        #   [[0,1,2,3], [4,5,6,7], [8,9,10,11]]
+        # window-major flat: [0,4,8, 1,5,9, 2,6,10, 3,7,11]
+        grid = np.arange(12, dtype=np.float32).reshape(3, 4)
         adapter = PrecomputedScoreAdapter(grid)
-        flat = grid.reshape(-1)
+        flat_wm = np.ascontiguousarray(grid.T).reshape(-1)
         batch = torch.zeros(2, 1, 1)
         first = adapter.forward(batch, batch, batch)[1]
-        np.testing.assert_allclose(first.numpy().reshape(-1), flat[:2])
+        np.testing.assert_allclose(first.numpy().reshape(-1), flat_wm[:2])
         second = adapter.forward(batch, batch, batch)[1]
-        np.testing.assert_allclose(second.numpy().reshape(-1), flat[2:4])
+        np.testing.assert_allclose(second.numpy().reshape(-1), flat_wm[2:4])
         # reset() rewinds to the start.
         adapter.reset()
         again = adapter.forward(batch, batch, batch)[1]
-        np.testing.assert_allclose(again.numpy().reshape(-1), flat[:2])
+        np.testing.assert_allclose(again.numpy().reshape(-1), flat_wm[:2])
 
     def test_runs_past_grid_raises(self):
         grid = np.arange(12, dtype=np.float32).reshape(3, 4)

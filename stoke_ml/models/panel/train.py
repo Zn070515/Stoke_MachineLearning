@@ -14,7 +14,7 @@ from stoke_ml.models.panel.model import PanelModel
 from stoke_ml.models.panel.loss import (
     UncertaintyLoss, FixedTaskWeights, AdjMSELoss, PairwiseRankingLoss,
 )
-from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateGroupedSampler
+from stoke_ml.models.panel.dataset import PanelDataset, panel_collate, DateSampler
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 from stoke_ml.models.panel.evaluate import evaluate_portfolio, _raw_clean_rank_ic
@@ -166,10 +166,14 @@ def _compute_val_loss(
     the PRIMARY checkpoint-selection metric.
     It shares the evaluate.py raw-clean-IC definition and its
     min_stocks_per_day threshold with the formal report, so the metric that
-    selects a checkpoint is exactly the metric the report prints.  The full
-    prediction grid is reconstructed in flat (n_stocks, n_windows) order (the
-    val_loader runs shuffle=False with no sampler), so like the sample-weighted
-    losses the RankIC is independent of batch boundaries.
+    selects a checkpoint is exactly the metric the report prints.
+
+    With date-centric batches (§七/§十六), the prediction grid is
+    reconstructed by placing each stock's prediction at
+    ``preds[stock_idx, window_idx]`` using the ``stock_indices`` and
+    ``date_idx`` fields from each batch.  This is independent of batch
+    boundaries — same as the old flat-order reshape but robust to date
+    skipping and varying stocks-per-date.
     """
     model.eval()
     n_batches = 0
@@ -179,10 +183,23 @@ def _compute_val_loss(
     uncer_num = uncer_den = 0.0
     nan_batches = 0
     skipped_batches = 0
-    all_preds: list[torch.Tensor] = []
+    n_stocks = val_data["static_features"].shape[0]
+    n_windows = val_loader.dataset.n_windows
+    seq_len = val_loader.dataset.seq_len
+    # Pre-allocate the full (n_stocks, n_windows) grid for direct placement —
+    # no torch.cat+reshape needed (§七 date-centric).
+    preds = torch.full((n_stocks, n_windows), float("nan"))
     with torch.no_grad():
         for batch in val_loader:
-            static, pk, po, y_dir, y_ret, y_vol, _, dir_mask, ret_mask, vol_mask = batch
+            (static, pk, po, y_dir, y_ret, y_vol,
+             date_idx, dir_mask, ret_mask, vol_mask, stock_indices) = batch
+            if stock_indices.numel() == 0:
+                skipped_batches += 1
+                continue
+            n_batches += 1
+            # Per-stock window indices — may differ when batch_size > 1 and
+            # collate concatenated multiple dates (date_idx varies per stock).
+            window_idx = date_idx - seq_len  # (M,)
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
@@ -192,14 +209,14 @@ def _compute_val_loss(
             dir_mask = dir_mask.to(device).float()
             ret_mask = ret_mask.to(device).float()
             vol_mask = vol_mask.to(device).float()
-            n_batches += 1
             with autocast("cuda", enabled=use_amp):
                 pred_dir, pred_ret, pred_vol = model(static, pk, po)
-                # Save the FULL (unmasked) prediction grid so the RankIC can be
-                # reconstructed in flat order at the end — NaN batches still
-                # contribute their slot; _compute_daily_ic filters them via the
-                # isfinite mask.
-                all_preds.append(pred_ret.detach().cpu().squeeze(-1))
+                # Place predictions directly in the (N, W) grid using
+                # per-stock stock_indices + window_idx (supports mixed-date
+                # batches when batch_size > 1).
+                preds[stock_indices, window_idx] = (
+                    pred_ret.detach().cpu().squeeze(-1)
+                )
                 if (torch.isnan(pred_dir).any() or torch.isnan(pred_ret).any()
                         or torch.isnan(pred_vol).any()):
                     nan_batches += 1
@@ -301,18 +318,10 @@ def _compute_val_loss(
             nan_batches, skipped_batches, n_batches,
         )
     model.train()
-    if uncer_den == 0 or not all_preds:
+    if uncer_den == 0:
         return float("inf"), float("inf"), float("inf"), float("inf"), float("nan")
-    # Reconstruct the FULL prediction grid in flat order (n_stocks, n_windows):
-    # the val_loader runs shuffle=False with no sampler, so flat index
-    # i = stock*n_windows + window regardless of batch boundaries.  The RankIC
-    # is then the SAME quantity as the formal report — evaluate._raw_clean_rank_ic
-    # ranks RAW clean returns (y_return_raw) and enforces config.min_stocks_per_day
-    # per date.  `diag` receives the pool
-    # statistics the train_panel failure path reports on.
-    n_stocks = val_data["static_features"].shape[0]
-    n_windows = val_loader.dataset.n_windows
-    preds = torch.cat(all_preds).reshape(n_stocks, n_windows)
+    # The prediction grid is already reconstructed in (n_stocks, n_windows)
+    # via direct placement.  RankIC is the SAME quantity as the formal report.
     daily_ics, _ = _raw_clean_rank_ic(
         val_data, preds.numpy(), n_windows, config.seq_len,
         min_stocks=config.min_stocks_per_day, diag=diag,
@@ -411,21 +420,25 @@ def train_panel(
         loss_groups, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
 
-    train_ds = PanelDataset(train_data, seq_len=config.seq_len,
-                            min_history=config.min_history)
-    train_sampler = DateGroupedSampler(train_ds.valid_mask)
+    train_ds = PanelDataset(
+        train_data, seq_len=config.seq_len, min_history=config.min_history,
+        max_stocks_per_date=config.max_stocks_per_date, training=True,
+    )
+    train_sampler = DateSampler(train_ds.valid_mask)
     train_loader = DataLoader(
-        train_ds, batch_size=config.batch_size,
+        train_ds, batch_size=1,
         sampler=train_sampler, collate_fn=panel_collate,
         num_workers=config.num_workers, pin_memory=True,
         drop_last=False, persistent_workers=config.num_workers > 0,
         generator=loader_generator,
     )
 
-    val_ds = PanelDataset(val_data, seq_len=config.seq_len,
-                          min_history=config.min_history)
+    val_ds = PanelDataset(
+        val_data, seq_len=config.seq_len, min_history=config.min_history,
+        max_stocks_per_date=None, training=False,
+    )
     val_loader = DataLoader(
-        val_ds, batch_size=config.batch_size,
+        val_ds, batch_size=1,
         shuffle=False, collate_fn=panel_collate,
         num_workers=0, pin_memory=False,
     )
@@ -523,7 +536,7 @@ def train_panel(
         accum_count = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask = batch
+            static, pk, po, y_dir, y_ret, y_vol, date_idx, dir_mask, ret_mask, vol_mask, _stock_idx = batch
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)

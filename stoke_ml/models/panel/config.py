@@ -73,6 +73,13 @@ class PanelConfig:
     # AND at least one target mask is set.
     min_history: int = 50
 
+    # Date-centric sampling (§七/§十六): max stocks per date in one batch.
+    # When a date has more valid stocks, a random subset is sampled each epoch.
+    # None = no cap (use all valid stocks — val default).  The DataLoader
+    # batch_size is always 1 in date-centric mode (one date == one batch);
+    # gradient-accumulation steps control how many dates to average over.
+    max_stocks_per_date: int | None = 512
+
     # Minimum number of eligible stocks a cross-section needs before its
     # per-day RankIC is kept.  Shared by checkpoint
     # selection (train._compute_val_loss) and the formal clean-IC evaluator

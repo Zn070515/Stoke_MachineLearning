@@ -80,16 +80,29 @@ class FittedScoreAdapter(nn.Module):
 class PrecomputedScoreAdapter(nn.Module):
     """Replay a precomputed (N, n_windows) score grid through the evaluator.
 
-    The evaluator's DataLoader emits samples in stock-major order (``idx =
-    stock * n_windows + window``), so a flat grid laid out in the same order
-    lines up when ``forward`` is called sequentially.  ``reset()`` must be
-    called before each evaluation; the position buffer makes the alignment
-    explicit and assertable instead of silently depending on iteration order.
+    §七/§十六 date-centric: the evaluator iterates windows sequentially
+    (shuffle=False) and for each window returns all eval-eligible stocks in
+    ascending index order.  The flat grid is therefore stored in
+    **window-major** order (window 0 stock 0..N-1, window 1 stock 0..N-1, …)
+    so that sequential calls to ``forward`` consume the correct per-window
+    chunks.  ``reset()`` must be called before each evaluation; the position
+    buffer makes the alignment explicit and assertable instead of silently
+    depending on iteration order.
     """
 
     def __init__(self, grid: np.ndarray):
         super().__init__()
-        flat = np.asarray(grid, dtype=np.float32).reshape(-1)
+        # grid is (N, W).  Transpose to (W, N) → flatten yields window-major
+        # order: [w0_s0, w0_s1, …, w0_sN-1, w1_s0, …] — matches date-centric
+        # sequential iteration where each fwd call receives one window's stocks
+        # in ascending index order.
+        grid_np = np.asarray(grid, dtype=np.float32)
+        if grid_np.ndim != 2:
+            raise ValueError(
+                f"PrecomputedScoreAdapter expects 2D (N, W) grid, "
+                f"got shape {grid_np.shape}"
+            )
+        flat = np.ascontiguousarray(grid_np.T).reshape(-1)
         self.register_buffer("_grid", torch.from_numpy(flat))
         self.register_buffer("_pos", torch.zeros((), dtype=torch.long))
 
