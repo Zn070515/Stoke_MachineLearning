@@ -17,8 +17,6 @@ from typing import Optional
 
 import pandas as pd
 
-from stoke_ml.crawler.eastmoney import EastMoneyClient
-
 logger = logging.getLogger(__name__)
 
 # ── Block trade (大宗交易) ───────────────────────────────────────────────
@@ -41,7 +39,18 @@ class BlockTradeSource:
     SOURCE_NAME = "eastmoney_block_trade"
 
     def __init__(self, min_interval: float = 1.2):
-        self._client = EastMoneyClient(min_interval=min_interval)
+        # EastMoneyClient is constructed lazily on first network use (§十六-1):
+        # the online crawler stack (browserforge, curl_cffi) is only installed
+        # in the `online` extra, so a module-load import would break CI jobs
+        # that install just dev+data-adapters.
+        self._min_interval = min_interval
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from stoke_ml.crawler.eastmoney import EastMoneyClient
+            self._client = EastMoneyClient(min_interval=self._min_interval)
+        return self._client
 
     def fetch(self, code: str, page_size: int = 50) -> pd.DataFrame:
         """Fetch block trade records for a stock with pagination.
@@ -52,7 +61,7 @@ class BlockTradeSource:
         all_raw = []
         page = 1
         while True:
-            page_data = self._client.datacenter(
+            page_data = self._get_client().datacenter(
                 "RPT_DATA_BLOCKTRADE",
                 filter_str=f'(SECURITY_CODE="{code}")',
                 page_size=page_size,
@@ -112,7 +121,8 @@ class BlockTradeSource:
         return pd.concat(frames, ignore_index=True)
 
     def close(self):
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
 
 # ── Shareholder count (股东户数变化) ────────────────────────────────────
@@ -137,7 +147,12 @@ class ShareholderSource:
     SOURCE_NAME = "eastmoney_shareholder"
 
     def __init__(self, min_interval: float = 0.8):
-        self._client = EastMoneyClient(min_interval=min_interval)
+        # EastMoneyClient is constructed lazily on first network use (§十六-1):
+        # the online crawler stack (browserforge, curl_cffi) is only installed
+        # in the `online` extra, so a module-load import would break CI jobs
+        # that install just dev+data-adapters.
+        self._min_interval = min_interval
+        self._client = None
         self._api_url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
         self._report = "RPT_HOLDERNUM_DET"
         self._columns = (
@@ -147,6 +162,12 @@ class ShareholderSource:
             "AVG_HOLD_NUM,AVG_MARKET_CAP,TOTAL_A_SHARES,TOTAL_MARKET_CAP,"
             "HOLD_NOTICE_DATE,CLOSE_PRICE,CHANGE_REASON,CHANGE_SHARES"
         )
+
+    def _get_client(self):
+        if self._client is None:
+            from stoke_ml.crawler.eastmoney import EastMoneyClient
+            self._client = EastMoneyClient(min_interval=self._min_interval)
+        return self._client
 
     def fetch_quarter(self, date_str: str, page_size: int = 500) -> pd.DataFrame:
         """Fetch shareholder count for ALL stocks on a quarter-end date.
@@ -162,7 +183,7 @@ class ShareholderSource:
         all_rows = []
         page = 1
         while True:
-            data = self._client.datacenter(
+            data = self._get_client().datacenter(
                 self._report,
                 filter_str=f"(END_DATE='{date_str}')",
                 page_size=page_size,
@@ -204,7 +225,7 @@ class ShareholderSource:
         all_raw = []
         page = 1
         while True:
-            page_data = self._client.datacenter(
+            page_data = self._get_client().datacenter(
                 "RPT_HOLDERNUMLATEST",
                 filter_str=f'(SECURITY_CODE="{code}")',
                 page_size=page_size,
@@ -258,7 +279,8 @@ class ShareholderSource:
         return pd.concat(frames, ignore_index=True)
 
     def close(self):
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
 
 # ── Lockup expiry (限售解禁) ────────────────────────────────────────────
@@ -280,7 +302,18 @@ class LockupExpirySource:
     SOURCE_NAME = "eastmoney_lockup"
 
     def __init__(self, min_interval: float = 1.2):
-        self._client = EastMoneyClient(min_interval=min_interval)
+        # EastMoneyClient is constructed lazily on first network use (§十六-1):
+        # the online crawler stack (browserforge, curl_cffi) is only installed
+        # in the `online` extra, so a module-load import would break CI jobs
+        # that install just dev+data-adapters.
+        self._min_interval = min_interval
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from stoke_ml.crawler.eastmoney import EastMoneyClient
+            self._client = EastMoneyClient(min_interval=self._min_interval)
+        return self._client
 
     def fetch_history(self, code: str, page_size: int = 15) -> pd.DataFrame:
         """Fetch historical lockup expiry records with pagination.
@@ -292,7 +325,7 @@ class LockupExpirySource:
         all_raw = []
         page = 1
         while True:
-            page_data = self._client.datacenter(
+            page_data = self._get_client().datacenter(
                 "RPT_LIFT_STAGE",
                 filter_str=f'(SECURITY_CODE="{code}")',
                 page_size=page_size,
@@ -328,7 +361,7 @@ class LockupExpirySource:
         all_raw = []
         page = 1
         while True:
-            page_data = self._client.datacenter(
+            page_data = self._get_client().datacenter(
                 "RPT_LIFT_STAGE",
                 filter_str=(
                     f'(SECURITY_CODE="{code}")'
@@ -381,7 +414,8 @@ class LockupExpirySource:
         }
 
     def close(self):
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
 
 # ── Dividend history (分红送转) ──────────────────────────────────────────
@@ -402,7 +436,18 @@ class DividendSource:
     SOURCE_NAME = "eastmoney_dividend"
 
     def __init__(self, min_interval: float = 1.2):
-        self._client = EastMoneyClient(min_interval=min_interval)
+        # EastMoneyClient is constructed lazily on first network use (§十六-1):
+        # the online crawler stack (browserforge, curl_cffi) is only installed
+        # in the `online` extra, so a module-load import would break CI jobs
+        # that install just dev+data-adapters.
+        self._min_interval = min_interval
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from stoke_ml.crawler.eastmoney import EastMoneyClient
+            self._client = EastMoneyClient(min_interval=self._min_interval)
+        return self._client
 
     def fetch(self, code: str, page_size: int = 20) -> pd.DataFrame:
         """Fetch dividend history for a stock with pagination.
@@ -414,7 +459,7 @@ class DividendSource:
         all_raw = []
         page = 1
         while True:
-            page_data = self._client.datacenter(
+            page_data = self._get_client().datacenter(
                 "RPT_SHAREBONUS_DET",
                 filter_str=f'(SECURITY_CODE="{code}")',
                 page_size=page_size,
@@ -468,4 +513,5 @@ class DividendSource:
         return pd.concat(frames, ignore_index=True)
 
     def close(self):
-        self._client.close()
+        if self._client is not None:
+            self._client.close()

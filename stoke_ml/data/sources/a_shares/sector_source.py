@@ -17,7 +17,6 @@ from typing import Optional
 import pandas as pd
 import requests
 
-from stoke_ml.crawler.eastmoney import EastMoneyClient
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.codes import (
     UnsupportedMarketError,
@@ -221,7 +220,18 @@ class ConceptBlockSource:
     SOURCE_NAME = "eastmoney_concept_blocks"
 
     def __init__(self, min_interval: float = 1.2):
-        self._client = EastMoneyClient(min_interval=min_interval)
+        # EastMoneyClient is constructed lazily on first network use (§十六-1):
+        # the online crawler stack (browserforge, curl_cffi) is only installed
+        # in the `online` extra, so a module-load import would break CI jobs
+        # that install just dev+data-adapters.
+        self._min_interval = min_interval
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from stoke_ml.crawler.eastmoney import EastMoneyClient
+            self._client = EastMoneyClient(min_interval=self._min_interval)
+        return self._client
 
     def fetch(self, code: str) -> pd.DataFrame:
         """Fetch all boards a stock belongs to.
@@ -236,7 +246,7 @@ class ConceptBlockSource:
             "fields": "f12,f14,f3,f128",
         }
         try:
-            r = self._client.get(
+            r = self._get_client().get(
                 PUSH2_SLIST_URL, params=params,
                 headers=EASTMONEY_HEADERS, timeout=15,
             )
@@ -291,4 +301,5 @@ class ConceptBlockSource:
         return pd.concat(frames, ignore_index=True)
 
     def close(self):
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
