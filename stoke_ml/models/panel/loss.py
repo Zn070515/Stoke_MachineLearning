@@ -130,8 +130,28 @@ class PairwiseRankingLoss(nn.Module):
     This is a hinge-loss variant of RankNet — it directly optimises for
     the ranking that IC and long-short Sharpe evaluate on.
 
-    A `date_idx` tensor maps each sample to its date position so that
-    pairwise comparisons are only computed within the same date group.
+    Date-centric contract (§七/§十六): ``date_idx`` maps each sample to its
+    date position so pairwise comparisons are only computed within the same
+    date group.  With the production DataLoader (``batch_size=1`` +
+    ``DateSampler``) a batch IS one calendar date's complete cross-section — or
+    a ``max_stocks_per_date``-capped random sample of it — so ALL intra-date
+    pairs are present and none are lost to batch boundaries (the old
+    stock-centric ``DateGroupedSampler`` problem).  With ``batch_size>1``
+    (mixed-date batches via ``panel_collate`` concatenation, or a future
+    gradient-accumulation scheme) ``date_idx`` still groups same-date stocks,
+    so pairs only ever form within a date.  When a date is cap-sampled, pairs
+    form over the sampled subset — a deliberate tradeoff (fewer pairs per
+    batch, bounded batch size).
+
+    Per-date prediction normalization is scale-invariant within each date:
+    predictions are re-scaled by their own date's std before the pairwise
+    differences, so multiplying one date's predictions by a positive constant
+    leaves that date's hinge term unchanged.
+
+    Gradient accumulation: each micro-batch is one date, and the per-date loss
+    is already normalized by its own pair count, so summing ``l_rank`` with
+    unit weight per micro-batch (train.py) weights every date equally
+    regardless of how many stocks/pairs it held.
 
     Temperature τ controls the soft-sign steepness for gradient flow.
     """
@@ -181,10 +201,10 @@ class PairwiseRankingLoss(nn.Module):
         # the whole batch (NaN * 0 == NaN propagates through the masked sum).
         pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # A batch can hold several dates' head/tail slices, so
-        # predictions are normalized PER DATE — not over the mixed batch — and
-        # each date's pairwise loss is weighted by its own pair count.  The
-        # date loop is cheap: DateGroupedSampler batches contain 1-2 dates.
+        # Predictions are normalized PER DATE — not over the mixed batch — and
+        # each date's pairwise loss is weighted by its own pair count.  With
+        # batch_size=1 (production) this loop runs once per date batch; the
+        # per-date grouping also handles batch_size>1 mixed-date batches.
         unique_dates = torch.unique(date_idx[valid])
         hinge_sum = torch.zeros((), device=pred.device, dtype=pred.dtype)
         spread_sum = torch.zeros((), device=pred.device, dtype=pred.dtype)

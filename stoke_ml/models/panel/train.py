@@ -78,32 +78,78 @@ def _configure_reproducibility(config: PanelConfig) -> dict:
     return report
 
 
-def _rank_pool_stats(ds: PanelDataset) -> tuple[list[int], int]:
-    """Per-date rank-eligible stock counts + total possible same-date pairs.
+def _expected_pairs(n_entry: int, n_ret: int, cap: int | None) -> float:
+    """Expected number of same-date pairs the rank loss forms for ONE date.
+
+    The dataset draws ``k = min(n_entry, cap)`` stocks uniformly WITHOUT
+    replacement from the date's entry-eligible pool (``n_entry``), and the rank
+    loss forms pairs over the ret-valid subset of that sample.  ``n_ret`` of
+    the ``n_entry`` pool members are ret-valid (return targets require a
+    realized exit), so the number X of ret-valid stocks in the sample is
+    hypergeometric: X ~ Hypergeometric(N=n_entry, K=n_ret, n=k).  E[C(X, 2)]
+    is the expected pair total, computable exactly from the counts alone — no
+    per-window sampling needed.
+
+    This is the honest denominator for ``pair_coverage``: it reflects the pair
+    space the loss actually samples from.  The naive C(min(n_entry, cap), 2)
+    over-counts whenever ret-invalid stocks sit in the entry pool (typical:
+    ret-valid < entry-valid), which made the old coverage metric structurally
+    unable to reach 1.0.
+    """
+    if n_ret < 2 or n_entry <= 0:
+        return 0.0
+    k = min(n_entry, cap) if cap is not None else n_entry
+    if k == 0:
+        return 0.0
+    p = n_ret / n_entry
+    e_x = k * p
+    var_x = (
+        k * p * (1.0 - p) * (n_entry - k) / (n_entry - 1)
+        if n_entry > 1 else 0.0
+    )
+    e_x2 = var_x + e_x * e_x
+    return (e_x2 - e_x) / 2.0
+
+
+def _rank_pool_stats(ds: PanelDataset) -> tuple[list[int], float]:
+    """Per-date rank-eligible stock counts + expected same-date pair total.
 
     PairwiseRankingLoss can only form pairs between stocks that share a target
     date AND both carry a valid return target.  With date-centric batching
-    (§七/§十六) each batch is ONE date, so no date is split across sub-batches;
-    but when a date's eligible stock count exceeds ``max_stocks_per_date`` the
-    dataset samples a capped subset and only those stocks participate.  The
-    theoretical pair total is therefore C(min(n, cap), 2) — ``pair_coverage``
-    is pairs actually formed over that capped space, so a capped dataset can
-    reach 1.0.
+    (§七/§十六) each training batch is ONE date, so no date is split across
+    batch boundaries; but two effects shrink the pair space the loss actually
+    samples from relative to the raw entry-eligible pool:
+
+    * return targets require a realized exit, so only the ret-valid subset of
+      the entry-eligible pool can form pairs; and
+    * when a date's entry-eligible count exceeds ``max_stocks_per_date`` the
+      dataset samples a capped subset, so pairs form only over the ret-valid
+      stocks that land in that sample.
+
+    ``expected_pairs`` is therefore the EXPECTED pair total under the dataset's
+    actual sampling scheme (uniform k-of-n draw → hypergeometric on the
+    ret-valid count; see ``_expected_pairs``).  It is the denominator
+    ``pair_coverage`` divides against — unlike the old C(min(n, cap), 2) total
+    it can be reached (≈1.0) when the epoch forms the expected number of pairs,
+    instead of being structurally capped below 1.0 by ret-invalid stocks.
+
+    ``stocks_per_date`` reports the per-date ret-valid count within the entry
+    pool — the number of stocks that can actually be ranked that day.
     """
-    cap = ds.max_stocks_per_date
     if ds.ret_target is None:
-        pool = ds.valid_mask
+        ret_avail = ds.valid_mask  # no return mask → every valid stock ranks
     else:
         # valid_mask is (N, N_windows) over target windows; ret_target is
         # (N, T) over absolute days.  Window w's target day is w + seq_len.
-        pool = ds.valid_mask & ds.ret_target[:, ds.seq_len:]
-    per_date = pool.sum(dim=0).tolist()
-    stocks_per_date = [n for n in per_date if n > 0]
-    possible_pairs = 0
-    for n in per_date:
-        capped = min(n, cap) if cap is not None else n
-        possible_pairs += capped * (capped - 1) // 2
-    return stocks_per_date, possible_pairs
+        ret_avail = ds.valid_mask & ds.ret_target[:, ds.seq_len:]
+    entry_counts = ds.valid_mask.sum(dim=0).tolist()
+    ret_counts = ret_avail.sum(dim=0).tolist()
+    stocks_per_date = [n for n in ret_counts if n > 0]
+    expected_pairs = sum(
+        _expected_pairs(e, r, ds.max_stocks_per_date)
+        for e, r in zip(entry_counts, ret_counts)
+    )
+    return stocks_per_date, expected_pairs
 
 
 def _entry_bias_report(train_data: dict, val_data: dict, seq_len: int) -> dict:
@@ -451,11 +497,12 @@ def train_panel(
         num_workers=0, pin_memory=False,
     )
 
-    # §十二-3: theoretical ranking pool — per-date eligible stock counts and
-    # the C(min(n, max_stocks_per_date), 2) pair total they imply.  Fixed for
-    # the dataset, so computed once here and reused as the coverage denominator
-    # every epoch.
-    rank_pool_sizes, rank_possible_pairs = _rank_pool_stats(train_ds)
+    # §十二-3: ranking-loss coverage denominator — the EXPECTED pair space the
+    # loss samples from per epoch (see _rank_pool_stats: the cap-sampled
+    # entry-eligible pool intersected with ret-valid, averaged over the
+    # dataset's random sampling).  Fixed for the dataset, so computed once here
+    # and reused as the coverage denominator every epoch.
+    rank_pool_sizes, rank_expected_pairs = _rank_pool_stats(train_ds)
 
     warmup = LinearLR(
         optimizer,
@@ -681,19 +728,23 @@ def train_panel(
         # no pairs contributes 0 and is not a fair divisor member either).
         rank_divisor = max(epoch_rank_batches, 1)
 
-        # §十二-3: ranking-loss coverage for the epoch.  When a date's eligible
-        # stock count exceeds max_stocks_per_date the dataset samples a capped
-        # subset, so pairs are only ever formed among that subset — record how
-        # much of the capped C(min(n, cap), 2) pair space the epoch actually
-        # covered so a silently degraded ranking signal is visible in history.
+        # §十二-3: ranking-loss coverage for the epoch.  When a date's
+        # entry-eligible count exceeds max_stocks_per_date the dataset samples
+        # a capped subset, so pairs form only over the ret-valid stocks that
+        # land in that sample — record how much of the EXPECTED pair space the
+        # epoch actually covered so a silently degraded ranking signal is
+        # visible in history.  The denominator is the expectation under the
+        # dataset's sampling (see _rank_pool_stats), so coverage can genuinely
+        # reach ~1.0 — the old C(min(n, cap), 2) could not when ret-invalid
+        # stocks sat in the entry pool.
         rank_active_rate = epoch_rank_batches / max(len(train_loader), 1)
-        pair_coverage = epoch_rank_pairs / max(rank_possible_pairs, 1)
+        pair_coverage = epoch_rank_pairs / max(rank_expected_pairs, 1)
         history.setdefault("rank_coverage", []).append({
             "stocks_per_date": rank_pool_sizes,
             "pair_coverage": pair_coverage,
             "rank_active_rate": rank_active_rate,
             "pairs_per_epoch": epoch_rank_pairs,
-            "possible_pairs": rank_possible_pairs,
+            "expected_pairs": rank_expected_pairs,
             "rank_active_batches": epoch_rank_batches,
         })
 
@@ -768,9 +819,9 @@ def train_panel(
 
         if rank_pool_sizes:
             logger.info(
-                "  Rank coverage: pairs=%d/%d (%.1f%%) active_batches=%d/%d "
+                "  Rank coverage: pairs=%d/%.1f (%.1f%%) active_batches=%d/%d "
                 "(%.1f%%) stocks/date max=%d mean=%.1f",
-                epoch_rank_pairs, rank_possible_pairs, 100 * pair_coverage,
+                epoch_rank_pairs, rank_expected_pairs, 100 * pair_coverage,
                 epoch_rank_batches, len(train_loader), 100 * rank_active_rate,
                 max(rank_pool_sizes), float(np.mean(rank_pool_sizes)))
 

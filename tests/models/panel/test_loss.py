@@ -1,9 +1,74 @@
 import inspect
 
+import numpy as np
 import torch
 from stoke_ml.models.panel.loss import (
     UncertaintyLoss, FixedTaskWeights, AdjMSELoss, PairwiseRankingLoss,
 )
+
+
+def _make_rank_panel(n_stocks=8, n_timesteps=90, seq_len=60, horizon=5):
+    """Small priced panel for the date-centric rank-loss integration tests.
+
+    Mirrors tests/models/panel/test_train.py::_make_masked_panel: real price
+    paths, per-task masks, and global date_indices — the exact shapes the
+    production ``PanelDataset`` consumes.
+    """
+    rng = np.random.RandomState(0)
+    close = np.full((n_stocks, n_timesteps), 10.0, dtype=np.float32)
+    shocks = rng.randn(n_stocks, n_timesteps - 1).astype(np.float32) * 0.02
+    close[:, 1:] = close[:, :1] * np.exp(np.cumsum(shocks, axis=1))
+    open_ = np.empty_like(close)
+    open_[:, 0] = close[:, 0]
+    gaps = 1.0 + rng.randn(n_stocks, n_timesteps - 1).astype(np.float32) * 0.005
+    open_[:, 1:] = close[:, :-1] * gaps
+
+    obs = np.ones((n_stocks, n_timesteps), dtype=bool)
+    entry = np.ones((n_stocks, n_timesteps), dtype=bool)
+    decision = np.ones((n_stocks, n_timesteps), dtype=bool)
+    decision[:, 0] = False  # no close[t-1]
+
+    ret_tgt = np.zeros((n_stocks, n_timesteps), dtype=bool)
+    vol_tgt = np.zeros((n_stocks, n_timesteps), dtype=bool)
+    for t in range(n_timesteps - horizon):
+        have_exit = np.isfinite(open_[:, t + horizon])
+        ret_tgt[:, t] = have_exit
+        if t + horizon < n_timesteps:
+            fwd = close[:, t + 1:t + horizon + 1]
+            vol_tgt[:, t] = have_exit & np.isfinite(fwd).all(axis=1)
+
+    y_ret = np.zeros((n_stocks, n_timesteps), dtype=np.float32)
+    for t in range(n_timesteps - horizon):
+        y_ret[:, t] = open_[:, t + horizon] / open_[:, t] - 1.0
+
+    y_dir = np.full((n_stocks, n_timesteps), -100, dtype=np.int64)
+    sel = y_ret[ret_tgt]
+    y_dir[ret_tgt] = np.where(sel > 0.001, 2, np.where(sel < -0.001, 0, 1))
+
+    y_vol = np.zeros((n_stocks, n_timesteps), dtype=np.float32)
+
+    static = rng.randn(n_stocks, n_timesteps, 4).astype(np.float32)
+    pk = rng.randn(n_stocks, n_timesteps, 12).astype(np.float32)
+    po = rng.randn(n_stocks, n_timesteps, 6).astype(np.float32)
+    date_indices = np.tile(np.arange(n_timesteps, dtype=np.int64)[None, :],
+                           (n_stocks, 1))
+
+    return {
+        "static_features": static,
+        "past_known": pk,
+        "past_observed": po,
+        "y_direction": y_dir,
+        "y_return": y_ret,
+        "y_volatility": y_vol,
+        "observation_mask": obs,
+        "entry_eligible_mask": entry,
+        "decision_eligible_mask": decision,
+        "return_target_mask": ret_tgt,
+        "vol_target_mask": vol_tgt,
+        "date_indices": date_indices,
+        "close_price": close,
+        "open_price": open_,
+    }
 
 
 class TestUncertaintyLoss:
@@ -219,3 +284,226 @@ class TestPairwiseRankingLoss:
         mask = torch.ones(8, dtype=torch.float32)
         loss = loss_fn(pred, target, mask, date_idx)
         assert torch.allclose(loss, torch.zeros(()), atol=1e-5)
+
+
+class TestPairwiseRankingLossDateCentric:
+    """§七/§十六 cross-sectional semantics of PairwiseRankingLoss on the
+    date-centric contract.  With the production DataLoader (batch_size=1 +
+    DateSampler) a batch IS one date's complete (or cap-sampled) cross-section;
+    batch_size>1 concatenates dates via panel_collate.  These tests pin the
+    pair-counting and per-date normalization either way."""
+
+    def test_complete_cross_section_single_date(self):
+        """One batch with N stocks on a single date produces exactly C(N,2)
+        pairs — the full cross-section, none lost to batch boundaries."""
+        loss_fn = PairwiseRankingLoss()
+        N = 7
+        date_idx = torch.zeros(N, dtype=torch.long)
+        target = torch.linspace(-1.0, 1.0, N)
+        pred = torch.linspace(-1.0, 1.0, N)  # perfect ordering → hinge 0
+        mask = torch.ones(N, dtype=torch.float32)
+        stats: list[dict] = []
+        loss = loss_fn(pred, target, mask, date_idx, stats=stats)
+        assert stats[0]["n_dates"] == 1
+        assert stats[0]["stocks_per_date"] == [N]
+        assert stats[0]["n_pairs"] == N * (N - 1) // 2
+        assert torch.isfinite(loss)
+
+    def test_mixed_date_grouping_exact_pair_total(self):
+        """2 dates × M stocks in one batch → n_pairs == 2 × C(M,2); pairs only
+        ever form within a date (no cross-date pairs)."""
+        loss_fn = PairwiseRankingLoss()
+        M = 4
+        date_idx = torch.tensor([0] * M + [1] * M)
+        target = torch.tensor([-0.2, -0.1, 0.1, 0.2, -2.0, -1.0, 1.0, 2.0],
+                              dtype=torch.float32)
+        pred = torch.tensor([0.1, 0.2, 0.3, 0.4, 1.0, 2.0, 3.0, 4.0],
+                            dtype=torch.float32)
+        mask = torch.ones(2 * M, dtype=torch.float32)
+        stats: list[dict] = []
+        loss = loss_fn(pred, target, mask, date_idx, stats=stats)
+        assert stats[0]["n_dates"] == 2
+        assert stats[0]["stocks_per_date"] == [M, M]
+        assert stats[0]["n_pairs"] == 2 * (M * (M - 1) // 2)
+        assert torch.isfinite(loss)
+
+    def test_per_date_scale_invariance_and_no_cross_date_pairs(self):
+        """Scale-invariance per date: multiplying ONE date's predictions by a
+        positive constant leaves the hinge unchanged (predictions are
+        normalized by their own date's std).  Also pins n_pairs == 2×C(3,2)
+        with no cross-date pairs."""
+        loss_fn = PairwiseRankingLoss(margin=0.0, tau=1.0,
+                                      spread_target=1.0, spread_weight=0.0)
+        date_idx = torch.tensor([0, 0, 0, 1, 1, 1])
+        target = torch.tensor([-0.1, 0.0, 0.1, -1.0, 0.0, 1.0],
+                              dtype=torch.float32)
+        pred = torch.tensor([0.2, 0.5, 0.8, 1.0, 2.0, 3.0], dtype=torch.float32)
+        mask = torch.ones(6, dtype=torch.float32)
+        stats: list[dict] = []
+        base = loss_fn(pred, target, mask, date_idx, stats=stats)
+        assert stats[0]["n_dates"] == 2
+        assert stats[0]["stocks_per_date"] == [3, 3]
+        assert stats[0]["n_pairs"] == 6  # 2 × C(3,2), no cross-date pairs
+
+        pred_scaled = pred.clone()
+        pred_scaled[3:] = pred_scaled[3:] * 10.0  # scale date 1 only
+        scaled = loss_fn(pred_scaled, target, mask, date_idx)
+        assert torch.allclose(scaled, base, atol=1e-6)
+
+    def test_date_with_two_stocks_forms_one_pair(self):
+        """Boundary: a date with exactly 2 ret-valid stocks forms exactly 1 pair."""
+        loss_fn = PairwiseRankingLoss()
+        date_idx = torch.tensor([0, 0, 1, 1])
+        target = torch.tensor([-0.1, 0.1, -0.2, 0.2], dtype=torch.float32)
+        pred = torch.tensor([0.3, 0.1, 0.4, 0.2], dtype=torch.float32)
+        mask = torch.ones(4, dtype=torch.float32)
+        stats: list[dict] = []
+        loss_fn(pred, target, mask, date_idx, stats=stats)
+        assert stats[0]["stocks_per_date"] == [2, 2]
+        assert stats[0]["n_pairs"] == 2  # 1 pair per date
+
+    def test_small_date_group_reported_honestly(self):
+        """A date with a single ret-valid stock appears in n_dates but NOT in
+        stocks_per_date / n_pairs — the stats report it honestly."""
+        loss_fn = PairwiseRankingLoss()
+        date_idx = torch.tensor([0, 0, 0, 1])
+        target = torch.tensor([-0.1, 0.0, 0.1, 0.5], dtype=torch.float32)
+        pred = torch.tensor([0.3, 0.2, 0.1, 0.4], dtype=torch.float32)
+        mask = torch.ones(4, dtype=torch.float32)
+        stats: list[dict] = []
+        loss = loss_fn(pred, target, mask, date_idx, stats=stats)
+        assert not torch.isnan(loss)
+        assert stats[0]["n_dates"] == 2
+        assert stats[0]["stocks_per_date"] == [3]
+        assert stats[0]["n_pairs"] == 3
+
+    def test_all_dates_below_two_ret_valid_zero_pairs_no_crash(self):
+        """A batch where NO date has >= 2 ret-valid stocks returns 0 loss and
+        does not crash; no stats entry is appended (there are no pairs)."""
+        loss_fn = PairwiseRankingLoss()
+        date_idx = torch.tensor([0, 0, 1])
+        target = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
+        pred = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
+        mask = torch.tensor([1.0, 0.0, 1.0])  # date 0: 1 valid, date 1: 1 valid
+        stats: list[dict] = []
+        loss = loss_fn(pred, target, mask, date_idx, stats=stats)
+        assert loss.item() == 0.0
+        assert not torch.isnan(loss)
+        assert stats == []
+
+
+class TestPairwiseRankingLossPanelDatasetIntegration:
+    """Feed a REAL PanelDataset window (the date-centric 11-tuple) into
+    PairwiseRankingLoss — proves the loss consumes the contract end-to-end."""
+
+    SEQ_LEN = 60
+
+    def _first_big_window(self, ds):
+        counts = ds.valid_mask.sum(dim=0)
+        return int(torch.where(counts >= 3)[0][0])
+
+    def test_capped_cross_section_forms_pairs_over_sample(self):
+        from stoke_ml.models.panel.dataset import PanelDataset
+        data = _make_rank_panel(n_stocks=8, n_timesteps=90, seq_len=self.SEQ_LEN,
+                                horizon=5)
+        cap = 4
+        ds = PanelDataset(data, seq_len=self.SEQ_LEN, min_history=50,
+                          max_stocks_per_date=cap, training=True)
+        window = self._first_big_window(ds)
+        (static, pk, po, y_dir, y_ret, y_vol,
+         date_idx, dir_mask, ret_mask, vol_mask, stock_indices) = ds[window]
+        assert ret_mask.numel() <= cap, (
+            f"capped batch exceeded cap: {ret_mask.numel()} > {cap}")
+        n_ret = int(ret_mask.sum().item())
+        loss_fn = PairwiseRankingLoss(margin=0.0, tau=0.1,
+                                      spread_target=1.0, spread_weight=0.5)
+        stats: list[dict] = []
+        # pred uses the 11-tuple's return target as a stand-in prediction — the
+        # point is the loss consumes the date-centric shapes/masks correctly.
+        loss = loss_fn(y_ret, y_ret, ret_mask.float(), date_idx, stats=stats)
+        assert torch.isfinite(loss)
+        assert stats[0]["n_dates"] == 1
+        assert stats[0]["n_pairs"] == n_ret * (n_ret - 1) // 2
+        assert stats[0]["stocks_per_date"] == [n_ret]
+
+    def test_uncapped_complete_cross_section(self):
+        from stoke_ml.models.panel.dataset import PanelDataset
+        data = _make_rank_panel(n_stocks=8, n_timesteps=90, seq_len=self.SEQ_LEN,
+                                horizon=5)
+        ds = PanelDataset(data, seq_len=self.SEQ_LEN, min_history=50,
+                          max_stocks_per_date=None, training=True)
+        window = self._first_big_window(ds)
+        (static, pk, po, y_dir, y_ret, y_vol,
+         date_idx, dir_mask, ret_mask, vol_mask, stock_indices) = ds[window]
+        n_valid = int(ds.valid_mask[:, window].sum().item())
+        assert stock_indices.numel() == n_valid  # complete cross-section
+        n_ret = int(ret_mask.sum().item())
+        loss_fn = PairwiseRankingLoss(margin=0.0, tau=0.1,
+                                      spread_target=1.0, spread_weight=0.5)
+        stats: list[dict] = []
+        loss = loss_fn(y_ret, y_ret, ret_mask.float(), date_idx, stats=stats)
+        assert torch.isfinite(loss)
+        assert stats[0]["n_dates"] == 1
+        assert stats[0]["n_pairs"] == n_ret * (n_ret - 1) // 2
+
+
+class TestRankPoolStatsExpectedPairs:
+    """§七/§十六 honest pair-coverage denominator (train._rank_pool_stats).
+
+    The old C(min(entry, cap), 2) over-counted the achievable pair space
+    whenever ret-invalid stocks sat in the entry pool (return targets require a
+    realized exit), so pair_coverage could structurally never reach 1.0 — the
+    code-review finding this sub-task fixes."""
+
+    def test_expected_pairs_no_cap_or_superset_cap(self):
+        from stoke_ml.models.panel.train import _expected_pairs
+        assert _expected_pairs(10, 10, None) == 45.0  # C(10,2)
+        assert _expected_pairs(10, 10, 20) == 45.0    # cap >= n → full cross-section
+        assert _expected_pairs(10, 10, 4) == 6.0      # sample 4 of 10, all ret-valid
+
+    def test_expected_pairs_degenerate(self):
+        from stoke_ml.models.panel.train import _expected_pairs
+        assert _expected_pairs(10, 0, 4) == 0.0   # no ret-valid → no pairs
+        assert _expected_pairs(4, 1, 4) == 0.0    # <2 ret-valid → no pairs
+        assert _expected_pairs(0, 0, 4) == 0.0    # empty date
+
+    def test_ret_invalid_stocks_shrink_achievable_pair_space(self):
+        """The reviewer's bias, exactly: with 10 entry-valid but only 5
+        ret-valid, capping the sample at 4 yields FEWER expected pairs than
+        C(min(10,4),2)=6 — the old denominator could not be reached."""
+        from stoke_ml.models.panel.train import _expected_pairs
+        naive = 4 * 3 // 2
+        expected = _expected_pairs(10, 5, 4)
+        assert 0.0 < expected < naive
+        # Exact hypergeometric expectation E[C(X,2)], X ~ Hypergeo(N=10,K=5,n=4).
+        e_x = 4 * 5 / 10
+        var_x = e_x * (1 - 5 / 10) * (10 - 4) / (10 - 1)
+        e_x2 = var_x + e_x * e_x
+        assert abs(expected - (e_x2 - e_x) / 2) < 1e-9
+
+    def test_rank_pool_stats_no_cap_is_exact(self):
+        from stoke_ml.models.panel.train import _rank_pool_stats
+        from stoke_ml.models.panel.dataset import PanelDataset
+        data = _make_rank_panel(n_stocks=8, n_timesteps=90, seq_len=60, horizon=5)
+        ds = PanelDataset(data, seq_len=60, min_history=50,
+                          max_stocks_per_date=None, training=True)
+        stocks_per_date, expected = _rank_pool_stats(ds)
+        ret_counts = (ds.valid_mask & ds.ret_target[:, ds.seq_len:]).sum(dim=0)
+        ret_counts = ret_counts.tolist()
+        assert stocks_per_date == [n for n in ret_counts if n > 0]
+        exact = sum(n * (n - 1) // 2 for n in ret_counts if n > 0)
+        assert abs(expected - exact) < 1e-6
+
+    def test_rank_pool_stats_capped_below_naive(self):
+        """With a cap the expectation never exceeds the naive C(min(entry,
+        cap), 2) total the old metric used."""
+        from stoke_ml.models.panel.train import _rank_pool_stats
+        from stoke_ml.models.panel.dataset import PanelDataset
+        data = _make_rank_panel(n_stocks=8, n_timesteps=90, seq_len=60, horizon=5)
+        ds = PanelDataset(data, seq_len=60, min_history=50,
+                          max_stocks_per_date=3, training=True)
+        _, expected = _rank_pool_stats(ds)
+        entry_counts = ds.valid_mask.sum(dim=0).tolist()
+        naive = sum(min(e, 3) * (min(e, 3) - 1) // 2
+                    for e in entry_counts if e > 0)
+        assert expected <= naive
