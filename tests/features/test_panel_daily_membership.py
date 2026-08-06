@@ -257,3 +257,53 @@ class TestMemberLimitedNormalization:
             expected = (member_vals[i] - mean) / std
             assert z == pytest.approx(expected, abs=1e-3), (
                 f"member {code} z={z:.4f} != member-only z={expected:.4f}")
+
+    def test_zero_member_sparse_date_pooled_fallback(self):
+        """A ZERO-member date whose all-stock cross-section is sparse (<5 rows)
+        must route the missing-date fallback through the sparse
+        expanding-moments path too.  Pre-fix the fallback ran a RAW groupby: on
+        a degenerate cross-section (e.g. [0, 0, 0]) the std clips to the 1e-8
+        floor and that date's z-scores collapse to exactly 0.  The pooled
+        expanding-moments fallback yields a real cross-sectional std instead.
+        """
+        panel = _make_synthetic_panel(n_stocks=3, n_days=200)
+        dates = sorted(panel["date"].unique())
+        member_codes = [f"{600000 + i:06d}" for i in range(2)]
+        non_member = f"{600002:06d}"
+        cut = dates[100]
+        # Members cover only dates[0..99]; dates[100..] have ZERO member rows.
+        membership = _member_frame(member_codes, dates[0], cut)
+        spike = dates[100]   # a zero-member date — non-member spikes to 100
+        target = dates[105]  # later zero-member date — non-member is back to 0
+
+        # Members stay constant 0.0; the non-member is 0.0 except a one-day
+        # spike on ``spike``.  On ``target`` the all-stock cross-section is
+        # [0, 0, 0] → the raw groupby std is 0 (clipped to 1e-8), but the
+        # expanding-moments fallback pools the earlier spike and yields a real
+        # pooled std, so ``target`` is z-scored with genuine cross-sectional
+        # scale rather than a degenerate clip.
+        aux = {}
+        for code in panel["stock_code"].unique():
+            rows = []
+            for d in dates:
+                v = 0.0
+                if code == non_member and d == spike:
+                    v = 100.0
+                rows.append({"date": d, "sentiment_mean": v})
+            aux[code] = {"sentiment": pd.DataFrame(rows)}
+
+        data = _pipeline().build_panel_features(
+            panel, aux_data=aux, horizon=HORIZON,
+            daily_membership=membership)
+
+        assert np.isfinite(data["past_observed"]).all()
+        col = _col_index(data["past_observed_cols"], "sentiment_mean")
+        sidx = list(data["stock_codes"]).index(non_member)
+        dcol = _date_index(data["global_dates"], target)
+        z = data["past_observed"][sidx, dcol, col]
+        # Pre-fix the fallback's degenerate clip makes this exactly 0; the
+        # pooled fallback must produce a real, non-zero statistic instead.
+        assert abs(z) > 1e-3, (
+            f"degenerate clip: zero-member sparse-date z={z:.6f} is ~0")
+        assert abs(z) < 20, (
+            f"z not bounded after pooled fallback: {z:.6f}")

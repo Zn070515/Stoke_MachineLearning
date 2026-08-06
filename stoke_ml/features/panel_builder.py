@@ -109,6 +109,53 @@ def _daily_member_flag(
     return pd.Series(is_member, index=all_feat.index)
 
 
+def _cross_section_stats(feat: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Per-date cross-sectional ``["mean", "std", "count"]`` for one column.
+
+    ``feat`` is the frame restricted to the desired statistical set (all
+    stocks, or a membership subset); ``col`` must be a column of ``feat``.
+    Sparse dates fall back to expanding moments (see below).
+    """
+    stats = feat.groupby("date")[col].agg(["mean", "std", "count"])
+    stats["std"] = stats["std"].fillna(1.0).clip(lower=1e-8)
+    # Dates with very few listed stocks (the 2000-2015 backfill has
+    # 1-5 stocks/day) give a degenerate cross-section: std→0 inflates
+    # z-scores to ±hundreds, which dominates the loss.  Fall back to
+    # the pooled global mean/std for those sparse dates — the global
+    # moments are stable even when the daily cross-section is tiny.
+    sparse = stats["count"] < 5
+    if sparse.any():
+        # Full-panel pooled moments would leak future dates' statistics
+        # into early dates' z-scores (the exact bias the per-date
+        # cross-section avoids).  Use expanding moments over dates <=
+        # the sparse date — strictly point-in-time.  Cumulative sums
+        # give O(dates) per column instead of O(dates^2).
+        sdf = feat[["date", col]].sort_values("date")
+        col_vals = sdf[col].to_numpy(dtype=np.float64)
+        # Treat inf as invalid too (np.nanmean/np.nanstd choke on it
+        # and would leak NaN through the z-score).
+        valid_vals = np.isfinite(col_vals)
+        x = np.where(valid_vals, col_vals, 0.0)
+        ccount = np.cumsum(valid_vals.astype(np.float64))
+        csum = np.cumsum(x)
+        csq = np.cumsum(x * x)
+        sdates = pd.to_datetime(sdf["date"]).to_numpy(dtype="datetime64[ns]")
+        sparse_dates = pd.to_datetime(stats.index[sparse]).to_numpy(dtype="datetime64[ns]")
+        pos = np.clip(
+            np.searchsorted(sdates, sparse_dates, side="right") - 1,
+            0, len(sdates) - 1,
+        )
+        cnt = np.maximum(ccount[pos], 1.0)
+        mean = csum[pos] / cnt
+        var = np.maximum(csq[pos] / cnt - mean * mean, 0.0)
+        std = np.maximum(np.sqrt(var), 1e-8)
+        # groupby agg returns float32 columns; the float64 arrays must
+        # be cast back or pandas raises LossySetitemError.
+        stats.loc[sparse, "mean"] = mean.astype(stats["mean"].dtype)
+        stats.loc[sparse, "std"] = std.astype(stats["std"].dtype)
+    return stats
+
+
 def build_panel_features(
     pipeline,
     panel: pd.DataFrame,
@@ -831,60 +878,35 @@ def build_panel_features(
             all_feat[c] = vals.replace([np.inf, -np.inf], np.nan)
 
     date_stats: dict[str, pd.DataFrame] = {}
+    # §T6: the member subset (hence the dates missing from it) is
+    # column-invariant — hoist the boolean mask and the missing-date set out of
+    # the per-column loop so each column does NOT re-run a full-panel groupby
+    # over ~33M rows just to find the same zero-member dates.
+    if is_member is not None:
+        member_feat = all_feat[is_member]
+        missing_dates = sorted(set(all_feat["date"]) - set(member_feat["date"]))
+    else:
+        member_feat = all_feat
+        missing_dates = []
     for col in norm_cols:
         if col not in all_feat.columns:
             continue
-        stat_feat = all_feat if is_member is None else all_feat[is_member]
-        stats = stat_feat.groupby("date")[col].agg(["mean", "std", "count"])
-        stats["std"] = stats["std"].fillna(1.0).clip(lower=1e-8)
-        # Dates with very few listed stocks (the 2000-2015 backfill has
-        # 1-5 stocks/day) give a degenerate cross-section: std→0 inflates
-        # z-scores to ±hundreds, which dominates the loss.  Fall back to
-        # the pooled global mean/std for those sparse dates — the global
-        # moments are stable even when the daily cross-section is tiny.
-        sparse = stats["count"] < 5
-        if sparse.any():
-            # Full-panel pooled moments would leak future dates' statistics
-            # into early dates' z-scores (the exact bias the per-date
-            # cross-section avoids).  Use expanding moments over dates <=
-            # the sparse date — strictly point-in-time.  Cumulative sums
-            # give O(dates) per column instead of O(dates^2).
-            sdf = stat_feat[["date", col]].sort_values("date")
-            col_vals = sdf[col].to_numpy(dtype=np.float64)
-            # Treat inf as invalid too (np.nanmean/np.nanstd choke on it
-            # and would leak NaN through the z-score).
-            valid_vals = np.isfinite(col_vals)
-            x = np.where(valid_vals, col_vals, 0.0)
-            ccount = np.cumsum(valid_vals.astype(np.float64))
-            csum = np.cumsum(x)
-            csq = np.cumsum(x * x)
-            sdates = pd.to_datetime(sdf["date"]).to_numpy(dtype="datetime64[ns]")
-            sparse_dates = pd.to_datetime(stats.index[sparse]).to_numpy(dtype="datetime64[ns]")
-            pos = np.clip(
-                np.searchsorted(sdates, sparse_dates, side="right") - 1,
-                0, len(sdates) - 1,
-            )
-            cnt = np.maximum(ccount[pos], 1.0)
-            mean = csum[pos] / cnt
-            var = np.maximum(csq[pos] / cnt - mean * mean, 0.0)
-            std = np.maximum(np.sqrt(var), 1e-8)
-            # groupby agg returns float32 columns; the float64 arrays must
-            # be cast back or pandas raises LossySetitemError.
-            stats.loc[sparse, "mean"] = mean.astype(stats["mean"].dtype)
-            stats.loc[sparse, "std"] = std.astype(stats["std"].dtype)
+        stats = _cross_section_stats(member_feat, col)
         date_stats[col] = stats
-        if is_member is not None:
+        if is_member is not None and missing_dates:
             # §T6: a date present in the panel but with ZERO member rows must
             # still receive stats — otherwise the .map below yields NaN and the
             # post-processing nan_to_num zeroes the WHOLE date's features.  Fall
-            # back to the all-stock groupby stats (the current behavior computed
-            # over the full cross-section) for exactly those dates.  Also covers
-            # a member subset with no entry for the date (sparse-fallback edges).
-            all_stats = all_feat.groupby("date")[col].agg(["mean", "std", "count"])
-            all_stats["std"] = all_stats["std"].fillna(1.0).clip(lower=1e-8)
-            missing = all_stats.index.difference(stats.index)
-            if len(missing):
-                date_stats[col] = pd.concat([stats, all_stats.loc[missing]])
+            # back to the all-stock cross-section stats for exactly those dates.
+            # Restricting to the missing-date rows makes the groupby tiny AND
+            # routes it through the sparse expanding-moments fallback — the
+            # all-stock cross-section on those dates can itself be sparse, and
+            # without the fallback its degenerate std→0 (clipped to 1e-8) would
+            # blow up that date's z-scores.  all_stats carries ONLY the missing
+            # dates, so no .loc[missing] filter is needed here.
+            missing_feat = all_feat[all_feat["date"].isin(missing_dates)]
+            all_stats = _cross_section_stats(missing_feat, col)
+            date_stats[col] = pd.concat([stats, all_stats])
 
     for df in all_feat_dfs:
         for col in norm_cols:
