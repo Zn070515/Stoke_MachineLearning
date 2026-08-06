@@ -1339,34 +1339,45 @@ def _save_artifacts(
 def _predict_outer(model, outer_data, config, device) -> np.ndarray | None:
     """Run the deployed checkpoint over the outer-test panel.
 
-    Uses the same no-sampler DataLoader as evaluate_portfolio, so every
-    (stock, window) pair is emitted in index order and the flattened return
-    predictions reshape back to (n_stocks, n_windows).  Window d enters at
-    panel column seq_len + d — i.e. global column val_start + d of the full
-    panel.  Returns None only when the outer panel has no windows.
+    Date-centric (§七/§十六): uses the same eval-mode no-sampler DataLoader as
+    evaluate_portfolio (training=False → eval_mask / full candidate pool,
+    max_stocks_per_date=None, batch_size=1).  Each ``__getitem__`` returns one
+    date's (M, ...) tensors; the return prediction is placed directly at
+    ``preds[stock_indices, window_idx]`` so the sparse grid is reconstructed
+    without a flat cat+reshape (which would mismatch when sum(M_i) !=
+    n_stocks*n_windows).  Cells for ineligible stocks/windows stay NaN.  Window
+    d enters at panel column seq_len + d — i.e. global column val_start + d of
+    the full panel.  Returns None only when the outer panel has no windows
+    (all-NaN grid).
     """
+    n_stocks = outer_data["static_features"].shape[0]
     val_ds = PanelDataset(outer_data, seq_len=config.seq_len,
-                          min_history=config.min_history)
+                          min_history=config.min_history,
+                          max_stocks_per_date=None, training=False)
     val_loader = DataLoader(
-        val_ds, batch_size=config.batch_size,
+        val_ds, batch_size=1,
         shuffle=False, collate_fn=panel_collate,
         num_workers=0, pin_memory=False,
     )
+    n_windows = val_ds.n_windows
+    seq_len = val_ds.seq_len
     model.eval()
-    preds_parts = []
+    preds = torch.full((n_stocks, n_windows), float("nan"))
     with torch.no_grad():
         for batch in val_loader:
-            static, pk, po, *_ = batch
+            static, pk, po, *_y, date_idx_t, _dm, _rm, _vm, stock_indices = batch
+            if stock_indices.numel() == 0:
+                continue
+            # Per-stock window indices (supports mixed-date batches).
+            window_idx = date_idx_t - seq_len
             static = static.to(device)
             pk = pk.to(device)
             po = po.to(device)
             _, pred_ret, _ = model(static, pk, po)
-            preds_parts.append(pred_ret.cpu().squeeze(-1))
-    if not preds_parts:
+            preds[stock_indices, window_idx] = pred_ret.cpu().squeeze(-1)
+    if torch.isnan(preds).all():
         return None
-    preds = torch.cat(preds_parts)
-    n_stocks = outer_data["static_features"].shape[0]
-    return preds.reshape(n_stocks, val_ds.n_windows).numpy()
+    return preds.numpy()
 
 
 def _best_eval_metrics(history: dict) -> tuple[dict, int]:
