@@ -545,6 +545,16 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
         _SWITCH_KEY.get(dim, f"use_{dim}"): pref and channel_allowed(dim, policy)
         for dim, pref in _BASE_DIM_PREFERENCE.items()
     }
+    # T3 research decision #1: fundamental is denied under safe-only
+    # (latest_revised_aligned) and may enter ONLY via an explicit ablation.
+    # --allow-fundamental-ablation forces use_fundamental=True REGARDLESS of
+    # policy — but ONLY that channel; the other policy-denied channels stay
+    # off.  Defensive getattr: callers passing a legacy args stub (no attr)
+    # keep the policy-derived default.  The store-meta fingerprint below
+    # consumes this dict, so an ablation store auto-differs from a
+    # non-ablation run.
+    if getattr(args, "allow_fundamental_ablation", False):
+        kwargs["use_fundamental"] = True
     kwargs["seq_len"] = seq_len
     kwargs["minute_mode"] = args.minute
     return kwargs
@@ -1723,6 +1733,15 @@ def main():
                              "index_membership/market_env_refine); allow-revised "
                              "additionally admits latest_revised_aligned channels "
                              "(legacy / ablation use).")
+    parser.add_argument("--allow-fundamental-ablation", action="store_true",
+                        help="T3 research decision #1: ABLATION ONLY — force the "
+                             "fundamental channel ON even under safe-only.  This "
+                             "is the ONLY way fundamental enters a safe-only run; "
+                             "never use it for formal headline/lockbox runs.  "
+                             "Under allow-revised fundamental is already on, so "
+                             "this is a no-op there.  Only the fundamental "
+                             "channel is affected — the other policy-denied "
+                             "channels stay off.")
     parser.add_argument("--quality-gate-report", type=str, default=None,
                         help="Path to the quality-gate report to verify "
                              "(default: <repo>/reports/data_quality_gate.json)")

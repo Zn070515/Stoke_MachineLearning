@@ -14,6 +14,7 @@ import pytest
 
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.features import cache_manifest
+from stoke_ml.features.aux_cols import FUNDAMENTAL_COLS
 from stoke_ml.features.pipeline import FeaturePipeline, _manifest_check_config
 
 N_STOCKS = 8
@@ -265,3 +266,50 @@ class TestRequireFeatureManifest:
         )
         known = set(data["past_known_cols"]) | set(data["past_observed_cols"])
         assert any(c.startswith("topic_") for c in known)
+
+    def _inject_fundamental_columns(self, pdir, code):
+        """Inject all 8 FUNDAMENTAL_COLS into one stock's prebuilt parquet —
+        the same shape a --panel-mode build_features.py run (all use_* True)
+        would have baked in."""
+        df = pd.read_parquet(str(pdir / f"{code}.parquet"))
+        for i, col in enumerate(FUNDAMENTAL_COLS):
+            df[col] = 0.01 * (i + 1)
+        df.to_parquet(str(pdir / f"{code}.parquet"), index=False, compression="lz4")
+
+    def test_use_fundamental_false_drops_fundamental_columns(self, tmp_path):
+        """T3 decision #1: a safe-only run (use_fundamental=False) must NOT
+        consume fundamental columns that a prebuilt parquet carries — the
+        prebuilt read path drops FUNDAMENTAL_COLS exactly like topic_* columns
+        (§七 pattern).  Without the fix, build_features.py's all-True build
+        would silently leak the revised-aligned channel into a formal run."""
+        panel = _make_synthetic_panel()
+        pdir, codes = _build_prebuilt_dir(tmp_path, panel)
+        self._inject_fundamental_columns(pdir, codes[0])
+        data = FeaturePipeline(
+            seq_len=SEQ_LEN, minute_mode=False,
+            use_board=False, use_sector=False, use_concept=False,
+            min_history=SEQ_LEN, use_fundamental=False,
+        ).build_panel_features(
+            panel, horizon=HORIZON, prebuilt_dir=str(pdir),
+            data_dir=str(tmp_path),
+        )
+        known = set(data["past_known_cols"]) | set(data["past_observed_cols"])
+        assert not known & set(FUNDAMENTAL_COLS)
+
+    def test_use_fundamental_true_keeps_fundamental_columns(self, tmp_path):
+        """T3: the explicit ablation path (use_fundamental=True) KEEPS the
+        FUNDAMENTAL_COLS — the flag is the ONLY way fundamental enters a
+        safe-only run."""
+        panel = _make_synthetic_panel()
+        pdir, codes = _build_prebuilt_dir(tmp_path, panel)
+        self._inject_fundamental_columns(pdir, codes[0])
+        data = FeaturePipeline(
+            seq_len=SEQ_LEN, minute_mode=False,
+            use_board=False, use_sector=False, use_concept=False,
+            min_history=SEQ_LEN, use_fundamental=True,
+        ).build_panel_features(
+            panel, horizon=HORIZON, prebuilt_dir=str(pdir),
+            data_dir=str(tmp_path),
+        )
+        known = set(data["past_known_cols"]) | set(data["past_observed_cols"])
+        assert set(FUNDAMENTAL_COLS) <= known

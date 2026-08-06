@@ -911,3 +911,36 @@ def test_panel_store_meta_fingerprints_vintage_policy(tp):
     assert allow["feature_switches"]["use_fundamental"] is True
     assert safe["feature_switches"]["use_fundamental"] is False
     assert safe["feature_switches"]["use_sentiment"] is True
+
+
+def test_allow_fundamental_ablation_reincludes_fundamental_under_safe_only(tp):
+    """T3 decision #1: --allow-fundamental-ablation is the ONLY way a
+    fundamental channel enters a safe-only run.  It forces use_fundamental=True
+    while the OTHER 7 policy-denied channels stay False — the flag is
+    fundamental-only, never a blanket allow-revised."""
+    kw = tp._panel_pipeline_kwargs(
+        _panel_args("safe-only", allow_fundamental_ablation=True), seq_len=60)
+    assert kw["use_fundamental"] is True
+    for dim in ("macro", "earnings", "valuation",
+                "index_membership", "market_env_refine", "pledge", "shareholder"):
+        assert kw[f"use_{dim}"] is False, dim
+
+
+def test_allow_fundamental_ablation_changes_store_fingerprint(tp):
+    """T3: the ablation flag must change the panel-store meta fingerprint — an
+    ablation store must never be reused by a non-ablation run (nor vice-versa),
+    exactly as a policy change does."""
+    base = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, n_stocks=100)
+    ablated = tp._panel_store_meta(
+        _panel_args("safe-only", allow_fundamental_ablation=True),
+        seq_len=60, n_stocks=100)
+    assert base["feature_switches"] != ablated["feature_switches"]
+    assert base["feature_switches"]["use_fundamental"] is False
+    assert ablated["feature_switches"]["use_fundamental"] is True
+
+
+def test_allow_fundamental_ablation_missing_flag_defaults_off(tp):
+    """T3: an args stub WITHOUT the new attr (a caller that predates the flag)
+    must not crash — the defensive read defaults the flag to off."""
+    kw = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
+    assert kw["use_fundamental"] is False

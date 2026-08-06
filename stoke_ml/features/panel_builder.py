@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.features import cache_manifest
+from stoke_ml.features.aux_cols import FUNDAMENTAL_COLS
 from stoke_ml.features.fundamental import FundamentalRefiner
 from stoke_ml.features.panel_helpers import (
     _min_vol_nobs,
@@ -239,6 +240,21 @@ def build_panel_features(
             # the non-PIT representation into a default training run.
             if not pipeline.use_topic:
                 feats = pipeline._drop_topic_columns(feats)
+            # T3 research decision #1: fundamental is denied under safe-only
+            # (latest_revised_aligned) and may enter ONLY via an explicit
+            # ablation.  build_features.py --panel-mode bakes ALL channels in
+            # with all-True defaults, so a safe-only --prebuilt run would
+            # otherwise silently consume the revised channel.  Mirror the
+            # topic_* drop: scrub FUNDAMENTAL_COLS from the loaded parquet
+            # whenever the run's pipeline does not request fundamental.  A
+            # deliberate per-channel scrub (NOT a generic 8-channel filter) —
+            # cross-channel column-name overlap (market_env vs
+            # market_env_refine, etc.) makes a generic filter risky; the other
+            # policy-denied channels' prebuilt leak is tracked separately.
+            if not pipeline.use_fundamental:
+                present = [c for c in FUNDAMENTAL_COLS if c in feats.columns]
+                if present:
+                    feats = feats.drop(columns=present)
             # A stale/hand-built parquet may carry a
             # weekend/duplicate bar that would pollute the UNION date axis.
             feats = pipeline._clean_calendar_dates(feats, code)
