@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,7 @@ from stoke_ml.data.universe import (
     load_universe_status,
     not_delisted_mask,
 )
+from stoke_ml.features.cache_manifest import current_config_hash, git_head
 from stoke_ml.features.pipeline import (
     FeaturePipeline, _PIT_STATIC_COLS, fold_dead_feature_columns,
 )
@@ -485,22 +487,181 @@ def _resolve_universe(
     raise ValueError(f"unknown --universe: {universe}")
 
 
-def _require_all_universe_prebuilt(universe: str, prebuilt: str | None) -> None:
+def _require_all_universe_prebuilt(
+    universe: str, prebuilt: str | None, store_complete: bool = False,
+) -> None:
     """§七-P0: ``--universe all`` without ``--prebuilt`` is refused outright.
 
     The full market cannot be feature-engineered in RAM (~225GB of feature
     arrays on a ~96GB host); it must read prebuilt panel features
-    (build_features.py --panel-mode).  Extracted from main() so the refusal is
+    (build_features.py --panel-mode).  A complete ``--panel-store`` is an
+    equivalent source (the full panel already persisted as mmap'd arrays), so
+    it lifts the requirement.  Extracted from main() so the refusal is
     unit-testable.
     """
-    if universe == "all" and not prebuilt:
+    if universe == "all" and not prebuilt and not store_complete:
         raise SystemExit(
-            "--universe all requires --prebuilt: the full market cannot be "
-            "feature-engineered in memory (5530 stocks x the full feature grid "
-            "~= 225GB on a ~96GB host, §七-P0).  Run "
-            "scripts/production/build_features.py --panel-mode first, then "
-            "re-run with --prebuilt data/features_panel."
+            "--universe all requires --prebuilt (or a complete --panel-store): "
+            "the full market cannot be feature-engineered in memory (5530 "
+            "stocks x the full feature grid ~= 225GB on a ~96GB host, §七-P0).  "
+            "Run scripts/production/build_features.py --panel-mode first, then "
+            "re-run with --prebuilt data/features_panel, or point --panel-store "
+            "at a previously-built store."
         )
+
+
+def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
+    """FeaturePipeline constructor kwargs for the panel build.
+
+    Single source of truth for the ``use_*`` switch set — shared by the live
+    pipeline construction AND the panel-store meta fingerprint, so a change to
+    the switches is caught by the store staleness guard.
+    """
+    return dict(
+        seq_len=seq_len,
+        minute_mode=args.minute,
+        use_sentiment=True, use_announcements=True,
+        use_guba=True, use_comment=True, use_margin=True,
+        use_northbound=True, use_dragon_tiger=True,
+        use_fundamental=True, use_etf_flow=True,
+        use_capital_flow=True, use_block_trade=True,
+        use_shareholder=True, use_lockup=True, use_dividend=True,
+        use_valuation=True,
+        use_board=False, use_sector=False, use_concept=False,
+    )
+
+
+def _panel_store_meta(args, seq_len: int, n_stocks: int | None = None) -> dict:
+    """Build-time fingerprint persisted in a panel store's meta.json.
+
+    Re-checked by load_panel_memmap on a store-backed re-run so a stale store
+    (different horizon / universe / feature switches / date window) is refused
+    instead of silently training on wrong targets — mirrors cache_manifest's
+    config_hash + range staleness logic.
+    """
+    return {
+        "horizon": args.horizon,
+        "seq_len": seq_len,
+        "start": args.start,
+        "end": args.end,
+        "universe": args.universe,
+        "n_stocks": n_stocks,
+        "feature_switches": _panel_pipeline_kwargs(args, seq_len),
+        "config_hash": current_config_hash(),
+        "git_commit": git_head(),
+    }
+
+
+def _validate_panel_store_path(path: str) -> None:
+    """Refuse a --panel-store that points at an existing FILE, not a dir.
+
+    save_panel_memmap raises on the same condition; this surfaces it as a
+    clear CLI error before any K-line work happens.
+    """
+    p = Path(path)
+    if p.exists() and not p.is_dir():
+        raise SystemExit(
+            f"--panel-store {path} exists but is not a directory — a panel "
+            "store is a directory of .npy/.json files.  Point at a new/empty "
+            "directory or remove the conflicting file."
+        )
+
+
+def _resolve_panel(
+    args, stock_list: list[str], seq_len: int, data_dir,
+    required_set: set[str], _store_load: bool,
+) -> tuple[dict, dict]:
+    """Resolve ``(panel_data, channel_manifest)`` for a training run.
+
+    §十六: when a COMPLETE ``--panel-store`` is present (``_store_load``), the
+    K-line load AND the feature build are skipped entirely — the stored panel's
+    arrays are mmap'd and read lazily downstream, so a re-run never reads 5530
+    stocks' OHLCV only to discard it.  The store is loaded under its meta.json
+    config guard (refuses stale horizon/universe/feature-switch targets).
+
+    Otherwise the panel is engineered live from K-line (+ aux), and when
+    ``--panel-store`` is set the result is persisted there with its meta.json
+    fingerprint for a future fast re-run.
+
+    Returns ``(panel_data, channel_manifest)``.  ``channel_manifest`` is the
+    channel-coverage dict for the required-channel gate; the store path probes
+    it from the stored panel's ``has_*`` flags (prebuilt semantics), the live
+    path from ``load_aux_data`` (or the same flag probe under ``--prebuilt``).
+    """
+    if _store_load:
+        logger.info("Loading panel memmap store from %s (skipping K-line load "
+                    "+ feature build)", args.panel_store)
+        panel_data = load_panel_memmap(
+            args.panel_store,
+            expected_meta=_panel_store_meta(args, seq_len, len(stock_list)))
+        channel_manifest = _prebuilt_channel_coverage(panel_data)
+        return panel_data, channel_manifest
+
+    logger.info("Loading K-line data for %d stocks from %s to %s...",
+                len(stock_list), args.start, args.end)
+    if args.minute:
+        from stoke_ml.data.minute_storage import MinuteStorage
+        ms = MinuteStorage(data_dir)
+        frames = []
+        for code in stock_list:
+            df = ms.load(code, args.start, args.end, args.minute_frequency)
+            if df is not None and not df.empty:
+                df["date"] = pd.to_datetime(df["datetime"]).dt.date
+                df["stock_code"] = code
+                frames.append(df)
+        if not frames:
+            logger.error("No minute data loaded for any stock — run download_minute.py first")
+            sys.exit(1)
+        logger.info("Minute mode: %d stocks @ %s-min, %d available in storage",
+                    len(frames), args.minute_frequency,
+                    len(ms.list_stocks(args.minute_frequency)))
+    else:
+        from stoke_ml.data.storage import DataStorage
+        ds = DataStorage(data_dir)
+        frames = []
+        for code in stock_list:
+            df = ds.load_daily(code, args.start, args.end,
+                               require_valid_manifest=True)
+            if df is not None and not df.empty:
+                df["stock_code"] = code
+                frames.append(df)
+        if not frames:
+            logger.error("No data loaded for any stock")
+            sys.exit(1)
+
+    panel = pd.concat(frames, ignore_index=True)
+    logger.info("Panel shape: %s", panel.shape)
+
+    # Load auxiliary data (unless --no-aux / --prebuilt — the store path
+    # skips this entirely; the stored panel already has every aux channel
+    # baked in).
+    aux_data = None
+    channel_manifest = {}
+    if not args.no_aux and not args.prebuilt:
+        logger.info("Loading auxiliary data...")
+        t_aux = time.time()
+        aux_data, channel_manifest = load_aux_data(
+            stock_list, data_dir, args.start, args.end,
+            required_channels=required_set,
+        )
+        logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
+
+    fp = FeaturePipeline(**_panel_pipeline_kwargs(args, seq_len))
+    panel_data = fp.build_panel_features(
+        panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
+        require_feature_manifest=args.require_feature_manifest,
+    )
+    if args.panel_store:
+        save_panel_memmap(
+            panel_data, args.panel_store,
+            meta=_panel_store_meta(args, seq_len, len(stock_list)))
+        logger.info("Saved panel memmap store to %s", args.panel_store)
+    if args.prebuilt:
+        # Live per-channel loading is skipped in prebuilt mode; probe the
+        # panel's has_* flags instead so the experiment still records what
+        # actually got in.
+        channel_manifest = _prebuilt_channel_coverage(panel_data)
+    return panel_data, channel_manifest
 
 
 # §七-P0 universe memory guard thresholds (GB).  --universe all is refused
@@ -1504,12 +1665,16 @@ def main():
     parser.add_argument("--panel-store", type=str, default=None,
                         help="§十六 memmap lazy-storage dir for the built panel. "
                              "When DIR already holds a complete store it is loaded "
-                             "instead of re-stacking the panel, so a large-universe "
-                             "re-run never materializes the whole dense (N,T,D) "
-                             "feature grid in RAM (arrays are mmap'd and read "
-                             "lazily by PanelDataset / _slice_panel).  Otherwise "
-                             "the panel built this run is persisted there for "
-                             "future runs.  Default: off — build in memory as "
+                             "instead of loading K-line + re-stacking the panel, so "
+                             "a large-universe re-run never materializes the whole "
+                             "dense (N,T,D) feature grid in RAM (arrays are mmap'd "
+                             "and read lazily by PanelDataset / _slice_panel).  A "
+                             "store's meta.json config fingerprint is checked on "
+                             "load — a mismatch (horizon/seq_len/start/end/"
+                             "universe/feature switches) REFUSES the run so a stale "
+                             "store can't silently train on wrong targets.  "
+                             "Otherwise the panel built this run is persisted there "
+                             "for future runs.  Default: off — build in memory as "
                              "always.")
     parser.add_argument("--no-require-quality-gate", action="store_true",
                         help="Skip the required quality-gate report check "
@@ -1551,6 +1716,14 @@ def main():
     if args.end is None:
         args.end = datetime.now().strftime("%Y-%m-%d")
 
+    # §十六: decide the store-load path up front — BEFORE universe resolution
+    # and the K-line load — so a complete-store re-run never reads the
+    # multi-GB input panel only to discard it.  meta.json staleness is checked
+    # at load (after universe resolution, when n_stocks is known).
+    _store_load = bool(args.panel_store) and panel_store_complete(args.panel_store)
+    if args.panel_store:
+        _validate_panel_store_path(args.panel_store)
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
@@ -1580,7 +1753,8 @@ def main():
     # rather than live-engineering 5530 stocks (~225GB of feature arrays on a
     # ~96GB host).  Without --prebuilt this is refused outright; with it the
     # post-build memory estimate below still warns when the panel is too big.
-    _require_all_universe_prebuilt(args.universe, args.prebuilt)
+    _require_all_universe_prebuilt(
+        args.universe, args.prebuilt, store_complete=_store_load)
 
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
@@ -1611,90 +1785,19 @@ def main():
     universe_used = list(stock_list)
 
     logger.info("Universe: %s", universe_desc)
-    logger.info("Loading K-line data for %d stocks from %s to %s...",
-                len(stock_list), args.start, args.end)
 
-    if args.minute:
-        from stoke_ml.data.minute_storage import MinuteStorage
-        ms = MinuteStorage(data_dir)
-        frames = []
-        for code in stock_list:
-            df = ms.load(code, args.start, args.end, args.minute_frequency)
-            if df is not None and not df.empty:
-                df["date"] = pd.to_datetime(df["datetime"]).dt.date
-                df["stock_code"] = code
-                frames.append(df)
-        if not frames:
-            logger.error("No minute data loaded for any stock — run download_minute.py first")
-            sys.exit(1)
-        logger.info("Minute mode: %d stocks @ %s-min, %d available in storage",
-                    len(frames), args.minute_frequency,
-                    len(ms.list_stocks(args.minute_frequency)))
-    else:
-        from stoke_ml.data.storage import DataStorage
-        ds = DataStorage(data_dir)
-        frames = []
-        for code in stock_list:
-            df = ds.load_daily(code, args.start, args.end,
-                               require_valid_manifest=True)
-            if df is not None and not df.empty:
-                df["stock_code"] = code
-                frames.append(df)
-        if not frames:
-            logger.error("No data loaded for any stock")
-            sys.exit(1)
-
-    panel = pd.concat(frames, ignore_index=True)
-    logger.info("Panel shape: %s", panel.shape)
-
-    # §十六: --panel-store is a persistent cache of the post-build panel.  A
-    # complete store skips re-stacking the dense (N,T,D) grid on re-run — the
-    # arrays are mmap'd and read lazily downstream.  When the store is fresh
-    # (or absent), the panel is built in memory as always and persisted for
-    # future runs.
-    _store_load = bool(args.panel_store) and panel_store_complete(args.panel_store)
-    if _store_load:
-        logger.info("Loading panel memmap store from %s (skipping feature build)",
-                    args.panel_store)
-
-    # Load auxiliary data (unless --no-aux / --prebuilt / a complete store is
-    # loaded — the stored panel already has every aux channel baked in).
+    # §十六: a complete --panel-store skips the K-line load AND the feature
+    # build entirely — the panel arrays are mmap'd and read lazily downstream.
+    # The decision was made up front (before universe resolution, so a store
+    # re-run never reads 5530 stocks' OHLCV only to discard it); _resolve_panel
+    # loads the store under its meta.json config guard, or else engineers the
+    # panel live (and persists it when --panel-store is set).
     required_set = {c.strip() for c in (args.require_aux_channels or "").split(",") if c.strip()}
-    aux_data = None
-    channel_manifest: dict = {}
-    if not args.no_aux and not args.prebuilt and not _store_load:
-        logger.info("Loading auxiliary data...")
-        t_aux = time.time()
-        aux_data, channel_manifest = load_aux_data(
-            stock_list, data_dir, args.start, args.end,
-            required_channels=required_set,
-        )
-        logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
-
-    # Build features
     seq_len = args.seq_len or (64 if args.minute else 60)
-    fp = FeaturePipeline(
-        seq_len=seq_len,
-        minute_mode=args.minute,
-        use_sentiment=True, use_announcements=True,
-        use_guba=True, use_comment=True, use_margin=True,
-        use_northbound=True, use_dragon_tiger=True,
-        use_fundamental=True, use_etf_flow=True,
-        use_capital_flow=True, use_block_trade=True,
-        use_shareholder=True, use_lockup=True, use_dividend=True,
-        use_valuation=True,
-        use_board=False, use_sector=False, use_concept=False,
-    )
-    if _store_load:
-        panel_data = load_panel_memmap(args.panel_store)
-    else:
-        panel_data = fp.build_panel_features(
-            panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
-            require_feature_manifest=args.require_feature_manifest,
-        )
-        if args.panel_store:
-            save_panel_memmap(panel_data, args.panel_store)
-            logger.info("Saved panel memmap store to %s", args.panel_store)
+
+    panel_data, channel_manifest = _resolve_panel(
+        args, stock_list, seq_len, data_dir, required_set, _store_load)
+
     # §v12-P0: panel row identity — stock_codes comes from the pipeline's
     # valid_codes (only stocks whose features survived cleaning), NEVER
     # re-derived from the raw panel: a stock whose features were cleaned out
@@ -1707,12 +1810,6 @@ def main():
         "panel stock_codes length != static_features rows (row identity broken)")
     assert len(set(panel_stocks)) == len(panel_stocks), (
         "duplicate stock codes in panel (row identity broken)")
-
-    if args.prebuilt or _store_load:
-        # Live per-channel loading is skipped in prebuilt / store mode; probe the
-        # panel's has_* flags instead so the experiment still records what
-        # actually got in.
-        channel_manifest = _prebuilt_channel_coverage(panel_data)
 
     # Required-channel gate: a required channel with ZERO
     # coverage aborts the experiment instead of silently training on air.
