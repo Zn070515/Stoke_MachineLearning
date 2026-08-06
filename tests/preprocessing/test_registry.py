@@ -1,5 +1,6 @@
 """Tests for FeatureRegistry — feature definitions, tagging, lineage."""
 import json
+import os
 import tempfile
 import numpy as np
 import pandas as pd
@@ -123,6 +124,25 @@ class TestFeatureRegistry:
             assert fd is not None
             assert fd.value_range == (-1.0, 1.0)
             assert "ablation=guba" in fd.tags
+
+    def test_save_cleans_tmp_on_failure(self, tmp_path, monkeypatch):
+        """§二十一: if os.replace fails, save() must propagate the original
+        error AND leave no ``.registry_*.json`` temp file behind — the
+        try/finally cleanup is the control flow this test pins."""
+        reg = FeatureRegistry()
+        reg.register(FeatureDefinition(name="f1", category="numeric"))
+
+        def _boom(src, dst):
+            raise PermissionError("replace denied")
+
+        monkeypatch.setattr("stoke_ml.preprocessing.registry.os.replace", _boom)
+        with pytest.raises(PermissionError, match="replace denied"):
+            reg.save(tmp_path / "registry.json")
+        leftovers = [
+            p for p in os.listdir(str(tmp_path))
+            if p.startswith(".registry_") and p.endswith(".json")
+        ]
+        assert leftovers == []
 
     def test_load_nonexistent_returns_empty(self):
         reg = FeatureRegistry.load("/tmp/nonexistent_registry_12345.json")

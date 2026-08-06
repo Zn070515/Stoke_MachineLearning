@@ -6,6 +6,7 @@ match the current inputs.  Existence + non-zero size alone is not enough.
 """
 import json
 import os
+import subprocess
 
 import pandas as pd
 import pyarrow as pa
@@ -220,15 +221,21 @@ class TestConfigSnapshot:
 
     def test_current_config_hash_propagates_hashing_bug(self, monkeypatch):
         """§二十一: only the config LOAD degrades to None; a programming error
-        inside the hashing step must propagate instead of being swallowed."""
+        inside the hashing step must propagate instead of being swallowed.
+
+        This mirrors the deliberate narrowing of ``_to_plain`` to
+        ``except ImportError``: production config.yaml has no ``${}``
+        interpolations, so an OmegaConf conversion failure is a real bug and
+        should surface rather than degrade to a stringified hash.
+        """
         import stoke_ml.config as config_mod
 
         monkeypatch.setattr(config_mod, "load_config", lambda: object())
-        monkeypatch.setattr(
-            cache_manifest, "config_hash", lambda cfg: (_ for _ in ()).throw(
-                RuntimeError("boom"),
-            ),
-        )
+
+        def _boom(cfg):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cache_manifest, "config_hash", _boom)
         with pytest.raises(RuntimeError, match="boom"):
             cache_manifest.current_config_hash()
 
@@ -305,6 +312,19 @@ class TestManifest:
         assert not cache_manifest.manifest_matches(
             gone, "000001", cfg, feature, data_dir, commit, cfg_hash
         )
+
+    def test_write_manifest_cleans_tmp_on_failure(self, tmp_path):
+        """§二十一: a failed manifest write must propagate the original error
+        AND leave no ``.tmp.*`` file behind — the try/finally cleanup is the
+        control flow this test pins."""
+        mpath = os.path.join(str(tmp_path), "out", ".manifests", "000001.json")
+        bad_payload = {"stock_code": "000001", "unserializable": {1, 2}}
+        with pytest.raises(TypeError):
+            cache_manifest.write_manifest(bad_payload, mpath)
+        d = os.path.dirname(mpath)
+        leftovers = [p for p in os.listdir(d) if "000001.json.tmp." in p]
+        assert leftovers == []
+        assert not os.path.exists(mpath)
 
     def test_manifest_records_channels_and_range(self, tmp_path):
         code = "000001"
@@ -441,6 +461,39 @@ class TestCodeTreeHash:
         assert cache_manifest.manifest_matches(
             mpath, "000001", cfg, feature, data_dir, commit, cfg_hash
         )
+
+
+class TestGitHead:
+    """§二十一: git_head() degrades to 'unknown' only for the external
+    non-repo conditions (CalledProcessError / OSError); anything else is a bug
+    and must propagate."""
+
+    def test_called_process_error_degrades_to_unknown(self, monkeypatch):
+        # Not a git repo: git rev-parse exits non-zero.
+        def _boom(*args, **kwargs):
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=["git", "rev-parse", "HEAD"],
+            )
+
+        monkeypatch.setattr(cache_manifest.subprocess, "run", _boom)
+        assert cache_manifest.git_head() == "unknown"
+
+    def test_os_error_degrades_to_unknown(self, monkeypatch):
+        # git not installed / not on PATH -> FileNotFoundError (an OSError).
+        def _boom(*args, **kwargs):
+            raise FileNotFoundError("git not on PATH")
+
+        monkeypatch.setattr(cache_manifest.subprocess, "run", _boom)
+        assert cache_manifest.git_head() == "unknown"
+
+    def test_unexpected_error_propagates(self, monkeypatch):
+        # Any non-external exception is a genuine bug -> must not be swallowed.
+        def _boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cache_manifest.subprocess, "run", _boom)
+        with pytest.raises(RuntimeError, match="boom"):
+            cache_manifest.git_head()
 
 
 class TestPaths:
