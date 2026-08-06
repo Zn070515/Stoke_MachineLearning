@@ -8,7 +8,6 @@ import logging
 import time
 
 import pandas as pd
-from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +32,9 @@ class AnnouncementSource:
     def _fetch_page(stock_code: str, begin_date: str, end_date: str,
                     page: int = 1, page_size: int = 100) -> tuple[list[dict], int]:
         """Fetch one page of announcements. Returns (items, total_count)."""
+        # online extra — import lazily so core/dev jobs can import this module
+        from curl_cffi import requests
+
         params = {
             "sr": -1,
             "page_size": page_size,

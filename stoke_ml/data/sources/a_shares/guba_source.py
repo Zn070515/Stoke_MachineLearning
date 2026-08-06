@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
-from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +322,9 @@ class GubaSource:
         Uses a shorter timeout than list pages since detail pages either
         return fast (success) or fast (WAF block) — never need 20s.
         """
+        # online extra — import lazily so core/dev jobs can import this module
+        from bs4 import BeautifulSoup
+
         url = GUBA_DETAIL_URL.format(code=stock_code, post_id=post_id)
         resp = _fetch_with_retry(url, timeout=8)
 

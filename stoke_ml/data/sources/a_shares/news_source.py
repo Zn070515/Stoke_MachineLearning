@@ -5,8 +5,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
-from bs4 import BeautifulSoup
-from curl_cffi import requests
 
 from stoke_ml.data.codes import (
     UnsupportedMarketError,
@@ -74,6 +72,10 @@ class SinaNewsSource:
                 ``pages_fetched`` and ``pagination_exhausted`` (download
                 completion evidence).
         """
+        # online extra — import lazily so core/dev jobs can import this module
+        from bs4 import BeautifulSoup
+        from curl_cffi import requests
+
         prefix = self._to_sina_prefix(stock_code)
         all_items = []
         pages_fetched = 0
@@ -157,6 +159,10 @@ class SinaNewsSource:
 
     def fetch_article_body(self, url: str) -> str | None:
         """Fetch full text of a Sina news article."""
+        # online extra — import lazily so core/dev jobs can import this module
+        from bs4 import BeautifulSoup
+        from curl_cffi import requests
+
         try:
             resp = requests.get(
                 url, headers=HEADERS, impersonate="chrome120", timeout=15,

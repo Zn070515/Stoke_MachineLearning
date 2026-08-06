@@ -8,7 +8,6 @@ import logging
 import time
 
 import pandas as pd
-from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +28,9 @@ class THSNewsSource:
     @staticmethod
     def _fetch_em_page(stock_code: str, page: int, page_size: int = 100) -> list[dict]:
         """Fetch one page of EastMoney search results."""
+        # online extra — import lazily so core/dev jobs can import this module
+        from curl_cffi import requests
+
         inner = {
             "uid": "",
             "keyword": stock_code,

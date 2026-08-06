@@ -6,6 +6,8 @@ Full text extracted from PDFs hosted at static.cninfo.com.cn.
 Rate limit: >= 0.1s between requests. Organise ID per stock cached in memory.
 PDF download is parallelised via thread pool (PyMuPDF releases GIL).
 """
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -15,9 +17,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import fitz  # PyMuPDF
 import pandas as pd
-from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,9 @@ def _org_id(session: requests.Session, code: str) -> str | None:
 
 def _parse_pdf_text(pdf_bytes: bytes) -> str:
     """Extract plain text from a PDF byte buffer via PyMuPDF."""
+    # online extra — import lazily so core/dev jobs can import this module
+    import fitz  # PyMuPDF
+
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         pages = []
@@ -115,6 +118,9 @@ def _download_pdfs_parallel(urls: list[str], max_workers: int = 8) -> dict[str, 
     results = dict(cached)
 
     def _fetch_one(url: str) -> tuple[str, str | None]:
+        # online extra — import lazily so core/dev jobs can import this module
+        from curl_cffi import requests
+
         try:
             if not hasattr(_thread_local, "session"):
                 _thread_local.session = requests.Session()
@@ -128,6 +134,7 @@ def _download_pdfs_parallel(urls: list[str], max_workers: int = 8) -> dict[str, 
             return url, None
 
     # Suppress MuPDF C-level stderr (corrupt PDF warnings flood logs, 50K+ lines)
+    import fitz  # PyMuPDF — online extra, lazy so core/dev jobs can import
     fitz.TOOLS.mupdf_display_errors(False)
     try:
         workers = max(1, min(max_workers, len(uncached)))
@@ -161,6 +168,9 @@ def _download_pdf(adjunct_url: str) -> str | None:
 
     url = f"{CNINFO_PDF_BASE}/{adjunct_url}"
     try:
+        # online extra — import lazily so core/dev jobs can import this module
+        from curl_cffi import requests
+
         if not hasattr(_thread_local, "session"):
             _thread_local.session = requests.Session()
         resp = _thread_local.session.get(url, headers=HEADERS, timeout=30)
@@ -189,7 +199,19 @@ class CninfoSource:
         self._cache_dir = pdf_cache_dir
         if pdf_cache_dir:
             os.makedirs(pdf_cache_dir, exist_ok=True)
-        self._session = requests.Session()
+        self._session = None  # curl_cffi session created lazily on first use
+
+    def _get_session(self):
+        """Return the per-instance curl_cffi session, created on first use.
+
+        online extra — lazy import so core/dev jobs can construct
+        CninfoSource without the online stack installed.
+        """
+        if self._session is None:
+            from curl_cffi import requests
+
+            self._session = requests.Session()
+        return self._session
 
     def fetch_announcements(
         self, stock_code: str, start_date: str = "2015-01-01",
@@ -202,7 +224,7 @@ class CninfoSource:
         if end_date is None:
             end_date = time.strftime("%Y-%m-%d")
 
-        org_id = _org_id(self._session, stock_code)
+        org_id = _org_id(self._get_session(), stock_code)
         if not org_id:
             logger.debug("CNINFO: no orgId for %s", stock_code)
             return pd.DataFrame(columns=["date", "title", "notice_type", "url"])
@@ -261,7 +283,7 @@ class CninfoSource:
         last_resp = None
         for attempt in range(3):
             try:
-                resp = self._session.post(
+                resp = self._get_session().post(
                     CNINFO_QUERY, data=body, headers=HEADERS,
                     timeout=30, impersonate="chrome120",
                 )
