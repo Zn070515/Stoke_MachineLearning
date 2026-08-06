@@ -208,10 +208,9 @@ class FeatureRegistry:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 f.write(payload)
             os.replace(tmp_path, str(path))
-        except Exception:
+        finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-            raise
 
     @classmethod
     def load(cls, path: Path | str) -> FeatureRegistry:

@@ -142,7 +142,12 @@ def _to_plain(value):
         from omegaconf import OmegaConf
         if OmegaConf.is_config(value):
             return OmegaConf.to_container(value, resolve=True)
-    except Exception:
+    except ImportError:
+        # OmegaConf is optional here: when it is not importable, the pure-Python
+        # recursion below still normalizes dict/list/tuple, and any leftover
+        # scalar is stringified by _stable_dumps' default=str — a correct,
+        # deterministic fallback.  A genuine conversion failure is NOT swallowed;
+        # it propagates so the hashing layer cannot silently degrade (§二十一).
         pass
     if isinstance(value, dict):
         return {k: _to_plain(v) for k, v in value.items()}
@@ -173,12 +178,16 @@ def current_config_hash() -> str | None:
     """config_hash of the active config.yaml's feature-affecting sections.
 
     Returns None (callers then skip the comparison) if config cannot load.
+    Only the config LOAD degrades to None — a missing / malformed config is an
+    environment condition.  Any programming error inside ``config_snapshot`` /
+    ``config_hash`` propagates instead of being swallowed (§二十一).
     """
     try:
         from stoke_ml.config import load_config
-        return config_hash(config_snapshot(load_config()))
+        cfg = load_config()
     except Exception:
         return None
+    return config_hash(config_snapshot(cfg))
 
 
 def git_head() -> str:
@@ -189,7 +198,9 @@ def git_head() -> str:
             capture_output=True, text=True, check=True,
         )
         return out.stdout.strip() or "unknown"
-    except Exception as exc:
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # Not a git repo (git rev-parse fails) or git unavailable (OSError):
+        # the documented non-repo degradation.  Any other exception propagates.
         logger.warning("git rev-parse failed (category=%s)", classify_error(exc).value)
         return "unknown"
 
@@ -242,7 +253,15 @@ def _upstream_manifest_hash(path: str) -> str | None:
     try:
         with open(sidecar, encoding="utf-8") as f:
             m = json.load(f)
-    except Exception:
+    except (OSError, ValueError) as exc:
+        # The sidecar EXISTS but cannot be read / parsed — deliberately distinct
+        # from "no sidecar" above.  Not fatal: the caller falls back to hashing
+        # the parquet bytes (still a correct fingerprint), but a corrupt storage
+        # sidecar is a real anomaly, so log it instead of swallowing it.
+        logger.warning(
+            "upstream manifest %s unreadable (category=%s), falling back to "
+            "byte hash", sidecar, classify_error(exc).value,
+        )
         return None
     sh = m.get("schema_hash")
     return sh if isinstance(sh, str) and sh else None
@@ -413,17 +432,21 @@ def channels_and_source_files(
 
 
 def write_manifest(payload: dict, manifest_path: str) -> None:
-    """Atomically write a manifest (tmp + os.replace)."""
+    """Atomically write a manifest (tmp + os.replace).
+
+    Any write failure propagates after the temp file is cleaned up — the
+    ``finally`` guarantees cleanup while preserving the original exception,
+    without a catch-and-reraise wrapper (§二十一).
+    """
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
     tmp = f"{manifest_path}.tmp.{os.getpid()}"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(tmp, manifest_path)
-    except Exception:
+    finally:
         if os.path.isfile(tmp):
             os.unlink(tmp)
-        raise
 
 
 def make_manifest(
@@ -505,7 +528,9 @@ def manifest_matches_detailed(
     try:
         with open(manifest_path, encoding="utf-8") as f:
             m = json.load(f)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
+        # An unreadable / malformed manifest is treated as stale (rebuild),
+        # never trusted — the safe direction for a disposable cache artifact.
         logger.warning(
             "manifest %s unreadable (category=%s), treating as stale",
             manifest_path, classify_error(exc).value,

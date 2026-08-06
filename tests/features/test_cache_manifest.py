@@ -10,6 +10,7 @@ import os
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from stoke_ml.data.generation_store import write_generation
 from stoke_ml.features import cache_manifest
@@ -105,6 +106,26 @@ class TestFingerprints:
         assert fp is not None
         assert fp != cache_manifest._sha1("upstream:abc123")
 
+    def test_daily_sidecar_corrupt_falls_back_to_content_with_warning(
+        self, tmp_path, caplog,
+    ):
+        """§二十一: a sidecar that EXISTS but is malformed is distinct from
+        'no sidecar'.  It still degrades to the byte hash (a correct
+        fingerprint), but a warning must surface — a corrupt storage sidecar is
+        a real anomaly, not a silent None."""
+        daily = tmp_path / "daily"
+        daily.mkdir()
+        p = daily / "000001.parquet"
+        _write_parquet(str(p))
+        (daily / "000001.manifest.json").write_text(
+            "{not valid json", encoding="utf-8",
+        )
+        with caplog.at_level("WARNING"):
+            fp = cache_manifest.file_fingerprint(str(p))
+        assert fp is not None
+        assert fp != cache_manifest._sha1("upstream:abc123")
+        assert any("falling back to byte hash" in r.message for r in caplog.records)
+
     def test_config_hash_sensitive_to_build_inputs(self):
         a = cache_manifest.config_hash(_base_config())
         b = cache_manifest.config_hash(_base_config(horizon=5))
@@ -185,6 +206,31 @@ class TestConfigSnapshot:
         assert h is not None and len(h) == 16
         # Deterministic across calls.
         assert h == cache_manifest.current_config_hash()
+
+    def test_current_config_hash_none_when_config_cannot_load(self, monkeypatch):
+        """A config-load failure (missing file) degrades to None — the
+        documented contract for callers to skip the comparison."""
+        import stoke_ml.config as config_mod
+
+        def _boom(*args, **kwargs):
+            raise FileNotFoundError("config missing")
+
+        monkeypatch.setattr(config_mod, "load_config", _boom)
+        assert cache_manifest.current_config_hash() is None
+
+    def test_current_config_hash_propagates_hashing_bug(self, monkeypatch):
+        """§二十一: only the config LOAD degrades to None; a programming error
+        inside the hashing step must propagate instead of being swallowed."""
+        import stoke_ml.config as config_mod
+
+        monkeypatch.setattr(config_mod, "load_config", lambda: object())
+        monkeypatch.setattr(
+            cache_manifest, "config_hash", lambda cfg: (_ for _ in ()).throw(
+                RuntimeError("boom"),
+            ),
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            cache_manifest.current_config_hash()
 
     def test_config_snapshot_accepts_flat_and_nested(self):
         snap = cache_manifest.config_snapshot({"features": {"seq_len": 60}})
@@ -514,6 +560,20 @@ class TestManifestDetailed:
         )
         assert not ok
         assert "manifest_missing" in reasons
+
+    def test_corrupt_manifest_reports_manifest_unreadable(self, tmp_path):
+        """§二十一: a manifest that exists but is malformed is treated as stale
+        (never trusted) and reports the documented ``manifest_unreadable``
+        reason — distinct from ``manifest_missing``."""
+        data_dir, feature, mpath, cfg, cfg_hash, commit = self._setup(tmp_path)
+        with open(mpath, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        ok, reasons = cache_manifest.manifest_matches_detailed(
+            mpath, "000001", cfg, feature, data_dir, commit, cfg_hash,
+        )
+        assert not ok
+        assert "manifest_unreadable" in reasons
+        assert "manifest_missing" not in reasons
 
 
 class TestSharedInputs:
