@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader
 
@@ -39,6 +41,7 @@ from stoke_ml.data.universe import (
     not_delisted_mask,
 )
 from stoke_ml.data.vintage_policy import VintagePolicy, channel_allowed
+from stoke_ml.features.aux_cols import FUNDAMENTAL_COLS
 from stoke_ml.features.cache_manifest import (
     _dir_content_hash, current_config_hash, git_head,
 )
@@ -817,6 +820,106 @@ def _enforce_universe_memory(
             universe, est_gb, n_stocks, n_timesteps, n_features,
         )
     return est_gb, action
+
+
+def _host_available_gb() -> float | None:
+    """Host currently-available memory in GB, or None when psutil is absent.
+
+    Shared by the pre-build and post-build universe-memory guards (§七-P0) so
+    both estimate against the same host snapshot.  psutil is optional — the
+    static thresholds still guard when it is missing.
+    """
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return None  # psutil optional — the static thresholds still guard
+
+
+def _estimate_panel_memory(
+    args, stock_list: list[str], data_dir,
+) -> tuple[int, int, int] | None:
+    """§七-P0 pre-build panel memory estimate: (n_stocks, n_timesteps, n_features).
+
+    The post-build guard runs after build_panel_features has np.zeros-allocated
+    the three dense (N, T, D) float32 grids, so a huge universe (--universe all,
+    csi800) can OOM the host BEFORE that guard ever runs.  This estimate is
+    computed from the resolved universe size plus a cheap schema read of the
+    first prebuilt parquet (pyarrow reads only the schema, never the data), so
+    an oversized universe is refused up front.
+
+    Returns None (skip the early guard) when the feature dim cannot be known
+    without building:
+      * live builds (``not args.prebuilt``) — D is unknown without a build, and
+        live builds are already bounded (default 500 stocks; --universe all
+        without --prebuilt is refused outright);
+      * a prebuilt dir with no readable ``*.parquet`` (first stock's parquet
+        missing/unreadable, or no parquets at all) — never crash the estimate
+        path.
+
+    N is the RESOLVED universe size — an upper bound, since the build keeps only
+    a surviving subset (conservative, as a safety guard should be).  T is the
+    trading-day count in [args.start, args.end].  D is the surviving feature
+    column count from the first parquet's schema after dropping exactly the
+    columns the build drops (``*_lag{N}``, ``topic_*`` when use_topic is off,
+    FUNDAMENTAL_COLS when use_fundamental is off, and the date/stock_code
+    identifiers).  D is a small over-estimate of the true per-array dims (the
+    parquet may carry a few label/price columns the arrays don't hold) — a
+    safety upper bound; the exact post-build check is the backstop.
+    """
+    if not args.prebuilt:
+        return None
+    parquets = sorted(Path(args.prebuilt).glob("*.parquet"))
+    if not parquets:
+        return None
+    try:
+        cols = list(pq.read_schema(str(parquets[0])).names)
+    except Exception:
+        return None  # unreadable schema — never crash the estimate path
+    seq_len = args.seq_len or (64 if args.minute else 60)
+    kwargs = _panel_pipeline_kwargs(args, seq_len)
+    surviving = [
+        c for c in cols
+        if c not in ("date", "stock_code")
+        and not re.search(r"_lag\d+$", c)
+        and not (c.startswith("topic_") and not kwargs.get("use_topic", False))
+        and not (c in FUNDAMENTAL_COLS and not kwargs.get("use_fundamental", False))
+    ]
+    n_stocks = len(stock_list)
+    lo = pd.Timestamp(args.start).date()
+    hi = pd.Timestamp(args.end).date()
+    try:
+        n_timesteps = len(get_research_calendar(strict=True).get_trading_days(lo, hi))
+    except ValueError:
+        # strict calendar extends only to verified_until — fall back to a
+        # ~ trading-day fraction of the raw span for the estimate.
+        n_timesteps = int((hi - lo).days * 0.7)
+    return n_stocks, n_timesteps, len(surviving)
+
+
+def _early_panel_memory_guard(
+    args, stock_list: list[str], data_dir, store_load: bool,
+) -> tuple[float, str] | None:
+    """§七-P0: enforce the pre-build universe memory estimate (main entry).
+
+    Runs BEFORE _resolve_panel so an oversized universe is refused before the
+    dense (N, T, D) grids are allocated.  Skipped when ``store_load`` is True
+    (no build — the store is mmap'd lazily and its surviving subset may be far
+    smaller than the requested universe) or when no estimate can be made.
+    Returns the ``(est_gb, action)`` verdict from _enforce_universe_memory, or
+    None when the early guard is skipped.  A refusal (no --allow-high-risk-
+    universe) raises SystemExit.
+    """
+    if store_load:
+        return None
+    est = _estimate_panel_memory(args, stock_list, data_dir)
+    if est is None:
+        return None
+    return _enforce_universe_memory(
+        args.universe, *est,
+        allow_override=args.allow_high_risk_universe,
+        available_gb=_host_available_gb(),
+    )
 
 
 # Channel coverage manifest: every aux channel is loaded
@@ -1866,6 +1969,14 @@ def main():
 
     universe_resolved = list(stock_list)
 
+    # §七-P0: refuse an oversized universe BEFORE the panel build allocates the
+    # dense (N, T, D) grids — the post-build check below is too late (the build
+    # itself can OOM first).  Skipped on a store-load re-run (no build, lazy
+    # mmap, and the store's surviving subset may be far smaller than the
+    # requested universe) and whenever the feature dim cannot be estimated
+    # without building (live builds — the post-build check covers those).
+    _early_panel_memory_guard(args, stock_list, data_dir, _store_load)
+
     # Stock-level quality is judged per-fold, point-in-time, inside the fold
     # loop (_fold_eligible_stocks uses only columns before train_end) — no
     # full-history ejection up front.  Row-level badness is
@@ -1976,16 +2087,10 @@ def main():
         static_dim + panel_data["past_known"].shape[2]
         + panel_data["past_observed"].shape[2]
     )
-    available_gb = None
-    try:
-        import psutil
-        available_gb = psutil.virtual_memory().available / (1024 ** 3)
-    except Exception:
-        available_gb = None  # psutil optional — the static thresholds still guard
     _enforce_universe_memory(
         args.universe, n_stocks, n_timesteps, n_features,
         allow_override=args.allow_high_risk_universe,
-        available_gb=available_gb,
+        available_gb=_host_available_gb(),
     )
 
     config = PanelConfig(

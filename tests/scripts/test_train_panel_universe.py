@@ -836,6 +836,138 @@ def test_enforce_available_gb_precheck_skips_other_universes(tp):
     assert est > 1.0
 
 
+# ── §七-P0 pre-build (T5) memory estimate / early guard ────────────────
+
+def _prebuilt_schema_df(extra_cols):
+    """A tiny multi-row DataFrame whose SCHEMA (only) the estimate reads."""
+    return pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "stock_code": ["000001", "000001"],
+        "close": [10.0, 10.5],
+        "ma_5": [9.9, 10.2],
+        **extra_cols,
+    })
+
+
+def test_estimate_panel_memory_live_build_none(tp):
+    """Live build (--prebuilt unset) → no pre-build estimate → the early guard
+    is skipped; the post-build actual-dims backstop covers live builds."""
+    args = _panel_args("allow-revised", prebuilt=None)
+    assert tp._estimate_panel_memory(args, ["000001"], "irrelevant") is None
+
+
+def test_estimate_panel_memory_missing_prebuilt_none(tp, tmp_path):
+    """A prebuilt dir with no *.parquet → None (never crash the estimate path)."""
+    args = _panel_args("allow-revised", prebuilt=str(tmp_path))
+    assert tp._estimate_panel_memory(args, ["000001"], str(tmp_path)) is None
+
+
+def test_estimate_panel_memory_reads_schema(tp, tmp_path):
+    """The estimate reads the FIRST prebuilt parquet's SCHEMA (not its data) and
+    drops exactly the columns the build drops: *_lag{N}, topic_* when use_topic
+    is off, FUNDAMENTAL_COLS when use_fundamental is off, plus the date/
+    stock_code identifiers."""
+    df = _prebuilt_schema_df({
+        "ma_5_lag1": [9.8, 9.9],      # *_lag{N} — always dropped
+        "topic_entropy": [0.1, 0.2],  # topic_* — dropped (use_topic off)
+        "roe": [0.1, 0.1],            # FUNDAMENTAL_COLS — dropped (safe-only)
+    })
+    df.to_parquet(str(tmp_path / "000001.parquet"))
+    stock_list = ["000001", "000002", "000003"]
+    args = _panel_args(
+        "safe-only", prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31", universe="all",
+    )
+    n, t, d = tp._estimate_panel_memory(args, stock_list, str(tmp_path))
+    assert n == len(stock_list)
+    assert t >= 1                       # a full year has positive trading days
+    assert d == 2                       # survivors: close, ma_5
+
+
+def test_estimate_panel_memory_fundamental_ablation_keeps_roe(tp, tmp_path):
+    """--allow-fundamental-ablation forces use_fundamental=True → the roe column
+    survives the estimate (the prebuilt parquet's fundamental cols are NOT
+    scrubbed on an ablation run)."""
+    df = _prebuilt_schema_df({"roe": [0.1, 0.1]})
+    df.to_parquet(str(tmp_path / "000001.parquet"))
+    stock_list = ["000001"]
+    args = _panel_args(
+        "safe-only", allow_fundamental_ablation=True,
+        prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31", universe="all",
+    )
+    n, t, d = tp._estimate_panel_memory(args, stock_list, str(tmp_path))
+    assert d == 3                       # close, ma_5, roe
+
+
+def test_early_enforce_universe_memory_refuses_oversized(tp, tmp_path):
+    """End-to-end: a huge resolved universe + a many-column prebuilt schema →
+    the estimate exceeds the 48 GB line and the early guard REFUSES (SystemExit
+    naming --allow-high-risk-universe) BEFORE any build happens."""
+    df = pd.DataFrame({f"f{i}": [0.0, 0.0] for i in range(10200)})
+    df["date"] = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    df["stock_code"] = ["000001", "000001"]
+    df.to_parquet(str(tmp_path / "000001.parquet"))
+    stock_list = [f"{i:06d}" for i in range(5530)]
+    args = _panel_args(
+        "allow-revised", universe="all", prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31",
+    )
+    with pytest.raises(SystemExit) as ei:
+        tp._early_panel_memory_guard(
+            args, stock_list, str(tmp_path), store_load=False)
+    msg = str(ei.value)
+    assert "universe=all" in msg
+    assert "--allow-high-risk-universe" in msg
+
+
+def test_early_enforce_universe_memory_override_allows_oversized(tp, tmp_path, caplog):
+    """--allow-high-risk-universe downgrades the early refusal to a warning; the
+    UN-overridden verdict is still 'refuse'."""
+    import logging
+    df = pd.DataFrame({f"f{i}": [0.0, 0.0] for i in range(10200)})
+    df["date"] = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    df["stock_code"] = ["000001", "000001"]
+    df.to_parquet(str(tmp_path / "000001.parquet"))
+    stock_list = [f"{i:06d}" for i in range(5530)]
+    args = _panel_args(
+        "allow-revised", universe="all", allow_high_risk_universe=True,
+        prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31",
+    )
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        est, action = tp._early_panel_memory_guard(
+            args, stock_list, str(tmp_path), store_load=False)
+    assert action == "refuse"
+    assert est > 48.0
+    assert any("--allow-high-risk-universe" in m for m in caplog.messages)
+
+
+def test_early_guard_ok_small_panel(tp, tmp_path):
+    """A small universe + small prebuilt schema → the early guard does NOT raise
+    and reports the UN-overridden verdict 'ok' (a legitimate run is not blocked)."""
+    df = _prebuilt_schema_df({"topic_entropy": [0.1, 0.2], "roe": [0.1, 0.1]})
+    df.to_parquet(str(tmp_path / "000001.parquet"))
+    stock_list = ["000001", "000002", "000003"]
+    args = _panel_args(
+        "safe-only", universe="random", prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31",
+    )
+    est, action = tp._early_panel_memory_guard(
+        args, stock_list, str(tmp_path), store_load=False)
+    assert action == "ok"
+    assert est > 0.0
+
+
+def test_early_guard_skipped_on_store_load(tp, tmp_path):
+    """A store-load re-run (no build, lazy mmap) must NEVER be refused by the
+    pre-build estimate — the store's surviving subset may be far smaller than
+    the requested universe; the post-build actual-dims check covers it."""
+    args = _panel_args("allow-revised", universe="all", prebuilt=None)
+    assert tp._early_panel_memory_guard(
+        args, ["000001"], str(tmp_path), store_load=True) is None
+
+
 # ── §T2: vintage-policy-driven feature switches ────────────────────────
 
 def _panel_args(vintage_policy, **overrides):
@@ -847,6 +979,11 @@ def _panel_args(vintage_policy, **overrides):
         "start": "2020-01-01",
         "end": "2024-12-31",
         "universe": "random",
+        # §七-P0 pre-build memory guard fields (T5).
+        "prebuilt": None,
+        "seq_len": None,
+        "allow_high_risk_universe": False,
+        "allow_fundamental_ablation": False,
     }
     base.update(overrides)
     return types.SimpleNamespace(**base)
