@@ -516,8 +516,10 @@ RESEARCH_QFQ_DAILY = DataContract(
     source_priority=("efinance", "akshare", "tushare", "baostock"),
     allowed_missingness={
         "turnover": (
-            "optional column; absent for ~850 STAR-market stocks, the feature "
-            "pipeline derives turnover_proxy from amount/close"
+            "optional column; absent for ~850 STAR-market stocks.  The feature "
+            "pipeline does not synthesize a turnover proxy from amount/close "
+            "any more (§五 P0: amount/qfq_close is not scale-invariant); "
+            "volume_ratio / amount_ratio carry the liquidity signal instead."
         ),
         "pct_change": "NaN on the first listing day",
     },

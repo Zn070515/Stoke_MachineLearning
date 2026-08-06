@@ -36,6 +36,12 @@ class TechnicalIndicators:
         volume = df["volume"].astype(float)
         amount = df.get("amount", None)
 
+        # §五 P0: qfq prices re-anchor on future corporate actions, so absolute
+        # price-level indicators (MA/EMA/MACD/BOLL/ATR) leak future behaviour
+        # into historical cross-sections.  Divide each by the contemporaneous
+        # close to make it a scale-invariant ratio.
+        close_safe = close.replace(0, 1e-10)
+
         new = {}  # collect all new columns here
 
         # ── 1. K-bar features (Alpha158 K系列) ────────────────────────
@@ -44,21 +50,21 @@ class TechnicalIndicators:
         # ── 2. Price standardization (Alpha158 价格系列) ──────────────
         new.update(_price_features(open_, high, low, close))
 
-        # ── 3. Moving averages ─────────────────────────────────────────
+        # ── 3. Moving averages (normalized by close — scale-invariant) ──
         for period in [5, 10, 20, 60, 120]:
-            new[f"ma_{period}"] = close.rolling(period).mean()
+            new[f"ma_{period}"] = close.rolling(period).mean() / close_safe
 
         ema_12 = close.ewm(span=12, adjust=False).mean()
         ema_26 = close.ewm(span=26, adjust=False).mean()
-        new["ema_12"] = ema_12
-        new["ema_26"] = ema_26
+        new["ema_12"] = ema_12 / close_safe
+        new["ema_26"] = ema_26 / close_safe
 
-        # ── 4. MACD ────────────────────────────────────────────────────
+        # ── 4. MACD (raw dif/dea computed from absolute EMAs, then /close) ──
         macd_dif = ema_12 - ema_26
         macd_dea = macd_dif.ewm(span=9, adjust=False).mean()
-        new["macd_dif"] = macd_dif
-        new["macd_dea"] = macd_dea
-        new["macd_hist"] = 2 * (macd_dif - macd_dea)
+        new["macd_dif"] = macd_dif / close_safe
+        new["macd_dea"] = macd_dea / close_safe
+        new["macd_hist"] = 2 * (macd_dif - macd_dea) / close_safe
 
         # ── 5. RSI ─────────────────────────────────────────────────────
         for period in [6, 12, 24]:
@@ -86,9 +92,10 @@ class TechnicalIndicators:
         boll_std = close.rolling(20).std()
         boll_upper = boll_mid + 2 * boll_std
         boll_lower = boll_mid - 2 * boll_std
-        new["boll_mid"] = boll_mid
-        new["boll_upper"] = boll_upper
-        new["boll_lower"] = boll_lower
+        new["boll_mid"] = boll_mid / close_safe
+        new["boll_upper"] = boll_upper / close_safe
+        new["boll_lower"] = boll_lower / close_safe
+        # boll_pct is %b (already scale-invariant) — computed from raw bands.
         bb_range = boll_upper - boll_lower
         new["boll_pct"] = (close - boll_lower) / bb_range.replace(0, 1e-10)
 
@@ -98,7 +105,7 @@ class TechnicalIndicators:
             (high - close.shift()).abs(),
             (low - close.shift()).abs(),
         ], axis=1).max(axis=1)
-        new["atr_14"] = tr.rolling(14).mean()
+        new["atr_14"] = tr.rolling(14).mean() / close_safe
 
         # ── 9. ROC ────────────────────────────────────────────────────
         for period in [6, 12, 20]:
@@ -152,7 +159,6 @@ class TechnicalIndicators:
             amount_ma5 = amount.rolling(5).mean()
             new["amount_ma5"] = amount_ma5
             new["amount_ratio"] = amount / amount_ma5.replace(0, 1e-10)
-            new["turnover_proxy"] = amount / close.replace(0, 1e-10)
 
         # ── 15. Rolling window: position stats (Alpha158) ──────────────
         new.update(_rolling_position(high, low, close))

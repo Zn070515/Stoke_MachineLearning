@@ -23,11 +23,16 @@ class TrendScorer:
         return result
 
     def _classify_trend(self, df: pd.DataFrame) -> pd.DataFrame:
-        ma5 = df["ma_5"].values
-        ma10 = df["ma_10"].values
-        ma20 = df["ma_20"].values
-        ma60 = df["ma_60"].values
-        close = df["close"].values
+        # §五 P0: df["ma_*"] are now close-normalized ratios, not absolute
+        # prices.  Compute the absolute MAs internally from close so the
+        # ordering comparisons stay valid (the trend_level output is itself
+        # scale-invariant: scaling OHLC by k leaves every comparison unchanged).
+        close = df["close"].astype(float)
+        ma5 = close.rolling(5).mean().values
+        ma10 = close.rolling(10).mean().values
+        ma20 = close.rolling(20).mean().values
+        ma60 = close.rolling(60).mean().values
+        close = close.values
 
         trend = np.full(len(df), 3, dtype=int)
         for i in range(len(df)):
@@ -49,11 +54,16 @@ class TrendScorer:
         return df
 
     def _compute_bias(self, df: pd.DataFrame) -> pd.DataFrame:
+        # §五 P0: df["ma_*"] hold close-normalized ratios now, so compute the
+        # absolute MA internally — the bias ratio (close - ma) / ma * 100 is
+        # scale-invariant and matches the old absolute-MA semantics exactly.
+        close = df["close"].astype(float)
         for period in [5, 10, 20, 60]:
             ma_col = f"ma_{period}"
             if ma_col in df.columns:
+                ma = close.rolling(period).mean()
                 df[f"bias_ma{period}"] = (
-                    (df["close"] - df[ma_col]) / df[ma_col] * 100
+                    (close - ma) / ma.replace(0, 1e-10) * 100
                 )
         return df
 
