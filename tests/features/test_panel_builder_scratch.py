@@ -305,9 +305,12 @@ def test_resume_skips_existing_pickles(monkeypatch, tmp_path):
     out1 = _build_and_preserve(monkeypatch, scratch, "run-1", sink1)
 
     # Simulate a hard-kill mid-Pass-1: one stock's pickle is missing and the
-    # manifest is back to "running".
+    # manifest is back to "running" (preserving the feature-switch fingerprint
+    # — a faithful same-switches crash).
     os.remove(os.path.join(scratch, "000002.pkl"))
-    _write_run_manifest(scratch, "run-1", stage="running")
+    _write_run_manifest(
+        scratch, "run-1", stage="running",
+        feature_switches_hash=pb._feature_switches_hash(_tiny_pipeline()))
 
     # Spy on _engineer_stock to count which stocks are (re-)engineered.
     engineered = []
@@ -343,10 +346,13 @@ def test_resume_corrupt_pickle_reengineered(monkeypatch, tmp_path):
 
     scratch = str(tmp_path / "store" / "scratch" / "run-1")
     _build_and_preserve(monkeypatch, scratch, "run-1", str(tmp_path / "sink1"))
-    # Corrupt one pickle + set the manifest back to "running".
+    # Corrupt one pickle + set the manifest back to "running", preserving the
+    # feature-switch fingerprint (a faithful crash: same switches, same run).
     with open(os.path.join(scratch, "000001.pkl"), "wb") as fh:
         fh.write(b"garbage partial pickle")
-    _write_run_manifest(scratch, "run-1", stage="running")
+    _write_run_manifest(
+        scratch, "run-1", stage="running",
+        feature_switches_hash=pb._feature_switches_hash(_tiny_pipeline()))
 
     engineered = []
     real_engineer = pb._engineer_stock
@@ -362,6 +368,61 @@ def test_resume_corrupt_pickle_reengineered(monkeypatch, tmp_path):
     )
     assert "000001" in engineered   # corrupt → re-engineered
     assert len(out2["stock_codes"]) == 3
+
+
+def test_resume_refuses_feature_switch_mismatch(monkeypatch, tmp_path):
+    """A scratch whose manifest fingerprint differs from the current run is
+    REFUSED on resume — resuming would skip old-schema pickles and engineer
+    new-schema ones into a silent hybrid panel."""
+    import stoke_ml.features.panel_builder as pb
+
+    scratch = str(tmp_path / "store" / "scratch" / "run-1")
+    _build_and_preserve(monkeypatch, scratch, "run-1", str(tmp_path / "sink1"))
+    # Simulate a crash (stage back to "running") under DIFFERENT feature
+    # switches: corrupt the recorded fingerprint to an unrelated switch set.
+    m = _read_run_manifest(scratch)
+    assert m["feature_switches_hash"]           # the builder now records it
+    m["stage"] = "running"
+    m["feature_switches_hash"] = "0" * 64
+    with open(os.path.join(scratch, "run_manifest.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(m, fh)
+
+    with pytest.raises(RuntimeError, match="feature switches"):
+        _tiny_pipeline().build_panel_features(
+            _tiny_panel(), horizon=1, memmap_dir=str(tmp_path / "sink2"),
+            scratch_dir=scratch, run_id="run-1")
+
+
+def test_done_manifest_not_resumed(monkeypatch, tmp_path, caplog):
+    """A preserved COMPLETED run (stage=done) is NOT resumed — a fresh full
+    rebuild happens with a warning, and the completed run's id is not adopted."""
+    import stoke_ml.features.panel_builder as pb
+
+    scratch = str(tmp_path / "store" / "scratch" / "run-1")
+    _build_and_preserve(monkeypatch, scratch, "run-1", str(tmp_path / "sink1"))
+    assert _read_run_manifest(scratch)["stage"] == "done"   # completed, not crashed
+
+    engineered = []
+    real_engineer = pb._engineer_stock
+
+    def spy(pipeline, code, *a, **k):
+        engineered.append(code)
+        return real_engineer(pipeline, code, *a, **k)
+
+    monkeypatch.setattr(pb, "_engineer_stock", spy)
+    with caplog.at_level("WARNING"):
+        _tiny_pipeline().build_panel_features(
+            _tiny_panel(), horizon=1, memmap_dir=str(tmp_path / "sink2"),
+            scratch_dir=scratch, run_id=None,
+        )
+    # Not resumed: every stock re-engineered (a fresh full rebuild), with a
+    # warning about the completed run, and a fresh run id (not the old one).
+    assert engineered == ["000001", "000002", "000003"]
+    assert "COMPLETED" in caplog.text
+    m = _read_run_manifest(scratch)
+    assert m["run_id"] != "run-1"
+    assert m.get("resumed") is not True
 
 
 def test_builder_startup_sweeps_stale_siblings(monkeypatch, tmp_path):

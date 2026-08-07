@@ -17,6 +17,7 @@ The five builder concerns were extracted into ``stoke_ml.features.panel_builders
   - ``_arrays.py``         — PanelArrays: allocation + sanitization + dict assembly (T8 seam)
   - ``_static_context.py`` — StaticContextBuilder: static / pk / po grid population + quantile ranks
 """
+import hashlib
 import json
 import logging
 import os
@@ -78,6 +79,29 @@ def _scratch_run_id() -> str:
     return f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
 
 
+def _feature_switches_hash(pipeline) -> str:
+    """Stable fingerprint of the feature-engineering switch set (§T7).
+
+    Snapshot of the pipeline's ``use_*`` flags plus ``seq_len`` / ``minute_mode``
+    — the dimensions that change a stock's engineered frame schema.  Recorded in
+    ``run_manifest.json`` so a same-scratch re-run can REFUSE to resume when the
+    switches changed: resuming would skip old-schema pickles and engineer
+    new-schema ones into a silent hybrid panel.
+
+    The builder is a config-free leaf module, so the fingerprint is derived from
+    the pipeline INSTANCE (the ``use_*`` attributes FeaturePipeline already
+    stores), not from CLI/config state.
+    """
+    keys = {
+        k: (bool(v) if isinstance(v, bool) else v)
+        for k, v in vars(pipeline).items()
+        if k.startswith("use_") or k in ("seq_len", "minute_mode")
+    }
+    return hashlib.sha256(
+        json.dumps(keys, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _read_run_manifest(scratch: str) -> dict | None:
     """Read ``run_manifest.json`` from a scratch dir, or None when absent/corrupt.
 
@@ -96,14 +120,17 @@ def _read_run_manifest(scratch: str) -> dict | None:
 def _write_run_manifest(
     scratch: str, run_id: str, stage: str, *,
     pid: int | None = None, resumed: bool = False,
+    feature_switches_hash: str | None = None,
 ) -> dict:
     """Write/overwrite ``run_manifest.json`` with the given stage (§T7).
 
     Fields: ``run_id`` / ``start_time`` / ``stage`` / ``pid`` (the §T7
-    contract) plus ``resumed`` when this is a crash-recovery re-run.
-    ``start_time`` is preserved from a prior manifest so a resumed run keeps
-    its original birth timestamp.  A write failure (read-only / locked scratch)
-    warns instead of crashing the build.
+    contract) plus ``resumed`` when this is a crash-recovery re-run, and
+    ``feature_switches_hash`` (the §T7 review fingerprint) when the caller
+    supplies it — the builder always does, so a resume target carries the
+    switch set it was built under.  ``start_time`` is preserved from a prior
+    manifest so a resumed run keeps its original birth timestamp.  A write
+    failure (read-only / locked scratch) warns instead of crashing the build.
     """
     prev = _read_run_manifest(scratch)
     manifest = {
@@ -113,6 +140,8 @@ def _write_run_manifest(
         "stage": stage,
         "pid": pid if pid is not None else os.getpid(),
     }
+    if feature_switches_hash is not None:
+        manifest["feature_switches_hash"] = feature_switches_hash
     if resumed:
         manifest["resumed"] = True
     try:
@@ -374,13 +403,43 @@ def _build_panel_streaming(
     # carries run_manifest.json (+ surviving pickles) is a crashed run: the
     # re-run ADOPTS its run_id and Pass 1 skips stocks whose pickle already
     # exists.  A fresh dir generates a new run_id.
+    #
+    # §T7 review: resume is gated on TWO conditions.
+    #   * The manifest's feature-switch fingerprint must MATCH the current run
+    #     (else resuming would skip old-schema pickles and engineer new-schema
+    #     ones into a silent hybrid panel) — REFUSE, don't guess.
+    #   * The prior run must NOT have completed (stage != "done") — a preserved
+    #     COMPLETED run is not a crash to recover: resuming it would be a silent
+    #     no-op (every pickle already present).  Its run_id is not adopted; a
+    #     fresh full rebuild runs with a warning.
     prev_manifest = _read_run_manifest(scratch)
-    resume = bool(prev_manifest and prev_manifest.get("run_id"))
+    feature_hash = _feature_switches_hash(pipeline)
+    resume = False
+    if prev_manifest and prev_manifest.get("run_id"):
+        prev_hash = prev_manifest.get("feature_switches_hash")
+        if prev_hash and prev_hash != feature_hash:
+            raise RuntimeError(
+                "streaming panel build: scratch dir %s belongs to a previous "
+                "run with DIFFERENT feature switches (recorded %s vs current "
+                "%s) — resuming would mix two feature schemas into a hybrid "
+                "panel (§T7).  Point --scratch-dir at a fresh dir, or delete "
+                "the old pickles for a full rebuild." % (
+                    scratch, prev_hash, feature_hash))
+        if prev_manifest.get("stage") == "done":
+            logger.warning(
+                "scratch %s already holds a COMPLETED run (run_id=%s, "
+                "stage=done) — not resuming; starting a fresh run (all "
+                "pickles re-engineered).  Point --scratch-dir at a fresh dir "
+                "to keep the completed run's artifacts.",
+                scratch, prev_manifest.get("run_id"))
+        else:
+            resume = True
     if resume:
         run_id = prev_manifest["run_id"]
     elif run_id is None:
         run_id = _scratch_run_id()
-    _write_run_manifest(scratch, run_id, stage="running", resumed=resume)
+    _write_run_manifest(scratch, run_id, stage="running", resumed=resume,
+                        feature_switches_hash=feature_hash)
 
     try:
         # ── Pass 1: engineer → disk + metadata ──────────────────────────
@@ -682,7 +741,10 @@ def _build_panel_streaming(
         # §T7: record a successful completion in run_manifest.json (the scratch
         # is normally removed by the finally below; the "done" stage matters
         # only when the dir survives, e.g. a hard kill right after the build).
-        _write_run_manifest(scratch, run_id, stage="done", resumed=resume)
+        # The fingerprint is re-recorded so a surviving "done" manifest still
+        # carries the switch set it was built under.
+        _write_run_manifest(scratch, run_id, stage="done", resumed=resume,
+                            feature_switches_hash=feature_hash)
 
         return arrays.assemble(
             global_dates, decision_arr, history_arr,
