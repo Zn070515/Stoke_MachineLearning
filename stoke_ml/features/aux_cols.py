@@ -71,8 +71,10 @@ MACRO_COLS = [
     "gdp_cn_yoy", "m2_yoy", "m1_yoy", "sf_total", "cpi_yoy",
 ]
 
-# Must match scripts/_preprocess_market_env.py output exactly (7 cols, no
-# limit-up temperature cols — that family is deferred).
+# Superset of both market_env sub-parts (verified PRICE + ablation-only ACCOUNT,
+# §T5).  Consumption gating happens upstream via feature_profile's
+# market_env_required_columns / use_market_env_account; this list only feeds
+# _active_cols after the merge gate has already filtered to the required set.
 MARKET_ENV_COLS = [
     "high_low_ratio", "mkt_cap_total_z", "avg_account_cap_z",
     "investor_new_num", "investor_new_z", "market_adv_ratio", "market_turnover_z",

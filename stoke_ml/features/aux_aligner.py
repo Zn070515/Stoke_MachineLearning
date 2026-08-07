@@ -48,6 +48,7 @@ from stoke_ml.features.aux_helpers import (
 # cycle-free — panel_builder already imports feature_profile the same way.
 from stoke_ml.config.feature_profile import (
     MARKET_ENV_ACCOUNT_COLS,
+    market_env_account_is_verified,
     market_env_required_columns,
 )
 
@@ -624,11 +625,11 @@ class AuxAligner:
         me = me.drop_duplicates(subset="date", keep="last")
         # §T5: consume the VERIFIED PRICE part always (the market_env channel's
         # required sub-set); the PROXY ACCOUNT part is consumed ONLY on the
-        # ablation opt-in (use_market_env_account) or automatically once the
-        # account part is declared verified (market_env_required_columns already
-        # includes it then — the ablation flag is redundant-but-harmless).
+        # ablation opt-in (use_market_env_account) — once the account part is
+        # declared verified, market_env_required_columns already includes it, so
+        # the flag is a no-op then.
         want = set(market_env_required_columns(None))
-        if self.use_market_env_account:
+        if self.use_market_env_account and not market_env_account_is_verified():
             want |= set(MARKET_ENV_ACCOUNT_COLS)
         available = [c for c in want if c in me.columns]
         if not available:
