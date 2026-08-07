@@ -56,6 +56,7 @@ def build_panel_features(
     require_feature_manifest: bool = False,
     data_dir: str | None = None,
     daily_membership: pd.DataFrame | None = None,
+    memmap_dir: str | None = None,
 ) -> dict:
     """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -103,6 +104,15 @@ def build_panel_features(
                   member).  Non-member stocks still get z-scored, but they do
                   NOT contribute to the mean/std (§T6 decision 2).  Default
                   None = the EXACT current all-stock behavior.
+        memmap_dir: optional directory to sink the three large (N, T, D)
+                  feature grids (static_features / past_known / past_observed)
+                  directly to disk via ``np.lib.format.open_memmap``, so the
+                  full dense grids never reside in RAM (T8, §七-P0).  When None
+                  (default) the current all-dense behavior is preserved.  The
+                  returned dict carries ``np.memmap`` objects for those keys;
+                  the caller must flush + close them before re-writing the same
+                  directory (Windows file-lock constraint — see panel_store.py
+                  docstring).
 
     Returns:
         dict with numpy arrays: static_features, past_known, past_observed,
@@ -387,7 +397,7 @@ def build_panel_features(
     N_stocks = len(all_feat_dfs)
 
     # ── Targets & masks (per-stock labels / PIT-static raw inputs) ──
-    arrays = PanelArrays(N_stocks, max_T)
+    arrays = PanelArrays(N_stocks, max_T, sink_dir=memmap_dir)
     target_builder = TargetBuilder(horizon, target_col)
     target_builder.compute(all_feat_dfs, valid_codes, max_T, date_to_pos, arrays)
 

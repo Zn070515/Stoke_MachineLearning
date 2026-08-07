@@ -1025,6 +1025,7 @@ class FeaturePipeline:
         require_feature_manifest: bool = False,
         data_dir: str | None = None,
         daily_membership: pd.DataFrame | None = None,
+        memmap_dir: str | None = None,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training.
 
@@ -1043,4 +1044,5 @@ class FeaturePipeline:
             require_feature_manifest=require_feature_manifest,
             data_dir=data_dir,
             daily_membership=daily_membership,
+            memmap_dir=memmap_dir,
         )

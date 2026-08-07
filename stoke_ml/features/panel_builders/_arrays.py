@@ -4,7 +4,13 @@
 write (scatter through public attributes), sanitization, and final dict
 assembly.  T8 swaps the ``np.zeros`` backing for chunked memmap without
 touching any builder loop.
+
+When ``sink_dir`` is set, the three big feature grids (static/pk/po) are
+allocated as ``np.lib.format.open_memmap`` files directly on disk, so the
+complete ``(N, T, D)`` grids never reside in RAM.  The 2-D target/mask arrays
+are small (N x T) and stay dense.
 """
+import os
 import numpy as np
 
 
@@ -15,18 +21,29 @@ class PanelArrays:
     into the public ndarray attributes directly during their per-stock loops.
     ``alloc_features()`` is called later (after column discovery gives the
     dimensionalities); ``sanitize()`` + ``assemble()`` run last.
+
+    Parameters
+    ----------
+    N_stocks : int
+    max_T : int
+    sink_dir : str or None
+        When set, the three big (N, T, D) grids are memmap-backed to disk
+        files under this directory.  Small 2-D arrays stay dense in RAM.
+        None (default) preserves the original all-dense behaviour.
     """
 
-    def __init__(self, N_stocks: int, max_T: int):
+    def __init__(self, N_stocks: int, max_T: int, sink_dir: str | None = None):
         self.N = N_stocks
         self.T = max_T
+        self._sink_dir = sink_dir
+        self._sink_paths: dict[str, str] = {}
         self._alloc_target_arrays()
 
     # -- allocation -------------------------------------------------------
 
     def _alloc_target_arrays(self):
         N, T = self.N, self.T
-        # Targets
+        # Targets — always dense (small N x T).
         self.y_dir = np.full((N, T), -100, dtype=np.int64)
         self.y_ret = np.zeros((N, T), dtype=np.float32)
         self.y_vol = np.zeros((N, T), dtype=np.float32)
@@ -55,11 +72,54 @@ class PanelArrays:
         self.stock_T = np.zeros(N, dtype=np.int32)
 
     def alloc_features(self, static_dim: int, pk_dim: int, po_dim: int):
-        """Allocate the three feature grids (called after column discovery)."""
+        """Allocate the three feature grids (called after column discovery).
+
+        When ``sink_dir`` is set, the grids are backed by disk files via
+        ``np.lib.format.open_memmap`` (writes proper .npy headers so
+        ``np.load(mmap_mode='r')`` can re-open them lazily).  The 2-D
+        target/mask arrays stay dense regardless.
+        """
         N, T = self.N, self.T
-        self.static = np.zeros((N, T, static_dim), dtype=np.float32)
-        self.pk = np.zeros((N, T, pk_dim), dtype=np.float32)
-        self.po = np.zeros((N, T, po_dim), dtype=np.float32)
+        if self._sink_dir is not None:
+            os.makedirs(self._sink_dir, exist_ok=True)
+            self.static = np.lib.format.open_memmap(
+                os.path.join(self._sink_dir, "static_features.npy"),
+                mode="w+", dtype=np.float32, shape=(N, T, static_dim),
+            )
+            self.pk = np.lib.format.open_memmap(
+                os.path.join(self._sink_dir, "past_known.npy"),
+                mode="w+", dtype=np.float32, shape=(N, T, pk_dim),
+            )
+            self.po = np.lib.format.open_memmap(
+                os.path.join(self._sink_dir, "past_observed.npy"),
+                mode="w+", dtype=np.float32, shape=(N, T, po_dim),
+            )
+            self._sink_paths = {
+                "static": os.path.join(self._sink_dir, "static_features.npy"),
+                "pk": os.path.join(self._sink_dir, "past_known.npy"),
+                "po": os.path.join(self._sink_dir, "past_observed.npy"),
+            }
+        else:
+            self.static = np.zeros((N, T, static_dim), dtype=np.float32)
+            self.pk = np.zeros((N, T, pk_dim), dtype=np.float32)
+            self.po = np.zeros((N, T, po_dim), dtype=np.float32)
+
+    def flush_sink(self):
+        """Flush pending data to the sink files and close underlying mappings.
+
+        Called AFTER the build is finished and ``assemble()`` has captured
+        the memmap references into the returned dict.  On Windows the caller
+        must close the sink before ``save_panel_memmap`` can write to the same
+        directory (open memmaps keep their backing files locked).
+        """
+        if not self._sink_paths:
+            return
+        for attr in ("po", "pk", "static"):
+            arr = getattr(self, attr, None)
+            if arr is not None and isinstance(arr, np.memmap):
+                arr.flush()
+                if hasattr(arr, "_mmap") and arr._mmap is not None:
+                    arr._mmap.close()
 
     # -- sanitization -----------------------------------------------------
 

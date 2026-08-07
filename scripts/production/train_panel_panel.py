@@ -275,17 +275,40 @@ def _resolve_panel(
         else:
             daily_membership = _mem
     fp = FeaturePipeline(**_panel_pipeline_kwargs(args, seq_len))
+    # T8 (§七-P0): when --panel-store is set, the three large (N,T,D) grids are
+    # written directly to disk via open_memmap — the full dense grids never
+    # reside in RAM.  After the build, the memmaps are flushed + closed so
+    # save_panel_memmap can safely write the remaining small arrays + metadata
+    # into the same directory (Windows locks open memmap files).  The store is
+    # then re-loaded to get lazy read-only memmaps for downstream training.
     panel_data = fp.build_panel_features(
         panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
         require_feature_manifest=args.require_feature_manifest,
         daily_membership=daily_membership,
+        memmap_dir=args.panel_store,
     )
     if args.panel_store:
+        # Flush + detach the three big memmap grids so save_panel_memmap can
+        # atomically write the small arrays + metadata without file-lock
+        # collisions on Windows (open memmaps keep their backing files locked).
+        for key in ("static_features", "past_known", "past_observed"):
+            arr = panel_data.get(key)
+            if arr is not None and isinstance(arr, np.memmap):
+                arr.flush()
+                if hasattr(arr, "_mmap") and arr._mmap is not None:
+                    arr._mmap.close()
+                del panel_data[key]
         save_panel_memmap(
             panel_data, args.panel_store,
             meta=_panel_store_meta(
                 args, seq_len, stock_list, data_dir, args.prebuilt))
         logger.info("Saved panel memmap store to %s", args.panel_store)
+        # Re-load the full store for downstream training — fresh lazy memmaps
+        # for all arrays (the big grids page-fault only the rows/cols touched).
+        panel_data = load_panel_memmap(
+            args.panel_store,
+            expected_meta=_panel_store_meta(
+                args, seq_len, stock_list, data_dir, args.prebuilt))
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the
         # panel's has_* flags instead so the experiment still records what
