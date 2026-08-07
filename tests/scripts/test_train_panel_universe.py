@@ -1344,8 +1344,13 @@ def test_headline_strict_turns_off_proxy_aligned_dims(tp):
     assert kw["use_fundamental"] is False       # latest_revised → denied
     for dim in ("board", "sector", "concept", "limit_up", "topic"):
         assert kw[f"use_{dim}"] is False, dim
-    # Legacy alias: the pre-T3 "safe-only" string parses to revision-safe, so
-    # an old args stub still yields the revision-safe switch set.
+    # Legacy alias — BACKWARD-COMPAT DESERIALIZATION of stored records, NOT a
+    # CLI path: the CLI choices now exclude "safe-only" (argparse rejects it),
+    # but stored records (JSON config / experiment meta written pre-T3) carry
+    # the old serialized "safe-only" string, and the VintagePolicy coercion
+    # must keep parsing those to revision-safe so legacy stores/experiments
+    # are not rejected on strict reads.  The "safe-only" string here simulates
+    # such a stored record being deserialized into the args namespace.
     legacy = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
     assert legacy["use_fundamental"] is False
     assert legacy["use_market_env"] is True

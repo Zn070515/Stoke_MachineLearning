@@ -171,7 +171,7 @@ def test_fundamental_refine_kept_when_fundamental_on():
     assert pipe.use_fundamental_refine is True
 
 
-def test_coupling_makes_safe_only_scrub_drop_refine_columns(tmp_path):
+def test_coupling_makes_revision_safe_scrub_drop_refine_columns(tmp_path):
     """End-to-end: with fundamental OFF the pipeline ALSO reports
     use_fundamental_refine False, so the scrub drops the fundamental_refine
     columns of a full prebuilt — a revision-safe run never leaks them."""

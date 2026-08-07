@@ -338,7 +338,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/compare_pipelines.py --st
 
 ## 测试
 
-~81 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
+~89 个测试文件位于 `tests/{features,models,preprocessing,data,evaluation}/`，覆盖 FE v2 新数据源、Panel 损失/评估、预处理链、数据存储与日历、特征缓存 manifest 与数据契约。用 venv 解释器运行：
 
 ```bash
 PYTHONPATH=. ./.venv/Scripts/python -m pytest tests/ -q
