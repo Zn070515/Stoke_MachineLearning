@@ -312,14 +312,11 @@ def _resolve_panel(
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the
         # panel's has_* flags instead so the experiment still records what
-        # actually got in.  A persisted store manifest (already present in
-        # panel_data on a store build) is preferred — it carries the accurate
-        # build-time coverage, including channels without a has_* flag.  Done
-        # BEFORE the store save below so the accurate manifest is what persists.
-        channel_manifest = (
-            panel_data.get("channel_coverage_manifest")
-            or _prebuilt_channel_coverage(panel_data)
-        )
+        # actually got in.  On a plain (no-store) build panel_data never carries
+        # a manifest key yet — the probe is the only source here.  (On a store
+        # build the manifest is set into panel_data AFTER this block and read
+        # back from the reloaded store below.)
+        channel_manifest = _prebuilt_channel_coverage(panel_data)
     if args.panel_store:
         # §T4: persist the channel-coverage manifest into the store so a later
         # store-backed replay reads the accurate build-time coverage directly
@@ -355,10 +352,12 @@ def _resolve_panel(
                 args, seq_len, stock_list, data_dir, args.prebuilt),
             strict_external_meta=strict)
         # Replay the persisted manifest (preferred) or fall back to the probe.
-        channel_manifest = (
-            panel_data.get("channel_coverage_manifest")
-            or _prebuilt_channel_coverage(panel_data)
-        )
+        # `is not None`, NOT `or`: a persisted-but-EMPTY manifest ({} — e.g. a
+        # --no-aux build) is a legitimately-empty build-time record that must be
+        # replayed as-is, not silently replaced by the probe.
+        stored = panel_data.get("channel_coverage_manifest")
+        channel_manifest = (stored if stored is not None
+                            else _prebuilt_channel_coverage(panel_data))
     return panel_data, channel_manifest
 
 # §七-P0 universe memory guard thresholds (GB).  --universe all is refused
@@ -600,7 +599,13 @@ def _trading_day_count(data_dir, start_date, end_date) -> int:
     try:
         cal = get_research_calendar(strict=True, data_dir=data_dir)
         return len(cal.get_trading_days(lo, hi))
-    except ValueError:
+    except ValueError as exc:
+        # Strict-calendar range overflow past verified_until (or a malformed
+        # calendar artifact) — fall back to a ~weekday fraction of the raw span
+        # so a coverage probe never crashes.  Logged at debug so a corrupted
+        # artifact is surfaced instead of silently masked.
+        logger.debug("trading-day count fell back to a weekday estimate for "
+                     "[%s, %s]: %s", start_date, end_date, exc)
         span_days = (hi - lo).days
         return max(1, int(round(span_days * 5 / 7)))
 
@@ -611,14 +616,35 @@ def _date_coverage_fraction(n_dates_in_range, data_dir, start_date, end_date) ->
     A falsy window (no start/end) treats any present data as fully covered
     (1.0 when ``n_dates_in_range > 0``), 0.0 otherwise.  This is the MEANINGFUL
     metric for market-wide broadcast channels — their value is the same for
-    every stock per date, so stock coverage is vacuous.
+    every stock per date, so stock coverage is vacuous.  The fraction is CLIPPED
+    at 1.0: a broadcast file written with ``resample("D")`` counts weekend dates
+    in the numerator while the denominator is trading days only, so the raw
+    ratio can exceed 1.0 — it only inflates (never false-aborts), and the clip
+    keeps reported coverage honest (§T4 review).
     """
     if not start_date or not end_date:
         return 1.0 if n_dates_in_range > 0 else 0.0
     n_trading = _trading_day_count(data_dir, start_date, end_date)
     if not n_trading:
         return 0.0
-    return round(n_dates_in_range / n_trading, 4)
+    return round(min(1.0, n_dates_in_range / n_trading), 4)
+
+
+def _filter_dates_in_range(dates, start_date, end_date):
+    """Return ``dates`` normalized and restricted to [start_date, end_date].
+
+    Shared by ``_probe_broadcast_dates`` AND the etf_flow aggregation so both
+    count in-window dates the same way — a date-coverage numerator that counted
+    every distinct date across full history would make the etf_flow contract
+    vacuous (almost always >= 1.0, able to pass with zero in-window data; §T4
+    review).  A falsy bound is treated as unbounded on that side.
+    """
+    dates = pd.to_datetime(dates).dt.normalize()
+    if start_date:
+        dates = dates[dates >= pd.Timestamp(start_date)]
+    if end_date:
+        dates = dates[dates <= pd.Timestamp(end_date)]
+    return dates
 
 
 def _probe_broadcast_dates(path, start_date, end_date, data_dir):
@@ -632,24 +658,22 @@ def _probe_broadcast_dates(path, start_date, end_date, data_dir):
     Normalizes a DatetimeIndex OR a date column like ``aux_aligner``'s
     ``_merge_industry`` / ``_merge_market_env``.  Returns ``(n_dates_in_range,
     status)`` where status is MISSING (file absent) / FAILED (unreadable) / OK.
+    The WHOLE body (not just the parquet read) is inside the try — a malformed
+    index/column must degrade to FAILED, never raise out of load_aux_data.
     """
     if not os.path.isfile(path):
         return 0, "MISSING"
     try:
         df = pd.read_parquet(path)
+        if "date" not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index().rename(columns={"index": "date"})
+            else:
+                return 0, "FAILED"
+        dates = _filter_dates_in_range(df["date"], start_date, end_date)
+        return int(dates.nunique()), "OK"
     except Exception:
         return 0, "FAILED"
-    if "date" not in df.columns:
-        if isinstance(df.index, pd.DatetimeIndex):
-            df = df.reset_index().rename(columns={"index": "date"})
-        else:
-            return 0, "FAILED"
-    dates = pd.to_datetime(df["date"]).dt.normalize()
-    if start_date:
-        dates = dates[dates >= pd.Timestamp(start_date)]
-    if end_date:
-        dates = dates[dates <= pd.Timestamp(end_date)]
-    return int(dates.nunique()), "OK"
 
 
 def _load_channel_aux(
@@ -807,9 +831,14 @@ def load_aux_data(
             # §T4: broadcast channel — stock coverage is vacuous (1.0 whenever
             # the aggregated data exists); DATE coverage is the meaningful metric.
             entry["stock_coverage"] = entry["coverage"]
+            # §T4 review: the numerator MUST be window-filtered — counting every
+            # distinct date across all sector files (full history) would make
+            # date_coverage ~1.0 with zero in-window data, vacating the 0.80
+            # contract.  Reuse the same in-window filter as _probe_broadcast_dates.
+            n_etf_dates = int(
+                _filter_dates_in_range(etf_agg["date"], start_date, end_date).nunique())
             entry["date_coverage"] = _date_coverage_fraction(
-                len(set(pd.to_datetime(etf_agg["date"]).dt.date)),
-                data_dir, start_date, end_date)
+                n_etf_dates, data_dir, start_date, end_date)
             entry["status"] = "OK"
             logger.info("[etf_flow] aggregated from %d sector files "
                         "(broadcast to %d stocks)", len(etf_frames), len(stock_list))

@@ -118,6 +118,9 @@ from scripts.production.train_panel_panel import (
     _load_channel_aux,  # noqa: F401  re-exported for import-compat
     load_aux_data,  # noqa: F401  re-exported for import-compat
     _prebuilt_channel_coverage,  # noqa: F401  re-exported for import-compat
+    _trading_day_count,  # noqa: F401  re-exported for import-compat
+    _date_coverage_fraction,  # noqa: F401  re-exported for import-compat
+    _probe_broadcast_dates,  # noqa: F401  re-exported for import-compat
     _BASE_DIM_PREFERENCE,  # noqa: F401  re-exported for import-compat
     _SWITCH_KEY,  # noqa: F401  re-exported for import-compat
     _UNIVERSE_MEMORY_WARN_GB,  # noqa: F401  re-exported for import-compat

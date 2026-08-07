@@ -1518,3 +1518,72 @@ def test_enforce_channel_coverage_unrequested_channel_ignored(tp):
     """A channel in the manifest but NOT in required_set is not gated at all."""
     manifest = {"sentiment": _manifest_entry(0, 0.0)}
     tp._enforce_channel_coverage({"guba"}, manifest, {})  # must not abort
+
+
+def _full_manifest(required_set, contracts):
+    """A manifest where every required channel is present at FULL coverage under
+    its own declared metric (stock_coverage for per-stock channels, date_coverage
+    for the broadcast ones) — used to isolate one unprobeable channel."""
+    manifest = {}
+    for ch in required_set:
+        contract = contracts.get(ch)
+        metric = contract.metric if contract is not None else "stock_coverage"
+        manifest[ch] = {"requested": True, "required": True,
+                        "loaded_stocks": 100, "coverage": 1.0,
+                        "stock_coverage": 1.0, "date_coverage": 1.0,
+                        "errors": 0, "status": "OK"}
+    return manifest
+
+
+def test_enforce_channel_coverage_formal_prebuilt_aborts_on_profile_required_unprobeable(
+        tp, caplog):
+    """The formal-default PREBUILT path: a channel the headline_v1 profile
+    REQUIRES and contracts (margin) that the prebuilt probe cannot cover (no
+    has_* flag) must ABORT the gate — coverage cannot be verified — while the
+    IDENTICAL manifest in EXPLORE mode only warns.  margin is genuinely profile-
+    required (not an arbitrary channel)."""
+    import logging
+    args = _panel_args("safe-only", feature_profile="headline_v1")
+    required_set, contracts, name = tp._resolve_required_set(args)
+    assert name == "headline_v1"
+    assert "margin" in required_set
+    assert "margin" in contracts
+    # A prebuilt has_* probe covers every required channel EXCEPT the flag-less
+    # margin — all others present at full coverage, margin absent.
+    manifest = _full_manifest(required_set, contracts)
+    manifest.pop("margin")
+
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage(
+                required_set, manifest, contracts, formal=True)
+    assert ei.value.code == 1
+    assert any("margin" in m for m in caplog.messages)
+    assert any("formal mode" in m for m in caplog.messages)
+
+    # EXPLORE mode on the identical manifest warns and does NOT abort.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        tp._enforce_channel_coverage(
+            required_set, manifest, contracts, formal=False)
+    assert any("margin" in m for m in caplog.messages)
+    assert any("no coverage probe" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_below_minimum_broadcast_date_metric(tp, caplog):
+    """A broadcast channel present at date_coverage below its contract minimum
+    aborts against the DECLARED metric (date_coverage for market_env), NOT the
+    stock_coverage default — guards the gate's per-contract metric read (§T4)."""
+    import logging
+    args = _panel_args("safe-only", feature_profile="headline_v1")
+    required_set, contracts, _ = tp._resolve_required_set(args)
+    assert contracts["market_env"].metric == "date_coverage"
+    manifest = _full_manifest(required_set, contracts)
+    manifest["market_env"]["date_coverage"] = 0.50  # < 0.95 contract
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage(
+                required_set, manifest, contracts, formal=False)
+    assert ei.value.code == 1
+    assert any("market_env" in m for m in caplog.messages)
+    assert any("0.5000 < minimum 0.9500" in m for m in caplog.messages)
