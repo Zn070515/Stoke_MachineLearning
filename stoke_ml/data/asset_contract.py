@@ -394,7 +394,7 @@ def write_asset_manifest(
         "vintage_pit",
     ):
         value = getattr(asset, key)
-        if value:
+        if value is not None:
             manifest[key] = value
     manifest.update(extra)
     atomic_write_json(asset_manifest_path(parquet_path), manifest)
@@ -442,6 +442,8 @@ def validate_asset_manifest(
         return {"exists": True, "ok": False, "reason": f"unreadable: {exc}"}
     actual = {"rows": int(len(actual_df)), "schema_hash": schema_hash(actual_df)}
     actual.update(_extent(actual_df, asset.extent_column))
+    # manifest-only keys (e.g. start/end when _extent is un-derivable and returns
+    # {}) intentionally go unchecked — the rows check covers the practical tamper.
     mismatches = [
         f"{key}: manifest={manifest.get(key)!r} actual={value!r}"
         for key, value in actual.items()
