@@ -15,11 +15,14 @@ from one or more snapshots marks a removal.
 Reconstruction: for each (index, stock), a membership spell is a run of
 consecutive snapshot dates in which the stock appears. in_date = the earliest
 refresh date (updateDate) seen in the run (a proxy for when membership became
-effective); out_date = the last snapshot date that still reported the stock
-(the last confirmation before removal); NaT means the stock was still a member
-at the final grid query (open-ended). Spans are resolved to the monthly grid —
-a stock joining/leaving between snapshots is attributed to the boundary of its
-presence run.
+effective); out_date = the FIRST ABSENT snapshot — the first grid month that no
+longer reported the stock (last present + 1 month) — NaT if the stock was still
+a member at the final grid query (open-ended). Every consumer
+(stoke_ml.data.universe.load_index_membership, the panel normalizer) reads the
+half-open interval in_date <= d < out_date, so out_date must be the first month
+the stock was GONE, never the last month it was confirmed. Spans are resolved
+to the monthly grid — a stock joining/leaving between snapshots is attributed
+to the boundary of its presence run.
 
 Outputs:
   data/a_shares/index_constituents_hist/snapshots/{index}/{YYYY-MM-DD}.parquet
@@ -29,6 +32,7 @@ Outputs:
 """
 import argparse
 import os
+import sys
 import time
 
 import pandas as pd
@@ -75,8 +79,11 @@ def rebuild_membership(snap_dir):
     query for every stock, so spells are keyed on CONTIGUOUS PRESENCE across
     snapshot dates rather than on updateDate: a stock present in consecutive
     monthly snapshots is one continuous membership spell. in_date = the run's
-    earliest refresh date (updateDate); out_date = the last snapshot that
-    reported the stock, NaT if the run reaches the final grid query.
+    earliest refresh date (updateDate); out_date = the FIRST ABSENT snapshot
+    month (last present + 1 month), NaT if the run reaches the final grid query.
+    Every consumer reads the half-open interval in_date <= d < out_date, so
+    out_date must be the first grid month the stock was gone, never the last
+    month it was confirmed.
     """
     frames = []
     for idx in INDICES:
@@ -110,12 +117,54 @@ def rebuild_membership(snap_dir):
         new_run.iloc[0] = True
         for _rid, rg in g.groupby(new_run.cumsum()):
             in_date = rg["updateDate"].min()
-            out_date = rg["query_date"].max()
-            still_active = out_date >= last_grid
+            # out_date is the FIRST ABSENT snapshot, not the last present one.
+            # Consumers read the half-open interval in_date <= d < out_date, so
+            # writing the last-present month here would wrongly drop the final
+            # confirmed member month.  Spells are contiguous (the split above on
+            # month_ids.diff().gt(1)), so the month right after the last present
+            # snapshot is exactly the first one the stock was absent from.
+            last_present = rg["query_date"].max()
+            out_date = last_present + pd.DateOffset(months=1)
+            # Query dates are month starts: out_date == last_grid means the
+            # final grid month WAS queried and the stock absent there (contiguous
+            # spell → the month after last_present is empty) → closed, not
+            # open-ended.  STRICT > also preserves open-endedness when the final
+            # grid month was never successfully queried (last_grid is the max
+            # query_date among SUCCESSFUL snapshots, i.e. earlier than out_date).
+            still_active = out_date > last_grid
             rows.append({"stock_code": code, "index_code": idx,
                          "in_date": in_date,
                          "out_date": pd.NaT if still_active else out_date})
     return pd.DataFrame(rows, columns=["stock_code", "index_code", "in_date", "out_date"])
+
+
+def _finalize(data_dir, start_date, end_date, requested, failed,
+              complete, skipped_existing, snap_dir, base) -> int:
+    """Write the run manifest, then rebuild + save membership.
+
+    Returns a non-zero exit code when the run is not fully successful.  The
+    manifest is ALWAYS written (a partial run is recorded honestly, §五-5); a
+    manifest-write failure RAISES — a run that cannot record its own coverage
+    must fail loudly, never be swallowed (§七).
+    """
+    write_run_manifest(
+        data_dir, "a_shares/index_constituents_hist",
+        start_date=start_date, end_date=end_date,
+        requested=requested, failed=failed, complete=complete,
+        success_count=len(complete),
+        skipped_existing_count=skipped_existing,
+    )  # no try/except: a manifest-write failure must propagate → non-zero exit
+    if failed:
+        # A partial run can never pass for complete (download_manifest.py's own
+        # principle): the manifest records the partial status AND the process
+        # exits non-zero so QA sees the gap.
+        return 1
+    mem = rebuild_membership(snap_dir)
+    mem.to_parquet(os.path.join(base, "membership.parquet"), index=False,
+                   compression="lz4")
+    print(f"membership.parquet: {len(mem)} spells, {mem['stock_code'].nunique()} stocks")
+    print(mem.groupby("index_code")["stock_code"].nunique().to_string())
+    return 0
 
 
 def main():
@@ -127,7 +176,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config()
-    base = os.path.join(cfg.project.data_dir, "a_shares", "index_constituents_hist")
+    data_dir = cfg.project.data_dir
+    base = os.path.join(data_dir, "a_shares", "index_constituents_hist")
     snap_dir = os.path.join(base, "snapshots")
     os.makedirs(snap_dir, exist_ok=True)
     for idx in INDICES:
@@ -195,20 +245,15 @@ def main():
         bs.logout()
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/index_constituents_hist",
-            start_date=args.start, end_date=args.end,
-            requested=requested, failed=failed_snapshots, complete=done_snapshots,
-            success_count=len(done_snapshots), skipped_existing_count=skipped_existing,
-        )
-    except Exception as exc:
-        print(f"run manifest write failed: {exc}")
-
-    mem = rebuild_membership(snap_dir)
-    mem.to_parquet(os.path.join(base, "membership.parquet"), index=False, compression="lz4")
-    print(f"membership.parquet: {len(mem)} spells, {mem['stock_code'].nunique()} stocks")
-    print(mem.groupby("index_code")["stock_code"].nunique().to_string())
+    # _finalize writes the manifest, then — only on a clean full run — rebuilds
+    # + saves membership.  It returns a non-zero exit code when the run is not
+    # fully successful and never swallows a manifest-write failure.
+    rc = _finalize(
+        data_dir, args.start, args.end, requested, failed_snapshots,
+        done_snapshots, skipped_existing, snap_dir, base,
+    )
+    if rc != 0:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":
