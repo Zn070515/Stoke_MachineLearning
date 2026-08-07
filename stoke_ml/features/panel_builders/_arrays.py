@@ -21,6 +21,40 @@ _FEATURE_GRID_KEYS: tuple[str, ...] = (
 )
 
 
+def compute_entry_fill_prob(
+    decision_arr: np.ndarray,
+    entry_arr: np.ndarray,
+) -> np.ndarray:
+    """Per-date ENTRY-side fill probability (§十八 audit).
+
+    ``entry_fill_prob[t]`` = the fraction of DECISION-eligible stocks at the
+    entry column t (a real close at t-1 + the universe gate, i.e. the pool the
+    strategy can actually rank) that ALSO have a fillable entry open at t
+    (``entry_arr[:, t]`` = a real open price).  NaN where no stock is
+    decision-eligible at t (denominator 0).
+
+    This is the ENTRY-side execution-risk diagnostic the audit asked for: a
+    stock that is decision-eligible today can still be suspended/delisted the
+    NEXT morning, so no entry open exists to trade — the live strategy cannot
+    know this at decision time.  It differs from the EXIT-side ``fill_prob``
+    (which pairs an entry with a real open at t+horizon and is therefore only
+    defined on ``[:max_T-horizon]``): ``entry_fill_prob`` concerns the entry
+    alone, so it is defined on the FULL ``[:max_T]`` grid, aligned to the
+    decision/entry masks.
+
+    Head seam: this per-date array is the training signal a future auxiliary
+    ``entry_fill_probability`` head (the audit's "auxiliary head OR report"
+    option) would consume; this module builds the report/array path.
+    """
+    denom = decision_arr.sum(axis=0)
+    numer = (decision_arr & entry_arr).sum(axis=0)
+    return np.divide(
+        numer, denom,
+        out=np.full(decision_arr.shape[1], np.nan),
+        where=denom > 0,
+    )
+
+
 def close_memmap_grids(
     panel_data: dict,
     keys: tuple[str, ...] = _FEATURE_GRID_KEYS,
@@ -194,6 +228,7 @@ class PanelArrays:
         history_arr: np.ndarray,
         universe_eligible_arr: np.ndarray,
         fill_prob_arr: np.ndarray,
+        entry_fill_prob_arr: np.ndarray,
         pk_cols: list,
         po_cols: list,
         valid_codes: list,
@@ -218,6 +253,10 @@ class PanelArrays:
             "forward_vol_nobs": self.forward_vol_nobs,
             "realized_return": self.realized,
             "fill_prob": fill_prob_arr,
+            # §十八: per-date ENTRY-side fill probability (see
+            # compute_entry_fill_prob) — the future auxiliary-head training
+            # signal; stored as a diagnostic alongside exit-side fill_prob.
+            "entry_fill_prob": entry_fill_prob_arr,
             "decision_eligible_mask": decision_arr,
             "history_eligible_mask": history_arr,
             "universe_eligible_mask": universe_eligible_arr,

@@ -74,6 +74,7 @@ def _storeable_panel(n_stocks=10, n_days=100, seq_len=60, horizon=5, seed=0):
         "forward_vol_nobs": np.full((n_stocks, n_days), horizon, dtype=np.int32),
         "realized_return": (rng.randn(n_stocks, n_days) * 0.02).astype(np.float32),
         "fill_prob": np.full(n_days, np.nan, dtype=np.float64),  # §T13
+        "entry_fill_prob": np.full(n_days, np.nan, dtype=np.float64),  # §T10a
         "close_price": np.full((n_stocks, n_days), 10.0, dtype=np.float32),
         "open_price": np.full((n_stocks, n_days), 10.0, dtype=np.float32),
         "stock_codes": stocks,
@@ -112,12 +113,13 @@ class TestPanelStoreRoundTrip:
                                       panel["global_dates"])
         assert loaded["stock_codes"] == panel["stock_codes"]
 
-        # Returned filename list matches what was written (fill_prob is an
-        # extra §T13 array persisted alongside the required keys).
+        # Returned filename list matches what was written (fill_prob and
+        # entry_fill_prob are extra §T13/§T10a diagnostics persisted alongside
+        # the required keys — they are NOT in _PANEL_ARRAY_KEYS).
         assert written == sorted(
             [f"{k}.npy" for k in _PANEL_ARRAY_KEYS]
             + [f"{k}.json" for k in _PANEL_JSON_KEYS]
-            + ["fill_prob.npy"])
+            + ["fill_prob.npy", "entry_fill_prob.npy"])
         assert panel_store_complete(tmp_path) is True
 
     def test_channel_coverage_manifest_optional_roundtrip(self, tmp_path):
@@ -578,6 +580,33 @@ class TestPanelStoreFillProbAndLabelPolicy:
         assert loaded["fill_prob"].shape == (n_days,)
         assert np.isnan(np.asarray(loaded["fill_prob"])).all()
         assert any("fill_prob" in r.message for r in caplog.records)
+
+    def test_roundtrip_carries_entry_fill_prob(self, tmp_path):
+        """A store saved WITH entry_fill_prob round-trips it elementwise."""
+        panel = _storeable_panel(seed=3)
+        n_days = panel["close_price"].shape[1]
+        efp = np.full(n_days, np.nan, dtype=np.float64)
+        efp[: n_days // 2] = 0.8
+        panel["entry_fill_prob"] = efp
+        save_panel_memmap(panel, tmp_path)
+        loaded = load_panel_memmap(tmp_path)
+        np.testing.assert_array_equal(
+            np.asarray(loaded["entry_fill_prob"]), efp, err_msg="entry_fill_prob")
+
+    def test_legacy_store_without_entry_fill_prob_warns_and_fills_nan(
+            self, tmp_path, caplog):
+        """A pre-T10a store (no entry_fill_prob.npy) loads — warned,
+        entry_fill_prob filled with NaN — instead of hard-failing.  It is an
+        OPTIONAL diagnostic like fill_prob, not a required-array key."""
+        panel = _storeable_panel(seed=4)
+        panel.pop("entry_fill_prob", None)  # simulate a pre-T10a store
+        save_panel_memmap(panel, tmp_path)
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(tmp_path)
+        n_days = panel["close_price"].shape[1]
+        assert loaded["entry_fill_prob"].shape == (n_days,)
+        assert np.isnan(np.asarray(loaded["entry_fill_prob"])).all()
+        assert any("entry_fill_prob" in r.message for r in caplog.records)
 
     def test_label_policy_mismatch_refuses(self, tmp_path):
         """A pre-T13 store (meta records no label_policy) is refused by a

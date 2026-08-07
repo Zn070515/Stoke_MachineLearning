@@ -97,9 +97,29 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
     kwargs["minute_mode"] = args.minute
     return kwargs
 
+def _entry_fill_prob_mean(panel_data: dict) -> float | None:
+    """Period mean of the per-date ENTRY-side fill probability (§十八 T10a).
+
+    ``entry_fill_prob[t]`` is the fraction of decision-eligible stocks at t
+    that actually get a fillable entry open — the execution-risk summary the
+    audit asked for.  NaN-ignoring mean over the panel dates; None when the
+    panel lacks the array (a pre-T10a build) or every value is NaN (no
+    decision-eligible date).  Recorded in the panel store's meta.json at
+    build time; it is an informational diagnostic, not a config binding.
+    """
+    efp = panel_data.get("entry_fill_prob")
+    if efp is None:
+        return None
+    efp = np.asarray(efp)
+    if not np.isfinite(efp).any():
+        return None
+    return float(np.nanmean(efp))
+
+
 def _panel_store_meta(
     args, seq_len: int, stock_list: list[str] | None = None,
     data_dir: str | None = None, prebuilt_dir: str | None = None,
+    entry_fill_prob_mean: float | None = None,
 ) -> dict:
     """Build-time fingerprint persisted in a panel store's meta.json.
 
@@ -181,6 +201,13 @@ def _panel_store_meta(
     if prebuilt_dir:
         meta["prebuilt_feature_manifest_hash"] = _dir_content_hash(
             os.path.join(prebuilt_dir, ".manifests"))
+    # §十八 (T10a): INFORMATIONAL execution-risk summary — the NaN-ignoring
+    # mean of the per-date ENTRY-side fill probability.  Explicitly NOT added
+    # to _CRITICAL_META_KEYS / _WARN_META_KEYS: it is a build-time diagnostic,
+    # not a config binding, so the load-side exact-key guard never compares it
+    # (a store built without it loads with the key simply absent).
+    if entry_fill_prob_mean is not None:
+        meta["entry_fill_prob_mean"] = entry_fill_prob_mean
     return meta
 
 def _validate_panel_store_path(path: str) -> None:
@@ -354,7 +381,8 @@ def _resolve_panel(
         save_panel_memmap(
             panel_data, args.panel_store,
             meta=_panel_store_meta(
-                args, seq_len, stock_list, data_dir, args.prebuilt),
+                args, seq_len, stock_list, data_dir, args.prebuilt,
+                entry_fill_prob_mean=_entry_fill_prob_mean(panel_data)),
             skip_npy=sink_grids)
         logger.info("Saved panel memmap store to %s", args.panel_store)
         # Re-load the full store for downstream training — fresh lazy memmaps

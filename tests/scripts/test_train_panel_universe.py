@@ -1334,6 +1334,33 @@ def test_panel_store_meta_records_universe_membership(tp, tmp_path):
     assert "universe_membership" not in non_csi
 
 
+# ── §十八 (T10a): ENTRY-side fill diagnostic reporting ─────────────────
+
+def test_entry_fill_prob_mean_records_in_store_meta(tp):
+    """_entry_fill_prob_mean is the NaN-ignoring period mean of the per-date
+    ENTRY-fill array (None when absent / all-NaN), and _panel_store_meta
+    records it as an INFORMATIONAL key (not a critical/warn binding, so the
+    load-side exact-key guard never compares it)."""
+    from scripts.production.train_panel_panel import _entry_fill_prob_mean
+
+    assert _entry_fill_prob_mean({}) is None
+    assert _entry_fill_prob_mean({"entry_fill_prob": None}) is None
+    all_nan = np.full(10, np.nan)
+    assert _entry_fill_prob_mean({"entry_fill_prob": all_nan}) is None
+    arr = np.array([np.nan, 0.5, 1.0, np.nan, 0.25])
+    assert np.isclose(_entry_fill_prob_mean({"entry_fill_prob": arr}), 0.5833333333)
+
+    base = tp._panel_store_meta(
+        _panel_args("safe-only"), seq_len=60,
+        stock_list=[f"{i:06d}" for i in range(100)])
+    assert "entry_fill_prob_mean" not in base
+    recorded = tp._panel_store_meta(
+        _panel_args("safe-only"), seq_len=60,
+        stock_list=[f"{i:06d}" for i in range(100)],
+        entry_fill_prob_mean=0.5833333333)
+    assert recorded["entry_fill_prob_mean"] == 0.5833333333
+
+
 def _fake_storage():
     """DataStorage replacement whose load_daily yields one tiny row per stock —
     enough for _resolve_panel's K-line concat without reading real disk data."""

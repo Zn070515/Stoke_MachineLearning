@@ -30,7 +30,10 @@ import pandas as pd
 from stoke_ml.config.feature_profile import CHANNEL_COLUMNS
 from stoke_ml.features import cache_manifest
 from stoke_ml.features.fundamental import FundamentalRefiner
-from stoke_ml.features.panel_builders._arrays import PanelArrays
+from stoke_ml.features.panel_builders._arrays import (
+    PanelArrays,
+    compute_entry_fill_prob,
+)
 from stoke_ml.features.panel_builders._eligibility import EligibilityBuilder
 from stoke_ml.features.panel_builders._normalizer import (
     DateWiseZScoreNormalizer, _daily_member_flag,  # noqa: F401  re-exported for import-compat
@@ -455,12 +458,19 @@ def _build_panel_streaming(
             )
         )
 
+        # §十八: ENTRY-side fill probability (full [:max_T] grid — the entry
+        # alone, no exit-horizon pairing).  Fraction of decision-eligible
+        # stocks at each entry column t with a real entry open at t.
+        entry_fill_prob_arr = compute_entry_fill_prob(
+            decision_arr, arrays.entry,
+        )
+
         # Sanitize + assemble.
         arrays.sanitize()
 
         return arrays.assemble(
             global_dates, decision_arr, history_arr,
-            universe_eligible_arr, fill_prob_arr,
+            universe_eligible_arr, fill_prob_arr, entry_fill_prob_arr,
             pk_cols_available, po_cols_available, valid_codes,
         )
     finally:
@@ -876,10 +886,18 @@ def build_panel_features(
         arrays.obs, arrays.first_col, arrays.amt60_raw, arrays.has_amount,
     )
 
+    # §十八: ENTRY-side fill probability (full [:max_T] grid — the entry
+    # alone, no exit-horizon pairing).  Fraction of decision-eligible
+    # stocks at each entry column t with a real entry open at t.
+    entry_fill_prob_arr = compute_entry_fill_prob(
+        decision_arr, arrays.entry,
+    )
+
     # ── Sanitize + final assembly ──
     arrays.sanitize()
 
     return arrays.assemble(
         global_dates, decision_arr, history_arr, universe_eligible_arr,
-        fill_prob_arr, pk_cols_available, po_cols_available, valid_codes,
+        fill_prob_arr, entry_fill_prob_arr,
+        pk_cols_available, po_cols_available, valid_codes,
     )

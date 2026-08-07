@@ -18,7 +18,10 @@ import pytest
 import shutil
 import tempfile
 
-from stoke_ml.features.panel_builders._arrays import PanelArrays
+from stoke_ml.features.panel_builders._arrays import (
+    PanelArrays,
+    compute_entry_fill_prob,
+)
 from stoke_ml.features.panel_builders._targets import TargetBuilder
 
 
@@ -97,6 +100,7 @@ def test_panel_arrays_round_trip():
         history_arr=np.ones((N, max_T), dtype=bool),
         universe_eligible_arr=np.ones((N, max_T), dtype=bool),
         fill_prob_arr=np.zeros(max_T, dtype=np.float64),
+        entry_fill_prob_arr=np.full(max_T, np.nan, dtype=np.float64),
         pk_cols=["pk0"],
         po_cols=["po0"],
         valid_codes=valid_codes,
@@ -109,6 +113,7 @@ def test_panel_arrays_round_trip():
         "observation_mask", "entry_eligible_mask",
         "return_target_mask", "vol_target_mask",
         "forward_vol_nobs", "realized_return", "fill_prob",
+        "entry_fill_prob",
         "decision_eligible_mask", "history_eligible_mask",
         "universe_eligible_mask",
         "close_price", "open_price",
@@ -160,6 +165,26 @@ def test_eligibility_builder_universe_mask(monkeypatch):
     # the entry at day 0, so the liquidity floor fails there.
     assert not universe[:, 0].any()
     assert universe[:, 1:].all()
+
+
+def test_compute_entry_fill_prob_fraction():
+    """entry_fill_prob[t] = fraction of decision-eligible stocks at t that ALSO
+    have a fillable entry open at t (§十八); NaN where no stock is
+    decision-eligible (denominator 0)."""
+    N, T = 3, 5
+    decision = np.zeros((N, T), dtype=bool)
+    decision[:, 1:] = True  # a decision needs a real close at t-1
+    entry = np.ones((N, T), dtype=bool)
+    entry[1, 2] = False  # stock 1 suspended on day 2 -> not fillable
+
+    prob = compute_entry_fill_prob(decision, entry)
+
+    assert prob.shape == (T,)
+    assert np.isnan(prob[0])           # no decision-eligible stock at t=0
+    assert np.isclose(prob[1], 1.0)    # 3/3 decision-eligible all fill
+    assert np.isclose(prob[2], 2.0 / 3.0)  # stock 1 eligible but unfillable
+    assert np.isclose(prob[3], 1.0)
+    assert np.isclose(prob[4], 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -305,6 +330,7 @@ class TestPanelArraysMemmap:
             history_arr=np.ones((N, T), dtype=bool),
             universe_eligible_arr=np.ones((N, T), dtype=bool),
             fill_prob_arr=np.zeros(T, dtype=np.float64),
+            entry_fill_prob_arr=np.full(T, np.nan, dtype=np.float64),
             pk_cols=["pk0", "pk1"],
             po_cols=["po0"],
             valid_codes=["A", "B"],
@@ -391,7 +417,8 @@ class TestBuildPanelFeaturesMemmap:
                     "return_target_mask", "vol_target_mask",
                     "realized_return", "close_price", "open_price",
                     "decision_eligible_mask", "history_eligible_mask",
-                    "universe_eligible_mask"):
+                    "universe_eligible_mask",
+                    "fill_prob", "entry_fill_prob"):
             self._assert_grid_matches(
                 key, memmap_out[key], dense[key],
             )
@@ -590,6 +617,7 @@ class TestBuildPanelFeaturesMemmap:
             "realized_return", "close_price", "open_price",
             "decision_eligible_mask", "history_eligible_mask",
             "universe_eligible_mask",
+            "fill_prob", "entry_fill_prob",
         ) + tuple(extra_grid_keys)
         for key in grid_keys:
             if key in dense and key in streaming:

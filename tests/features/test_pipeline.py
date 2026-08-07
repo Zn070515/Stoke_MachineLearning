@@ -846,6 +846,44 @@ class TestPanelCarriedReturnLabel:
         # tail columns (t+horizon >= max_T) → NaN
         assert np.isnan(fill[10]) and np.isnan(fill[11])
 
+    def test_entry_fill_prob_per_date_fraction(self):
+        """entry_fill_prob[t] = fraction of DECISION-eligible stocks at t with
+        a fillable entry open at t (§十八); NaN where no stock is
+        decision-eligible (t=0: no close[t-1] yet).  Unlike fill_prob it has
+        NO horizon pairing, so the full [:max_T] grid is populated."""
+        dates = pd.bdate_range("2020-01-02", periods=12)
+        open_ = np.arange(10.0, 22.0)
+        close = open_ + 0.5
+        base = pd.DataFrame({
+            "date": dates,
+            "open": open_,
+            "high": np.maximum(open_, close) + 0.2,
+            "low": np.minimum(open_, close) - 0.2,
+            "close": close,
+            "volume": np.full(12, 1_000_000.0),
+            "amount": np.full(12, 1_000_000.0) * close,
+        })
+        A = base.copy(); A["stock_code"] = "600001"
+        B = base.copy(); B["stock_code"] = "600002"
+        B.loc[4, "open"] = 0.0  # B has a real close[3] but no entry open at day 4
+        p = FeaturePipeline(seq_len=5).build_panel_features(
+            pd.concat([A, B], ignore_index=True), aux_data={}, horizon=2)
+        efp = p["entry_fill_prob"]
+        assert "entry_fill_prob" in p, "entry_fill_prob must be in the panel payload"
+        assert efp.shape == (12,)
+        # t=0: no decision (no real close at t-1) → NaN
+        assert np.isnan(efp[0])
+        # t=1,2,3: both decision-eligible AND fillable → 2/2
+        assert np.isclose(efp[1], 1.0)
+        assert np.isclose(efp[2], 1.0)
+        assert np.isclose(efp[3], 1.0)
+        # t=4: B is decision-eligible (real close[3]) but has NO entry open
+        # (open[4]=0) → only A fills → 1/2.  This is exactly the §十八
+        # decision-eligible-but-unfillable execution-risk scenario.
+        assert np.isclose(efp[4], 0.5)
+        # t=5..11: both decision-eligible and fillable → 1.0
+        assert np.isclose(efp[5:], 1.0).all()
+
 
 class TestPanelTruncationInvariance:
     """Anti-cheat test #2: features must not see the future.

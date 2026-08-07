@@ -577,19 +577,19 @@ def load_panel_memmap(
         _validate_meta(out, expected_meta, recorded=recorded,
                        strict_external_meta=strict_external_meta)
     _validate_self_consistency(data, out, recorded=recorded)
-    # §T13: a store built before the carried-return label era predates the
-    # per-date exit-fill array.  Tolerate its absence — fill NaN and warn —
-    # rather than refuse, so a legacy store still loads.  Reusing a pre-T13
+    # §T13 / §T10a: legacy-store tolerance for the per-date fill diagnostics.
+    # A store built before these arrays existed loads with NaN fill + warn
+    # instead of refusing.  The semantics guard is elsewhere: reusing a pre-T13
     # store for a NEW training run is separately refused by the label_policy
     # critical-key guard in _validate_meta (a pre-T13 store records no
     # label_policy; the current build requires "carry_to_last_close_v1"), so
     # this tolerance only serves inspection / legacy reads.
+    n_dates = (
+        int(data["global_dates"].shape[0])
+        if "global_dates" in data and hasattr(data["global_dates"], "shape")
+        else 0
+    )
     if "fill_prob" not in data:
-        n_dates = (
-            int(data["global_dates"].shape[0])
-            if "global_dates" in data and hasattr(data["global_dates"], "shape")
-            else 0
-        )
         data["fill_prob"] = np.full(n_dates, np.nan, dtype=np.float64)
         logger.warning(
             "panel store %s predates the carried-return label (T13) — no "
@@ -597,6 +597,18 @@ def load_panel_memmap(
             "use the old clean-open-only semantics, so a current training run "
             "is refused by the label_policy meta guard; rebuild the store for "
             "current labels.", out,
+        )
+    # §T10a (§十八): a store built before the ENTRY-side fill diagnostic
+    # predates entry_fill_prob.npy.  Tolerate its absence — fill NaN and warn
+    # — mirroring fill_prob.  It is an OPTIONAL diagnostic, NOT a label, so a
+    # current training run is unaffected by its absence; rebuild to record it.
+    if "entry_fill_prob" not in data:
+        data["entry_fill_prob"] = np.full(n_dates, np.nan, dtype=np.float64)
+        logger.warning(
+            "panel store %s predates the ENTRY-fill diagnostic (T10a) — no "
+            "entry_fill_prob.npy; loaded with entry_fill_prob=NaN.  It is an "
+            "execution-risk diagnostic (decision-eligible-but-unfillable), "
+            "not a label; rebuild the store to record it.", out,
         )
     return data
 
