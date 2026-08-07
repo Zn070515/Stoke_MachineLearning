@@ -11,7 +11,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.sources.a_shares.market_breadth_source import MarketBreadthSource
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -27,8 +27,9 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    data_dir = cfg.project.data_dir
     out_dir = args.output or os.path.join(
-        cfg.project.data_dir, "a_shares", "market_breadth"
+        data_dir, "a_shares", "market_breadth"
     )
     os.makedirs(out_dir, exist_ok=True)
 
@@ -52,14 +53,13 @@ def main():
             logger.error("%s: %s", name, str(e)[:120])
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/market_breadth",
-            requested=list(data.keys()), failed=failed, complete=done,
-            success_count=len(done),
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    # A manifest-write failure is FATAL — a run that cannot record its own
+    # coverage must fail loudly, never exit 0 (§十一).
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/market_breadth",
+        requested=list(data.keys()), failed=failed, complete=done,
+        success_count=len(done),
+    )
 
     logger.info("Done.")
 

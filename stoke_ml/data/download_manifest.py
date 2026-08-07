@@ -7,7 +7,9 @@ training / QA reads to know the true coverage of the universe.
 """
 import datetime as dt
 import json
+import logging
 import os
+import sys
 
 SCHEMA_VERSION = "1.3"
 
@@ -158,6 +160,39 @@ def write_manifest(
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
     return manifest
+
+
+def write_run_manifest_or_exit(
+    data_dir: str,
+    dataset: str,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    requested: list[str],
+    failed: list[str],
+    complete: set[str],
+    success_count: int | None = None,
+    skipped_existing_count: int = 0,
+) -> dict:
+    """Like :func:`write_run_manifest`, but a write failure is FATAL.
+
+    A run that cannot record its own coverage must fail loudly — the parquet
+    landing on disk is worthless if the manifest that proves the run's true
+    coverage is silently missing (§五-5).  On success returns the manifest dict
+    normally; on failure logs at error and exits non-zero.  Used by the
+    production downloaders so a manifest write is never swallowed (§十一).
+    """
+    try:
+        return write_run_manifest(
+            data_dir, dataset,
+            start_date=start_date, end_date=end_date,
+            requested=requested, failed=failed, complete=complete,
+            success_count=success_count,
+            skipped_existing_count=skipped_existing_count,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).error("run manifest write failed: %s", exc)
+        sys.exit(1)
 
 
 def load_manifest(path: str) -> dict | None:
