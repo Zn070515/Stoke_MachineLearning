@@ -288,20 +288,34 @@ def _resolve_panel(
         memmap_dir=args.panel_store,
     )
     if args.panel_store:
-        # Flush + detach the three big memmap grids so save_panel_memmap can
-        # atomically write the small arrays + metadata without file-lock
-        # collisions on Windows (open memmaps keep their backing files locked).
-        for key in ("static_features", "past_known", "past_observed"):
-            arr = panel_data.get(key)
-            if arr is not None and isinstance(arr, np.memmap):
-                arr.flush()
-                if hasattr(arr, "_mmap") and arr._mmap is not None:
-                    arr._mmap.close()
-                del panel_data[key]
+        # T8: the three big grids are memmap-backed ONLY when the memmap sink
+        # was actually used (memmap_dir == args.panel_store).  Derive the
+        # skip set from which grids are np.memmap so a build that fell back to
+        # dense (e.g. a test stub) still writes every array normally.
+        sink_grids = {
+            k for k in ("static_features", "past_known", "past_observed")
+            if isinstance(panel_data.get(k), np.memmap)
+        }
+        # Flush + close the memmap grids so save_panel_memmap can write the
+        # small arrays + metadata without file-lock collisions on Windows (open
+        # memmaps keep their backing files locked).  KEEP them in panel_data:
+        # save_panel_memmap's self-consistency fingerprints
+        # (_feature_schema_hash) must read the grids' .dtype to record the
+        # T4 schema binding — deleting them would silently drop
+        # feature_schema_hash and disable the tampered-past_known_cols guard.
+        # skip_npy tells save_panel_memmap NOT to rewrite the files the sink
+        # already wrote (the .npy files are present on disk; a closed memmap's
+        # header props stay readable, so no data access is needed).
+        for key in sink_grids:
+            arr = panel_data[key]
+            arr.flush()
+            if hasattr(arr, "_mmap") and arr._mmap is not None:
+                arr._mmap.close()
         save_panel_memmap(
             panel_data, args.panel_store,
             meta=_panel_store_meta(
-                args, seq_len, stock_list, data_dir, args.prebuilt))
+                args, seq_len, stock_list, data_dir, args.prebuilt),
+            skip_npy=sink_grids)
         logger.info("Saved panel memmap store to %s", args.panel_store)
         # Re-load the full store for downstream training — fresh lazy memmaps
         # for all arrays (the big grids page-fault only the rows/cols touched).

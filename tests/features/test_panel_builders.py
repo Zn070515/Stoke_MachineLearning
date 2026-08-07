@@ -306,9 +306,34 @@ class TestBuildPanelFeaturesMemmap:
         np.testing.assert_array_equal(
             memmap_out["global_dates"], dense["global_dates"])
 
+    def _meta(self):
+        """A meta fingerprint matching this class's small fixture."""
+        return {
+            "horizon": 1, "seq_len": 10, "start": "2024-01-01",
+            "end": "2024-12-31", "universe": "csi300", "n_stocks": 3,
+            "feature_switches": {"seq_len": 10},
+            "config_hash": "hash-abc", "git_commit": "abc123",
+            "label_policy": "carry_to_last_close_v1",
+        }
+
+    def _flush_close(self, panel_data):
+        """Flush + close the three big memmap grids, KEEPING them in the dict
+        (their .dtype header props stay readable; save_panel_memmap reads only
+        header props for the feature_schema_hash binding and skips rewriting
+        the files via skip_npy)."""
+        for key in ("static_features", "past_known", "past_observed"):
+            arr = panel_data.get(key)
+            if arr is not None and isinstance(arr, np.memmap):
+                arr.flush()
+                if hasattr(arr, "_mmap") and arr._mmap is not None:
+                    arr._mmap.close()
+
     def test_round_trip_save_load(self, tmp_path):
-        """Build with memmap sink, save the remaining arrays + metadata,
-        then load everything back — values match the dense reference."""
+        """Build with memmap sink, save the remaining arrays + metadata (with a
+        real meta= so the feature_schema_hash binding is recorded), then load
+        everything back — values match the dense reference and the T4 schema
+        binding round-trips."""
+        import json
         from stoke_ml.models.panel.panel_store import (
             save_panel_memmap, load_panel_memmap, panel_store_complete,
         )
@@ -319,23 +344,31 @@ class TestBuildPanelFeaturesMemmap:
 
         # Build with memmap sink into the store dir.
         memmap_out = self._build_fixture(tmp_path, memmap_dir=store)
+        self._flush_close(memmap_out)
+        meta = self._meta()
 
-        # Flush + close the three big memmap grids so save_panel_memmap
-        # can safely write the remaining files (Windows file-lock).
-        for key in ("static_features", "past_known", "past_observed"):
-            arr = memmap_out.get(key)
-            if arr is not None and isinstance(arr, np.memmap):
-                arr.flush()
-                if hasattr(arr, "_mmap") and arr._mmap is not None:
-                    arr._mmap.close()
-                del memmap_out[key]
-
-        # Write remaining small arrays + metadata.
-        save_panel_memmap(memmap_out, store)
+        # Write remaining small arrays + metadata.  skip_npy keeps
+        # save_panel_memmap from rewriting the already-sunk big grids (and
+        # from touching a closed memmap's data); the arrays REMAIN in the dict
+        # so _feature_schema_hash can read their .dtype and record the binding.
+        save_panel_memmap(memmap_out, store, meta=meta,
+                          skip_npy={"static_features", "past_known",
+                                    "past_observed"})
         assert panel_store_complete(store)
 
-        # Reload the full store.
-        loaded = load_panel_memmap(store)
+        # T4 schema binding: meta.json must record a non-None feature_schema_hash
+        # (the review bug: deleting the grids made this None and silently
+        # disabled the tamper guard at load).
+        with open(os.path.join(store, "meta.json"), encoding="utf-8") as fh:
+            recorded = json.load(fh)
+        assert recorded.get("feature_schema_hash"), (
+            "feature_schema_hash must be recorded on the memmap-sink path — "
+            "the grids must stay in panel_data for _feature_schema_hash")
+        assert recorded.get("stock_order_hash"), (
+            "stock_order_hash must also be recorded")
+
+        # Reload the full store; expected_meta validates against meta.json.
+        loaded = load_panel_memmap(store, expected_meta=meta)
 
         # All values match the dense reference.
         for key in ("static_features", "past_known", "past_observed",
@@ -347,6 +380,37 @@ class TestBuildPanelFeaturesMemmap:
                 np.asarray(loaded[key]), np.asarray(dense[key]),
                 err_msg=f"round-trip mismatch on {key}")
         assert loaded["stock_codes"] == dense["stock_codes"]
+
+    def test_sink_store_records_schema_binding_tamper_refused(self, tmp_path):
+        """Regression for the review bug: the memmap-sink store path MUST record
+        feature_schema_hash in meta.json, and a tampered past_known_cols.json
+        is REFUSED at load (T4 schema binding preserved)."""
+        import json
+        from stoke_ml.models.panel.panel_store import (
+            save_panel_memmap, load_panel_memmap, panel_store_complete,
+        )
+
+        store = str(tmp_path / "store")
+        os.makedirs(store, exist_ok=True)
+        memmap_out = self._build_fixture(tmp_path, memmap_dir=store)
+        self._flush_close(memmap_out)
+        save_panel_memmap(memmap_out, store, meta=self._meta(),
+                          skip_npy={"static_features", "past_known",
+                                    "past_observed"})
+        assert panel_store_complete(store)
+
+        # Tamper past_known_cols.json — must be refused by the self-consistency
+        # guard (feature_schema_hash), not silently accepted.
+        cols_path = os.path.join(store, "past_known_cols.json")
+        with open(cols_path, encoding="utf-8") as fh:
+            cols = json.load(fh)
+        cols[-1] = "pk_tampered"
+        with open(cols_path, "w", encoding="utf-8") as fh:
+            json.dump(cols, fh)
+
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(store, expected_meta=self._meta())
+        assert "feature_schema_hash" in str(ei.value)
 
     def test_tracemalloc_memmap_peak_below_dense(self, tmp_path):
         """Build a small synthetic universe twice; memmap peak < dense peak."""

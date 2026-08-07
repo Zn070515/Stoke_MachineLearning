@@ -230,6 +230,7 @@ def _merge_self_fingerprints(meta: dict, panel_data: dict) -> None:
 
 def save_panel_memmap(
     panel_data: dict, out_dir: str | Path, meta: dict | None = None,
+    skip_npy: set[str] | None = None,
 ) -> list[str]:
     """Persist every array of a build_panel_features output dict to disk.
 
@@ -245,8 +246,21 @@ def save_panel_memmap(
     place so a partially-written store is never mistaken for complete (see
     :func:`panel_store_complete`).
 
+    ``skip_npy`` names arrays that are ALREADY on disk as ``{name}.npy`` in
+    ``out_dir`` and must NOT be rewritten (T8: the memmap sink wrote the big
+    feature grids directly via ``open_memmap``).  Each skipped name is still
+    treated as present in the store (verified to exist — an absent file raises
+    so the store cannot silently come up incomplete) and counted in the return
+    list, but ``_atomic_npy`` is skipped: rewriting over an open memmap hits a
+    Windows file-lock (open memmaps keep their backing files locked), and
+    re-copying a multi-GB grid would defeat the purpose of the sink.  The
+    arrays remain in ``panel_data`` (their ``.dtype``/``.shape`` header props
+    stay readable even after the mapping is closed) so the self-consistency
+    fingerprints are still computed from the ACTUAL panel — deleting them would
+    silently drop ``feature_schema_hash`` and disable T4's schema tamper guard.
+
     Returns the sorted list of written file names (``<name>.npy`` /
-    ``<name>.json`` / ``meta.json``).
+    ``<name>.json`` / ``meta.json``), including skipped-but-present arrays.
     """
     out = Path(out_dir)
     if out.exists() and not out.is_dir():
@@ -261,12 +275,24 @@ def save_panel_memmap(
     marker = out / _COMPLETE_MARKER
     if marker.exists():
         marker.unlink()
+    skip_npy = skip_npy or set()
     written: list[str] = []
     for name, value in panel_data.items():
         if value is None:
             continue
         if isinstance(value, np.ndarray):
             if name.startswith("has_"):
+                continue
+            if name in skip_npy:
+                # T8: already memmap-sunk to disk — verify and skip the write.
+                p = out / f"{name}.npy"
+                if not p.is_file():
+                    raise FileNotFoundError(
+                        f"save_panel_memmap: array {name!r} requested via "
+                        f"skip_npy (already memmap-sunk), but {p} does not "
+                        "exist — the store would be incomplete."
+                    )
+                written.append(f"{name}.npy")
                 continue
             _atomic_npy(out, name, np.asarray(value))
             written.append(f"{name}.npy")
