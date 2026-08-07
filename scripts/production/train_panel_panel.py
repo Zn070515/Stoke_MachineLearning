@@ -897,6 +897,19 @@ def _enforce_formal_manifests(
     Channels with NO data on disk are NOT checked here: the coverage gate
     (``train_panel_gates._enforce_channel_coverage``) already aborts a required
     channel at zero coverage.  This gate is the MANIFEST side of §十九-9 only.
+
+    WHY a FULL per-stock scan (not a single-stock sample): the per-stock
+    channels (sentiment/guba/comment/fundamental/announcement) carry PER-STOCK
+    asset manifests (``{code}.parquet`` + ``{code}.manifest.json``), so
+    validating one representative stock would miss tampering on any other stock
+    and silently weaken the formal guarantee — correctness over I/O.  A
+    single-read refactor (threading ``require_valid_manifest=True`` into the
+    lenient loads below) was considered and rejected: it would route manifest
+    failures through ``_load_channel_aux``'s per-stock ``except Exception``
+    error accounting (downgrading a hard abort to a per-channel FAILED/partial
+    note) and would lose this gate's all-channels-at-once aggregate diagnostics
+    (§T4 review #2).  The pre-pass's extra read cost is bounded by the ~500-stock
+    formal live universe — the price of fail-closed verification.
     """
     from stoke_ml.data.news_storage import NewsStorage
     from stoke_ml.data.guba_storage import GubaStorage
@@ -914,20 +927,24 @@ def _enforce_formal_manifests(
     code_set = set(stock_list)
 
     def _per_stock(ch: str, storage, load_name: str) -> None:
-        """Formal per-stock read of one channel; first failure is fatal.
+        """Formal per-stock read of one channel.
 
-        The storage's ``load_*(..., require_valid_manifest=True)`` raises
-        ``ValueError`` (via ``asset_contract.check_asset_read``) the moment a
-        present parquet's manifest is missing or mismatched; a stock with no
-        file on disk returns an empty frame without raising (its absence is the
-        coverage gate's concern).  One representative failure per channel is
-        enough to abort it — the same channel-wide defect hits every stock.
+        Validates EVERY stock's manifest for this channel: the storage's
+        ``load_*(..., require_valid_manifest=True)`` raises ``ValueError`` (via
+        ``asset_contract.check_asset_read``) the moment a present parquet's
+        manifest is missing or mismatched, and ``OSError`` on a disk-level read
+        failure; a stock with no file on disk returns an empty frame without
+        raising (its absence is the coverage gate's concern).  A stock with a
+        valid manifest loads normally and the loop advances.  On the FIRST
+        failure the problem is recorded and the loop stops — the same
+        channel-wide defect hits every stock, so one representative failure is
+        enough to abort the channel.
         """
         load = getattr(storage, load_name)
         for code in stock_list:
             try:
                 load(code, start_date, end_date, require_valid_manifest=True)
-            except Exception as exc:
+            except (ValueError, OSError) as exc:
                 problems.append(f"{ch}[{code}]: {exc}")
                 return
 
@@ -981,6 +998,9 @@ def _enforce_formal_manifests(
                         if not report["ok"]:
                             problems.append(_fmt_manifest_problem(path, report))
                             break
+            # Zero sector files (or no etf_flow dir) → NOT a manifest problem:
+            # a required etf_flow channel at zero coverage is aborted by the
+            # coverage gate (_enforce_channel_coverage), not here (§T4 review #5).
         elif ch in ("industry", "market_env"):
             fname = ("industry_returns.parquet" if ch == "industry"
                      else "market_env_daily.parquet")

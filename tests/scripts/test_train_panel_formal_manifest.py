@@ -167,6 +167,36 @@ def test_formal_unadopted_market_wide_channel_fails(tp, tmp_path):
     assert "no asset-manifest support" in msg or "no asset-manifest contract" in msg
 
 
+def test_formal_multi_channel_aggregates_all_failures(tp, tmp_path):
+    """TWO required channels failing at once → BOTH channel names appear in the
+    single SystemExit message, locking the aggregate diagnostics join format."""
+    data_dir = _write_guba(tmp_path)
+    _tamper_content(data_dir)  # guba: content (schema_hash) mismatch
+    # sentiment: parquet present but manifest MISSING → formal read raises
+    sentiment_dir = os.path.join(data_dir, "a_shares", "sentiment")
+    os.makedirs(sentiment_dir, exist_ok=True)
+    pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "stock_code": ["000001", "000001"],
+        "sentiment_mean": [0.1, -0.2],
+        "sentiment_std": [0.3, 0.1],
+        "news_count": [2, 1],
+        "positive_ratio": [0.6, 0.4],
+        "negative_ratio": [0.2, 0.5],
+        "has_news": [True, True],
+    }).to_parquet(os.path.join(sentiment_dir, "000001.parquet"),
+                  index=False, compression="lz4")
+    with pytest.raises(SystemExit) as ei:
+        tp.load_aux_data(
+            ["000001"], data_dir, "2024-01-01", "2024-12-31",
+            required_channels={"guba", "sentiment"}, formal=True)
+    msg = str(ei.value)
+    assert "guba" in msg
+    assert "sentiment" in msg
+    assert "schema_hash" in msg
+    assert "manifest missing" in msg
+
+
 # ── formal=False (explore): the same states WARN and PROCEED ─────────────
 
 def test_explore_missing_manifest_proceeds(tp, tmp_path, caplog):
