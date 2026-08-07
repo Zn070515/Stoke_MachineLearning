@@ -389,9 +389,9 @@ def _experiment_signature(version: dict, config: PanelConfig,
              .encode("utf-8"))
     # §T19 (§T2/§T7): the vintage-admission policy and the frozen feature-profile
     # identity are part of what a deep run IS.  A safe-only run DENIES
-    # latest_revised_aligned channels (fundamental/macro/earnings/valuation/
-    # pledge/shareholder/index_membership/market_env_refine) that an
-    # allow-revised run admits, and a different frozen feature profile is a
+    # latest_revised-sourced channels (fundamental/macro/earnings/valuation/
+    # pledge/shareholder/index_membership/market_env_refine/sector/concept)
+    # that an allow-revised run admits, and a different frozen feature profile is a
     # different feature recipe (required_channels + per-channel coverage
     # minimums).  Two runs differing ONLY in either lever train on materially
     # different channels, so they MUST be distinct trials — never conflated into

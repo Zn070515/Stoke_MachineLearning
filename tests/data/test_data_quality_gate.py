@@ -1095,13 +1095,15 @@ class TestUniverseReconciliationFormalReport:
 
 
 class TestChannelVintageFormalReport:
-    """v15 §六/§十: the report surfaces the channel→vintage declaration under the
-    run's vintage-admission policy — present in every run regardless of profile,
-    each entry carrying exactly channel/status/rationale/allowed — and locks the
-    documented revision-leakage sources (fundamental, macro) as
-    latest_revised_aligned.  Under the default safe-only policy the revised-
-    aligned channels are marked allowed=False while raw_vintage_safe /
-    derived_versioned (incl. the price channel) stay allowed=True."""
+    """v15 §六/§十 / v16 §十二: the report surfaces the channel→3-dim vintage
+    declaration under the run's vintage-admission policy — present in every run
+    regardless of profile, each entry carrying exactly
+    channel/source_vintage/transform/pit_alignment/rationale/allowed — and
+    locks the documented revision-leakage sources (fundamental, macro) as
+    latest_revised source.  Under the default safe-only policy the
+    latest_revised-sourced channels are marked allowed=False while
+    immutable_snapshot-sourced channels (incl. the price channel) stay
+    allowed=True."""
 
     def test_report_carries_channel_vintage_declaration(self, tmp_path, monkeypatch):
         root = tmp_path / "data"
@@ -1126,14 +1128,15 @@ class TestChannelVintageFormalReport:
         assert report["vintage_policy"] == "safe-only"
         assert isinstance(section, list) and len(section) > 0
         for entry in section:
-            assert set(entry) == {"channel", "status", "rationale", "allowed"}
-            assert entry["status"] in {
-                "raw_vintage_safe", "derived_versioned", "latest_revised_aligned"}
+            assert set(entry) == {"channel", "source_vintage", "transform",
+                                  "pit_alignment", "rationale", "allowed"}
+            assert entry["source_vintage"] in {"immutable_snapshot", "latest_revised"}
             assert isinstance(entry["allowed"], bool)
         by_name = {e["channel"]: e for e in section}
-        assert by_name["fundamental"]["status"] == "latest_revised_aligned"
-        assert by_name["macro"]["status"] == "latest_revised_aligned"
-        # Default safe-only policy: revised-aligned denied, raw/derived admitted.
+        assert by_name["fundamental"]["source_vintage"] == "latest_revised"
+        assert by_name["macro"]["source_vintage"] == "latest_revised"
+        # Default safe-only policy: latest_revised-sourced denied,
+        # immutable_snapshot-sourced admitted.
         assert by_name["fundamental"]["allowed"] is False
         assert by_name["macro"]["allowed"] is False
         assert by_name["sentiment"]["allowed"] is True
@@ -1199,7 +1202,7 @@ class TestChannelVintageFormalReport:
 
     def test_formal_rejects_incomplete_vintage_declaration(self, tmp_path, monkeypatch):
         """§T2: formal mode FAILs when a documented use_* channel carries no
-        vintage declaration (silently unknown_vintage/denied is a hard FAIL)."""
+        vintage declaration (silently denied-by-default is a hard FAIL)."""
         root = self._vintage_gate_root(tmp_path)
         self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
@@ -1207,6 +1210,7 @@ class TestChannelVintageFormalReport:
             "channels": [],
             "missing_channels": ["fundamental"],
             "daily_qfq_allowed": True,
+            "declaration_complete": True,
         })
         rc = _run_gate(
             self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
@@ -1230,6 +1234,7 @@ class TestChannelVintageFormalReport:
             "channels": [],
             "missing_channels": [],
             "daily_qfq_allowed": False,
+            "declaration_complete": True,
         })
         rc = _run_gate(
             self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
@@ -1254,6 +1259,7 @@ class TestChannelVintageFormalReport:
             "channels": [],
             "missing_channels": [],
             "daily_qfq_allowed": True,
+            "declaration_complete": True,
         })
         rc = _run_gate(
             self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
@@ -1275,6 +1281,54 @@ class TestChannelVintageFormalReport:
             "channels": [],
             "missing_channels": ["fundamental"],
             "daily_qfq_allowed": True,
+            "declaration_complete": True,
+        })
+        rc = _run_gate(
+            self._vintage_gate_argv(root, tmp_path / "report", profile=None),
+            monkeypatch,
+        )
+        assert rc == 0
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is True
+        assert report["channel_vintage"] == []  # the fake was consumed
+
+    def test_formal_rejects_incomplete_three_dim_declaration(self, tmp_path, monkeypatch):
+        """§T7: formal mode FAILs when the 3-dim declaration is incomplete —
+        every declared channel must carry non-"unknown" source_vintage /
+        transform / pit_alignment."""
+        root = self._vintage_gate_root(tmp_path)
+        self._relax_formal_profile(monkeypatch)
+        self._patch_vintage_report(monkeypatch, {
+            "vintage_policy": "safe-only",
+            "channels": [],
+            "missing_channels": [],
+            "daily_qfq_allowed": True,
+            "declaration_complete": False,
+        })
+        rc = _run_gate(
+            self._vintage_gate_argv(root, tmp_path / "report", profile="formal"),
+            monkeypatch,
+        )
+        assert rc == 1
+        report = json.loads(
+            (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
+        )
+        assert report["passed"] is False
+        assert report["vintage_policy"] == "safe-only"
+        assert report["channel_vintage"] == []  # the fake was consumed
+
+    def test_bootstrap_does_not_fail_on_incomplete_three_dim_declaration(self, tmp_path, monkeypatch):
+        """§T7 control: bootstrap REPORTS an incomplete 3-dim declaration but
+        never ENFORCES it — the same fake that fails formal leaves rc==0 here."""
+        root = self._vintage_gate_root(tmp_path)
+        self._patch_vintage_report(monkeypatch, {
+            "vintage_policy": "safe-only",
+            "channels": [],
+            "missing_channels": [],
+            "daily_qfq_allowed": True,
+            "declaration_complete": False,
         })
         rc = _run_gate(
             self._vintage_gate_argv(root, tmp_path / "report", profile=None),

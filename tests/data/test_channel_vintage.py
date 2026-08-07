@@ -1,37 +1,46 @@
-"""v15 §六/§十 channel-vintage declaration tests.
+"""v15 §六/§十 / v16 §十二 channel-vintage declaration tests.
 
 The module ``stoke_ml.data.channel_vintage`` is the curated governance
 declaration that the formal gate report surfaces.  Every declared channel must
-carry one of the three DECLARED statuses (``raw_vintage_safe`` /
-``derived_versioned`` / ``latest_revised_aligned``) and a non-empty rationale;
-``unknown_vintage`` is the reserved deny-by-default fallback of ``status_of()``
-and is NEVER a declared label.  The documented revision-leakage sources
-(fundamental, macro) must be locked as ``latest_revised_aligned``; the derived
-+ versioned price channel (daily_qfq) must be ``derived_versioned``; the
-declaration must stay deterministic and in sync with the CLAUDE.md ``use_*``
-dimension list.
+carry the three DECLARED 3-dim labels (``source_vintage`` / ``transform`` /
+``pit_alignment`` — none ``"unknown"``) and a non-empty rationale; the
+``"unknown"`` values are the reserved deny-by-default fallbacks of the
+accessors and are NEVER declared labels.  The documented revision-leakage
+sources (fundamental, macro) must be locked as ``latest_revised`` source; the
+price channel (daily_qfq) must be ``immutable_snapshot`` source with a
+``formula_versioned`` transform and ``proxy`` alignment; the declaration must
+stay deterministic and in sync with the CLAUDE.md ``use_*`` dimension list.
 """
 import importlib
 
 import stoke_ml.data.channel_vintage as cv
 from stoke_ml.data.channel_vintage import CHANNEL_VINTAGE
 
-VALID_STATUSES = {
-    "raw_vintage_safe",
-    "derived_versioned",
-    "latest_revised_aligned",
-}
+DECLARED_SOURCE_VINTAGES = {"immutable_snapshot", "latest_revised"}
+DECLARED_TRANSFORMS = {"raw", "model_versioned", "formula_versioned"}
+DECLARED_PIT_ALIGNMENTS = {"verified", "proxy"}
 
 
 def test_all_entries_have_valid_status_and_nonempty_rationale():
-    """Every channel has a legal declared status and a concrete, non-empty
-    rationale."""
+    """Every channel carries the three DECLARED 3-dim labels (none "unknown")
+    and a concrete, non-empty rationale."""
     assert len(CHANNEL_VINTAGE) > 0
     for e in CHANNEL_VINTAGE:
-        assert e.status in VALID_STATUSES, f"{e.channel}: bad status {e.status!r}"
-        assert e.status != "unknown_vintage", (
-            f"{e.channel}: unknown_vintage is never a declared status"
+        assert e.source_vintage in DECLARED_SOURCE_VINTAGES, (
+            f"{e.channel}: bad source_vintage {e.source_vintage!r}"
         )
+        assert e.transform in DECLARED_TRANSFORMS, (
+            f"{e.channel}: bad transform {e.transform!r}"
+        )
+        assert e.pit_alignment in DECLARED_PIT_ALIGNMENTS, (
+            f"{e.channel}: bad pit_alignment {e.pit_alignment!r}"
+        )
+        for dim, value in (("source_vintage", e.source_vintage),
+                           ("transform", e.transform),
+                           ("pit_alignment", e.pit_alignment)):
+            assert value != "unknown", (
+                f"{e.channel}: 'unknown' is never a declared {dim}"
+            )
         assert isinstance(e.rationale, str) and e.rationale.strip(), (
             f"{e.channel}: empty rationale"
         )
@@ -45,43 +54,56 @@ def test_channels_are_unique():
 
 def test_core_revision_leakage_sources_are_latest_revised_aligned():
     """§十五: fundamental and macro are the documented revision-leakage source
-    — locked as latest_revised_aligned, exactly."""
+    — locked as latest_revised source, exactly."""
     by_name = cv.CHANNEL_VINTAGE_BY_NAME
-    assert by_name["fundamental"].status == "latest_revised_aligned"
-    assert by_name["macro"].status == "latest_revised_aligned"
+    assert by_name["fundamental"].source_vintage == "latest_revised"
+    assert by_name["macro"].source_vintage == "latest_revised"
 
 
 def test_derived_price_channel_is_derived_versioned():
-    """§T2: the qfq price channel is derived + versioned (not an immutable raw
-    snapshot), and the immutable-event sentiment channel is raw_vintage_safe."""
+    """§T2/§T7: the qfq price channel is immutable-sourced (raw OHLC +
+    adjustment-factor history) with a formula_versioned transform (re-anchoring)
+    and proxy alignment — not an immutable raw-value snapshot."""
     by_name = cv.CHANNEL_VINTAGE_BY_NAME
-    assert by_name["daily_qfq"].status == "derived_versioned"
-    assert by_name["sentiment"].status == "raw_vintage_safe"
+    assert by_name["daily_qfq"].source_vintage == "immutable_snapshot"
+    assert by_name["daily_qfq"].transform == "formula_versioned"
+    assert by_name["daily_qfq"].pit_alignment == "proxy"
 
 
 def test_known_statuses_is_exactly_all_four_states():
-    """§T2: KNOWN_STATUSES is EXACTLY the 3 declared states plus the reserved
-    unknown_vintage deny-by-default fallback — a stray 5th status added to the
-    vocabulary must fail this equality, not slip through a superset check."""
-    assert set(cv.KNOWN_STATUSES) == {
-        "raw_vintage_safe", "derived_versioned", "latest_revised_aligned",
-        "unknown_vintage",
+    """§T2/§T7: each axis vocabulary is EXACTLY its declared labels plus the
+    reserved "unknown" deny-by-default fallback — a stray extra label added to
+    a vocabulary must fail this equality, not slip through a superset check."""
+    assert set(cv.KNOWN_SOURCE_VINTAGES) == {
+        "immutable_snapshot", "latest_revised", "unknown",
     }
+    assert set(cv.KNOWN_TRANSFORMS) == {
+        "raw", "model_versioned", "formula_versioned", "unknown",
+    }
+    assert set(cv.KNOWN_PIT_ALIGNMENTS) == {"verified", "proxy", "unknown"}
 
 
 def test_status_of_defaults_to_unknown_vintage():
-    """§T2: status_of() returns unknown_vintage for any undeclared channel (the
-    deny-by-default fallback) and the declared status for curated channels."""
-    assert cv.status_of("definitely_not_a_channel") == "unknown_vintage"
-    assert cv.status_of("sentiment") == "raw_vintage_safe"
+    """§T2/§T7: the 3-dim accessors return "unknown" for any undeclared channel
+    (the deny-by-default fallback) and the declared labels for curated channels;
+    declaration_of() returns None for the undeclared one."""
+    assert cv.declaration_of("definitely_not_a_channel") is None
+    assert cv.source_vintage_of("definitely_not_a_channel") == "unknown"
+    assert cv.transform_of("definitely_not_a_channel") == "unknown"
+    assert cv.pit_alignment_of("definitely_not_a_channel") == "unknown"
+    assert cv.source_vintage_of("sentiment") == "immutable_snapshot"
+    assert cv.transform_of("sentiment") == "model_versioned"
+    assert cv.pit_alignment_of("sentiment") == "verified"
 
 
 def test_declaration_is_deterministic_across_imports():
     """Two (re)imports yield byte-identical content — frozen dataclass + stable
     ordering make the report serialization deterministic."""
-    first = [(e.channel, e.status, e.rationale) for e in cv.CHANNEL_VINTAGE]
+    first = [(e.channel, e.source_vintage, e.transform, e.pit_alignment,
+              e.rationale) for e in cv.CHANNEL_VINTAGE]
     reloaded = importlib.reload(cv)
-    second = [(e.channel, e.status, e.rationale) for e in reloaded.CHANNEL_VINTAGE]
+    second = [(e.channel, e.source_vintage, e.transform, e.pit_alignment,
+               e.rationale) for e in reloaded.CHANNEL_VINTAGE]
     assert first == second
 
 
@@ -100,3 +122,23 @@ def test_by_name_index_matches_declaration():
     assert set(cv.CHANNEL_VINTAGE_BY_NAME) == {e.channel for e in cv.CHANNEL_VINTAGE}
     for e in cv.CHANNEL_VINTAGE:
         assert cv.CHANNEL_VINTAGE_BY_NAME[e.channel] is e
+
+
+def test_news_three_dim_classification():
+    """§T7 (plan's named example): news 原文 is immutable_snapshot, but the
+    sentiment score is a model_versioned transform (version must be recorded,
+    not the channel denied); alignment is verified."""
+    e = cv.CHANNEL_VINTAGE_BY_NAME["sentiment"]
+    assert e.source_vintage == "immutable_snapshot"
+    assert e.transform == "model_versioned"
+    assert e.pit_alignment == "verified"
+
+
+def test_capital_flow_three_dim_classification():
+    """§T7 (plan's named example): capital_flow stays ALLOWED but is HONESTLY
+    labeled — immutable_snapshot source with a formula_versioned transform
+    (vendor-computed) and verified alignment."""
+    e = cv.CHANNEL_VINTAGE_BY_NAME["capital_flow"]
+    assert e.source_vintage == "immutable_snapshot"
+    assert e.transform == "formula_versioned"
+    assert e.pit_alignment == "verified"

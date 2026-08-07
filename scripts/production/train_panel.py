@@ -292,14 +292,15 @@ def main():
                              "(inner_val/outer_test) are membership-gated.")
     parser.add_argument("--vintage-policy", type=str, default="safe-only",
                         choices=["safe-only", "allow-revised"],
-                        help="§T2: vintage-admission policy for the feature set.  "
-                             "safe-only (default) admits raw_vintage_safe + "
-                             "derived_versioned channels and DENIES "
-                             "latest_revised_aligned ones (fundamental/macro/"
+                        help="§T2/§T7: vintage-admission policy for the feature "
+                             "set.  safe-only (default) admits channels whose "
+                             "source_vintage is immutable_snapshot and DENIES "
+                             "latest_revised-sourced ones (fundamental/macro/"
                              "earnings/valuation/pledge/shareholder/"
-                             "index_membership/market_env_refine); allow-revised "
-                             "additionally admits latest_revised_aligned channels "
-                             "(legacy / ablation use).")
+                             "index_membership/market_env_refine/sector/"
+                             "concept); allow-revised additionally admits "
+                             "latest_revised-sourced channels (legacy / "
+                             "ablation use).")
     parser.add_argument("--allow-fundamental-ablation", action="store_true",
                         help="T3 research decision #1: ABLATION ONLY — force the "
                              "fundamental channel ON even under safe-only.  This "

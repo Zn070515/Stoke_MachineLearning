@@ -83,8 +83,9 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
         _SWITCH_KEY.get(dim, f"use_{dim}"): pref and channel_allowed(dim, policy)
         for dim, pref in _BASE_DIM_PREFERENCE.items()
     }
-    # T3 research decision #1: fundamental is denied under safe-only
-    # (latest_revised_aligned) and may enter ONLY via an explicit ablation.
+    # T3 research decision #1: fundamental is denied under safe-only (its
+    # source_vintage is latest_revised) and may enter ONLY via an explicit
+    # ablation.
     # --allow-fundamental-ablation forces use_fundamental=True REGARDLESS of
     # policy — but ONLY that channel; the other policy-denied channels stay
     # off.  Defensive getattr: callers passing a legacy args stub (no attr)

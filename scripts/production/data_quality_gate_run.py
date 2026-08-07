@@ -198,10 +198,11 @@ def main():
     # Computed ONCE so the report and the formal enforcement share the same
     # view.  Informational for bootstrap; formal mode ENFORCES it below.
     vintage = vintage_report(VintagePolicy(args.vintage_policy))
-    # §T2: formal mode refuses an incomplete or self-contradictory vintage
-    # declaration.  An undeclared documented channel would be silently
-    # unknown_vintage (denied) — formal must surface that as a hard FAIL rather
-    # than let a consumer guess.  daily_qfq must always be admissible (no model
+    # §T2/§T7: formal mode refuses an incomplete or self-contradictory 3-dim
+    # vintage declaration.  An undeclared documented channel (denied by
+    # default) or a declaration whose source_vintage/transform/pit_alignment is
+    # the reserved "unknown" fallback must surface as a hard FAIL rather than
+    # let a consumer guess.  daily_qfq must always be admissible (no model
     # trains without the price channel).
     if args.profile == "formal":
         if vintage["missing_channels"]:
@@ -219,6 +220,15 @@ def main():
                 f"ERROR: --profile formal vintage policy {args.vintage_policy} "
                 f"denies daily_qfq — a model cannot train without the price "
                 f"channel.",
+                file=sys.stderr,
+            )
+        if not vintage["declaration_complete"]:
+            passed = False
+            print(
+                "ERROR: --profile formal requires a COMPLETE 3-dim vintage "
+                "declaration (every declared channel must declare "
+                "source_vintage/transform/pit_alignment, none 'unknown'); "
+                "refusing an incomplete declaration.",
                 file=sys.stderr,
             )
     os.makedirs(args.output, exist_ok=True)

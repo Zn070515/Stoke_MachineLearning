@@ -1,20 +1,23 @@
-"""Vintage-based channel admission policy (§T2 / v15 §六/§十).
+"""Vintage-based channel admission policy (§T2/T7 / v15 §六/§十, v16 §十二).
 
-Decides which channels a training run may consume based on their declared
-vintage status (see ``stoke_ml.data.channel_vintage``).
+Decides which channels a training run may consume based on their declared 3-dim
+vintage classification (see ``stoke_ml.data.channel_vintage``).
 
-- ``SAFE_ONLY`` (``"safe-only"``) admits ``raw_vintage_safe`` and
-  ``derived_versioned`` channels and DENIES ``latest_revised_aligned`` ones
-  (fundamental/macro/earnings/valuation/pledge/shareholder/
-  index_membership/market_env_refine/sector/concept).  The default for formal
-  headline/lockbox runs — a research-correctness guard against revision
-  leakage.  ``derived_versioned`` carries ``daily_qfq``, so the price channel
-  stays admissible (a model cannot train without it).
-- ``ALLOW_REVISED`` (``"allow-revised"``) additionally admits
-  ``latest_revised_aligned`` channels (legacy / ablation use).
+- ``SAFE_ONLY`` (``"safe-only"``) admits ``immutable_snapshot``-sourced
+  channels and DENIES ``latest_revised``-sourced ones (fundamental/macro/
+  earnings/valuation/pledge/shareholder/index_membership/market_env_refine/
+  sector/concept).  The default for formal headline/lockbox runs — a
+  research-correctness guard against revision leakage.  ``daily_qfq`` is
+  ``immutable_snapshot``-sourced, so the price channel stays admissible (a
+  model cannot train without it).
+- ``ALLOW_REVISED`` (``"allow-revised"``) additionally admits the
+  ``latest_revised``-sourced channels (legacy / ablation use).
 
-``unknown_vintage`` (any undeclared channel) is denied under BOTH policies —
-the mandatory deny-by-default fallback.
+Admission checks BOTH the source and transform layers: a channel whose
+``source_vintage`` or ``transform`` is the reserved ``"unknown"`` fallback (or
+an undeclared channel) is denied under BOTH policies — the mandatory
+deny-by-default.  ``pit_alignment`` is a RECORDING dimension and does not gate
+admission.
 
 This module imports ``channel_vintage`` one-way; ``channel_vintage`` never
 imports this module (no circular import).
@@ -40,16 +43,21 @@ def channel_allowed(
 ) -> bool:
     """Whether ``channel`` may be consumed under ``policy``.
 
-    ``unknown_vintage`` (an undeclared channel) is False under BOTH policies —
-    the mandatory deny-by-default.  ``raw_vintage_safe`` / ``derived_versioned``
-    are always allowed; ``latest_revised_aligned`` only under ``ALLOW_REVISED``.
+    SOURCE-based admission with a BOTH-LAYERS check: an undeclared channel (no
+    declaration) OR a channel whose ``source_vintage``/``transform`` is the
+    reserved ``"unknown"`` fallback is False under BOTH policies — the
+    mandatory deny-by-default.  ``immutable_snapshot``-sourced channels are
+    always allowed; ``latest_revised``-sourced channels only under
+    ``ALLOW_REVISED``.
     """
     if not isinstance(policy, VintagePolicy):
         policy = VintagePolicy(policy)
-    status = _cv.status_of(channel, vintage_by_name=vintage_by_name)
-    if status == "unknown_vintage":
+    entry = _cv.declaration_of(channel, vintage_by_name=vintage_by_name)
+    if entry is None:
         return False
-    if status == "latest_revised_aligned":
+    if entry.source_vintage == "unknown" or entry.transform == "unknown":
+        return False
+    if entry.source_vintage == "latest_revised":
         return policy is VintagePolicy.ALLOW_REVISED
     return True
 
@@ -99,8 +107,11 @@ def vintage_report(
     caller can pass a crafted partial declaration or a hypothetical declaration
     to prove enforcement without touching module globals.
 
-    Returns ``{"vintage_policy", "channels": [{channel,status,rationale,
-    allowed}...], "missing_channels", "daily_qfq_allowed"}``.
+    Returns ``{"vintage_policy", "channels": [{channel,source_vintage,
+    transform,pit_alignment,rationale,allowed}...], "missing_channels",
+    "daily_qfq_allowed", "declaration_complete"}``.  ``declaration_complete``
+    is True iff ``missing_channels`` is empty AND every declared channel has
+    all three dims set to DECLARED (non-``"unknown"``) values.
     """
     if not isinstance(policy, VintagePolicy):
         policy = VintagePolicy(policy)
@@ -109,23 +120,37 @@ def vintage_report(
     if documented_dims is None:
         documented_dims = _cv.DOCUMENTED_USE_DIMS
     by_name = {e.channel: e for e in declaration}
+    channels = [
+        {
+            "channel": e.channel,
+            "source_vintage": e.source_vintage,
+            "transform": e.transform,
+            "pit_alignment": e.pit_alignment,
+            "rationale": e.rationale,
+            "allowed": channel_allowed(e.channel, policy, vintage_by_name=by_name),
+        }
+        for e in declaration  # declaration order preserved → deterministic
+    ]
+    missing_channels = sorted(
+        set(documented_dims) - {e.channel for e in declaration}
+    )
+    declaration_complete = (
+        not missing_channels
+        and all(
+            e.source_vintage != "unknown"
+            and e.transform != "unknown"
+            and e.pit_alignment != "unknown"
+            for e in declaration
+        )
+    )
     return {
         "vintage_policy": policy.value,
-        "channels": [
-            {
-                "channel": e.channel,
-                "status": e.status,
-                "rationale": e.rationale,
-                "allowed": channel_allowed(e.channel, policy, vintage_by_name=by_name),
-            }
-            for e in declaration  # declaration order preserved → deterministic
-        ],
-        "missing_channels": sorted(
-            set(documented_dims) - {e.channel for e in declaration}
-        ),
+        "channels": channels,
+        "missing_channels": missing_channels,
         "daily_qfq_allowed": channel_allowed(
             "daily_qfq", policy, vintage_by_name=by_name
         ),
+        "declaration_complete": declaration_complete,
     }
 
 

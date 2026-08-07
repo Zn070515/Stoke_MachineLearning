@@ -182,10 +182,10 @@ class FeatureProfile:
     vintage_policy: str
 
 
-# The formal baseline profile (v15 §十四).  ``required_channels`` is exactly
-# the safe-only-ALLOWED (raw_vintage_safe + derived_versioned) channels that
-# default ON in FeaturePipeline — i.e. it excludes the 9
-# latest_revised_aligned denied channels (fundamental/macro/earnings/valuation/
+# The formal baseline profile (v15 §十四, v16 §十二).  ``required_channels`` is
+# exactly the safe-only-ALLOWED (immutable_snapshot-sourced) channels that
+# default ON in FeaturePipeline — i.e. it excludes the 10
+# latest_revised-sourced denied channels (fundamental/macro/earnings/valuation/
 # pledge/shareholder/index_membership/market_env_refine/sector/concept) and the
 # default-off board/sector/concept/limit_up/topic dimensions.  ``macro`` is
 # denied under safe-only, so it is deliberately absent despite defaulting ON.

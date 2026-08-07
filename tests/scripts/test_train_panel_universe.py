@@ -527,10 +527,11 @@ def test_signature_changes_with_research_choices(tp):
 
 def test_signature_binds_vintage_policy(tp):
     """§T19: two runs differing ONLY in the vintage-admission policy train on
-    materially different channels — safe-only denies latest_revised_aligned
-    (fundamental/macro/earnings/valuation/pledge/shareholder/index_membership/
-    market_env_refine) that allow-revised admits — so they MUST be distinct
-    trials, never conflated into one experiment."""
+    materially different channels — safe-only denies latest_revised-sourced
+    channels (fundamental/macro/earnings/valuation/pledge/shareholder/
+    index_membership/market_env_refine/sector/concept) that allow-revised
+    admits — so they MUST be distinct trials, never conflated into one
+    experiment."""
     from stoke_ml.models.panel import PanelConfig
 
     base = {
@@ -1201,10 +1202,10 @@ def test_allow_revised_reproduces_todays_switch_set(tp):
 
 
 def test_safe_only_denies_revised_aligned_dims(tp):
-    """safe-only additionally turns OFF the base-True, latest_revised_aligned
+    """safe-only additionally turns OFF the base-True, latest_revised-sourced
     dims (fundamental/macro/earnings/valuation/index_membership/
-    market_env_refine/pledge/shareholder) while keeping derived_versioned
-    (market_env/industry) and raw_vintage_safe (sentiment) ON."""
+    market_env_refine/pledge/shareholder) while keeping immutable_snapshot-
+    sourced (sentiment) and formula-derived (market_env/industry) ON."""
     kw = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
     for dim in ("fundamental", "macro", "earnings", "valuation",
                 "index_membership", "market_env_refine", "pledge", "shareholder"):
