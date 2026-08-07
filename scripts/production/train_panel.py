@@ -110,6 +110,7 @@ from scripts.production.train_panel_panel import (
     _validate_panel_store_path,
     _resolve_panel,
     _panel_memory_gb,  # noqa: F401  re-exported for import-compat
+    _streaming_peak_memory_gb,  # noqa: F401  re-exported for import-compat
     _enforce_universe_memory,
     _host_available_gb,
     _estimate_panel_memory,  # noqa: F401  re-exported for import-compat

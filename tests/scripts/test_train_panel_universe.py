@@ -1156,6 +1156,108 @@ def test_early_guard_skipped_on_store_load(tp, tmp_path):
         args, ["000001"], str(tmp_path), store_load=True) is None
 
 
+# ── §T10c: build-path-aware pre-build memory guard (streaming first build) ──
+
+def test_streaming_peak_memory_gb_bounded(tp):
+    """§T10c: the streaming resident-peak estimate is bounded and roughly
+    independent of n_stocks — a full-market streaming build is a few GB, not
+    the ~228 GB dense estimate.  use_fundamental_refine gates the resident
+    cs_panel_df term (the only other bounded-in-size resident structure)."""
+    gb = tp._streaming_peak_memory_gb(6500, 1700, use_fundamental_refine=True)
+    assert 0.0 < gb < 10.0
+    # n_stocks is NOT an input — the peak is bounded, not universe-scaled.
+    assert (tp._streaming_peak_memory_gb(6500, 1700, True)
+            == tp._streaming_peak_memory_gb(6500, 1700, True))
+    # refine OFF drops the cs_panel_df term → smaller peak.
+    assert (tp._streaming_peak_memory_gb(6500, 1700, False) < gb)
+
+
+def test_streaming_all_not_refused_direct(tp):
+    """§T10c: a full-market 'all' STREAMING build (first build into
+    --panel-store) is NOT refused — the bounded peak (~3.7 GB) never trips the
+    dense 48 GB line; it WARNS as a heads-up about the build's disk/IO size."""
+    est, action = tp._enforce_universe_memory(
+        "all", 5530, 6500, 1700, available_gb=64.0,
+        streaming=True, use_fundamental_refine=True)
+    assert action == "warn"
+    assert est < 10.0
+
+
+def test_streaming_csi800_not_refused_direct(tp):
+    """§T10c: csi800 streaming is also NOT refused (warn heads-up)."""
+    est, action = tp._enforce_universe_memory(
+        "csi800", 800, 6500, 1700, available_gb=64.0,
+        streaming=True, use_fundamental_refine=True)
+    assert action == "warn"
+    assert est < 10.0
+
+
+def test_streaming_small_universe_ok_direct(tp):
+    """§T10c: csi500 streaming — not in the largest-universe warn set → 'ok'."""
+    est, action = tp._enforce_universe_memory(
+        "csi500", 500, 6500, 1700, available_gb=64.0,
+        streaming=True, use_fundamental_refine=True)
+    assert action == "ok"
+
+
+def test_dense_all_still_refused_direct(tp):
+    """§T10c: the SAME 'all' universe WITHOUT --panel-store (live dense) is
+    refused exactly as today — the dense formula + 48 GB line unchanged."""
+    with pytest.raises(SystemExit) as ei:
+        tp._enforce_universe_memory("all", 5530, 6500, 1700)
+    msg = str(ei.value)
+    assert "universe=all" in msg
+    assert "--allow-high-risk-universe" in msg
+
+
+def test_streaming_host_available_refuse_still_fires(tp):
+    """§T10c: the streaming safety floor is preserved — when the bounded peak
+    exceeds the host's ACTUAL available RAM, the streaming path still refuses."""
+    with pytest.raises(SystemExit) as ei:
+        tp._enforce_universe_memory(
+            "all", 5530, 6500, 1700, available_gb=1.0,
+            streaming=True, use_fundamental_refine=True)
+    msg = str(ei.value)
+    assert "universe=all" in msg
+    assert "available" in msg
+    assert "--allow-high-risk-universe" in msg
+
+
+def test_early_guard_streaming_first_build_not_refused(tp, tmp_path, monkeypatch):
+    """End-to-end: a full-market FIRST build into --panel-store (streaming) is
+    admitted by the pre-build guard, while the IDENTICAL universe/schema
+    WITHOUT --panel-store (live dense) is refused exactly as today.  Same
+    resolved universe + prebuilt schema → the dense estimate refuses; the
+    bounded streaming peak is admissible."""
+    df = pd.DataFrame({f"f{i}": [0.0, 0.0] for i in range(10200)})
+    df["date"] = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    df["stock_code"] = ["000001", "000001"]
+    df.to_parquet(str(tmp_path / "000001.parquet"))
+    stock_list = [f"{i:06d}" for i in range(5530)]
+    # Dense: same universe/schema WITHOUT --panel-store → refused (> 48 GB).
+    dense_args = _panel_args(
+        "allow-revised", universe="all", prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31",
+    )
+    with pytest.raises(SystemExit) as ei:
+        tp._early_panel_memory_guard(
+            dense_args, stock_list, str(tmp_path), store_load=False)
+    assert "--allow-high-risk-universe" in str(ei.value)
+    # Streaming: same universe/schema, first build into --panel-store → NOT
+    # refused (bounded resident peak; warn heads-up for 'all').
+    stream_args = _panel_args(
+        "allow-revised", universe="all", prebuilt=str(tmp_path), seq_len=60,
+        start="2024-01-01", end="2024-12-31",
+    )
+    stream_args.panel_store = str(tmp_path / "out_store")
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._host_available_gb", lambda: 64.0)
+    est, action = tp._early_panel_memory_guard(
+        stream_args, stock_list, str(tmp_path), store_load=False)
+    assert action != "refuse"
+    assert est < 10.0
+
+
 # ── §T2: vintage-policy-driven feature switches ────────────────────────
 
 def _panel_args(vintage_policy, **overrides):

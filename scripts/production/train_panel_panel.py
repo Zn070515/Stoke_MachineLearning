@@ -413,6 +413,42 @@ def _panel_memory_gb(n_stocks: int, n_timesteps: int, n_features: int) -> float:
     """§七-P0: dominant resident panel memory estimate in GB (float32 arrays)."""
     return int(n_stocks) * int(n_timesteps) * int(n_features) * 4 / (1024 ** 3)
 
+# §T10c: conservative RESIDENT-PEAK bound for the STREAMING panel build (T5),
+# which memmap-sinks the three (N,T,D) grids to disk (open_memmap) so the dense
+# grids never reside in RAM.  The resident peak is bounded and roughly
+# INDEPENDENT of n_stocks.  Components:
+#   * ONE stock's ZI-aligned feature frame at a time — n_timesteps ×
+#     n_features float64 × pandas overhead (~2.5×) — the per-stock transient;
+#   * the cross-sectional-fundamental panel cs_panel_df (~2-3 GB at full-market
+#     scale) — ONLY when use_fundamental_refine is enabled (the ONE bounded-in-
+#     size resident structure, kept through Pass 3 for the left-merge);
+#   * the per-date normalizer-stats accumulator + scratch pickle I/O buffers
+#     (~0.5 GB headroom).
+_STREAMING_PER_STOCK_PANDAS_OVERHEAD = 2.5
+_STREAMING_CS_PANEL_GB = 3.0
+_STREAMING_FIXED_BUFFERS_GB = 0.5
+
+def _streaming_peak_memory_gb(
+    n_timesteps: int, n_features: int, use_fundamental_refine: bool,
+) -> float:
+    """§T10c: bounded resident-peak estimate (GB) for the STREAMING panel build.
+
+    See the module constants for the components.  The per-stock transient is
+    ONE stock's frame (n_timesteps × n_features float64 × pandas overhead);
+    the only other resident structure is the cross-sectional-fundamental panel
+    when ``use_fundamental_refine`` is enabled.  Roughly independent of
+    n_stocks — what scales with the universe is the ON-DISK memmap grids +
+    scratch pickles, not the resident set.  The static 48/96 GB dense lines
+    never trip on this bound; the streaming verdict relies on the host's
+    actual available RAM as the only refusal floor.
+    """
+    per_stock = (
+        int(n_timesteps) * int(n_features) * 8
+        * _STREAMING_PER_STOCK_PANDAS_OVERHEAD / (1024 ** 3)
+    )
+    cs = _STREAMING_CS_PANEL_GB if use_fundamental_refine else 0.0
+    return per_stock + cs + _STREAMING_FIXED_BUFFERS_GB
+
 def _enforce_universe_memory(
     universe: str,
     n_stocks: int,
@@ -421,13 +457,15 @@ def _enforce_universe_memory(
     *,
     allow_override: bool = False,
     available_gb: float | None = None,
+    streaming: bool = False,
+    use_fundamental_refine: bool = False,
 ) -> tuple[float, str]:
     """§七-P0: refuse / warn when a universe's panel cannot realistically fit in RAM.
 
     Returns ``(est_gb, action)`` where ``action`` is the UN-overridden verdict:
     "refuse" / "warn" / "ok".
 
-    Verdict rules:
+    Verdict rules (DENSE residency — the default, ``streaming=False``):
       * universe == "all": est > _UNIVERSE_MEMORY_REFUSE_GB → "refuse".
       * universe == "csi800": est > _UNIVERSE_MEMORY_HARD_GB → "refuse";
         est > _UNIVERSE_MEMORY_WARN_GB → "warn".
@@ -436,12 +474,59 @@ def _enforce_universe_memory(
         est > available_gb → "refuse" (the estimate alone already guarantees
         the panel will not fit on THIS host).
 
+    Verdict rules (STREAMING build, ``streaming=True`` — §T10c): the build
+    memmap-sinks the (N,T,D) grids to disk, so its RESIDENT peak is bounded and
+    roughly independent of n_stocks (``_streaming_peak_memory_gb``).  The
+    static 48/96 GB lines — written for the dense residency path — never trip
+    on the ~few-GB bound.  Instead:
+      * universe in ("all", "csi800"): "warn" — a heads-up about the build's
+        size / disk-IO cost, not a RAM refusal;
+      * any other universe: "ok";
+      * ``available_gb`` known and est > available_gb → "refuse" — the ONLY
+        refusal floor for a streaming build (the bounded peak must still fit
+        the host's ACTUAL available RAM).
+    ``use_fundamental_refine`` (only read when ``streaming=True``) gates the
+    resident cs_panel_df term of the streaming peak.
+
     Side effect: when the verdict is "refuse" and ``allow_override`` is False,
     raises SystemExit with a message that names the estimate, the available
     memory (when known), the threshold, and the ``--allow-high-risk-universe``
     escape hatch.  When the verdict is "warn", OR "refuse" with
     ``allow_override=True``, logs a prominent WARNING instead.
     """
+    if streaming:
+        # §T10c: bounded streaming resident peak — the dense formula must NOT
+        # gate a first build into --panel-store (a full-market streaming build
+        # is ~3.7 GB resident, not the ~228 GB the dense estimate implies).
+        est_gb = _streaming_peak_memory_gb(
+            n_timesteps, n_features, use_fundamental_refine)
+        action = "ok"
+        if universe in ("all", "csi800"):
+            action = "warn"
+        if available_gb is not None and est_gb > available_gb:
+            action = "refuse"
+        if action == "refuse" and not allow_override:
+            avail = f"vs available {available_gb:.1f} GB" if available_gb is not None else \
+                "vs host available memory (unknown — psutil not installed)"
+            raise SystemExit(
+                f"universe={universe}: streaming panel build resident peak "
+                f"{est_gb:.1f} GB (n_timesteps={n_timesteps} x "
+                f"n_features={n_features}; the (N,T,D) grids are memmap-sunk "
+                f"to disk) {avail} — the bounded streaming build cannot fit "
+                f"the host's available memory (§七-P0).  Re-scope with a "
+                f"smaller --stocks cap or pass --allow-high-risk-universe to "
+                f"run it anyway."
+            )
+        if action in ("warn", "refuse"):
+            logger.warning(
+                "universe=%s: streaming panel build resident peak %.1f GB "
+                "(memmap-sunk grids; bounded, roughly independent of "
+                "n_stocks) — §七-P0 heads-up: a full-market streaming build "
+                "is large on DISK/IO even though RAM stays bounded.  Pass "
+                "--allow-high-risk-universe to run it anyway.",
+                universe, est_gb,
+            )
+        return est_gb, action
     est_gb = _panel_memory_gb(n_stocks, n_timesteps, n_features)
     action = "ok"
     if universe == "all" and est_gb > _UNIVERSE_MEMORY_REFUSE_GB:
@@ -571,16 +656,35 @@ def _early_panel_memory_guard(
     Returns the ``(est_gb, action)`` verdict from _enforce_universe_memory, or
     None when the early guard is skipped.  A refusal (no --allow-high-risk-
     universe) raises SystemExit.
+
+    §T10c: the guard is BUILD-PATH-AWARE — a FIRST build into ``--panel-store``
+    (``streaming=True``) is a memmap-sunk two-pass build whose resident peak is
+    bounded and roughly independent of n_stocks, so it is judged against the
+    bounded streaming peak (not the dense estimate), making a full-market
+    streaming first build admissible.
     """
     if store_load:
         return None
     est = _estimate_panel_memory(args, stock_list, data_dir)
     if est is None:
         return None
+    # §T10c: a FIRST build into --panel-store routes build_panel_features to the
+    # STREAMING/two-pass path (memmap_dir set; store_load is already handled by
+    # the early return above, so a set panel_store here means build-into-store,
+    # not load).  The streaming resident peak is bounded and roughly independent
+    # of n_stocks, so the DENSE estimate must not gate it.  use_fundamental_refine
+    # gates the resident cs_panel_df term of the streaming peak; FeaturePipeline
+    # defaults it True and train_panel.py has no CLI lever for it, so an absent
+    # stub attr reads True (conservative).
+    streaming = bool(getattr(args, "panel_store", None))
+    use_fundamental_refine = bool(
+        getattr(args, "use_fundamental_refine", True))
     return _enforce_universe_memory(
         args.universe, *est,
         allow_override=args.allow_high_risk_universe,
         available_gb=_host_available_gb(),
+        streaming=streaming,
+        use_fundamental_refine=use_fundamental_refine,
     )
 
 # Channel coverage manifest: every aux channel is loaded
