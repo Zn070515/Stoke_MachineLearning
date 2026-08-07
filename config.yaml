@@ -95,6 +95,16 @@ training:
     train_years: 2
     val_months: 3
 
+# Streaming panel-build scratch dirs (§T7): the STREAMING path (--panel-store)
+# writes per-stock Pass-1 pickles + memmap grids to a scratch dir.  stale_days
+# is the orphan-scratch startup-sweep window; safety_margin_gb is the disk
+# headroom added on top of the final-panel + scratch-pickle estimate before a
+# build is refused for insufficient free space.  Both are read via
+# scripts/production/train_panel_panel.py (fall back to panel_builder defaults).
+panel_scratch:
+  stale_days: 7
+  safety_margin_gb: 5.0
+
 # Evaluation
 evaluation:
   primary_metric: "mcc"

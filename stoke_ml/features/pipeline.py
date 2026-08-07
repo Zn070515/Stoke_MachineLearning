@@ -1039,6 +1039,11 @@ class FeaturePipeline:
         data_dir: str | None = None,
         daily_membership: pd.DataFrame | None = None,
         memmap_dir: str | None = None,
+        scratch_dir: str | None = None,
+        run_id: str | None = None,
+        scratch_stale_days: int = 7,
+        scratch_cleanup_root: str | None = None,
+        scratch_cleanup_prefix: str | None = None,
     ) -> dict:
         """Build panel-format features for VSN+xLSTM training.
 
@@ -1058,4 +1063,9 @@ class FeaturePipeline:
             data_dir=data_dir,
             daily_membership=daily_membership,
             memmap_dir=memmap_dir,
+            scratch_dir=scratch_dir,
+            run_id=run_id,
+            scratch_stale_days=scratch_stale_days,
+            scratch_cleanup_root=scratch_cleanup_root,
+            scratch_cleanup_prefix=scratch_cleanup_prefix,
         )

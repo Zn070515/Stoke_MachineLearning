@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,6 +43,11 @@ from stoke_ml.models.panel.code_tree_hash import (
     hash_json,
 )
 from stoke_ml.features.panel_builders._arrays import close_memmap_grids
+from stoke_ml.features.panel_builder import (
+    _DEFAULT_SCRATCH_SAFETY_MARGIN_GB,
+    _DEFAULT_SCRATCH_STALE_DAYS,
+    _scratch_run_id,
+)
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.panel.panel_store import (
     load_panel_memmap,
@@ -520,11 +527,22 @@ def _resolve_panel(
     # save_panel_memmap can safely write the remaining small arrays + metadata
     # into the same directory (Windows locks open memmap files).  The store is
     # then re-loaded to get lazy read-only memmaps for downstream training.
+    # §T7: resolve the streaming scratch dir (explicit --scratch-dir >
+    # <panel-store>/scratch/<run_id>/ > system temp) and refuse up front when
+    # the estimate-based disk footprint cannot fit the scratch drive.  The
+    # scratch spec is threaded into the builder for crash-resume + stale sweep.
+    scratch_dir, scratch_run_id, cleanup_root, cleanup_prefix = _resolve_scratch_dir(args)
+    _enforce_streaming_disk_space(args, stock_list, data_dir, scratch_dir)
     panel_data = fp.build_panel_features(
         panel, aux_data=aux_data, horizon=args.horizon, prebuilt_dir=args.prebuilt,
         require_feature_manifest=args.require_feature_manifest,
         daily_membership=daily_membership,
         memmap_dir=args.panel_store,
+        scratch_dir=scratch_dir,
+        run_id=scratch_run_id,
+        scratch_stale_days=_scratch_stale_days(),
+        scratch_cleanup_root=cleanup_root,
+        scratch_cleanup_prefix=cleanup_prefix,
     )
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the
@@ -821,6 +839,164 @@ def _estimate_panel_memory(
         # ~ trading-day fraction of the raw span for the estimate.
         n_timesteps = int((hi - lo).days * 0.7)
     return n_stocks, n_timesteps, len(surviving)
+
+# ── §T7 streaming-build scratch-dir + disk pre-check ───────────────────────
+# The STREAMING panel build (T5) memmap-sinks the (N,T,D) grids to disk AND
+# writes one per-stock engineered-feature pickle to scratch per Pass-1 stock,
+# so it needs a scratch dir with enough free space for the final footprint +
+# the scratch pickles + a safety margin.  The pre-build estimate below is the
+# egregious-case guard; the builder's exact post-Pass-1 backstop cannot
+# underestimate (the authoritative net).
+_SCRATCH_DISK_ASSUMED_N_FEATURES = 1700  # live-path D is unknown w/o a build; documented assumption (§十五-3)
+_SCRATCH_PICKLE_OVERHEAD = 1.3  # float64 pickle ≈ 8B/feature × ~1.3 overhead
+_SCRATCH_TEMP_PREFIX = "panel_stream_scratch_"
+
+
+def _scratch_stale_days() -> int:
+    """§T7 orphan-scratch stale window (days) — config.yaml ``panel_scratch.stale_days``."""
+    try:
+        from stoke_ml.config import load_config
+        cfg = load_config().get("panel_scratch", {})
+        return int(cfg.get("stale_days", _DEFAULT_SCRATCH_STALE_DAYS))
+    except Exception:
+        return _DEFAULT_SCRATCH_STALE_DAYS
+
+
+def _scratch_safety_margin_gb() -> float:
+    """§T7 disk safety margin (GB) — config.yaml ``panel_scratch.safety_margin_gb``."""
+    try:
+        from stoke_ml.config import load_config
+        cfg = load_config().get("panel_scratch", {})
+        return float(cfg.get("safety_margin_gb", _DEFAULT_SCRATCH_SAFETY_MARGIN_GB))
+    except Exception:
+        return _DEFAULT_SCRATCH_SAFETY_MARGIN_GB
+
+
+def _resolve_scratch_dir(args) -> tuple[str, str, str | None, str | None]:
+    """§T7 resolve the streaming build's scratch spec.
+
+    Priority: explicit ``--scratch-dir`` > ``<panel-store>/scratch/<run_id>/``
+    > system temp (``panel_stream_scratch_<run_id>``).  Returns
+    ``(scratch_dir, run_id, cleanup_root, cleanup_prefix)``.
+
+    An explicit ``--scratch-dir`` never participates in the startup stale sweep
+    (``cleanup_root`` is None) — a user-chosen location is never swept.  The
+    panel-store-derived and temp locations ARE swept (only dirs older than
+    ``_scratch_stale_days()``), because they are owned by this tool.
+    """
+    run_id = _scratch_run_id()
+    # Defensive getattr: legacy args stubs (unit tests / older callers) may not
+    # carry the §T7 attr yet; the real CLI arg defaults to None.
+    if getattr(args, "scratch_dir", None):
+        return args.scratch_dir, run_id, None, None
+    if args.panel_store:
+        root = os.path.join(args.panel_store, "scratch")
+        return os.path.join(root, run_id), run_id, root, None
+    return (
+        os.path.join(tempfile.gettempdir(), _SCRATCH_TEMP_PREFIX + run_id),
+        run_id,
+        tempfile.gettempdir(),
+        _SCRATCH_TEMP_PREFIX,
+    )
+
+
+def _streaming_disk_required_gb(
+    n_stocks: int, n_timesteps: int, n_features: int,
+) -> float:
+    """§T7 disk required for a streaming build (GB): final panel grids + the
+    scratch pickles + the safety margin — never under-budgets."""
+    final_panel = (
+        int(n_stocks) * int(n_timesteps) * int(n_features) * 4 / (1024 ** 3)
+    )
+    scratch = (
+        int(n_stocks) * int(n_timesteps) * int(n_features) * 8
+        * _SCRATCH_PICKLE_OVERHEAD / (1024 ** 3)
+    )
+    return final_panel + scratch + _scratch_safety_margin_gb()
+
+
+def _streaming_disk_estimate(
+    args, stock_list: list[str], data_dir,
+) -> tuple[int, int, int] | None:
+    """§T7 pre-build disk estimate: (n_stocks, n_timesteps, n_features).
+
+    Mirrors ``_estimate_panel_memory`` for DISK: N is the resolved universe
+    size (upper bound), T the trading-day count in [args.start, args.end].  D
+    is read from the first prebuilt parquet's schema (surviving columns) when
+    ``--prebuilt``; on a live build D is unknown without engineering, so the
+    documented assumption ``_SCRATCH_DISK_ASSUMED_N_FEATURES`` is used.  Never
+    raises — returns None when the estimate cannot be made (skip the early
+    guard); the builder's exact backstop remains the authoritative net.
+    """
+    n_stocks = len(stock_list)
+    lo = pd.Timestamp(args.start).date()
+    hi = pd.Timestamp(args.end).date()
+    if args.prebuilt:
+        parquets = sorted(Path(args.prebuilt).glob("*.parquet"))
+        if not parquets:
+            return None
+        try:
+            import pyarrow.parquet as pq  # lazy — optional dependency
+            cols = list(pq.read_schema(str(parquets[0])).names)
+        except Exception:
+            return None
+        seq_len = args.seq_len or (64 if args.minute else 60)
+        kwargs = _panel_pipeline_kwargs(args, seq_len)
+        n_features = len([
+            c for c in cols
+            if c not in ("date", "stock_code")
+            and not re.search(r"_lag\d+$", c)
+            and not (c.startswith("topic_") and not kwargs.get("use_topic", False))
+            and not (c in FUNDAMENTAL_COLS and not kwargs.get("use_fundamental", False))
+        ])
+    else:
+        n_features = _SCRATCH_DISK_ASSUMED_N_FEATURES
+    try:
+        n_timesteps = len(get_research_calendar(
+            strict=True, data_dir=data_dir).get_trading_days(lo, hi))
+    except ValueError:
+        n_timesteps = int((hi - lo).days * 0.7)
+    return n_stocks, n_timesteps, n_features
+
+
+def _enforce_streaming_disk_space(
+    args, stock_list: list[str], data_dir, scratch_dir: str,
+) -> tuple[float, float] | None:
+    """§T7 refuse to start a streaming build whose disk footprint cannot fit.
+
+    Estimate-based pre-build check: when ``--panel-store`` is set (the STREAMING
+    path), compute the required disk (final grids + scratch pickles + margin)
+    vs the scratch drive's free space; insufficient → SystemExit BEFORE any
+    engineering work.  No ``--panel-store`` (dense build) → no-op (None).  The
+    builder's exact post-Pass-1 backstop is the second, un-underestimating net.
+
+    Returns ``(required_gb, free_gb)`` when checked, else None.
+    """
+    if not args.panel_store:
+        return None
+    est = _streaming_disk_estimate(args, stock_list, data_dir)
+    if est is None:
+        return None
+    # Create the scratch dir first: shutil.disk_usage needs an existing path on
+    # POSIX (os.statvfs raises on a missing one; Windows tolerates it).  The
+    # builder also makedirs it idempotently, so this is only an early-existence
+    # guarantee for the pre-check, never a semantic difference.
+    os.makedirs(scratch_dir, exist_ok=True)
+    required_gb = _streaming_disk_required_gb(*est)
+    free_gb = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
+    if required_gb > free_gb:
+        n_stocks, n_timesteps, n_features = est
+        raise SystemExit(
+            f"streaming panel build into --panel-store requires "
+            f"{required_gb:.1f} GB which exceeds free space {free_gb:.1f} GB "
+            f"on the scratch drive ({scratch_dir}) (n_stocks={n_stocks} x "
+            f"n_timesteps={n_timesteps} x n_features={n_features} + scratch "
+            f"pickles + margin) — the build cannot fit (§T7).  Point "
+            f"--scratch-dir at a drive with more room, or shrink the "
+            f"universe/stocks."
+        )
+    return required_gb, free_gb
+
 
 def _early_panel_memory_guard(
     args, stock_list: list[str], data_dir, store_load: bool,

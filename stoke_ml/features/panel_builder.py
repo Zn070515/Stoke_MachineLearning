@@ -17,12 +17,15 @@ The five builder concerns were extracted into ``stoke_ml.features.panel_builders
   - ``_arrays.py``         — PanelArrays: allocation + sanitization + dict assembly (T8 seam)
   - ``_static_context.py`` — StaticContextBuilder: static / pk / po grid population + quantile ranks
 """
+import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+import time
 from collections import Counter, defaultdict
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -51,6 +54,111 @@ from stoke_ml.features.panel_helpers import (
 from stoke_ml.features.temporal import add_calendar_features
 
 logger = logging.getLogger(__name__)
+
+# §T7: streaming-build scratch-dir management.  The streaming / two-pass
+# builder writes each stock's engineered frame to a per-stock scratch pickle
+# instead of keeping the full panel resident.  The scratch dir is now
+# directable (--scratch-dir / <panel-store>/scratch/<run_id>/), disk-pre-checked
+# (estimate pre-build + exact post-Pass-1 backstop), carries a run_manifest.json,
+# and orphan scratch dirs from a hard-killed build are swept at startup.
+_RUN_MANIFEST_NAME = "run_manifest.json"
+_DEFAULT_SCRATCH_STALE_DAYS = 7
+_DEFAULT_SCRATCH_SAFETY_MARGIN_GB = 5.0
+
+
+def _scratch_run_id() -> str:
+    """Run id for the streaming-build scratch dir (§T7).
+
+    Same ``YYYYMMDD-HHMMSS-<pid>`` convention as ``preprocess_new_data.py``'s
+    write-manifest ``run_id``, so the two share one vocabulary.  Unique per
+    process; a re-run is a NEW run unless the caller points ``--scratch-dir``
+    at a previous run's scratch dir (see the resume logic in
+    ``_build_panel_streaming``).
+    """
+    return f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
+
+
+def _read_run_manifest(scratch: str) -> dict | None:
+    """Read ``run_manifest.json`` from a scratch dir, or None when absent/corrupt.
+
+    The manifest marks a scratch dir as belonging to a specific run (§T7): a
+    dir that still holds its manifest + per-stock pickles is a crashed run a
+    same-scratch re-run can resume (Pass 1 skips the pickles already on disk).
+    """
+    path = os.path.join(scratch, _RUN_MANIFEST_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_run_manifest(
+    scratch: str, run_id: str, stage: str, *,
+    pid: int | None = None, resumed: bool = False,
+) -> dict:
+    """Write/overwrite ``run_manifest.json`` with the given stage (§T7).
+
+    Fields: ``run_id`` / ``start_time`` / ``stage`` / ``pid`` (the §T7
+    contract) plus ``resumed`` when this is a crash-recovery re-run.
+    ``start_time`` is preserved from a prior manifest so a resumed run keeps
+    its original birth timestamp.  A write failure (read-only / locked scratch)
+    warns instead of crashing the build.
+    """
+    prev = _read_run_manifest(scratch)
+    manifest = {
+        "run_id": run_id,
+        "start_time": (prev or {}).get(
+            "start_time", datetime.now().isoformat(timespec="seconds")),
+        "stage": stage,
+        "pid": pid if pid is not None else os.getpid(),
+    }
+    if resumed:
+        manifest["resumed"] = True
+    try:
+        with open(os.path.join(scratch, _RUN_MANIFEST_NAME), "w",
+                  encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True)
+    except OSError as exc:  # never crash the build over a diagnostic file
+        logger.warning("could not write %s in %s: %s",
+                       _RUN_MANIFEST_NAME, scratch, exc)
+    return manifest
+
+
+def _cleanup_stale_scratch_dirs(
+    root: str, n_days: int, *, prefix: str | None = None,
+    exclude: str | None = None,
+) -> list[str]:
+    """Remove scratch dirs under *root* whose mtime is older than *n_days* (§T7).
+
+    Startup sweep for orphan scratch dirs a hard-killed build left behind (its
+    ``finally`` never ran).  Only DIRECTORY entries are candidates; *prefix*
+    (when given) restricts removal to entries with a matching name (the
+    ``panel_stream_scratch_`` temp fallback), and *exclude* — the CURRENT run's
+    dir — is never touched.  Every removal uses ``ignore_errors=True`` so a
+    Windows file-lock on a leftover pickle logs instead of crashing the new
+    build (mirrors the builder's own ``finally``).  Returns the removed paths.
+    """
+    removed: list[str] = []
+    if not root or not os.path.isdir(root):
+        return removed
+    cutoff = time.time() - n_days * 86400
+    exclude_abs = os.path.abspath(exclude) if exclude else None
+    for name in os.listdir(root):
+        if prefix is not None and not name.startswith(prefix):
+            continue
+        p = os.path.join(root, name)
+        if not os.path.isdir(p):
+            continue
+        if exclude_abs is not None and os.path.abspath(p) == exclude_abs:
+            continue
+        try:
+            if os.path.getmtime(p) < cutoff:
+                shutil.rmtree(p, ignore_errors=True)
+                removed.append(p)
+        except OSError:
+            continue
+    return removed
 
 
 def _engineer_stock(
@@ -213,6 +321,11 @@ def _build_panel_streaming(
     input_stocks: int,
     drop_reasons: Counter,
     drop_examples: dict[str, list[str]],
+    scratch_dir: str | None = None,
+    run_id: str | None = None,
+    scratch_stale_days: int = _DEFAULT_SCRATCH_STALE_DAYS,
+    scratch_cleanup_root: str | None = None,
+    scratch_cleanup_prefix: str | None = None,
 ) -> dict:
     """Streaming / two-pass panel build (§T5).
 
@@ -222,8 +335,53 @@ def _build_panel_streaming(
     The only bounded structure is the per-date normalizer-stats accumulator
     and the (optional) cross-sectional-fundamental panel (~9 cols x total
     rows).
+
+    §T7 scratch management (the audit §四/§十五 remediation):
+      * ``scratch_dir`` — where Pass-1 pickles land.  A given dir is reused
+        (created if missing); ``None`` falls back to a fresh OS-temp dir
+        (legacy behavior).
+      * ``run_id`` — the run identity recorded in ``run_manifest.json``.
+        ``None`` derives a fresh one (``_scratch_run_id``) UNLESS the dir
+        already holds a manifest (a crashed run), in which case the crashed
+        run's id is ADOPTED and Pass 1 RESUMES by skipping per-stock pickles
+        that already exist (crash recovery).
+      * ``scratch_stale_days`` + ``scratch_cleanup_root``/``prefix`` — a
+        startup sweep removes orphan scratch dirs older than the stale window
+        (never the current dir).  Callers pass ``None`` for the root to skip
+        the sweep (an explicit ``--scratch-dir`` location is never swept).
+      * An EXACT disk backstop runs after Pass 1 (once N/T/D and the actual
+        scratch bytes are known) and refuses before the memmap grids are
+        allocated if the scratch drive cannot hold the final footprint +
+        margin — the estimate-based pre-build check (train_panel_panel) is the
+        egregious-case guard; this backstop cannot underestimate.
     """
-    scratch = tempfile.mkdtemp(prefix="panel_stream_scratch_")
+    if scratch_dir is None:
+        scratch = tempfile.mkdtemp(prefix="panel_stream_scratch_")
+    else:
+        scratch = scratch_dir
+        os.makedirs(scratch, exist_ok=True)
+
+    # §T7 startup sweep of orphan scratch dirs (a hard-killed build's
+    # leftovers).  Excludes the current dir; explicit --scratch-dir callers
+    # pass no cleanup root, so a user-chosen location is never swept.
+    if scratch_cleanup_root is not None:
+        _cleanup_stale_scratch_dirs(
+            scratch_cleanup_root, scratch_stale_days,
+            prefix=scratch_cleanup_prefix, exclude=scratch,
+        )
+
+    # §T7 run manifest + crash-resume detection.  A scratch dir that already
+    # carries run_manifest.json (+ surviving pickles) is a crashed run: the
+    # re-run ADOPTS its run_id and Pass 1 skips stocks whose pickle already
+    # exists.  A fresh dir generates a new run_id.
+    prev_manifest = _read_run_manifest(scratch)
+    resume = bool(prev_manifest and prev_manifest.get("run_id"))
+    if resume:
+        run_id = prev_manifest["run_id"]
+    elif run_id is None:
+        run_id = _scratch_run_id()
+    _write_run_manifest(scratch, run_id, stage="running", resumed=resume)
+
     try:
         # ── Pass 1: engineer → disk + metadata ──────────────────────────
         valid_codes: list[str] = []
@@ -233,22 +391,37 @@ def _build_panel_streaming(
         N_stocks = 0
 
         for code in codes:
-            feats = _engineer_stock(
-                pipeline, code, prebuilt_dir, panel, aux_data, data_dir,
-                drop_reasons, drop_examples,
-            )
+            pkl_path = os.path.join(scratch, f"{code}.pkl")
+            feats = None
+            # §T7 crash-recovery: a same-scratch re-run skips engineering a
+            # stock whose pickle already exists (it completed before the
+            # crash) and re-reads it to collect the same Pass-1 metadata.  A
+            # corrupt/partial pickle (a kill during the write) re-engineers.
+            if resume and os.path.isfile(pkl_path):
+                try:
+                    feats = pd.read_pickle(pkl_path)
+                except Exception:
+                    logger.warning(
+                        "resume: unreadable scratch pickle %s — re-engineering "
+                        "stock %s", pkl_path, code)
+                    feats = None
             if feats is None:
-                continue
-            # Collect metadata BEFORE writing to disk.
+                feats = _engineer_stock(
+                    pipeline, code, prebuilt_dir, panel, aux_data, data_dir,
+                    drop_reasons, drop_examples,
+                )
+                if feats is None:
+                    continue
+                # Serialize the freshly-engineered frame to scratch pickle.
+                feats.to_pickle(pkl_path)
+            # Collect metadata from the loaded/engineered frame (a resumed stock
+            # contributes it from its re-read pickle, without re-engineering).
             valid_codes.append(code)
             all_cols.update(feats.columns)
             sdates = {pd.Timestamp(d).date() for d in feats["date"]}
             all_dates.update(sdates)
             if not has_sector_code and "sector_code" in feats.columns:
                 has_sector_code = True
-            # Serialize to scratch pickle.
-            pkl_path = os.path.join(scratch, f"{code}.pkl")
-            feats.to_pickle(pkl_path)
             N_stocks += 1
 
         if not valid_codes:
@@ -350,6 +523,35 @@ def _build_panel_streaming(
                             first_df[col].fillna(0.0).astype(np.float32)
                         )
             all_cols.update(new_cs_cols)
+
+        # §T7 exact disk backstop: after Pass 1 + the cs discovery the
+        # footprint is KNOWN (N_stocks x max_T x len(all_cols) float32 grids
+        # + the actual scratch pickle bytes).  Refuse BEFORE the memmap grids
+        # are allocated and the heavy passes run — the estimate-based
+        # pre-check (train_panel_panel) guards the egregious cases up front;
+        # this is the hard net that cannot underestimate, so a build never
+        # dies mid-way on ENOSPC.
+        if max_T and N_stocks:
+            scratch_bytes = sum(
+                os.path.getsize(os.path.join(scratch, f"{c}.pkl"))
+                for c in valid_codes
+            )
+            grid_bytes = N_stocks * max_T * len(all_cols) * 4
+            margin = _DEFAULT_SCRATCH_SAFETY_MARGIN_GB * (1024 ** 3)
+            need = grid_bytes + scratch_bytes + margin
+            free = shutil.disk_usage(scratch).free
+            if need > free:
+                raise RuntimeError(
+                    "streaming panel build: exact disk footprint "
+                    f"{(grid_bytes + scratch_bytes) / (1024 ** 3):.1f} GB "
+                    f"(final grids {N_stocks} x {max_T} x {len(all_cols)} x "
+                    f"4B = {grid_bytes / (1024 ** 3):.1f} GB + scratch "
+                    f"pickles {scratch_bytes / (1024 ** 3):.1f} GB) + safety "
+                    f"margin {_DEFAULT_SCRATCH_SAFETY_MARGIN_GB:.0f} GB "
+                    f"exceeds the scratch drive's free space "
+                    f"{free / (1024 ** 3):.1f} GB at {scratch} (§T7).  Free "
+                    f"disk space or point --scratch-dir at a larger drive."
+                )
 
         # Discover PK / PO / static columns.
         static_cols_available = list(_PIT_STATIC_COLS)
@@ -477,6 +679,11 @@ def _build_panel_streaming(
         # Sanitize + assemble.
         arrays.sanitize()
 
+        # §T7: record a successful completion in run_manifest.json (the scratch
+        # is normally removed by the finally below; the "done" stage matters
+        # only when the dir survives, e.g. a hard kill right after the build).
+        _write_run_manifest(scratch, run_id, stage="done", resumed=resume)
+
         return arrays.assemble(
             global_dates, decision_arr, history_arr,
             universe_eligible_arr, fill_prob_arr, entry_fill_prob_arr,
@@ -498,6 +705,11 @@ def build_panel_features(
     data_dir: str | None = None,
     daily_membership: pd.DataFrame | None = None,
     memmap_dir: str | None = None,
+    scratch_dir: str | None = None,
+    run_id: str | None = None,
+    scratch_stale_days: int = _DEFAULT_SCRATCH_STALE_DAYS,
+    scratch_cleanup_root: str | None = None,
+    scratch_cleanup_prefix: str | None = None,
 ) -> dict:
     """Build panel-format features for VSN+xLSTM training from a multi-stock panel.
 
@@ -554,6 +766,23 @@ def build_panel_features(
                   the caller must flush + close them before re-writing the same
                   directory (Windows file-lock constraint — see panel_store.py
                   docstring).
+        scratch_dir: §T7 optional dir for the STREAMING path's per-stock
+                  Pass-1 pickles (only read when ``memmap_dir`` is set).  A
+                  given dir is reused (created if missing); ``None`` (default)
+                  falls back to a fresh OS-temp dir (legacy behavior).
+        run_id: §T7 optional run identity recorded in ``run_manifest.json``.
+                  ``None`` derives a fresh one unless the scratch dir already
+                  holds a manifest, in which case the crashed run's id is
+                  adopted and Pass 1 RESUMES by skipping pickles already on
+                  disk (crash recovery).
+        scratch_stale_days: §T7 orphan-scratch stale window (days) for the
+                  startup sweep (default ``_DEFAULT_SCRATCH_STALE_DAYS``).
+        scratch_cleanup_root: §T7 parent dir scanned at startup for stale
+                  scratch dirs (None = skip the sweep — an explicit
+                  ``--scratch-dir`` is never swept).
+        scratch_cleanup_prefix: §T7 when set, the sweep removes only entries
+                  with this name prefix (the ``panel_stream_scratch_`` temp
+                  fallback).
 
     Returns:
         dict with numpy arrays: static_features, past_known, past_observed,
@@ -690,6 +919,11 @@ def build_panel_features(
             prebuilt_dir, panel, aux_data, data_dir,
             daily_membership, memmap_dir, min_history,
             codes, input_stocks, drop_reasons, drop_examples,
+            scratch_dir=scratch_dir,
+            run_id=run_id,
+            scratch_stale_days=scratch_stale_days,
+            scratch_cleanup_root=scratch_cleanup_root,
+            scratch_cleanup_prefix=scratch_cleanup_prefix,
         )
 
     # ── Dense path (byte-identical) ──

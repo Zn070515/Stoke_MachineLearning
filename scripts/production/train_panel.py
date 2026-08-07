@@ -269,6 +269,14 @@ def main():
                              "Otherwise the panel built this run is persisted there "
                              "for future runs.  Default: off — build in memory as "
                              "always.")
+    parser.add_argument("--scratch-dir", type=str, default=None,
+                        help="§T7 scratch dir for the STREAMING panel build's "
+                             "per-stock Pass-1 pickles.  Default: derived as "
+                             "<panel-store>/scratch/<run_id>/; with no "
+                             "--panel-store the build is not streaming (dense "
+                             "in-memory) so this is unused.  An explicit "
+                             "location is never swept by the startup stale "
+                             "cleanup (only tool-owned dirs are).")
     parser.add_argument("--no-require-quality-gate", action="store_true",
                         help="Skip the required quality-gate report check "
                              "(dev smoke only; §六-2 wants a matching report "
