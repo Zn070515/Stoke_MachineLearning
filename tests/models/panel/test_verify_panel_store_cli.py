@@ -99,3 +99,16 @@ class TestVerifyPanelStoreCli:
             f"stdout={proc.stdout}\nstderr={proc.stderr}")
         assert "ERROR" in proc.stderr
         assert "chunk_manifest" in proc.stderr
+
+    def test_malformed_manifest_exit_1(self, tmp_path):
+        """A chunk_manifest.json that is NOT valid JSON (e.g. `{not json`)
+        cannot be parsed → exit 1 + ERROR on stderr.  The corrupt manifest is
+        a verification failure (JSONDecodeError is a ValueError, surfaced as
+        ERROR like the other malformed-manifest guards), never a silent pass."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        (tmp_path / "chunk_manifest.json").write_text("{not json", encoding="utf-8")
+        proc = _run_cli(tmp_path)
+        assert proc.returncode == 1, (
+            f"expected exit 1 on malformed manifest:\n"
+            f"stdout={proc.stdout}\nstderr={proc.stderr}")
+        assert "ERROR" in proc.stderr

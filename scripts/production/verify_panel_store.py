@@ -19,8 +19,9 @@ line with true lowercase JSON booleans:
 Failure (stderr, exit 1):
     ERROR: panel store at <dir>: chunk 32 of past_known.npy does not match ...
 
-Only ``RuntimeError`` (corruption / tamper / missing or malformed manifest) is
-translated to a non-zero exit; unexpected exceptions (coding bugs, OSError)
+Only ``RuntimeError`` (corruption / tamper / missing or malformed manifest) and
+``ValueError`` (a corrupt / unparseable manifest or meta — ``JSONDecodeError``)
+are translated to a non-zero exit; unexpected exceptions (coding bugs, OSError)
 propagate with their traceback so a real failure is never masked as a clean
 "store not verified" exit.
 """
@@ -50,10 +51,13 @@ def main(argv=None) -> int:
 
     try:
         result = verify_panel_store_chunks(args.dir)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         # The verification failure IS the contract: report it and exit non-zero.
-        # Any other exception type is an unexpected bug — let it propagate so
-        # it surfaces as a traceback, never as a false "store not verified".
+        # RuntimeError covers the check's corruption/tamper/missing-manifest
+        # guards; ValueError covers a corrupt or unparseable manifest/meta
+        # (JSONDecodeError) — both are operator-facing errors, not tracebacks.
+        # Other exception types (OSError, coding bugs) still propagate so a real
+        # failure is never masked as a clean "store not verified" exit.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
