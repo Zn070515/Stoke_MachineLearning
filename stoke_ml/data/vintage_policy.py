@@ -44,17 +44,21 @@ def channel_allowed(
     """Whether ``channel`` may be consumed under ``policy``.
 
     SOURCE-based admission with a BOTH-LAYERS check: an undeclared channel (no
-    declaration) OR a channel whose ``source_vintage``/``transform`` is the
-    reserved ``"unknown"`` fallback is False under BOTH policies — the
-    mandatory deny-by-default.  ``immutable_snapshot``-sourced channels are
-    always allowed; ``latest_revised``-sourced channels only under
-    ``ALLOW_REVISED``.
+    declaration), a channel whose ``source_vintage``/``transform`` is OUTSIDE
+    the KNOWN_* vocabularies, OR one set to the reserved ``"unknown"`` fallback
+    is False under BOTH policies — the mandatory deny-by-default.
+    ``immutable_snapshot``-sourced channels are always allowed;
+    ``latest_revised``-sourced channels only under ``ALLOW_REVISED``.
     """
     if not isinstance(policy, VintagePolicy):
         policy = VintagePolicy(policy)
     entry = _cv.declaration_of(channel, vintage_by_name=vintage_by_name)
     if entry is None:
         return False
+    if entry.source_vintage not in _cv.KNOWN_SOURCE_VINTAGES:
+        return False  # out-of-vocabulary source → treat as undeclared
+    if entry.transform not in _cv.KNOWN_TRANSFORMS:
+        return False  # out-of-vocabulary transform → treat as undeclared
     if entry.source_vintage == "unknown" or entry.transform == "unknown":
         return False
     if entry.source_vintage == "latest_revised":
@@ -111,7 +115,8 @@ def vintage_report(
     transform,pit_alignment,rationale,allowed}...], "missing_channels",
     "daily_qfq_allowed", "declaration_complete"}``.  ``declaration_complete``
     is True iff ``missing_channels`` is empty AND every declared channel has
-    all three dims set to DECLARED (non-``"unknown"``) values.
+    all three dims set to DECLARED values — a member of its KNOWN_* vocabulary
+    AND not the reserved ``"unknown"`` fallback.
     """
     if not isinstance(policy, VintagePolicy):
         policy = VintagePolicy(policy)
@@ -137,8 +142,11 @@ def vintage_report(
     declaration_complete = (
         not missing_channels
         and all(
-            e.source_vintage != "unknown"
+            e.source_vintage in _cv.KNOWN_SOURCE_VINTAGES
+            and e.source_vintage != "unknown"
+            and e.transform in _cv.KNOWN_TRANSFORMS
             and e.transform != "unknown"
+            and e.pit_alignment in _cv.KNOWN_PIT_ALIGNMENTS
             and e.pit_alignment != "unknown"
             for e in declaration
         )

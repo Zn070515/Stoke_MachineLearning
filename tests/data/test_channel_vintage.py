@@ -52,15 +52,15 @@ def test_channels_are_unique():
     assert len(names) == len(set(names)), "duplicate channel names present"
 
 
-def test_core_revision_leakage_sources_are_latest_revised_aligned():
+def test_core_revision_leakage_sources_are_latest_revised_sourced():
     """§十五: fundamental and macro are the documented revision-leakage source
-    — locked as latest_revised source, exactly."""
+    — locked as latest_revised-sourced, exactly."""
     by_name = cv.CHANNEL_VINTAGE_BY_NAME
     assert by_name["fundamental"].source_vintage == "latest_revised"
     assert by_name["macro"].source_vintage == "latest_revised"
 
 
-def test_derived_price_channel_is_derived_versioned():
+def test_derived_price_channel_is_formula_versioned():
     """§T2/§T7: the qfq price channel is immutable-sourced (raw OHLC +
     adjustment-factor history) with a formula_versioned transform (re-anchoring)
     and proxy alignment — not an immutable raw-value snapshot."""
@@ -70,7 +70,7 @@ def test_derived_price_channel_is_derived_versioned():
     assert by_name["daily_qfq"].pit_alignment == "proxy"
 
 
-def test_known_statuses_is_exactly_all_four_states():
+def test_known_axis_vocabularies_are_exact():
     """§T2/§T7: each axis vocabulary is EXACTLY its declared labels plus the
     reserved "unknown" deny-by-default fallback — a stray extra label added to
     a vocabulary must fail this equality, not slip through a superset check."""
@@ -83,7 +83,7 @@ def test_known_statuses_is_exactly_all_four_states():
     assert set(cv.KNOWN_PIT_ALIGNMENTS) == {"verified", "proxy", "unknown"}
 
 
-def test_status_of_defaults_to_unknown_vintage():
+def test_accessors_default_to_unknown():
     """§T2/§T7: the 3-dim accessors return "unknown" for any undeclared channel
     (the deny-by-default fallback) and the declared labels for curated channels;
     declaration_of() returns None for the undeclared one."""

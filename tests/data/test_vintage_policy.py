@@ -150,6 +150,25 @@ def test_vintage_report_declaration_complete_false_on_unknown_dim():
                            vintage_by_name=crafted_by_name) is False
 
 
+def test_vintage_report_declaration_complete_false_on_out_of_vocab_source():
+    """§T7: a crafted declaration where one channel declares an OUT-OF-
+    VOCABULARY source_vintage (e.g. a typo "immutable_snapshoot") is NOT
+    complete — and that channel is denied under BOTH policies by the
+    vocabulary-guarded admission check."""
+    crafted = tuple(
+        dataclasses.replace(e, source_vintage="immutable_snapshoot")
+        if e.channel == "sentiment" else e
+        for e in CHANNEL_VINTAGE
+    )
+    crafted_by_name = {e.channel: e for e in crafted}
+    report = vintage_report(SAFE_ONLY, declaration=crafted)
+    assert report["declaration_complete"] is False
+    assert channel_allowed("sentiment", SAFE_ONLY,
+                           vintage_by_name=crafted_by_name) is False
+    assert channel_allowed("sentiment", ALLOW_REVISED,
+                           vintage_by_name=crafted_by_name) is False
+
+
 # ── §T6 / §十四: universe-membership provenance ──────────────────────────
 
 _UM_DICT = {
