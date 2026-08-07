@@ -18,6 +18,7 @@ from stoke_ml.data.asset_contract import (
     release_lock as _release_lock,
     write_asset_manifest,
 )
+from stoke_ml.data.channel_sources import CHANNEL_SOURCE, processed_data_type
 from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
@@ -29,16 +30,40 @@ DEFAULT_DEGRADE_THRESHOLD = 0.2
 _SCHEMA_RESERVED = frozenset({"date", "stock_code"})
 
 
+# Live per-stock data types for the feature channels MarketWideStorage serves.
+# Ordered to match the historical MARKET_DATA_TYPES list.  industry_ranking /
+# concept_blocks are the UN-processed live dirs of the sector / concept channels
+# (whose registry live_dir IS their *_processed dir), so they stay literal.
+_LIVE_FEATURE_TYPES = [
+    "dragon_tiger", "margin", "northbound", "capital_flow", "block_trade",
+    "shareholder", "lockup", "dividend", "industry_ranking", "concept_blocks",
+    "valuation",
+]
+
+# Market-wide data types with no feature-channel registry entry.
+_NON_CHANNEL_LIVE_TYPES = [
+    "limit_up_zt", "limit_up_zb", "limit_up_dt", "limit_up_yzt",
+    "limit_up_sentiment", "lockup_upcoming", "sina_fund_flow",
+]
+
+# Registry channels whose MarketWideStorage live dir has a DISTINCT *_processed
+# variant; the processed data type is the last segment of that dir (§T2).
+_PROCESSED_FEATURE_CHANNELS = (
+    "capital_flow", "block_trade", "shareholder", "lockup",
+    "dividend", "sector", "concept", "board",
+)
+
+
+def _processed_feature_types() -> list[str]:
+    return [
+        processed_data_type(CHANNEL_SOURCE[ch]) for ch in _PROCESSED_FEATURE_CHANNELS
+    ]
+
+
 MARKET_DATA_TYPES = [
-    "dragon_tiger", "margin", "northbound",
-    "capital_flow", "limit_up_zt", "limit_up_zb", "limit_up_dt", "limit_up_yzt",
-    "limit_up_sentiment", "block_trade", "shareholder", "lockup", "lockup_upcoming",
-    "dividend", "industry_ranking", "concept_blocks",
-    "sina_fund_flow",
-    # Processed output variants
-    "capital_flow_processed", "block_trade_processed", "shareholder_processed",
-    "lockup_processed", "dividend_processed", "industry_ranking_processed",
-    "concept_blocks_processed", "board_processed", "valuation",
+    *_LIVE_FEATURE_TYPES,
+    *_NON_CHANNEL_LIVE_TYPES,
+    *_processed_feature_types(),
 ]
 
 # File-level asset contracts for the headline_v1 channels that persist through

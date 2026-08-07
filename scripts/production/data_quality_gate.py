@@ -80,6 +80,7 @@ from stoke_ml.data.calendar import (
     load_calendar,
     most_recent_completed_trading_day,
 )
+from stoke_ml.data.channel_sources import CHANNEL_SOURCE, processed_data_type
 from stoke_ml.data.contract import get_contract
 from stoke_ml.config import get_project_root
 from stoke_ml.utils.error_summary import classify_error
@@ -164,15 +165,16 @@ def _official_trading_days(dates: pd.Series) -> frozenset:
     return cached
 
 # Processed dirs whose embedded close/OHLC must equal canonical daily.
+# Derived from CHANNEL_SOURCE (§T2): the ``*_processed`` dir NAME is the last
+# segment of the channel's processed_dir, so it lives in ONE place.
+_AUX_CLOSE_CHANNELS = ("block_trade", "board", "dividend", "sector", "lockup",
+                       "shareholder")
 AUX_CLOSE_DIRS = [
-    "block_trade_processed",
-    "board_processed",
-    "dividend_processed",
-    "industry_ranking_processed",
-    "lockup_processed",
-    "shareholder_processed",
+    processed_data_type(CHANNEL_SOURCE[ch]) for ch in _AUX_CLOSE_CHANNELS
 ]
-AUX_PCT_DIRS = ["board_processed", "industry_ranking_processed"]
+AUX_PCT_DIRS = [
+    processed_data_type(CHANNEL_SOURCE[ch]) for ch in ("board", "sector")
+]
 
 # Sparsity canary: features with non-zero ratio below this across the sampled
 # panel are reported as event-sparse (they carry signal only for a small subset).

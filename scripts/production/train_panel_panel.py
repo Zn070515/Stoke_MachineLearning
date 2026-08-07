@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.data.calendar import get_research_calendar
+from stoke_ml.data.channel_sources import CHANNEL_SOURCE, live_data_type, source_dir
 from stoke_ml.data.universe import (
     load_index_membership,
     load_universe_status,
@@ -45,6 +46,15 @@ from scripts.production.train_panel_registry import _calendar_freeze
 from scripts.production.train_panel_universe import _is_csi_universe
 
 logger = logging.getLogger(__name__)
+
+
+# §T2: MarketWideStorage feature channels load_aux_data iterates.  The live
+# data type each storage reads is derived from the CHANNEL_SOURCE registry
+# (``live_data_type``), so the a_shares subdir names live in ONE place.
+_MARKET_WIDE_CHANNELS = (
+    "margin", "northbound", "dragon_tiger", "capital_flow", "block_trade",
+    "shareholder", "lockup", "dividend", "valuation",
+)
 
 
 # §T2: base preference for each documented use_* dimension — what the feature
@@ -940,13 +950,12 @@ def load_aux_data(
 
     # MarketWideStorage channels (margin/northbound/dragon_tiger/capital_flow/
     # block_trade/shareholder/lockup/dividend/valuation) — identical pattern.
-    for ch in (
-        "margin", "northbound", "dragon_tiger", "capital_flow", "block_trade",
-        "shareholder", "lockup", "dividend", "valuation",
-    ):
+    # The storage's data type is the channel's LIVE dir last segment (§T2).
+    for ch in _MARKET_WIDE_CHANNELS:
         _load_channel_aux(
             ch, stock_list, result, manifest,
-            make_storage=lambda ch=ch: MarketWideStorage(data_dir, ch),
+            make_storage=lambda ch=ch: MarketWideStorage(
+                data_dir, live_data_type(CHANNEL_SOURCE[ch])),
             load_one=lambda st, code, ch=ch: st.load(code, start_date, end_date),
             required=(ch in required_set),
         )
@@ -1005,14 +1014,18 @@ def load_aux_data(
     # the file exists); DATE coverage is the meaningful metric (§T4).  The
     # feature pipeline loads these itself (aux_aligner), so load_aux_data only
     # records the coverage probe in the manifest (broadcast, not per-stock).
-    for name, rel_path in (
-        ("industry", os.path.join("a_shares", "industry",
-                                  "industry_returns.parquet")),
-        ("market_env", os.path.join("a_shares", "market_breadth",
-                                    "market_env_daily.parquet")),
+    # §T2: the broadcast file's DIRECTORY comes from the CHANNEL_SOURCE
+    # registry; the filename is the channel-specific artifact (not a path
+    # literal) so the two paths can't drift.  The registry path is joined
+    # segment-by-segment to stay byte-identical with the historical literal.
+    for name, fname in (
+        ("industry", "industry_returns.parquet"),
+        ("market_env", "market_env_daily.parquet"),
     ):
         entry = _new_channel_entry(True, name in required_set)
         manifest[name] = entry
+        rel_path = os.path.join(
+            *source_dir(CHANNEL_SOURCE[name]).split("/"), fname)
         path = os.path.join(data_dir, rel_path)
         n_dates, status = _probe_broadcast_dates(
             path, start_date, end_date, data_dir)

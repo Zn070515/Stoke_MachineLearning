@@ -24,6 +24,7 @@ from datetime import datetime
 import pandas as pd
 
 from stoke_ml.config import get_project_root, load_config
+from stoke_ml.data.channel_sources import CHANNEL_SOURCE, source_dir
 from stoke_ml.data.storage import DataStorage
 from stoke_ml.data.news_storage import NewsStorage
 from stoke_ml.data.market_wide_storage import MarketWideStorage
@@ -78,6 +79,18 @@ def _load_stock_parquet(directory: str, code: str) -> pd.DataFrame:
         )
         _load_summary.record_exc(exc, "stock_parquet")
         return pd.DataFrame()
+
+
+def _channel_stock_dir(data_dir: str, channel: str) -> str:
+    """The per-stock source dir for a channel under ``data_dir`` (§T2).
+
+    Resolved from the CHANNEL_SOURCE registry — the processed variant when one
+    exists, else the live dir — so the ``*_processed`` string literals that
+    build_one used to hard-code all live in ONE place.  The registry path is
+    joined segment-by-segment so the result is byte-identical to the historical
+    ``os.path.join(a_shares, "<literal>")`` form on every platform.
+    """
+    return os.path.join(data_dir, *source_dir(CHANNEL_SOURCE[channel]).split("/"))
 
 
 def _load_opt(args: dict, storage_key: str, method: str, code: str):
@@ -164,10 +177,9 @@ def build_one(args: dict) -> tuple[str, str, str]:
         if df.empty:
             return code, "empty", ""
         # limit_up_df intentionally absent (family deferred, top scope note)
-        a_shares = os.path.join(args["data_dir"], "a_shares")
-        pledge_df = _load_stock_parquet(os.path.join(a_shares, "pledge_processed"), code)
+        pledge_df = _load_stock_parquet(_channel_stock_dir(args["data_dir"], "pledge"), code)
         index_membership_df = _load_stock_parquet(
-            os.path.join(a_shares, "index_membership_processed"), code)
+            _channel_stock_dir(args["data_dir"], "index_membership"), code)
         pipeline.save_features(
             output_path, df,
             sentiment_df=_load_opt(args, "news_storage", "load_daily_sentiment", code),
@@ -176,15 +188,15 @@ def build_one(args: dict) -> tuple[str, str, str]:
             dragon_tiger_df=_load_opt(args, "dt_storage", "load", code),
             fundamental_df=_load_opt(args, "fund_storage", "forward_fill_to_daily", code),
             earnings_df=_load_opt(args, "earnings_storage", "load_daily", code),
-            valuation_df=_load_stock_parquet(os.path.join(a_shares, "valuation"), code),
-            capital_flow_df=_load_stock_parquet(os.path.join(a_shares, "capital_flow_processed"), code),
-            board_df=_load_stock_parquet(os.path.join(a_shares, "board_processed"), code),
-            sector_df=_load_stock_parquet(os.path.join(a_shares, "industry_ranking_processed"), code),
-            block_trade_df=_load_stock_parquet(os.path.join(a_shares, "block_trade_processed"), code),
-            dividend_df=_load_stock_parquet(os.path.join(a_shares, "dividend_processed"), code),
-            lockup_df=_load_stock_parquet(os.path.join(a_shares, "lockup_processed"), code),
-            shareholder_df=_load_stock_parquet(os.path.join(a_shares, "shareholder_processed"), code),
-            concept_df=_load_stock_parquet(os.path.join(a_shares, "concept_blocks_processed"), code),
+            valuation_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "valuation"), code),
+            capital_flow_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "capital_flow"), code),
+            board_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "board"), code),
+            sector_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "sector"), code),
+            block_trade_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "block_trade"), code),
+            dividend_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "dividend"), code),
+            lockup_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "lockup"), code),
+            shareholder_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "shareholder"), code),
+            concept_df=_load_stock_parquet(_channel_stock_dir(args["data_dir"], "concept"), code),
             guba_df=_load_opt(args, "guba_storage", "load_daily_sentiment", code),
             comment_df=_load_opt(args, "comment_storage", "build_features", code),
             announcement_df=_load_opt(args, "ann_storage", "load_daily_sentiment", code),

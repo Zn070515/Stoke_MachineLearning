@@ -14,32 +14,46 @@ import os
 import subprocess
 from datetime import datetime, timezone
 
+from stoke_ml.data.channel_sources import CHANNEL_SOURCE, source_subdirs
 from stoke_ml.utils.error_summary import classify_error
 
 logger = logging.getLogger(__name__)
 
 # Per-stock channel directories under data/a_shares/{subdir}/{code}.parquet.
+# Derived from the CHANNEL_SOURCE registry (§T2) so the live/prebuilt path
+# strings live in ONE place and a rename can't drift silently.  The manifest
+# key names differ from the canonical channel names (e.g. guba_sentiment →
+# guba, announcements_sentiment → announcement), so ``_SOURCE_CHANNELS`` maps
+# each key to its registry channel; ``source_subdirs`` yields the historical
+# tuple form (the path segments under ``a_shares/``).
+_SOURCE_CHANNELS = {
+    "sentiment": "sentiment",
+    "guba_sentiment": "guba",
+    "comment_sentiment": "comment",
+    "announcements_sentiment": "announcement",
+    "fundamentals": "fundamental",
+    "margin": "margin",
+    "northbound": "northbound",
+    "dragon_tiger": "dragon_tiger",
+    "valuation": "valuation",
+    "capital_flow": "capital_flow",
+    "board": "board",
+    "sector": "sector",
+    "block_trade": "block_trade",
+    "dividend": "dividend",
+    "lockup": "lockup",
+    "shareholder": "shareholder",
+    "concept": "concept",
+    "pledge": "pledge",
+    "index_membership": "index_membership",
+}
+
 SOURCE_SUBDIRS = {
     "daily": ("daily",),
-    "sentiment": ("sentiment",),
-    "guba_sentiment": ("guba_sentiment",),
-    "comment_sentiment": ("comment_sentiment",),
-    "announcements_sentiment": ("announcements", "sentiment"),
-    "fundamentals": ("fundamentals",),
-    "margin": ("margin",),
-    "northbound": ("northbound",),
-    "dragon_tiger": ("dragon_tiger",),
-    "valuation": ("valuation",),
-    "capital_flow": ("capital_flow_processed",),
-    "board": ("board_processed",),
-    "sector": ("industry_ranking_processed",),
-    "block_trade": ("block_trade_processed",),
-    "dividend": ("dividend_processed",),
-    "lockup": ("lockup_processed",),
-    "shareholder": ("shareholder_processed",),
-    "concept": ("concept_blocks_processed",),
-    "pledge": ("pledge_processed",),
-    "index_membership": ("index_membership_processed",),
+    **{
+        key: source_subdirs(CHANNEL_SOURCE[channel])
+        for key, channel in _SOURCE_CHANNELS.items()
+    },
 }
 
 # Market-wide snapshot files shared by every stock.
