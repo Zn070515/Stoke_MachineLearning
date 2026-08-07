@@ -6,6 +6,8 @@ panel builder (``_resolve_panel``), the universe memory guards, the aux-channel
 coverage manifest loading, and the has_* flag probe.  ``train_panel``
 re-exports these names for backward compatibility.
 """
+import hashlib
+import json
 import logging
 import os
 import re
@@ -32,6 +34,11 @@ from stoke_ml.features.cache_manifest import (
     _dir_content_hash,
     current_config_hash,
     git_head,
+    shared_inputs_hash,
+)
+from stoke_ml.models.panel.code_tree_hash import (
+    feature_code_tree_hash,
+    hash_json,
 )
 from stoke_ml.features.panel_builders._arrays import close_memmap_grids
 from stoke_ml.features.pipeline import FeaturePipeline
@@ -130,10 +137,89 @@ def _entry_fill_prob_mean(panel_data: dict) -> float | None:
     return float(np.nanmean(efp))
 
 
+def _manifest_body_digest(path: str) -> str:
+    """Content digest of ONE ``*.manifest.json`` sidecar, ``written_at`` excluded.
+
+    ``written_at`` is a per-write TIMESTAMP, so a content-identical rewrite of
+    the same data (a re-download that changed nothing) must NOT change the aux
+    asset-root binding — the §T6 guard binds WHAT the data is, not when it was
+    written.  The sidecar is parsed as JSON and the timestamp key dropped before
+    the canonical digest; a non-JSON / unreadable sidecar degrades to hashing
+    its RAW BYTES (a partial rewrite still visible, and a JSON-level nicety like
+    written_at exclusion is moot when the file is not JSON anyway).  Returns the
+    hex digest — never None: an unreadable sidecar maps to ``"<unreadable>"`` so
+    the entry stays present (fail-closed, the tree differs from an absent one).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError):
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            return "<unreadable>"
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if k != "written_at"}
+    return hash_json(obj)
+
+
+def _asset_manifest_entries(root: str) -> dict[str, str]:
+    """Sorted relpath → digest map of every ``*.manifest.json`` under ``root``.
+
+    The value is the content digest of the sidecar with ``written_at`` excluded
+    (``_manifest_body_digest``).  The key is the file's name relative to the
+    channel's LIVE asset root — so adding / removing / renaming a stock's
+    sidecar changes the map even when every remaining sidecar's bytes are
+    unchanged.  An absent / empty root yields an empty map (the channel has no
+    asset manifests to bind — the §七 guard then treats "no aux assets bound"
+    as the channel's honest state).
+    """
+    if not os.path.isdir(root):
+        return {}
+    entries: dict[str, str] = {}
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".manifest.json"):
+            continue
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            entries[name] = _manifest_body_digest(path)
+    return entries
+
+
+def _aux_asset_root_hash(
+    data_dir: str, required_set: set[str], *, live_aux: bool,
+) -> str:
+    """Content hash of the REQUIRED channels' live asset-manifest roots (§T6).
+
+    The §七 guard's "changed aux tomorrow" binding: for every required channel,
+    hash the sorted relpath → digest map of the ``*.manifest.json`` sidecars
+    under that channel's CHANNEL_SOURCE ``live_dir`` (``written_at`` excluded).
+    ``live_aux`` is itself part of the hash — a LIVE build (aux bound by these
+    roots) is never interchangeable with a PREBUILT / ``--no-aux`` build, whose
+    aux is bound differently (prebuilt feature manifest) or not at all.
+
+    Fail-closed: a required channel with no CHANNEL_SOURCE entry is recorded as
+    an explicit marker (``{"__missing_registry_entry__": True}``) — never
+    silently dropped, so an unknown channel still differentiates the binding.
+    An empty required set yields a stable hash over just the ``live_aux`` flag.
+    """
+    channels: dict[str, dict] = {}
+    for ch in sorted(required_set or ()):
+        spec = CHANNEL_SOURCE.get(ch)
+        if spec is None:
+            channels[ch] = {"__missing_registry_entry__": True}
+            continue
+        root = os.path.join(data_dir, *spec.live_dir.split("/"))
+        channels[ch] = _asset_manifest_entries(root)
+    return hash_json({"live_aux": bool(live_aux), "channels": channels})
+
+
 def _panel_store_meta(
     args, seq_len: int, stock_list: list[str] | None = None,
     data_dir: str | None = None, prebuilt_dir: str | None = None,
     entry_fill_prob_mean: float | None = None,
+    *, required_set: set[str] | None = None,
 ) -> dict:
     """Build-time fingerprint persisted in a panel store's meta.json.
 
@@ -154,6 +240,28 @@ def _panel_store_meta(
       otherwise, skipped at load — mirrors the config_hash None-skip), and a
       mismatch warns-and-proceeds (each is re-derivable by rebuilding the
       store).
+
+    §T6/§七 provenance — ``_WARN_META_KEYS`` content bindings that answer "was
+    this store built from what is on disk RIGHT NOW":
+
+    * ``feature_code_tree_hash`` — content hash of the ``stoke_ml/`` +
+      ``scripts/production/`` source trees (every ``*.py`` file's bytes, NOT
+      ``git_commit``).  An uncommitted code edit changes the hash, so a store
+      built from edited feature code is refused instead of silently reused
+      (code_tree_hash).  Recorded on EVERY build.
+    * ``aux_asset_root_hash`` — content hash of the REQUIRED channels' live
+      asset-manifest roots (``*.manifest.json`` sidecars, ``written_at``
+      excluded).  Recorded ONLY for a LIVE-aux build (``data_dir`` set and no
+      ``--prebuilt`` / ``--no-aux``): the store binds TODAY's aux roots, so
+      changed aux TOMORROW makes a formal load refuse.  A prebuilt / no-aux
+      store records no aux binding (its aux is bound via
+      ``prebuilt_feature_manifest_hash`` or not at all).
+    * ``panel_input_hash`` — SHA-256 aggregate (canonical JSON) of EVERY input
+      provenance component: code tree, aux root, config hash, feature switches,
+      label policy, vintage policy, feature profile, horizon / seq_len / window,
+      universe + n_stocks, data manifest, calendar, universe status/membership,
+      prebuilt feature manifest, and the shared-inputs hash.  One aggregate key
+      so a change ANYWHERE is a single mismatch.  Recorded on every build.
     """
     # §T6 decision 2: CSI universes bake the daily-member cross-section
     # normalization into the panel arrays, so the store fingerprint must record
@@ -215,6 +323,44 @@ def _panel_store_meta(
     if prebuilt_dir:
         meta["prebuilt_feature_manifest_hash"] = _dir_content_hash(
             os.path.join(prebuilt_dir, ".manifests"))
+    # §T6/§七 provenance block — computed AFTER the data_dir/prebuilt blocks so
+    # the aggregate can fold every component above; placed BEFORE the
+    # informational entry-fill key.  `live_aux` mirrors _resolve_panel's aux
+    # branch (`if not args.no_aux and not args.prebuilt`) so the aux ROOT binding
+    # is recorded exactly when the live aux path actually consumed those roots.
+    live_aux = bool(
+        not getattr(args, "no_aux", False)
+        and not (prebuilt_dir or getattr(args, "prebuilt", None)))
+    tree_hash = feature_code_tree_hash()
+    meta["feature_code_tree_hash"] = tree_hash
+    if data_dir is not None and live_aux:
+        meta["aux_asset_root_hash"] = _aux_asset_root_hash(
+            data_dir, required_set or set(), live_aux=True)
+    meta["panel_input_hash"] = hash_json({
+        "schema_version": 1,
+        "feature_code_tree_hash": tree_hash,
+        "aux_asset_root_hash": meta.get("aux_asset_root_hash"),
+        "config_hash": meta["config_hash"],
+        "feature_switches": meta["feature_switches"],
+        "label_policy": meta["label_policy"],
+        "vintage_policy": getattr(args, "vintage_policy", None),
+        "feature_profile": getattr(args, "feature_profile", None),
+        "horizon": args.horizon,
+        "seq_len": seq_len,
+        "start": args.start,
+        "end": args.end,
+        "universe": args.universe,
+        "n_stocks": meta["n_stocks"],
+        "data_manifest_hash": meta.get("data_manifest_hash"),
+        "calendar_hash": meta.get("calendar_hash"),
+        "universe_status_hash": meta.get("universe_status_hash"),
+        "membership_hash": meta.get("membership_hash"),
+        "universe_membership": meta.get("universe_membership"),
+        "prebuilt_feature_manifest_hash": meta.get(
+            "prebuilt_feature_manifest_hash"),
+        "shared_inputs_hash": (
+            shared_inputs_hash(data_dir) if data_dir is not None else None),
+    })
     # §十八 (T10a): INFORMATIONAL execution-risk summary — the NaN-ignoring
     # mean of the per-date ENTRY-side fill probability.  Explicitly NOT added
     # to _CRITICAL_META_KEYS / _WARN_META_KEYS: it is a build-time diagnostic,
@@ -272,7 +418,8 @@ def _resolve_panel(
         panel_data = load_panel_memmap(
             args.panel_store,
             expected_meta=_panel_store_meta(
-                args, seq_len, stock_list, data_dir, args.prebuilt),
+                args, seq_len, stock_list, data_dir, args.prebuilt,
+                required_set=required_set),
             strict_external_meta=strict)
         # §T4: a store built with the manifest persisted reads the ACCURATE
         # build-time coverage directly; a legacy store without it falls back to
@@ -400,7 +547,8 @@ def _resolve_panel(
             panel_data, args.panel_store,
             meta=_panel_store_meta(
                 args, seq_len, stock_list, data_dir, args.prebuilt,
-                entry_fill_prob_mean=_entry_fill_prob_mean(panel_data)),
+                entry_fill_prob_mean=_entry_fill_prob_mean(panel_data),
+                required_set=required_set),
             skip_npy=sink_grids)
         logger.info("Saved panel memmap store to %s", args.panel_store)
         # Re-load the full store for downstream training — fresh lazy memmaps
@@ -408,7 +556,8 @@ def _resolve_panel(
         panel_data = load_panel_memmap(
             args.panel_store,
             expected_meta=_panel_store_meta(
-                args, seq_len, stock_list, data_dir, args.prebuilt),
+                args, seq_len, stock_list, data_dir, args.prebuilt,
+                required_set=required_set),
             strict_external_meta=strict)
         # Replay the persisted manifest (preferred) or fall back to the probe.
         # `is not None`, NOT `or`: a persisted-but-EMPTY manifest ({} — e.g. a

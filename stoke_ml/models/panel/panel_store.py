@@ -102,18 +102,22 @@ _CRITICAL_META_KEYS: tuple[str, ...] = (
     "feature_switches", "config_hash", "label_policy",
 )
 
-# Warn-and-proceed keys (T4 §八): bind the store to the EXTERNAL data
-# artifacts it was built from — data manifest, calendar, universe
-# status/delist, index membership, prebuilt feature manifest.  In EXPLORE mode
+# Warn-and-proceed keys (T4 §八 + T6 §七): bind the store to the EXTERNAL
+# data artifacts it was built from — data manifest, calendar, universe
+# status/delist, index membership, prebuilt feature manifest, PLUS the §T6
+# input-provenance content hashes (feature code tree, required channels' live
+# asset-manifest roots, and the panel_input_hash aggregate).  In EXPLORE mode
 # (strict_external_meta=False) a mismatch warns loudly but proceeds (each is
 # re-derivable by rebuilding the store), so stale is suspicious, not fatal;
 # one side missing the key skips the comparison, mirroring config_hash.  In
-# FORMAL mode (strict_external_meta=True) the same keys HARD-FAIL (T1): if
-# upstream data/calendar/membership changed — or either side cannot be vouched
-# for — the stored panel is stale and must be rebuilt, never reused.
+# FORMAL mode (strict_external_meta=True) the same keys HARD-FAIL (T1/T6): if
+# upstream data/calendar/membership changed, OR the feature code tree / aux
+# asset roots changed, OR either side cannot be vouched for — the stored panel
+# is stale and must be rebuilt, never reused.
 _WARN_META_KEYS: tuple[str, ...] = (
     "data_manifest_hash", "calendar_hash", "universe_status_hash",
     "membership_hash", "prebuilt_feature_manifest_hash",
+    "feature_code_tree_hash", "aux_asset_root_hash", "panel_input_hash",
 )
 
 # §十九 (T10b): chunk-content integrity.  The header bindings above bind
@@ -525,13 +529,16 @@ def _validate_meta(
     Research-critical fields (``_CRITICAL_META_KEYS``) must match or the load
     is refused — the stored panel's targets / column set / calendar would be
     stale.  ``_WARN_META_KEYS`` (external-artifact hashes: data manifest,
-    calendar, universe status/delist, membership, prebuilt feature manifest)
-    warn-and-proceed on mismatch in explore mode (``strict_external_meta``
-    False), compared only when BOTH sides carry a value (each is re-derivable
-    by rebuilding the store, so stale is suspicious, not fatal).  In formal
-    mode (``strict_external_meta`` True) the same keys HARD-FAIL (T1): an
-    upstream data/calendar/membership change — or a key one side cannot vouch
-    for — means the stored panel is stale and must be rebuilt, never reused.
+    calendar, universe status/delist, membership, prebuilt feature manifest,
+    plus the §T6 input-provenance bindings feature_code_tree_hash /
+    aux_asset_root_hash / panel_input_hash) warn-and-proceed on mismatch in
+    explore mode (``strict_external_meta`` False), compared only when BOTH
+    sides carry a value (each is re-derivable by rebuilding the store, so stale
+    is suspicious, not fatal).  In formal mode (``strict_external_meta`` True)
+    the same keys HARD-FAIL (T1/T6): an upstream data/calendar/membership
+    change — or a feature-code / aux-root change, or a key one side cannot
+    vouch for — means the stored panel is stale and must be rebuilt, never
+    reused.
     Non-critical fields (git_commit) drift with a loud warning and a proceed,
     mirroring cache_manifest's stale-manifest logic.  ``config_hash`` is
     compared only when BOTH sides have it (None means config could not load).
@@ -767,11 +774,12 @@ def load_panel_memmap(
     research-critical field (horizon, seq_len, start/end, universe, feature
     switches, config_hash) raises RuntimeError naming the mismatch, so a stale
     store can never silently feed wrong targets.  git_commit drift only warns,
-    and ``_WARN_META_KEYS`` (external-artifact hashes) drift with a loud
-    warning and a proceed in explore mode — or, when ``strict_external_meta``
-    is True (formal mode, T1), are a HARD-FAIL: a drifted or one-side-missing
-    external hash means the stored panel was built from upstream data that no
-    longer matches this run, so it is refused and must be rebuilt.  It is the
+    and ``_WARN_META_KEYS`` (external-artifact hashes + the §T6 input-
+    provenance bindings) drift with a loud warning and a proceed in explore
+    mode — or, when ``strict_external_meta`` is True (formal mode, T1/T6), are
+    a HARD-FAIL: a drifted or one-side-missing external hash means the stored
+    panel was built from upstream data / feature code / aux asset roots that no
+    longer match this run, so it is refused and must be rebuilt.  It is the
     caller's job to pass the formal/explore flag (train_panel threads
     ``_formal_mode(args)``).  Independently of ``expected_meta``, the store's
     self-consistency fingerprints (feature schema + stock order, see
