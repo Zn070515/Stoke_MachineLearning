@@ -55,6 +55,11 @@ def test_import_chain_succeeds_without_pyarrow():
     proc = subprocess.run(
         [sys.executable, "-c", _BLOCK_PYARROW_IMPORT],
         capture_output=True, text=True,
+        # The child sets PYTHONIOENCODING=utf-8, so its stderr (which may carry
+        # non-ASCII bytes from a transitive torch import warning) must be decoded
+        # as UTF-8.  Decoding with the Windows locale (GBK) crashes the reader
+        # thread on those bytes.  errors="replace" is a belt-and-suspenders.
+        encoding="utf-8", errors="replace",
         env=_subprocess_env(),
     )
     assert proc.returncode == 0, (
