@@ -1165,9 +1165,9 @@ def test_streaming_peak_memory_gb_bounded(tp):
     cs_panel_df term (the only other bounded-in-size resident structure)."""
     gb = tp._streaming_peak_memory_gb(6500, 1700, use_fundamental_refine=True)
     assert 0.0 < gb < 10.0
-    # n_stocks is NOT an input — the peak is bounded, not universe-scaled.
-    assert (tp._streaming_peak_memory_gb(6500, 1700, True)
-            == tp._streaming_peak_memory_gb(6500, 1700, True))
+    # n_stocks is NOT an input (no n_stocks parameter) — the resident peak is
+    # bounded and roughly n_stocks-independent, only the on-disk grids scale
+    # with the universe.
     # refine OFF drops the cs_panel_df term → smaller peak.
     assert (tp._streaming_peak_memory_gb(6500, 1700, False) < gb)
 

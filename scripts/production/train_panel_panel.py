@@ -424,7 +424,7 @@ def _panel_memory_gb(n_stocks: int, n_timesteps: int, n_features: int) -> float:
 #     size resident structure, kept through Pass 3 for the left-merge);
 #   * the per-date normalizer-stats accumulator + scratch pickle I/O buffers
 #     (~0.5 GB headroom).
-_STREAMING_PER_STOCK_PANDAS_OVERHEAD = 2.5
+_STREAMING_PER_STOCK_PANDAS_OVERHEAD = 2.5  # observed ~2.2x on a (6500,1700) float64 frame; 2.5x gives ~15% headroom
 _STREAMING_CS_PANEL_GB = 3.0
 _STREAMING_FIXED_BUFFERS_GB = 0.5
 
