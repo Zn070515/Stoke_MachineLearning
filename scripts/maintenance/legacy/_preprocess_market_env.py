@@ -1,4 +1,9 @@
 # ARCHIVED (maintenance/legacy): historical/one-off — NOT part of the canonical pipeline. See scripts/README.md.
+# SUPERSEDED (§八/T5): the canonical builder is scripts/production/build_market_env.py.
+# This archived script is kept READ-ONLY for reproducibility of the historical
+# market_env_daily.parquet.  It maps the monthly account data-MONTH label to a
+# proxy day with no honest PIT declaration — the production builder declares the
+# price/account split instead.  Do NOT alter its behavior.
 """Build a global daily market-environment panel (limit-up temperature DEFERRED).
 
 Merges: account_stats (monthly investor/mkt-cap), highs_lows (daily breadth),

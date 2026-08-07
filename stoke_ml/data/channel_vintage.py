@@ -301,10 +301,15 @@ CHANNEL_VINTAGE: tuple[ChannelVintageStatus, ...] = (
         source_vintage="immutable_snapshot",
         transform="formula_versioned",
         pit_alignment="proxy",
-        rationale="Market-breadth features are computed from realized daily "
-                  "prices via a formula (formula_versioned); the underlying qfq "
-                  "price channel is re-anchored by a corporate action, so the "
-                  "alignment to 'what was knowable at T' is only a PROXY.",
+        rationale="§T5 split: the broadcast market_env_daily.parquet carries "
+                  "two parts.  The PRICE part (high/low breadth, market "
+                  "turnover, industry advance) is SAME-DAY trade data → "
+                  "verified PIT.  The ACCOUNT part (monthly investor/mkt-cap "
+                  "stats) has a real publish date the raw source does NOT "
+                  "record, so its alignment is only a PROXY (month-end proxy "
+                  "date).  One file carries both, so the channel-level label "
+                  "is the STRICTER of the two (proxy); the per-part split is "
+                  "declared in feature_profile + the manifest 'parts' field.",
     ),
     ChannelVintageStatus(
         channel="industry",

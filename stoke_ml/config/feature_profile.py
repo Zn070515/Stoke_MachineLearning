@@ -121,6 +121,47 @@ for _channel, _cols in CHANNEL_COLUMNS.items():
 del _channel, _cols, _col, _COLUMN_OWNER
 
 
+# ── market_env price/account part split (§八/T5) ──────────────────────────
+# The broadcast ``a_shares/market_breadth/market_env_daily.parquet`` carries TWO
+# time-attribution kinds in ONE consumer-facing file (backward compat — the
+# feature layer / broadcast probe / formal manifest gate all read that single
+# file).  The PRICE part (same-day trade data) is ``verified``-PIT and stays in
+# the revision-safe required set.  The ACCOUNT part (monthly investor/mkt-cap
+# stats) has a real publish date that the shipped account_stats.parquet does NOT
+# record (only the data-month label), so its alignment is declared PROXY and it
+# is excluded from the revision-safe required sub-set (ablation-only, mirroring
+# ``use_topic``).  The single file's manifest carries the STRICTER of the two
+# labels (``vintage_pit="proxy"`` via channel_vintage); these constants are the
+# per-part declaration that keeps the price part required while the account part
+# stays honest.
+MARKET_ENV_PRICE_COLS: frozenset[str] = frozenset({
+    "high_low_ratio", "market_adv_ratio", "market_turnover_z",
+})
+MARKET_ENV_ACCOUNT_COLS: frozenset[str] = frozenset({
+    "mkt_cap_total_z", "avg_account_cap_z", "investor_new_num", "investor_new_z",
+})
+#: Honest PIT label for the account part: ``"proxy"`` while the raw source
+#: records no real publish date (the shipped account_stats.parquet does not).
+#: A builder that finds a real publish date may upgrade to ``"verified"`` — the
+#: channel_vintage ``market_env`` entry must follow the same upgrade (both stay
+#: the STRICTER-of-the-two label).
+MARKET_ENV_ACCOUNT_PIT: str = "proxy"
+
+
+def market_env_required_columns(profile_name: str | None) -> frozenset[str]:
+    """The market_env COLUMNS a profile REQUIRES: the PRICE part only.
+
+    A required sub-set may never include a channel part whose PIT is unverified
+    — while ``MARKET_ENV_ACCOUNT_PIT == "proxy"`` the account part is excluded
+    (ablation-only, mirroring ``use_topic``); only a verified account part would
+    be admitted back into the required sub-set.
+    """
+    cols = set(MARKET_ENV_PRICE_COLS)
+    if MARKET_ENV_ACCOUNT_PIT == "verified":
+        cols |= set(MARKET_ENV_ACCOUNT_COLS)
+    return frozenset(cols)
+
+
 # ── FeatureProfile ────────────────────────────────────────────────────────
 
 # The coverage METRICS a channel contract can declare (§T4, the semantic
@@ -199,6 +240,14 @@ class FeatureProfile:
 # the file exists) and date coverage is the meaningful metric.  dragon_tiger is
 # deliberately absent from the map (presence-only), preserving the convention
 # that a required channel absent from the contract map is presence-only.
+#
+# §T5 market_env split: ``market_env`` stays required + ``date_coverage 0.95``
+# because the file it gates carries the VERIFIED price part (high/low breadth,
+# market turnover, industry advance) — see ``MARKET_ENV_PRICE_COLS``.  The
+# ACCOUNT part (``MARKET_ENV_ACCOUNT_COLS``) is PROXY-PIT while
+# ``MARKET_ENV_ACCOUNT_PIT == "proxy"`` and is excluded from the required
+# sub-set (``market_env_required_columns`` returns the price part only);
+# it rides along in the same file as an ablation-only sub-part, never required.
 FEATURE_PROFILES: dict[str, FeatureProfile] = {
     "headline_v1": FeatureProfile(
         name="headline_v1",
