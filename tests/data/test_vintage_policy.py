@@ -251,10 +251,12 @@ def test_allowed_channels_headline_strict_is_verified_union_waiver():
 
 def test_denied_channels_headline_strict_exact_set():
     """T3: headline-strict denies the 10 latest_revised-sourced channels PLUS
-    the non-waived proxy-aligned industry channel; daily_qfq / market_env are
-    scale-invariant and waived (NOT denied)."""
+    the non-waived proxy-aligned channels (industry, and the §T5 market_env
+    ACCOUNT sub-part whose absolute-count features are NOT scale-invariant);
+    daily_qfq / market_env are scale-invariant and waived (NOT denied)."""
     _, revised = _declared_sets()
-    assert denied_channels(HEADLINE_STRICT) == revised | {"industry"}
+    assert denied_channels(HEADLINE_STRICT) == (
+        revised | {"industry", "market_env_account"})
     assert "daily_qfq" not in denied_channels(HEADLINE_STRICT)
     assert "market_env" not in denied_channels(HEADLINE_STRICT)
 

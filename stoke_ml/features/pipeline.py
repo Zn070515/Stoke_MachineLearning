@@ -124,6 +124,11 @@ class FeaturePipeline:
         use_limit_up: bool = False,  # DEFERRED (limit-up ecology, top scope note)
         use_pledge: bool = True,
         use_market_env: bool = True,
+        # §T5: the ACCOUNT sub-part of the market_env file (monthly
+        # investor/mkt-cap stats) is PROXY-PIT while the raw source records no
+        # real publish date, so it is OFF by default (ablation-only, mirroring
+        # use_topic).  The PRICE sub-part is always consumed via use_market_env.
+        use_market_env_account: bool = False,
         use_index_membership: bool = True,
         use_market_env_refine: bool = True,
         minute_mode: bool = False,
@@ -191,10 +196,12 @@ class FeaturePipeline:
         self.use_limit_up = use_limit_up  # inert while deferred (not wired in _engineer_features)
         self.use_pledge = use_pledge
         self.use_market_env = use_market_env
+        self.use_market_env_account = use_market_env_account
         self.use_index_membership = use_index_membership
         self.use_market_env_refine = use_market_env_refine
         self._aux = AuxAligner(
             {k: getattr(self, f"use_{k}") for k in AuxAligner.AUX_KEYS}
+            | {"market_env_account": use_market_env_account}
         )
         self.minute_mode = minute_mode
         self.feature_selection_k = feature_selection_k

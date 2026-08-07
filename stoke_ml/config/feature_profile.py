@@ -71,6 +71,75 @@ _MARKET_ENV_REFINE_COLS = frozenset(
     | {"menv_regime_z"}
 )
 
+
+# ── market_env price/account part split (§八/T5) ──────────────────────────
+# The broadcast ``a_shares/market_breadth/market_env_daily.parquet`` carries TWO
+# time-attribution kinds in ONE consumer-facing file (backward compat — the
+# feature layer / broadcast probe / formal manifest gate all read that single
+# file).  The PRICE part (same-day trade data) is ``verified``-PIT and is the
+# revision-safe REQUIRED sub-set.  The ACCOUNT part (monthly investor/mkt-cap
+# stats) has a real publish date that the shipped account_stats.parquet does NOT
+# record (only the data-month label), so its alignment is declared PROXY and it
+# is CONSUMED ONLY via an explicit ablation opt-in (``use_market_env_account``,
+# default OFF — mirroring ``use_topic``); the moment the builder upgrades the
+# account part to ``verified`` (real publish date recorded), it joins the
+# required/verified set automatically and the ablation flag stops mattering.
+# The single file's manifest carries the STRICTER of the two labels
+# (``vintage_pit="proxy"`` via channel_vintage); these constants are the
+# per-part declaration that keeps the price part required while the account part
+# stays honest.
+#
+# ENFORCEMENT wiring (these constants are NOT decorative — they are the single
+# source of truth for the real consumption path):
+#   * ``CHANNEL_COLUMNS["market_env"]`` is the PRICE-ONLY set → the generic
+#     prebuilt scrub in panel_builder treats the market_env channel atomically
+#     as the verified price subset (always kept, ``use_market_env`` default ON).
+#   * ``CHANNEL_COLUMNS["market_env_account"]`` is the ACCOUNT set → the same
+#     scrub drops it whenever ``use_market_env_account`` is OFF (the default),
+#     and ``aux_aligner._merge_market_env`` merges it ONLY when the ablation
+#     flag is ON or the account part is verified.
+MARKET_ENV_PRICE_COLS: frozenset[str] = frozenset({
+    "high_low_ratio", "market_adv_ratio", "market_turnover_z",
+})
+MARKET_ENV_ACCOUNT_COLS: frozenset[str] = frozenset({
+    "mkt_cap_total_z", "avg_account_cap_z", "investor_new_num", "investor_new_z",
+})
+#: Honest PIT label for the account part: ``"proxy"`` while the raw source
+#: records no real publish date (the shipped account_stats.parquet does not).
+#: A builder that finds a real publish date upgrades to ``"verified"`` — the
+#: channel_vintage ``market_env`` entry must follow the same upgrade (both stay
+#: the STRICTER-of-the-two label).
+MARKET_ENV_ACCOUNT_PIT: str = "proxy"
+
+
+def market_env_account_is_verified() -> bool:
+    """Whether the account part is declared ``verified`` (real publish date).
+
+    Read as a FUNCTION (not a bare constant) so the builders/consumers that
+    import it observe a future upgrade of ``MARKET_ENV_ACCOUNT_PIT`` at CALL
+    time — a test (or a future builder upgrade) that flips the module global
+    takes effect everywhere without re-importing.
+    """
+    return MARKET_ENV_ACCOUNT_PIT == "verified"
+
+
+def market_env_required_columns(profile_name: str | None = None) -> frozenset[str]:
+    """The market_env COLUMNS a run REQUIRES: the verified PRICE part, plus the
+    ACCOUNT part once it is declared ``verified``.
+
+    A required sub-set may never include a channel part whose PIT is unverified
+    — while ``MARKET_ENV_ACCOUNT_PIT == "proxy"`` the account part is excluded
+    (ablation-only, mirroring ``use_topic``); only a verified account part would
+    be admitted back into the required sub-set.  ``profile_name`` is accepted
+    for call-site clarity (every shipped profile shares the same required
+    sub-set today).
+    """
+    cols = set(MARKET_ENV_PRICE_COLS)
+    if market_env_account_is_verified():
+        cols |= set(MARKET_ENV_ACCOUNT_COLS)
+    return frozenset(cols)
+
+
 CHANNEL_COLUMNS: dict[str, frozenset[str]] = {
     "sentiment": frozenset(_aux.SENTIMENT_COLS),
     "guba": frozenset(_aux.GUBA_COLS),
@@ -98,7 +167,11 @@ CHANNEL_COLUMNS: dict[str, frozenset[str]] = {
     "macro": frozenset(_aux.MACRO_COLS),
     "pledge": frozenset(_ph.PLEDGE_COLS),
     "index_membership": frozenset(_ph.INDEX_MEMBER_COLS),
-    "market_env": frozenset(_aux.MARKET_ENV_COLS),
+    # §T5: the market_env channel is the PRICE-ONLY (verified) part; the ACCOUNT
+    # part is its own ablation-only channel so the generic scrub can drop it
+    # whenever use_market_env_account is OFF (the default).  See the split block.
+    "market_env": MARKET_ENV_PRICE_COLS,
+    "market_env_account": MARKET_ENV_ACCOUNT_COLS,
     "market_env_refine": _MARKET_ENV_REFINE_COLS,
     "limit_up": frozenset(_ph.LIMIT_UP_COLS),
 }
@@ -119,47 +192,6 @@ for _channel, _cols in CHANNEL_COLUMNS.items():
         )
         _COLUMN_OWNER[_col] = _channel
 del _channel, _cols, _col, _COLUMN_OWNER
-
-
-# ── market_env price/account part split (§八/T5) ──────────────────────────
-# The broadcast ``a_shares/market_breadth/market_env_daily.parquet`` carries TWO
-# time-attribution kinds in ONE consumer-facing file (backward compat — the
-# feature layer / broadcast probe / formal manifest gate all read that single
-# file).  The PRICE part (same-day trade data) is ``verified``-PIT and stays in
-# the revision-safe required set.  The ACCOUNT part (monthly investor/mkt-cap
-# stats) has a real publish date that the shipped account_stats.parquet does NOT
-# record (only the data-month label), so its alignment is declared PROXY and it
-# is excluded from the revision-safe required sub-set (ablation-only, mirroring
-# ``use_topic``).  The single file's manifest carries the STRICTER of the two
-# labels (``vintage_pit="proxy"`` via channel_vintage); these constants are the
-# per-part declaration that keeps the price part required while the account part
-# stays honest.
-MARKET_ENV_PRICE_COLS: frozenset[str] = frozenset({
-    "high_low_ratio", "market_adv_ratio", "market_turnover_z",
-})
-MARKET_ENV_ACCOUNT_COLS: frozenset[str] = frozenset({
-    "mkt_cap_total_z", "avg_account_cap_z", "investor_new_num", "investor_new_z",
-})
-#: Honest PIT label for the account part: ``"proxy"`` while the raw source
-#: records no real publish date (the shipped account_stats.parquet does not).
-#: A builder that finds a real publish date may upgrade to ``"verified"`` — the
-#: channel_vintage ``market_env`` entry must follow the same upgrade (both stay
-#: the STRICTER-of-the-two label).
-MARKET_ENV_ACCOUNT_PIT: str = "proxy"
-
-
-def market_env_required_columns(profile_name: str | None) -> frozenset[str]:
-    """The market_env COLUMNS a profile REQUIRES: the PRICE part only.
-
-    A required sub-set may never include a channel part whose PIT is unverified
-    — while ``MARKET_ENV_ACCOUNT_PIT == "proxy"`` the account part is excluded
-    (ablation-only, mirroring ``use_topic``); only a verified account part would
-    be admitted back into the required sub-set.
-    """
-    cols = set(MARKET_ENV_PRICE_COLS)
-    if MARKET_ENV_ACCOUNT_PIT == "verified":
-        cols |= set(MARKET_ENV_ACCOUNT_COLS)
-    return frozenset(cols)
 
 
 # ── FeatureProfile ────────────────────────────────────────────────────────
@@ -246,8 +278,10 @@ class FeatureProfile:
 # market turnover, industry advance) — see ``MARKET_ENV_PRICE_COLS``.  The
 # ACCOUNT part (``MARKET_ENV_ACCOUNT_COLS``) is PROXY-PIT while
 # ``MARKET_ENV_ACCOUNT_PIT == "proxy"`` and is excluded from the required
-# sub-set (``market_env_required_columns`` returns the price part only);
-# it rides along in the same file as an ablation-only sub-part, never required.
+# sub-set (``market_env_required_columns`` returns the price part only).  It
+# rides along in the same file as an ablation-only sub-part (consumed only when
+# ``use_market_env_account`` is ON, or once the account part is verified),
+# never required.
 FEATURE_PROFILES: dict[str, FeatureProfile] = {
     "headline_v1": FeatureProfile(
         name="headline_v1",

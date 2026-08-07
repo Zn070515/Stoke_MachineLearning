@@ -72,6 +72,10 @@ _BASE_DIM_PREFERENCE = {
     "index_membership": True, "market_env": True, "market_env_refine": True,
     "board": False, "sector": False, "concept": False,
     "limit_up": False, "topic": False,
+    # §T5: the market_env ACCOUNT sub-part is PROXY-PIT (ablation-only,
+    # mirroring topic) — OFF by default so a revision-safe formal run consumes
+    # only the verified PRICE part.  The PRICE part rides on use_market_env.
+    "market_env_account": False,
 }
 # dim → FeaturePipeline kwarg name; only "announcement" differs (use_announcements).
 _SWITCH_KEY = {"announcement": "use_announcements"}

@@ -152,7 +152,7 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --
 
 ## 特征维度
 
-FeaturePipeline 支持 **27个 `use_*` 数据维度**（25 默认开启 + `use_topic` 默认关闭（ablation-only，§七 PIT 泄漏）+ `use_limit_up` 未接线；见表；全部左连接 + ZI填充 + PIT lag(1)；FE v2 新增 4 维标 ★）：
+FeaturePipeline 支持 **28个 `use_*` 数据维度**（25 默认开启 + `use_topic` 默认关闭（ablation-only，§七 PIT 泄漏）+ `use_limit_up` 未接线 + `use_market_env_account` 默认关闭（ablation-only，§T5 proxy PIT）；见表；全部左连接 + ZI填充 + PIT lag(1)；FE v2 新增 4 维标 ★）：
 
 | 维度 | 开关 | 列数 | 密度 | 数据源 |
 |------|------|------|------|--------|
@@ -179,7 +179,8 @@ FeaturePipeline 支持 **27个 `use_*` 数据维度**（25 默认开启 + `use_t
 | macro (宏观) | `use_macro` | 28 | 高(日频) | macro_daily.parquet |
 | pledge (股权质押) ★ | `use_pledge` | 5 | 中 | 数据中心 (FE v2) |
 | index_membership (指数成分) ★ | `use_index_membership` | 3 | 低 | Baostock月度重建 (FE v2) |
-| market_env (市场环境) ★ | `use_market_env` | 7 | 高(全市场日频) | market_breadth (FE v2) |
+| market_env (市场环境, price) ★ | `use_market_env` | 3 (verified price) | 高(全市场日频) | market_breadth (FE v2) |
+| market_env account (账户统计) | `use_market_env_account` | 4 (mkt_cap_total_z / avg_account_cap_z / investor_new_num / investor_new_z) | 高(全市场月频) | market_breadth — **默认关闭** (ablation-only, proxy PIT) |
 | macro regime (宏观制度) ★ | `use_market_env_refine` | 49 | 高(日频) | MarketEnvRefiner (FE v2) |
 | limit-up ecology (涨停生态) | `use_limit_up` | 20 | 低 | 数据中心 — **未接线** (DEFERRED) |
 | topic-model (主题模型, global_frozen, §七) | `use_topic` | topic_* (entropy/dominant/sent/ratio/dispersion) | 高(新闻) | 全局冻结主题模型 — **默认关闭** (ablation-only) |

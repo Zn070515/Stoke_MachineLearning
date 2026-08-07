@@ -154,6 +154,7 @@ def build_one(args: dict) -> tuple[str, str, str]:
             use_limit_up=args["use_limit_up"],  # False (deferred, top scope note)
             use_pledge=args["use_pledge"],
             use_market_env=args["use_market_env"],
+            use_market_env_account=args.get("use_market_env_account", False),
             use_market_env_refine=args["use_market_env_refine"],
             use_index_membership=args["use_index_membership"],
         )
@@ -271,6 +272,16 @@ def main():
                         help="Exclude market breadth (7 market-env cols); use "
                              "--no-market-env-refine for menv_* macro-regime factors. "
                              "market_state_* (board) is a separate channel")
+    parser.add_argument("--market-env-account", dest="use_market_env_account", action="store_true",
+                        default=False,
+                        help="§T5 ablation: also consume the PROXY-PIT ACCOUNT "
+                             "sub-part of the market_env file (monthly "
+                             "investor/mkt-cap stats: mkt_cap_total_z / "
+                             "avg_account_cap_z / investor_new_num / "
+                             "investor_new_z).  OFF by default — the account "
+                             "part is ablation-only while its alignment is a "
+                             "proxy (mirrors use_topic); the verified PRICE "
+                             "part is always consumed via --market-env.")
     parser.add_argument("--market-env-refine", dest="use_market_env_refine", action="store_true",
                         default=True,
                         help="Include MarketEnvRefiner macro-regime factors (menv_*, default)")
@@ -354,6 +365,7 @@ def main():
         "use_limit_up": False,  # limit-up deferred (top scope note)
         "use_pledge": args.use_pledge,
         "use_market_env": args.use_market_env,
+        "use_market_env_account": args.use_market_env_account,
         "use_market_env_refine": args.use_market_env_refine,
         "use_index_membership": args.use_index_membership,
         "storage": storage,

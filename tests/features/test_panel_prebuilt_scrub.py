@@ -182,3 +182,40 @@ def test_coupling_makes_revision_safe_scrub_drop_refine_columns(tmp_path):
     known = _build(pdir, panel, pipe)
     assert "f_score" not in known
     assert "valuation_composite_z" not in known
+
+
+# ── §T5 market_env ACCOUNT part: scrub agrees with the price/account split ─
+
+def test_market_env_account_scrubbed_when_off_kept_when_on(tmp_path):
+    """§T5: the PROXY ACCOUNT part is its own channel — the generic scrub drops
+    it on the default run (use_market_env_account off) and keeps it on the
+    explicit ablation opt-in, while the PRICE part always survives."""
+    pdir, panel, codes = _build_prebuilt(tmp_path)
+    account_cols = list(CHANNEL_COLUMNS["market_env_account"])
+    price_cols = list(CHANNEL_COLUMNS["market_env"])
+    _inject_columns(pdir, codes, account_cols + price_cols)
+    # default (ablation flag off) → account cols scrubbed, price cols kept
+    known = _build(pdir, panel, _base_pipeline())
+    for col in account_cols:
+        assert col not in known, f"account col {col!r} leaked in proxy default"
+    for col in price_cols:
+        assert col in known, f"price col {col!r} was over-scrubbed"
+    # explicit ablation opt-in → account cols kept
+    known_on = _build(pdir, panel, _base_pipeline(use_market_env_account=True))
+    for col in account_cols:
+        assert col in known_on, f"account col {col!r} missing with flag on"
+
+
+def test_market_env_account_kept_when_verified(monkeypatch, tmp_path):
+    """§T5: once the account part is declared VERIFIED (real publish date), it is
+    part of the required/verified set and is kept by default — the ablation
+    flag being off must not scrub it."""
+    import stoke_ml.config.feature_profile as _fp
+    monkeypatch.setattr(_fp, "MARKET_ENV_ACCOUNT_PIT", "verified")
+    pdir, panel, codes = _build_prebuilt(tmp_path)
+    account_cols = list(CHANNEL_COLUMNS["market_env_account"])
+    _inject_columns(pdir, codes, account_cols)
+    # verified account part joins the verified set → kept even with flag off
+    known = _build(pdir, panel, _base_pipeline())
+    for col in account_cols:
+        assert col in known, f"verified account col {col!r} was scrubbed"

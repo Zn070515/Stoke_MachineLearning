@@ -179,7 +179,8 @@ def test_output_schema_backward_compatible(bme, tmp_path):
 def test_headline_v1_required_set_reflects_split():
     """headline_v1 under revision-safe keeps the PRICE part required (the
     ``market_env`` channel = the file that carries it) and excludes the ACCOUNT
-    part while it is proxy (ablation-only)."""
+    part while it is proxy (ablation-only, its own channel so the generic scrub
+    drops it whenever use_market_env_account is OFF)."""
     from stoke_ml.config.feature_profile import (
         CHANNEL_COLUMNS,
         FEATURE_PROFILES,
@@ -190,11 +191,19 @@ def test_headline_v1_required_set_reflects_split():
     )
     p = FEATURE_PROFILES["headline_v1"]
     assert "market_env" in p.required_channels          # price part required
+    assert "market_env_account" not in p.required_channels  # account part ablation-only
     assert MARKET_ENV_ACCOUNT_PIT == "proxy"            # account part proxy
     # the account part is excluded from the required sub-set while proxy
     assert market_env_required_columns("headline_v1") == MARKET_ENV_PRICE_COLS
-    # the split partitions the 7-column file exactly, no overlap
-    assert MARKET_ENV_PRICE_COLS | MARKET_ENV_ACCOUNT_COLS == CHANNEL_COLUMNS["market_env"]
+    # the split partitions the 7-column file exactly, no overlap, and the
+    # market_env channel is the PRICE-ONLY part (verified default consumption)
+    assert CHANNEL_COLUMNS["market_env"] == MARKET_ENV_PRICE_COLS
+    assert CHANNEL_COLUMNS["market_env_account"] == MARKET_ENV_ACCOUNT_COLS
+    assert MARKET_ENV_PRICE_COLS | MARKET_ENV_ACCOUNT_COLS == frozenset({
+        "high_low_ratio", "mkt_cap_total_z", "avg_account_cap_z",
+        "investor_new_num", "investor_new_z", "market_adv_ratio",
+        "market_turnover_z",
+    })
     assert MARKET_ENV_PRICE_COLS.isdisjoint(MARKET_ENV_ACCOUNT_COLS)
 
 

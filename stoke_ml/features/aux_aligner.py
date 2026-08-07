@@ -30,7 +30,7 @@ from stoke_ml.features.aux_cols import (
     VALUATION_COLS,
     INDUSTRY_COLS,
     MACRO_COLS,
-    MARKET_ENV_COLS,
+    MARKET_ENV_COLS,  # noqa: F401  re-exported for import-compat (pipeline.py temporal assembly)
     STATE_MAX_STALENESS,
 )
 from stoke_ml.features.aux_helpers import (
@@ -39,6 +39,16 @@ from stoke_ml.features.aux_helpers import (
     _merge_daily_aux,
     _aggregate_concept_long,
     _load_macro_features,
+)
+
+# §T5: the market_env price/account split is the single source of truth for
+# WHICH columns the live merge consumes (price part always; account part only
+# on the ablation opt-in or once verified).  feature_profile imports only leaf
+# feature modules (aux_cols / panel_helpers / market_env), so this import is
+# cycle-free — panel_builder already imports feature_profile the same way.
+from stoke_ml.config.feature_profile import (
+    MARKET_ENV_ACCOUNT_COLS,
+    market_env_required_columns,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +75,10 @@ class AuxAligner:
         flags = dict(flags or {})
         for key in self.AUX_KEYS:
             setattr(self, f"use_{key}", bool(flags.get(key, True)))
+        # §T5: the market_env ACCOUNT sub-part is OFF by default (ablation-only,
+        # mirroring use_topic).  Not part of AUX_KEYS because that loop defaults
+        # every key to True; this sub-part must default False.
+        self.use_market_env_account = bool(flags.get("market_env_account", False))
         self._warned_missing: set[str] = set()
         self._macro_cache: pd.DataFrame | None = None
         self._industry_cache: pd.DataFrame | None = None
@@ -608,7 +622,15 @@ class AuxAligner:
                 return df
         me["date"] = pd.to_datetime(me["date"]).dt.normalize()
         me = me.drop_duplicates(subset="date", keep="last")
-        available = [c for c in MARKET_ENV_COLS if c in me.columns]
+        # §T5: consume the VERIFIED PRICE part always (the market_env channel's
+        # required sub-set); the PROXY ACCOUNT part is consumed ONLY on the
+        # ablation opt-in (use_market_env_account) or automatically once the
+        # account part is declared verified (market_env_required_columns already
+        # includes it then — the ablation flag is redundant-but-harmless).
+        want = set(market_env_required_columns(None))
+        if self.use_market_env_account:
+            want |= set(MARKET_ENV_ACCOUNT_COLS)
+        available = [c for c in want if c in me.columns]
         if not available:
             return df
         df = df.merge(me[["date"] + available], on="date", how="left")

@@ -14,23 +14,29 @@ import pytest
 from stoke_ml.config.feature_profile import (
     CHANNEL_COLUMNS,
     FEATURE_PROFILES,
+    MARKET_ENV_ACCOUNT_COLS,
+    MARKET_ENV_ACCOUNT_PIT,
+    MARKET_ENV_PRICE_COLS,
     CoverageContract,
     FeatureProfile,
     _COVERAGE_METRICS,
+    market_env_required_columns,
     minimum_coverage,
     profile_for,
     resolve_required_channels,
 )
 from stoke_ml.data.vintage_policy import VintagePolicy, channel_allowed
 
-# The 27 channels CHANNEL_COLUMNS must own (docs table, §十四).
+# The channels CHANNEL_COLUMNS must own (docs table, §十四 — the 27 documented
+# dimensions, plus the §T5 market_env_account sub-channel for the PROXY-PIT
+# ACCOUNT part of the market_env file).
 _EXPECTED_CHANNELS = frozenset({
     "sentiment", "guba", "comment", "announcement", "margin", "northbound",
     "dragon_tiger", "fundamental", "fundamental_refine", "earnings",
     "valuation", "etf_flow", "capital_flow", "block_trade", "shareholder",
     "lockup", "dividend", "board", "sector", "concept", "industry", "macro",
-    "pledge", "index_membership", "market_env", "market_env_refine",
-    "limit_up",
+    "pledge", "index_membership", "market_env", "market_env_account",
+    "market_env_refine", "limit_up",
 })
 
 
@@ -75,6 +81,42 @@ def test_market_env_bare_vs_refine_names_disjoint():
     menv = CHANNEL_COLUMNS["market_env"]
     menv_refine = CHANNEL_COLUMNS["market_env_refine"]
     assert menv.isdisjoint(menv_refine)
+
+
+# ── §T5 market_env price/account split (enforcement) ───────────────────
+
+def test_market_env_channel_owns_price_only_account_is_own_channel():
+    """§T5: the market_env channel is the VERIFIED PRICE part; the PROXY ACCOUNT
+    part is its own ablation-only channel so the generic scrub can drop it
+    whenever use_market_env_account is OFF (the default)."""
+    assert CHANNEL_COLUMNS["market_env"] == MARKET_ENV_PRICE_COLS
+    assert CHANNEL_COLUMNS["market_env_account"] == MARKET_ENV_ACCOUNT_COLS
+    # the two parts partition the 7-column consumer file exactly, no overlap
+    assert MARKET_ENV_PRICE_COLS | MARKET_ENV_ACCOUNT_COLS == frozenset({
+        "high_low_ratio", "mkt_cap_total_z", "avg_account_cap_z",
+        "investor_new_num", "investor_new_z", "market_adv_ratio",
+        "market_turnover_z",
+    })
+    assert MARKET_ENV_PRICE_COLS.isdisjoint(MARKET_ENV_ACCOUNT_COLS)
+
+
+def test_market_env_required_columns_price_only_while_account_proxy():
+    """§T5: while MARKET_ENV_ACCOUNT_PIT == 'proxy', the required sub-set is the
+    PRICE part only — a required sub-set never includes an unverified part."""
+    assert MARKET_ENV_ACCOUNT_PIT == "proxy"
+    assert market_env_required_columns("headline_v1") == MARKET_ENV_PRICE_COLS
+
+
+def test_market_env_required_columns_expands_when_account_verified(monkeypatch):
+    """§T5: the moment the account part is declared verified (a real publish
+    date is recorded by the builder), the account columns join the required
+    sub-set automatically — no ablation flag needed."""
+    import stoke_ml.config.feature_profile as _fp
+    monkeypatch.setattr(_fp, "MARKET_ENV_ACCOUNT_PIT", "verified")
+    assert _fp.market_env_account_is_verified() is True
+    assert market_env_required_columns("headline_v1") == (
+        MARKET_ENV_PRICE_COLS | MARKET_ENV_ACCOUNT_COLS
+    )
 
 
 # ── headline_v1 profile ───────────────────────────────────────────────

@@ -27,7 +27,10 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 
-from stoke_ml.config.feature_profile import CHANNEL_COLUMNS
+from stoke_ml.config.feature_profile import (
+    CHANNEL_COLUMNS,
+    market_env_account_is_verified,
+)
 from stoke_ml.features import cache_manifest
 from stoke_ml.features.fundamental import FundamentalRefiner
 from stoke_ml.features.panel_builders._arrays import (
@@ -69,7 +72,10 @@ def _engineer_stock(
     Side-effects: mutates *drop_reasons* and *drop_examples* for drop
     accounting.
     """
-    from stoke_ml.config.feature_profile import CHANNEL_COLUMNS
+    from stoke_ml.config.feature_profile import (
+        CHANNEL_COLUMNS,
+        market_env_account_is_verified,
+    )
 
     if prebuilt_dir:
         path = os.path.join(prebuilt_dir, f"{code}.parquet")
@@ -93,6 +99,14 @@ def _engineer_stock(
         _channel_switch_attr = {"announcement": "use_announcements"}
         _off_cols: list[str] = []
         for _channel, _cols in CHANNEL_COLUMNS.items():
+            # §T5: the market_env ACCOUNT part is dropped whenever
+            # use_market_env_account is OFF (the proxy default) — EXCEPT once
+            # the account part is declared verified, when it is part of the
+            # required/verified set and must never be scrubbed by the ablation
+            # flag being off (the verified state is global, so a verified
+            # account part is consumed regardless of the run's flag).
+            if _channel == "market_env_account" and market_env_account_is_verified():
+                continue
             _switch = getattr(
                 pipeline,
                 _channel_switch_attr.get(_channel, f"use_{_channel}"),

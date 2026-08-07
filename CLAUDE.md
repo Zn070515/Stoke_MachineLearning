@@ -125,7 +125,7 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
                 use_guba=False, use_comment=False)
 ```
 
-**27 `use_*` data dimensions** (25 default-on + `use_topic` ablation-only, OFF by default + `use_limit_up` deferred; all lagged 1 day to prevent leakage, merged via left-join ZI):
+**28 `use_*` data dimensions** (25 default-on + `use_topic` ablation-only OFF + `use_limit_up` deferred + `use_market_env_account` ablation-only OFF; all lagged 1 day to prevent leakage, merged via left-join ZI):
 | Dimension | switch | Columns | Data density |
 |---|---|---|---|
 | sentiment (news) | `use_sentiment` | 6 | medium |
@@ -151,7 +151,8 @@ FeaturePipeline(seq_len=60, use_sentiment=True, use_announcements=False,
 | macro | `use_macro` | 28 | high (daily) |
 | pledge | `use_pledge` | 5 | medium |
 | index membership | `use_index_membership` | 3 | low |
-| market env | `use_market_env` | 7 | high (all-market) |
+| market env (price) | `use_market_env` | 3 (verified price) | high (all-market) |
+| market env account | `use_market_env_account` | 4 (mkt_cap_total_z / avg_account_cap_z / investor_new_num / investor_new_z) | high (all-market) | — **OFF by default (ablation-only, proxy PIT)** |
 | macro regime refine | `use_market_env_refine` | 49 | high (daily) |
 | limit-up ecology | `use_limit_up` | 20 | low — **DEFERRED** |
 | topic-model (global_frozen, §七) | `use_topic` | topic_* (entropy/dominant/sent/ratio/dispersion) | high (news) | — **OFF by default (ablation-only)** |

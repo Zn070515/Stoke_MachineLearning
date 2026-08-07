@@ -244,6 +244,80 @@ class TestMergeHelpers:
         assert result["net_profit_yoy_low"].iloc[1] == 2.0
 
 
+class TestMarketEnvAccountSplit:
+    """§T5: the market_env ACCOUNT sub-part (PROXY-PIT, monthly investor/mkt-cap
+    stats) is consumed ONLY via the explicit ablation opt-in
+    (``use_market_env_account``) or once it is declared VERIFIED — never by a
+    default revision-safe run.  The PRICE part (verified, same-day trade data)
+    is always consumed.  Exercises the REAL consumption path
+    (``_engineer_features`` → ``_merge_market_env``), not just the manifest."""
+
+    _ACCOUNT_COLS = (
+        "mkt_cap_total_z", "avg_account_cap_z",
+        "investor_new_num", "investor_new_z",
+    )
+    _PRICE_COLS = ("high_low_ratio", "market_adv_ratio", "market_turnover_z")
+
+    def _me_df(self, df):
+        return pd.DataFrame({
+            "date": df["date"],
+            "high_low_ratio": 0.5,
+            "market_adv_ratio": 0.6,
+            "market_turnover_z": 0.1,
+            "mkt_cap_total_z": 0.2,
+            "avg_account_cap_z": 0.3,
+            "investor_new_num": 100.0,
+            "investor_new_z": 0.4,
+        })
+
+    def _pipe(self, **kw):
+        base = dict(
+            seq_len=20, use_sentiment=False, use_announcements=False,
+            use_guba=False, use_comment=False,
+        )
+        base.update(kw)
+        return FeaturePipeline(**base)
+
+    def test_default_proxy_run_excludes_account_cols(self):
+        """(a) The default formal pipeline consumes ONLY the verified PRICE
+        columns — the 4 PROXY ACCOUNT columns are absent from the engineered
+        feature matrix."""
+        pipe = self._pipe()
+        assert pipe.use_market_env_account is False
+        df = _make_kl(60)
+        feats = pipe._engineer_features(df.copy(), market_env_df=self._me_df(df))
+        for c in self._PRICE_COLS:
+            assert c in feats.columns, f"price col {c!r} missing"
+        for c in self._ACCOUNT_COLS:
+            assert c not in feats.columns, f"account col {c!r} leaked in proxy default"
+
+    def test_ablation_flag_on_includes_account_cols(self):
+        """(b) The explicit ablation opt-in (use_market_env_account=True) adds
+        the ACCOUNT columns — they are consumed on that flag, and only on it."""
+        pipe = self._pipe(use_market_env_account=True)
+        assert pipe.use_market_env_account is True
+        df = _make_kl(60)
+        feats = pipe._engineer_features(df.copy(), market_env_df=self._me_df(df))
+        for c in self._PRICE_COLS:
+            assert c in feats.columns
+        for c in self._ACCOUNT_COLS:
+            assert c in feats.columns, f"account col {c!r} missing with flag on"
+
+    def test_verified_account_included_by_default(self, monkeypatch):
+        """(c) Once the account part is declared VERIFIED (builder upgrade), the
+        account columns join the verified set automatically — included on a
+        default run with the ablation flag OFF."""
+        import stoke_ml.config.feature_profile as _fp
+        monkeypatch.setattr(_fp, "MARKET_ENV_ACCOUNT_PIT", "verified")
+        pipe = self._pipe()  # use_market_env_account defaults False
+        df = _make_kl(60)
+        feats = pipe._engineer_features(df.copy(), market_env_df=self._me_df(df))
+        for c in self._PRICE_COLS:
+            assert c in feats.columns
+        for c in self._ACCOUNT_COLS:
+            assert c in feats.columns, f"verified account col {c!r} missing by default"
+
+
 def _make_panel_kl(dates, seed):
     """Synthetic OHLCV K-line for one stock on a given date list."""
     rng = np.random.RandomState(seed)

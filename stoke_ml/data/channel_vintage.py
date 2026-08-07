@@ -312,6 +312,22 @@ CHANNEL_VINTAGE: tuple[ChannelVintageStatus, ...] = (
                   "declared in feature_profile + the manifest 'parts' field.",
     ),
     ChannelVintageStatus(
+        channel="market_env_account",
+        source_vintage="immutable_snapshot",
+        transform="formula_versioned",
+        pit_alignment="proxy",
+        rationale="§T5: the ACCOUNT sub-part of the market_env file (monthly "
+                  "investor/mkt-cap stats).  The published values are immutable "
+                  "point-in-time snapshots (no later revision rewrites the past "
+                  "publication) and the daily market_env_daily.parquet stores "
+                  "formula-derived z-scores → formula_versioned.  Its decision-"
+                  "date alignment is only a PROXY (month-end proxy date while "
+                  "the raw source records no real publish date), so it is "
+                  "ablation-only (use_market_env_account OFF by default, "
+                  "mirroring topic) and is NOT scale-invariant (absolute "
+                  "counts) — denied under headline-strict, never required.",
+    ),
+    ChannelVintageStatus(
         channel="industry",
         source_vintage="immutable_snapshot",
         transform="formula_versioned",
@@ -425,14 +441,16 @@ CHANNEL_VINTAGE_BY_NAME: dict[str, ChannelVintageStatus] = {
     e.channel: e for e in CHANNEL_VINTAGE
 }
 
-# The 27 documented ``use_*`` dimensions (CLAUDE.md Feature Layer table).
+# The 28 documented ``use_*`` dimensions (CLAUDE.md Feature Layer table) —
+# the 27 data dimensions plus the §T5 ``market_env_account`` sub-channel
+# (the PROXY-PIT ACCOUNT part of the market_env file, ablation-only).
 DOCUMENTED_USE_DIMS: frozenset[str] = frozenset({
     "sentiment", "guba", "comment", "announcement", "margin", "northbound",
     "dragon_tiger", "fundamental", "earnings", "valuation", "etf_flow",
     "capital_flow", "block_trade", "shareholder", "lockup", "dividend",
     "board", "sector", "concept", "industry", "macro", "pledge",
-    "index_membership", "market_env", "market_env_refine", "limit_up",
-    "topic",
+    "index_membership", "market_env", "market_env_account", "market_env_refine",
+    "limit_up", "topic",
 })
 
 # The three-axis vocabularies.  The ``"unknown"`` value on each axis is the

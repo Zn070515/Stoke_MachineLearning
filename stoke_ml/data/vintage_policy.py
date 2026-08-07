@@ -70,10 +70,14 @@ HEADLINE_STRICT_WAIVER_CHANNELS: frozenset[str] = frozenset({
     # all history; adjusted-price RETURNS (and price ratios) cancel that factor,
     # so the proxy alignment does not bias the price signal a model trains on.
     "daily_qfq",
-    # market_env: market-breadth features (advance/decline, %-of-stocks above
-    # an MA, cross-sectional ranks) are computed from realized prices via
-    # scale-invariant ratios/ranks — the same qfq re-scaling cancels, so the
-    # proxy alignment does not bias the breadth signal.
+    # market_env: §T5 split — the broadcast file carries a PRICE part
+    # (high/low breadth, market turnover, industry advance — scale-invariant
+    # ratios/ranks from realized prices, where qfq re-scaling cancels) and an
+    # ACCOUNT part (absolute monthly counts: investor_new_num etc., NOT
+    # scale-invariant).  HEADLINE_STRICT consumes ONLY the verified PRICE part
+    # (the account part is PROXY-PIT and ablation-only via use_market_env_account
+    # under every tier), so the scale-invariance justification applies only to
+    # the part actually consumed — the waiver is accurate.
     "market_env",
 })
 
