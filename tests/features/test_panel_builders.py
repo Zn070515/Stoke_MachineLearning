@@ -213,6 +213,59 @@ class TestPanelArraysMemmap:
         loaded = np.load(tmp_path / "past_known.npy", mmap_mode="r")
         assert loaded[0, 0, 0] == 42.0
 
+    def test_close_memmap_grids_module_function(self, tmp_path):
+        """The module-level close_memmap_grids is the single source of truth
+        for the flush+close sequence: it returns the set of keys it closed and
+        leaves dense/absent keys untouched."""
+        from stoke_ml.features.panel_builders._arrays import (
+            close_memmap_grids,
+        )
+
+        N, T = 2, 10
+        arrays = PanelArrays(N, T, sink_dir=str(tmp_path))
+        arrays.alloc_features(static_dim=1, pk_dim=2, po_dim=1)
+        arrays.pk[0, 0, 0] = 7.0
+        arrays.flush_sink()  # close the memmap mappings
+
+        # A dict mirroring build_panel_features output: memmap grids + a dense
+        # 2-D array + metadata lists.
+        panel = {
+            "static_features": arrays.static,
+            "past_known": arrays.pk,
+            "past_observed": arrays.po,
+            "y_direction": np.full((N, T), -100, dtype=np.int64),
+            "stock_codes": ["A", "B"],
+        }
+        closed = close_memmap_grids(panel)
+        # Only the three feature grids are memmaps -> exactly those returned.
+        assert closed == {"static_features", "past_known", "past_observed"}
+        # The closed memmaps keep their header props (used by
+        # _feature_schema_hash to record the T4 schema binding).
+        assert panel["past_known"].shape == (N, T, 2)
+        assert panel["past_known"].dtype == np.float32
+        # Dense / non-array keys untouched.
+        assert panel["y_direction"][0, 0] == -100
+        assert panel["stock_codes"] == ["A", "B"]
+
+        # Calling again is a no-op (already closed) and still returns the keys.
+        closed_again = close_memmap_grids(panel)
+        assert closed_again == {"static_features", "past_known", "past_observed"}
+
+    def test_close_memmap_grids_mmap_attr_canary(self, tmp_path):
+        """Canary: ``close_memmap_grids`` closes the mapping via the private
+        numpy ``_mmap`` attribute.  Assert the attribute exists on the venv
+        numpy (2.2.6 per uv.lock) so a future dependency bump that renames it
+        fails this test instead of silently leaking the Windows file lock."""
+        arrays = PanelArrays(2, 10, sink_dir=str(tmp_path))
+        arrays.alloc_features(static_dim=1, pk_dim=1, po_dim=1)
+        assert hasattr(arrays.static, "_mmap"), (
+            "numpy memmap must expose _mmap (venv numpy 2.2.6) — the "
+            "close-memmap cleanup relies on it to release the Windows file "
+            "lock; bump the pin or update close_memmap_grids if this fails"
+        )
+        assert arrays.static._mmap is not None
+        arrays.flush_sink()  # must not raise
+
     def test_assemble_returns_memmap_objects(self, tmp_path):
         """assemble() returns memmap-backed objects for the three big grids
         when a sink_dir is configured."""

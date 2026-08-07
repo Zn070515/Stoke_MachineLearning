@@ -292,6 +292,22 @@ def save_panel_memmap(
                         f"skip_npy (already memmap-sunk), but {p} does not "
                         "exist — the store would be incomplete."
                     )
+                # Header-only shape/dtype guard: a stale/partial .npy with the
+                # right filename but wrong dims must not survive as a complete
+                # store.  np.load(mmap_mode='r') reads only the .npy header —
+                # .shape/.dtype are header props, no data is materialized.
+                on_disk = np.load(p, mmap_mode="r")
+                if (
+                    on_disk.shape != value.shape
+                    or on_disk.dtype != value.dtype
+                ):
+                    raise RuntimeError(
+                        f"save_panel_memmap: skip_npy array {name!r} exists at "
+                        f"{p} but its on-disk header "
+                        f"{on_disk.shape}/{on_disk.dtype} does not match the "
+                        f"in-memory array {value.shape}/{value.dtype} — the "
+                        "sink wrote stale/partial data; rebuild the store."
+                    )
                 written.append(f"{name}.npy")
                 continue
             _atomic_npy(out, name, np.asarray(value))

@@ -29,6 +29,7 @@ from stoke_ml.features.cache_manifest import (
     current_config_hash,
     git_head,
 )
+from stoke_ml.features.panel_builders._arrays import close_memmap_grids
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.models.panel.panel_store import (
     load_panel_memmap,
@@ -288,29 +289,19 @@ def _resolve_panel(
         memmap_dir=args.panel_store,
     )
     if args.panel_store:
-        # T8: the three big grids are memmap-backed ONLY when the memmap sink
-        # was actually used (memmap_dir == args.panel_store).  Derive the
-        # skip set from which grids are np.memmap so a build that fell back to
-        # dense (e.g. a test stub) still writes every array normally.
-        sink_grids = {
-            k for k in ("static_features", "past_known", "past_observed")
-            if isinstance(panel_data.get(k), np.memmap)
-        }
-        # Flush + close the memmap grids so save_panel_memmap can write the
+        # T8: flush + close the memmap grids so save_panel_memmap can write the
         # small arrays + metadata without file-lock collisions on Windows (open
-        # memmaps keep their backing files locked).  KEEP them in panel_data:
-        # save_panel_memmap's self-consistency fingerprints
-        # (_feature_schema_hash) must read the grids' .dtype to record the
-        # T4 schema binding — deleting them would silently drop
-        # feature_schema_hash and disable the tampered-past_known_cols guard.
+        # memmaps keep their backing files locked).  close_memmap_grids (the
+        # single source of truth for the close sequence) returns the set of
+        # grids that were actually np.memmap — i.e. the arrays the sink wrote —
+        # so a build that fell back to dense (e.g. a test stub) writes every
+        # array normally.  The grids REMAIN in panel_data: save_panel_memmap's
+        # self-consistency fingerprints (_feature_schema_hash) read their
+        # .dtype (a closed memmap keeps header props) to record the T4 schema
+        # binding — deleting them would silently drop feature_schema_hash.
         # skip_npy tells save_panel_memmap NOT to rewrite the files the sink
-        # already wrote (the .npy files are present on disk; a closed memmap's
-        # header props stay readable, so no data access is needed).
-        for key in sink_grids:
-            arr = panel_data[key]
-            arr.flush()
-            if hasattr(arr, "_mmap") and arr._mmap is not None:
-                arr._mmap.close()
+        # already wrote.
+        sink_grids = close_memmap_grids(panel_data)
         save_panel_memmap(
             panel_data, args.panel_store,
             meta=_panel_store_meta(

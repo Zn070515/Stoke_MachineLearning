@@ -13,6 +13,55 @@ are small (N x T) and stay dense.
 import os
 import numpy as np
 
+# The three large (N, T, D) feature-grid keys of the build_panel_features
+# output dict.  Only these are memmap-sunk by the T8 sink; the 2-D target/mask
+# arrays stay dense.
+_FEATURE_GRID_KEYS: tuple[str, ...] = (
+    "static_features", "past_known", "past_observed",
+)
+
+
+def close_memmap_grids(
+    panel_data: dict,
+    keys: tuple[str, ...] = _FEATURE_GRID_KEYS,
+) -> set[str]:
+    """Flush + close memmap-backed grids in *panel_data* (T8 sink cleanup).
+
+    Single source of truth for the flush+close sequence — both
+    :meth:`PanelArrays.flush_sink` and ``_resolve_panel`` (train_panel_panel)
+    delegate here, so the lock-sensitive close sequence lives in ONE place.
+
+    Returns the set of keys that were actually ``np.memmap`` (i.e. the arrays
+    the memmap sink wrote, which a re-save via ``save_panel_memmap(skip_npy=...)``
+    should NOT rewrite).  Keys that are dense or absent are left untouched and
+    not returned.
+
+    A CLOSED memmap keeps its ``.dtype``/``.shape`` header props readable, so
+    callers may keep the arrays in *panel_data* afterwards — only DATA access
+    is invalid after close.  Closing the underlying mapping is what releases
+    the Windows file lock so ``save_panel_memmap`` can atomically write the
+    remaining small arrays + metadata into the same directory.
+    """
+    closed: set[str] = set()
+    for key in keys:
+        arr = panel_data.get(key)
+        if arr is not None and isinstance(arr, np.memmap):
+            # ``_mmap`` is a private numpy attribute.  Validated against numpy
+            # 2.2.6 (uv.lock / the venv): the memmap object keeps the mapping
+            # at ``arr._mmap`` and header props (.dtype/.shape) survive close.
+            # The canary test test_close_memmap_grids_mmap_attr pins this for a
+            # future dependency bump.
+            mmap_obj = getattr(arr, "_mmap", None)
+            # Idempotent: a mapping already closed (mmap_obj.closed True) must
+            # not be flushed again — np.memmap.flush() raises ValueError on a
+            # closed mapping.  Default True = skip (never crash) if the mmap
+            # object exposes no .closed attribute.
+            if mmap_obj is not None and not getattr(mmap_obj, "closed", True):
+                arr.flush()
+                mmap_obj.close()
+            closed.add(key)
+    return closed
+
 
 class PanelArrays:
     """Container for all dense panel arrays (T8 memmap seam).
@@ -107,19 +156,20 @@ class PanelArrays:
     def flush_sink(self):
         """Flush pending data to the sink files and close underlying mappings.
 
-        Called AFTER the build is finished and ``assemble()`` has captured
-        the memmap references into the returned dict.  On Windows the caller
-        must close the sink before ``save_panel_memmap`` can write to the same
-        directory (open memmaps keep their backing files locked).
+        Delegates to the module-level :func:`close_memmap_grids` (the single
+        source of truth for the flush+close sequence).  Called AFTER the build
+        is finished and ``assemble()`` has captured the memmap references into
+        the returned dict.  On Windows the caller must close the sink before
+        ``save_panel_memmap`` can write to the same directory (open memmaps
+        keep their backing files locked).
         """
         if not self._sink_paths:
             return
-        for attr in ("po", "pk", "static"):
-            arr = getattr(self, attr, None)
-            if arr is not None and isinstance(arr, np.memmap):
-                arr.flush()
-                if hasattr(arr, "_mmap") and arr._mmap is not None:
-                    arr._mmap.close()
+        close_memmap_grids({
+            "static_features": self.static,
+            "past_known": self.pk,
+            "past_observed": self.po,
+        })
 
     # -- sanitization -----------------------------------------------------
 
