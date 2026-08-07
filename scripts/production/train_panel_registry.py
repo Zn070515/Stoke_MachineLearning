@@ -343,7 +343,8 @@ def _experiment_signature(version: dict, config: PanelConfig,
     NEW trial.  Each defaults to 'none' so non-baseline callers are unaffected.
 
     §T19: the deep-run signature additionally binds the vintage-admission
-    policy (--vintage-policy: safe-only vs allow-revised) and the frozen
+    policy (--vintage-policy: revision-safe / allow-revised / headline-strict)
+    and the frozen
     feature-profile identity — runs differing ONLY in either lever train on
     materially different channels and MUST be distinct trials.  Both default to
     'none' so the baseline run (which has neither switch) is unaffected.
@@ -388,7 +389,7 @@ def _experiment_signature(version: dict, config: PanelConfig,
     h.update(f"seq_features={seq_features if seq_features is not None else 'none'};"
              .encode("utf-8"))
     # §T19 (§T2/§T7): the vintage-admission policy and the frozen feature-profile
-    # identity are part of what a deep run IS.  A safe-only run DENIES
+    # identity are part of what a deep run IS.  A revision-safe run DENIES
     # latest_revised-sourced channels (fundamental/macro/earnings/valuation/
     # pledge/shareholder/index_membership/market_env_refine/sector/concept)
     # that an allow-revised run admits, and a different frozen feature profile is a
@@ -400,8 +401,9 @@ def _experiment_signature(version: dict, config: PanelConfig,
     h.update(f"vintage_policy={vintage_policy or 'none'};".encode("utf-8"))
     # §十四: the universe-membership provenance is part of what a deep run IS —
     # a CSI universe gate consumes membership.parquet (Baostock monthly
-    # reconstruction, latest-reconstructed), so feature-vintage safe-only does
-    # NOT free the run of latest-reconstructed data in its universe gate, and
+    # reconstruction, latest-reconstructed), so feature-vintage revision-safe
+    # does NOT free the run of latest-reconstructed data in its universe gate,
+    # and
     # a different membership provenance (e.g. a future official effective-date
     # artifact) is a NEW trial.  None → 'none' so callers without the lever
     # (non-CSI / baseline) hash a stable signature.

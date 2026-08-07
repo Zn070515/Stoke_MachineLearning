@@ -166,10 +166,11 @@ class FeaturePipeline:
         self.use_fundamental = use_fundamental
         # §T7: fundamental_refine is COUPLED to the fundamental channel — without
         # the channel there is nothing to refine, so turning fundamental off
-        # silently turns the refiner off too.  This is what makes the safe-only
-        # vintage switch set (which turns use_fundamental off) also drop the
-        # fundamental_refine columns on the prebuilt scrub path, instead of the
-        # refiner running anyway on columns that were never requested (§T3 leak).
+        # silently turns the refiner off too.  This is what makes the
+        # revision-safe vintage switch set (which turns use_fundamental off) also
+        # drop the fundamental_refine columns on the prebuilt scrub path, instead
+        # of the refiner running anyway on columns that were never requested
+        # (§T3 leak).
         if not use_fundamental:
             use_fundamental_refine = False
         self.use_earnings = use_earnings

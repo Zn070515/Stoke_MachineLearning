@@ -92,7 +92,7 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
         _SWITCH_KEY.get(dim, f"use_{dim}"): pref and channel_allowed(dim, policy)
         for dim, pref in _BASE_DIM_PREFERENCE.items()
     }
-    # T3 research decision #1: fundamental is denied under safe-only (its
+    # T3 research decision #1: fundamental is denied under revision-safe (its
     # source_vintage is latest_revised) and may enter ONLY via an explicit
     # ablation.
     # --allow-fundamental-ablation forces use_fundamental=True REGARDLESS of
@@ -202,7 +202,7 @@ def _panel_store_meta(
             # §T6/§十四: when membership is consumed (a CSI universe) the store
             # ALSO self-describes the membership PROVENANCE — Baostock monthly
             # reconstruction (latest-reconstructed), SEPARATE from the feature
-            # vintage policy, so a feature-vintage safe-only store never
+            # vintage policy, so a feature-vintage revision-safe store never
             # silently implies its universe gate avoided latest-reconstructed
             # data.  Non-CSI stores stay untouched (symmetric with the
             # membership_hash conditional).

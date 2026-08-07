@@ -5,7 +5,7 @@ scrub (``panel_builder.py``): every channel's EXACT output-column set, with an
 overlap invariant (a column belongs to ≤1 channel) that makes the scrub safe —
 a column is dropped for exactly one channel's switch, never for the wrong one.
 ``FEATURE_PROFILES["headline_v1"]`` is the formal baseline: required channels
-all safe-only-ALLOWED, with tunable minimum-coverage thresholds.
+all revision-safe-ALLOWED, with tunable minimum-coverage thresholds.
 
 None of these read the 109GB feature store.
 """
@@ -90,12 +90,13 @@ def test_headline_v1_is_a_frozen_profile():
         p.required_channels = ("mutated",)  # frozen dataclass
 
 
-def test_headline_v1_required_channels_all_safe_only_allowed():
+def test_headline_v1_required_channels_all_revision_safe_allowed():
     """Every required channel of the formal baseline must be admissible under
-    the safe-only vintage policy — a required channel the policy denies would
-    be self-contradictory (require something the run is forbidden to consume)."""
+    the revision-safe vintage policy — a required channel the policy denies
+    would be self-contradictory (require something the run is forbidden to
+    consume)."""
     for ch in _headline().required_channels:
-        assert channel_allowed(ch, VintagePolicy.SAFE_ONLY), ch
+        assert channel_allowed(ch, VintagePolicy.REVISION_SAFE), ch
 
 
 def test_headline_v1_required_channels_exact_baseline():
@@ -107,7 +108,7 @@ def test_headline_v1_required_channels_exact_baseline():
 
 
 def test_headline_v1_excludes_policy_denied_and_default_off_dims():
-    """safe-only denies fundamental/macro/earnings/valuation/pledge/
+    """revision-safe denies fundamental/macro/earnings/valuation/pledge/
     shareholder/index_membership/market_env_refine/sector/concept, and
     board/sector/concept/limit_up/topic default OFF — none may be required."""
     required = set(_headline().required_channels)
@@ -162,8 +163,8 @@ def test_headline_v1_coverage_contracts_exact_map():
     }
 
 
-def test_headline_v1_vintage_policy_is_safe_only():
-    assert _headline().vintage_policy == "safe-only"
+def test_headline_v1_vintage_policy_is_revision_safe():
+    assert _headline().vintage_policy == "revision-safe"
 
 
 def test_headline_v1_is_the_only_shipped_profile():

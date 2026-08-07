@@ -67,8 +67,9 @@ MARKET_DATA_TYPES = [
 ]
 
 # File-level asset contracts for the headline_v1 channels that persist through
-# MarketWideStorage (§十七).  Only the 7 safe-only-ALLOWED headline channels are
-# adopted here; every other MARKET_DATA_TYPES value (limit_up_*, shareholder,
+# MarketWideStorage (§十七).  Only the 7 revision-safe-ALLOWED headline
+# channels are adopted here; every other MARKET_DATA_TYPES value (limit_up_*,
+# shareholder,
 # industry_ranking, the *_processed variants, valuation) is NOT in scope and
 # gets no contract — its files stay manifest-less and read leniently, exactly
 # as before.  ``_asset_for`` returns None for those, so the manifest hooks are

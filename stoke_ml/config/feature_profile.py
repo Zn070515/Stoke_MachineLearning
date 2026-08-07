@@ -6,16 +6,17 @@ Two responsibilities, both consumed by the v15 audit-fix plan:
    the single source of truth for the generic prebuilt scrub in
    ``stoke_ml.features.panel_builder``.  A prebuilt parquet built with
    all-True defaults may carry a channel whose ``use_*`` switch is OFF in the
-   consuming run (safe-only vintage / ablation); the scrub drops exactly that
-   channel's columns using ONLY these exact sets — never name-prefix matching,
+   consuming run (revision-safe vintage / ablation); the scrub drops exactly
+   that channel's columns using ONLY these exact sets — never name-prefix
+   matching,
    which is the market_env-vs-macd / market_env-refine collision trap.
 
 2. ``FeatureProfile`` / ``FEATURE_PROFILES`` — frozen, named feature recipes
    declaring which channels a formal run REQUIRES and each required channel's
    coverage CONTRACT (the metric measured + the minimum), plus the vintage
    policy the profile is validated against.  ``headline_v1`` is the formal
-   baseline: the safe-only-ALLOWED, default-ON channels with tunable per-channel
-   contracts.  The coverage gate in ``scripts/production/train_panel.py``
+   baseline: the revision-safe-ALLOWED, default-ON channels with tunable
+   per-channel contracts.  The coverage gate in ``scripts/production/train_panel.py``
    enforces these contracts per run, measuring the declared metric (stock-level
    on the live path, cell-level on the prebuilt probe).
 
@@ -173,7 +174,7 @@ class FeatureProfile:
             exceed zero) — dragon_tiger is the shipped profile's presence-only
             channel.
         vintage_policy:   the VintagePolicy the profile is validated against
-            (headline_v1 is the ``safe-only`` baseline).
+            (headline_v1 is the ``revision-safe`` baseline).
     """
 
     name: str
@@ -183,12 +184,12 @@ class FeatureProfile:
 
 
 # The formal baseline profile (v15 §十四, v16 §十二).  ``required_channels`` is
-# exactly the safe-only-ALLOWED (immutable_snapshot-sourced) channels that
+# exactly the revision-safe-ALLOWED (immutable_snapshot-sourced) channels that
 # default ON in FeaturePipeline — i.e. it excludes the 10
 # latest_revised-sourced denied channels (fundamental/macro/earnings/valuation/
 # pledge/shareholder/index_membership/market_env_refine/sector/concept) and the
 # default-off board/sector/concept/limit_up/topic dimensions.  ``macro`` is
-# denied under safe-only, so it is deliberately absent despite defaulting ON.
+# denied under revision-safe, so it is deliberately absent despite defaulting ON.
 #
 # ``coverage_contracts`` thresholds ARE the historical ``minimum_coverage``
 # values — NOT re-tuned (§T4).  The metric split: every per-stock channel
@@ -221,7 +222,7 @@ FEATURE_PROFILES: dict[str, FeatureProfile] = {
             "industry": CoverageContract("date_coverage", 0.95),
             "market_env": CoverageContract("date_coverage", 0.95),
         },
-        vintage_policy="safe-only",
+        vintage_policy="revision-safe",
     ),
 }
 

@@ -527,10 +527,11 @@ def test_signature_changes_with_research_choices(tp):
 
 def test_signature_binds_vintage_policy(tp):
     """§T19: two runs differing ONLY in the vintage-admission policy train on
-    materially different channels — safe-only denies latest_revised-sourced
+    materially different channels — revision-safe denies latest_revised-sourced
     channels (fundamental/macro/earnings/valuation/pledge/shareholder/
     index_membership/market_env_refine/sector/concept) that allow-revised
-    admits — so they MUST be distinct trials, never conflated into one
+    admits, and headline-strict (T3) additionally denies proxy-aligned
+    channels — so they MUST be distinct trials, never conflated into one
     experiment."""
     from stoke_ml.models.panel import PanelConfig
 
@@ -542,11 +543,15 @@ def test_signature_binds_vintage_policy(tp):
     }
     cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
                       past_observed_dim=20, horizon=1, seed=42)
-    s_safe = tp._experiment_signature(base, cfg, vintage_policy="safe-only")
+    s_safe = tp._experiment_signature(base, cfg, vintage_policy="revision-safe")
     assert (tp._experiment_signature(base, cfg, vintage_policy="allow-revised")
             != s_safe)
+    # T3: headline-strict is a materially different channel set (denies proxy
+    # channels too) → a distinct trial from revision-safe.
+    assert (tp._experiment_signature(base, cfg, vintage_policy="headline-strict")
+            != s_safe)
     # Same policy + same everything else → same signature (a re-run).
-    assert tp._experiment_signature(base, cfg, vintage_policy="safe-only") == s_safe
+    assert tp._experiment_signature(base, cfg, vintage_policy="revision-safe") == s_safe
 
 
 def test_signature_binds_feature_profile(tp):
@@ -1058,12 +1063,12 @@ def test_estimate_panel_memory_reads_schema(tp, tmp_path):
     df = _prebuilt_schema_df({
         "ma_5_lag1": [9.8, 9.9],      # *_lag{N} — always dropped
         "topic_entropy": [0.1, 0.2],  # topic_* — dropped (use_topic off)
-        "roe": [0.1, 0.1],            # FUNDAMENTAL_COLS — dropped (safe-only)
+        "roe": [0.1, 0.1],            # FUNDAMENTAL_COLS — dropped (revision-safe)
     })
     df.to_parquet(str(tmp_path / "000001.parquet"))
     stock_list = ["000001", "000002", "000003"]
     args = _panel_args(
-        "safe-only", prebuilt=str(tmp_path), seq_len=60,
+        "revision-safe", prebuilt=str(tmp_path), seq_len=60,
         start="2024-01-01", end="2024-12-31", universe="all",
     )
     n, t, d = tp._estimate_panel_memory(args, stock_list, str(tmp_path))
@@ -1080,7 +1085,7 @@ def test_estimate_panel_memory_fundamental_ablation_keeps_roe(tp, tmp_path):
     df.to_parquet(str(tmp_path / "000001.parquet"))
     stock_list = ["000001"]
     args = _panel_args(
-        "safe-only", allow_fundamental_ablation=True,
+        "revision-safe", allow_fundamental_ablation=True,
         prebuilt=str(tmp_path), seq_len=60,
         start="2024-01-01", end="2024-12-31", universe="all",
     )
@@ -1138,7 +1143,7 @@ def test_early_guard_ok_small_panel(tp, tmp_path):
     df.to_parquet(str(tmp_path / "000001.parquet"))
     stock_list = ["000001", "000002", "000003"]
     args = _panel_args(
-        "safe-only", universe="random", prebuilt=str(tmp_path), seq_len=60,
+        "revision-safe", universe="random", prebuilt=str(tmp_path), seq_len=60,
         start="2024-01-01", end="2024-12-31",
     )
     est, action = tp._early_panel_memory_guard(
@@ -1308,12 +1313,13 @@ def test_allow_revised_reproduces_todays_switch_set(tp):
     assert kw["minute_mode"] is False
 
 
-def test_safe_only_denies_revised_aligned_dims(tp):
-    """safe-only additionally turns OFF the base-True, latest_revised-sourced
-    dims (fundamental/macro/earnings/valuation/index_membership/
-    market_env_refine/pledge/shareholder) while keeping immutable_snapshot-
-    sourced (sentiment) and formula-derived (market_env/industry) ON."""
-    kw = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
+def test_revision_safe_denies_revised_aligned_dims(tp):
+    """revision-safe additionally turns OFF the base-True,
+    latest_revised-sourced dims (fundamental/macro/earnings/valuation/
+    index_membership/market_env_refine/pledge/shareholder) while keeping
+    immutable_snapshot-sourced (sentiment) and formula-derived (market_env/
+    industry) ON."""
+    kw = tp._panel_pipeline_kwargs(_panel_args("revision-safe"), seq_len=60)
     for dim in ("fundamental", "macro", "earnings", "valuation",
                 "index_membership", "market_env_refine", "pledge", "shareholder"):
         assert kw[f"use_{dim}"] is False, dim
@@ -1322,6 +1328,27 @@ def test_safe_only_denies_revised_aligned_dims(tp):
     assert kw["use_industry"] is True
     for dim in ("board", "sector", "concept", "limit_up", "topic"):
         assert kw[f"use_{dim}"] is False, dim
+
+
+def test_headline_strict_turns_off_proxy_aligned_dims(tp):
+    """T3: headline-strict additionally gates on pit_alignment == "verified" —
+    the proxy-aligned industry channel is turned OFF (not waived) while
+    verified channels (sentiment/capital_flow) stay ON and the scale-invariant
+    market_env stays ON via its waiver.  The legacy "safe-only" string also
+    coerces to revision-safe (a legacy args stub keeps working)."""
+    kw = tp._panel_pipeline_kwargs(_panel_args("headline-strict"), seq_len=60)
+    assert kw["use_sentiment"] is True          # verified
+    assert kw["use_capital_flow"] is True       # verified
+    assert kw["use_market_env"] is True         # proxy but scale-invariant waiver
+    assert kw["use_industry"] is False          # proxy, NOT waived → denied
+    assert kw["use_fundamental"] is False       # latest_revised → denied
+    for dim in ("board", "sector", "concept", "limit_up", "topic"):
+        assert kw[f"use_{dim}"] is False, dim
+    # Legacy alias: the pre-T3 "safe-only" string parses to revision-safe, so
+    # an old args stub still yields the revision-safe switch set.
+    legacy = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
+    assert legacy["use_fundamental"] is False
+    assert legacy["use_market_env"] is True
 
 
 def test_base_dim_preference_matches_documented_dims(tp):
@@ -1343,20 +1370,20 @@ def test_panel_store_meta_fingerprints_vintage_policy(tp):
     """§T2: the vintage policy enters the panel-store meta fingerprint via
     feature_switches, so a policy change auto-invalidates a stale store."""
     allow = tp._panel_store_meta(_panel_args("allow-revised"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
-    safe = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    safe = tp._panel_store_meta(_panel_args("revision-safe"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert allow["feature_switches"] != safe["feature_switches"]
     assert allow["feature_switches"]["use_fundamental"] is True
     assert safe["feature_switches"]["use_fundamental"] is False
     assert safe["feature_switches"]["use_sentiment"] is True
 
 
-def test_allow_fundamental_ablation_reincludes_fundamental_under_safe_only(tp):
+def test_allow_fundamental_ablation_reincludes_fundamental_under_revision_safe(tp):
     """T3 decision #1: --allow-fundamental-ablation is the ONLY way a
-    fundamental channel enters a safe-only run.  It forces use_fundamental=True
-    while the OTHER 7 policy-denied channels stay False — the flag is
-    fundamental-only, never a blanket allow-revised."""
+    fundamental channel enters a revision-safe run.  It forces
+    use_fundamental=True while the OTHER 7 policy-denied channels stay False —
+    the flag is fundamental-only, never a blanket allow-revised."""
     kw = tp._panel_pipeline_kwargs(
-        _panel_args("safe-only", allow_fundamental_ablation=True), seq_len=60)
+        _panel_args("revision-safe", allow_fundamental_ablation=True), seq_len=60)
     assert kw["use_fundamental"] is True
     for dim in ("macro", "earnings", "valuation",
                 "index_membership", "market_env_refine", "pledge", "shareholder"):
@@ -1367,9 +1394,9 @@ def test_allow_fundamental_ablation_changes_store_fingerprint(tp):
     """T3: the ablation flag must change the panel-store meta fingerprint — an
     ablation store must never be reused by a non-ablation run (nor vice-versa),
     exactly as a policy change does."""
-    base = tp._panel_store_meta(_panel_args("safe-only"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    base = tp._panel_store_meta(_panel_args("revision-safe"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     ablated = tp._panel_store_meta(
-        _panel_args("safe-only", allow_fundamental_ablation=True),
+        _panel_args("revision-safe", allow_fundamental_ablation=True),
         seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert base["feature_switches"] != ablated["feature_switches"]
     assert base["feature_switches"]["use_fundamental"] is False
@@ -1379,7 +1406,7 @@ def test_allow_fundamental_ablation_changes_store_fingerprint(tp):
 def test_allow_fundamental_ablation_missing_flag_defaults_off(tp):
     """T3: an args stub WITHOUT the new attr (a caller that predates the flag)
     must not crash — the defensive read defaults the flag to off."""
-    kw = tp._panel_pipeline_kwargs(_panel_args("safe-only"), seq_len=60)
+    kw = tp._panel_pipeline_kwargs(_panel_args("revision-safe"), seq_len=60)
     assert kw["use_fundamental"] is False
 
 
@@ -1411,14 +1438,14 @@ def test_panel_store_meta_csi_marks_daily_membership_norm(tp):
     stale store built for the all-stock z-norm must refuse to mix.  Non-CSI
     universes never carry the key."""
     csi = tp._panel_store_meta(
-        _panel_args("safe-only", universe="csi300"),
+        _panel_args("revision-safe", universe="csi300"),
         seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert csi["feature_switches"].get("daily_membership_norm") is True
     # The pseudo-switch is ADDED to the real switch set, never replacing it.
     assert csi["feature_switches"]["seq_len"] == 60
     assert csi["feature_switches"]["use_sentiment"] is True
     non_csi = tp._panel_store_meta(
-        _panel_args("safe-only", universe="random"),
+        _panel_args("revision-safe", universe="random"),
         seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert "daily_membership_norm" not in non_csi["feature_switches"]
 
@@ -1432,11 +1459,11 @@ def test_panel_store_meta_records_universe_membership(tp, tmp_path):
     um = {"source": "Baostock monthly reconstruction",
           "vintage": "latest-reconstructed", "resolution": "monthly"}
     csi = tp._panel_store_meta(
-        _panel_args("safe-only", universe="csi300"), seq_len=60,
+        _panel_args("revision-safe", universe="csi300"), seq_len=60,
         stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path))
     assert csi["universe_membership"] == um
     non_csi = tp._panel_store_meta(
-        _panel_args("safe-only", universe="random"), seq_len=60,
+        _panel_args("revision-safe", universe="random"), seq_len=60,
         stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path))
     assert "universe_membership" not in non_csi
 
@@ -1458,11 +1485,11 @@ def test_entry_fill_prob_mean_records_in_store_meta(tp):
     assert np.isclose(_entry_fill_prob_mean({"entry_fill_prob": arr}), 0.5833333333)
 
     base = tp._panel_store_meta(
-        _panel_args("safe-only"), seq_len=60,
+        _panel_args("revision-safe"), seq_len=60,
         stock_list=[f"{i:06d}" for i in range(100)])
     assert "entry_fill_prob_mean" not in base
     recorded = tp._panel_store_meta(
-        _panel_args("safe-only"), seq_len=60,
+        _panel_args("revision-safe"), seq_len=60,
         stock_list=[f"{i:06d}" for i in range(100)],
         entry_fill_prob_mean=0.5833333333)
     assert recorded["entry_fill_prob_mean"] == 0.5833333333
@@ -1514,7 +1541,7 @@ def test_resolve_panel_passes_membership_for_csi(tp, monkeypatch, caplog):
     monkeypatch.setattr(
         "scripts.production.train_panel_panel.load_index_membership",
         lambda data_dir, indices: mem)
-    args = _panel_args("safe-only", universe="csi300", no_aux=True)
+    args = _panel_args("revision-safe", universe="csi300", no_aux=True)
     args.panel_store = None
     args.require_feature_manifest = False
     panel_data, channel_manifest = tp._resolve_panel(
@@ -1536,7 +1563,7 @@ def test_resolve_panel_empty_membership_warns_and_degrades(tp, monkeypatch, capl
     monkeypatch.setattr(
         "scripts.production.train_panel_panel.load_index_membership",
         lambda data_dir, indices: empty)
-    args = _panel_args("safe-only", universe="csi800", no_aux=True)
+    args = _panel_args("revision-safe", universe="csi800", no_aux=True)
     args.panel_store = None
     args.require_feature_manifest = False
     with caplog.at_level("WARNING"):
@@ -1559,7 +1586,7 @@ def test_resolve_required_set_profile_adds_channels(tp):
     required_channels into the explicit --require-aux-channels set and carries
     the profile's per-channel coverage CONTRACTS (metric + threshold)."""
     from stoke_ml.config.feature_profile import FEATURE_PROFILES
-    args = _panel_args("safe-only", feature_profile="headline_v1",
+    args = _panel_args("revision-safe", feature_profile="headline_v1",
                        require_aux_channels="sentiment,extra_ch")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "headline_v1"
@@ -1572,7 +1599,7 @@ def test_resolve_required_set_cli_default_activates_headline_v1(tp):
     """The CLI default --feature-profile headline_v1 (a formal, gate-enforced
     run) activates the profile — no explicit flag needed."""
     from stoke_ml.config.feature_profile import FEATURE_PROFILES
-    args = _panel_args("safe-only", feature_profile="headline_v1")
+    args = _panel_args("revision-safe", feature_profile="headline_v1")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "headline_v1"
     assert contracts == FEATURE_PROFILES["headline_v1"].coverage_contracts
@@ -1587,7 +1614,7 @@ def test_resolve_required_set_cli_default_activates_headline_v1(tp):
 
 
 def test_resolve_required_set_none_disables_profile(tp):
-    args = _panel_args("safe-only", feature_profile="none",
+    args = _panel_args("revision-safe", feature_profile="none",
                        require_aux_channels="guba")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "none"
@@ -1598,7 +1625,7 @@ def test_resolve_required_set_none_disables_profile(tp):
 def test_resolve_required_set_no_formal_skips_profile(tp):
     """--no-formal (exploratory) never activates the profile — the set is just
     the explicit channels, even when a profile is named."""
-    args = _panel_args("safe-only", feature_profile="headline_v1",
+    args = _panel_args("revision-safe", feature_profile="headline_v1",
                        no_formal=True, require_aux_channels="guba")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "none"
@@ -1608,7 +1635,7 @@ def test_resolve_required_set_no_formal_skips_profile(tp):
 
 def test_resolve_required_set_no_gate_skips_profile(tp):
     """--no-require-quality-gate (dev smoke) also never activates the profile."""
-    args = _panel_args("safe-only", feature_profile="headline_v1",
+    args = _panel_args("revision-safe", feature_profile="headline_v1",
                        no_require_quality_gate=True, require_aux_channels="guba")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "none"
@@ -1619,7 +1646,7 @@ def test_resolve_required_set_no_gate_skips_profile(tp):
 def test_resolve_required_set_unknown_profile_aborts(tp):
     """A TYPO'd profile name on an active gate must abort loudly, not silently
     skip the coverage gate."""
-    args = _panel_args("safe-only", feature_profile="bogus")
+    args = _panel_args("revision-safe", feature_profile="bogus")
     with pytest.raises(SystemExit) as ei:
         tp._resolve_required_set(args)
     assert "unknown feature profile" in str(ei.value)
@@ -1731,7 +1758,7 @@ def test_enforce_channel_coverage_formal_prebuilt_aborts_on_profile_required_unp
     IDENTICAL manifest in EXPLORE mode only warns.  margin is genuinely profile-
     required (not an arbitrary channel)."""
     import logging
-    args = _panel_args("safe-only", feature_profile="headline_v1")
+    args = _panel_args("revision-safe", feature_profile="headline_v1")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "headline_v1"
     assert "margin" in required_set
@@ -1763,7 +1790,7 @@ def test_enforce_channel_coverage_below_minimum_broadcast_date_metric(tp, caplog
     aborts against the DECLARED metric (date_coverage for market_env), NOT the
     stock_coverage default — guards the gate's per-contract metric read (§T4)."""
     import logging
-    args = _panel_args("safe-only", feature_profile="headline_v1")
+    args = _panel_args("revision-safe", feature_profile="headline_v1")
     required_set, contracts, _ = tp._resolve_required_set(args)
     assert contracts["market_env"].metric == "date_coverage"
     manifest = _full_manifest(required_set, contracts)

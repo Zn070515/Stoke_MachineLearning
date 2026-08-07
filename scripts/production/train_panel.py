@@ -291,26 +291,34 @@ def main():
                              "learns from the broad historical-member union and "
                              "only the RANKED candidate pools "
                              "(inner_val/outer_test) are membership-gated.")
-    parser.add_argument("--vintage-policy", type=str, default="safe-only",
-                        choices=["safe-only", "allow-revised"],
-                        help="§T2/§T7: vintage-admission policy for the feature "
-                             "set.  safe-only (default) admits channels whose "
-                             "source_vintage is immutable_snapshot and DENIES "
+    parser.add_argument("--vintage-policy", type=str, default="revision-safe",
+                        choices=["revision-safe", "allow-revised",
+                                 "headline-strict"],
+                        help="§T2/§T7/§T3: vintage-admission policy for the "
+                             "feature set.  revision-safe (default) admits "
+                             "channels whose source_vintage is "
+                             "immutable_snapshot and DENIES "
                              "latest_revised-sourced ones (fundamental/macro/"
                              "earnings/valuation/pledge/shareholder/"
                              "index_membership/market_env_refine/sector/"
                              "concept); allow-revised additionally admits "
                              "latest_revised-sourced channels (legacy / "
-                             "ablation use).")
+                             "ablation use); headline-strict (new) is the "
+                             "strictest tier — it additionally requires "
+                             "pit_alignment == \"verified\" (with an explicit "
+                             "scale-invariant waiver for daily_qfq/market_env), "
+                             "so proxy-aligned channels are denied unless "
+                             "waived.  The legacy name \"safe-only\" is the "
+                             "pre-T3 alias for revision-safe.")
     parser.add_argument("--allow-fundamental-ablation", action="store_true",
                         help="T3 research decision #1: ABLATION ONLY — force the "
-                             "fundamental channel ON even under safe-only.  This "
-                             "is the ONLY way fundamental enters a safe-only run; "
-                             "never use it for formal headline/lockbox runs.  "
-                             "Under allow-revised fundamental is already on, so "
-                             "this is a no-op there.  Only the fundamental "
-                             "channel is affected — the other policy-denied "
-                             "channels stay off.")
+                             "fundamental channel ON even under revision-safe.  "
+                             "This is the ONLY way fundamental enters a "
+                             "revision-safe run; never use it for formal "
+                             "headline/lockbox runs.  Under allow-revised "
+                             "fundamental is already on, so this is a no-op "
+                             "there.  Only the fundamental channel is affected "
+                             "— the other policy-denied channels stay off.")
     parser.add_argument("--quality-gate-report", type=str, default=None,
                         help="Path to the quality-gate report to verify "
                              "(default: <repo>/reports/data_quality_gate.json)")
@@ -499,7 +507,7 @@ def main():
     # reconstruction, latest-reconstructed) for CSI universes that consume
     # membership.parquet, None otherwise — declared EXPLICITLY in the summary
     # and the trial signature, never implied-bypassed by feature-vintage
-    # safe-only.  Separated from the feature VintagePolicy on purpose (audit §十四).
+    # revision-safe.  Separated from the feature VintagePolicy on purpose (audit §十四).
     universe_membership = universe_membership_provenance(args.universe)
     # §八.3: record what gates each split consumes so a run is self-describing.
     # inner_train default is the broad historical-member union (ungated);
@@ -1260,7 +1268,7 @@ def main():
             # §T6/§十四: the feature vintage policy (what CHANNELS this run
             # admitted) AND the universe-membership provenance (the CSI
             # membership the universe gate consumed) are declared side by side
-            # — feature-vintage safe-only NEVER implies the universe gate
+            # — feature-vintage revision-safe NEVER implies the universe gate
             # avoided latest-reconstructed membership data.
             "feature_vintage": args.vintage_policy,
             "universe_membership": universe_membership,

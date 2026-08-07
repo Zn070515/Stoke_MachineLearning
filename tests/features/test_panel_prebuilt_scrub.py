@@ -1,7 +1,7 @@
 """§T7/§十四: generic per-channel prebuilt scrub driven by CHANNEL_COLUMNS.
 
 ``build_features.py --panel-mode`` bakes EVERY channel in with all-True
-defaults, so a restricted run (safe-only vintage / ablation) would otherwise
+defaults, so a restricted run (revision-safe vintage / ablation) would otherwise
 silently consume channels its pipeline does not request.  The prebuilt load
 loop drops the EXACT ``CHANNEL_COLUMNS`` set of every channel whose ``use_*``
 switch is OFF — by set membership, never name-prefix matching (the
@@ -9,7 +9,7 @@ market_env-vs-macd / market_env_refine collision trap).
 
 These tests inject denied-channel columns into synthetic prebuilt parquets and
 assert they are scrubbed when the channels are OFF and KEPT when ON, plus the
-fundamental_refine↔fundamental coupling that makes a safe-only run drop the
+fundamental_refine↔fundamental coupling that makes a revision-safe run drop the
 refiner's columns too.
 """
 import numpy as np
@@ -86,7 +86,7 @@ def _build(pdir, panel, pipeline):
 
 
 def test_scrub_drops_denied_channel_columns_when_off(tmp_path):
-    """A safe-only-like switch set (fundamental/earnings/macro/pledge/
+    """A revision-safe-like switch set (fundamental/earnings/macro/pledge/
     market_env_refine OFF) must drop exactly those channels' injected columns —
     while keeping a market_env bare column and the technical survivor."""
     pdir, panel, codes = _build_prebuilt(tmp_path)
@@ -174,7 +174,7 @@ def test_fundamental_refine_kept_when_fundamental_on():
 def test_coupling_makes_safe_only_scrub_drop_refine_columns(tmp_path):
     """End-to-end: with fundamental OFF the pipeline ALSO reports
     use_fundamental_refine False, so the scrub drops the fundamental_refine
-    columns of a full prebuilt — a safe-only run never leaks them."""
+    columns of a full prebuilt — a revision-safe run never leaks them."""
     pdir, panel, codes = _build_prebuilt(tmp_path)
     _inject_columns(pdir, codes, ["f_score", "valuation_composite_z"])
     pipe = _base_pipeline(use_fundamental=False)

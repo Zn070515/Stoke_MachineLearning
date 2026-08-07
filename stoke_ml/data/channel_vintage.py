@@ -61,10 +61,15 @@ deny axis：
 ``"unknown"``
     RESERVED default of the accessors; NEVER a declared ``pit_alignment``.
 
-安全门禁只看 source + transform 两层（``vintage_policy.channel_allowed``）：
-safe-only 放行 ``immutable_snapshot`` 来源且 transform 非 ``"unknown"`` 的
+安全门禁在 revision-safe / allow-revised 下只看 source + transform 两层
+（``vintage_policy.channel_allowed``）：``revision-safe``（原 ``safe-only``，
+§T3 改名）放行 ``immutable_snapshot`` 来源且 transform 非 ``"unknown"`` 的
 channel，拒绝 ``latest_revised`` 来源；``allow-revised`` 额外放行
-``latest_revised`` 来源。``pit_alignment`` 是记录维，不参与放行判定。
+``latest_revised`` 来源。``pit_alignment`` 在 revision-safe / allow-revised
+下是记录维，不参与放行判定；新增的 ``headline-strict`` 档把它升级为
+admission gate —— 要求 ``pit_alignment == "verified"``，proxy 对齐的 channel
+除非在 scale-invariant waiver 白名单（``HEADLINE_STRICT_WAIVER_CHANNELS``，
+daily_qfq / market_env）否则拒绝。
 
 分类准则（honest, not comfortable）
 -----------------------------------
@@ -85,11 +90,13 @@ channel，拒绝 ``latest_revised`` 来源；``allow-revised`` 额外放行
 策略（policy）
 -------------
 ``stoke_ml/data/vintage_policy.py`` 的 ``VintagePolicy`` 决定训练可消费的
-channel 集合：``safe-only``（默认）只放行 immutable_snapshot 来源的 channel
-（含 daily_qfq，保证价格 channel 永远可用），拒绝 latest_revised 来源；
-``allow-revised`` 额外放行 latest_revised 来源。正式门禁在 formal 模式下
-强制执行本声明 —— 不完整（missing documented channel 或三维声明含
-``"unknown"``）或自相矛盾（拒绝 daily_qfq）的声明使 ``passed = False``。
+channel 集合：``revision-safe``（默认，§T3 由 ``safe-only`` 改名）只放行
+immutable_snapshot 来源的 channel（含 daily_qfq，保证价格 channel 永远可用），
+拒绝 latest_revised 来源；``allow-revised`` 额外放行 latest_revised 来源；
+``headline-strict``（§T3 新增，最严）还要求 ``pit_alignment == "verified"``
+（scale-invariant 的 daily_qfq / market_env 有显式 waiver）。正式门禁在
+formal 模式下强制执行本声明 —— 不完整（missing documented channel 或三维
+声明含 ``"unknown"``）或自相矛盾（拒绝 daily_qfq）的声明使 ``passed = False``。
 """
 
 from __future__ import annotations

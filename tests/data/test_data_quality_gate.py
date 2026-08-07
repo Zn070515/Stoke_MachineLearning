@@ -1100,7 +1100,7 @@ class TestChannelVintageFormalReport:
     regardless of profile, each entry carrying exactly
     channel/source_vintage/transform/pit_alignment/rationale/allowed — and
     locks the documented revision-leakage sources (fundamental, macro) as
-    latest_revised source.  Under the default safe-only policy the
+    latest_revised source.  Under the default revision-safe policy the
     latest_revised-sourced channels are marked allowed=False while
     immutable_snapshot-sourced channels (incl. the price channel) stay
     allowed=True."""
@@ -1125,7 +1125,7 @@ class TestChannelVintageFormalReport:
             (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
         )
         section = report["channel_vintage"]
-        assert report["vintage_policy"] == "safe-only"
+        assert report["vintage_policy"] == "revision-safe"
         assert isinstance(section, list) and len(section) > 0
         for entry in section:
             assert set(entry) == {"channel", "source_vintage", "transform",
@@ -1135,7 +1135,7 @@ class TestChannelVintageFormalReport:
         by_name = {e["channel"]: e for e in section}
         assert by_name["fundamental"]["source_vintage"] == "latest_revised"
         assert by_name["macro"]["source_vintage"] == "latest_revised"
-        # Default safe-only policy: latest_revised-sourced denied,
+        # Default revision-safe policy: latest_revised-sourced denied,
         # immutable_snapshot-sourced admitted.
         assert by_name["fundamental"]["allowed"] is False
         assert by_name["macro"]["allowed"] is False
@@ -1206,7 +1206,7 @@ class TestChannelVintageFormalReport:
         root = self._vintage_gate_root(tmp_path)
         self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
-            "vintage_policy": "safe-only",
+            "vintage_policy": "revision-safe",
             "channels": [],
             "missing_channels": ["fundamental"],
             "daily_qfq_allowed": True,
@@ -1221,7 +1221,7 @@ class TestChannelVintageFormalReport:
             (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
         )
         assert report["passed"] is False
-        assert report["vintage_policy"] == "safe-only"
+        assert report["vintage_policy"] == "revision-safe"
         assert report["channel_vintage"] == []  # the fake was consumed
 
     def test_formal_rejects_denied_price_channel(self, tmp_path, monkeypatch):
@@ -1230,7 +1230,7 @@ class TestChannelVintageFormalReport:
         root = self._vintage_gate_root(tmp_path)
         self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
-            "vintage_policy": "safe-only",
+            "vintage_policy": "revision-safe",
             "channels": [],
             "missing_channels": [],
             "daily_qfq_allowed": False,
@@ -1255,7 +1255,7 @@ class TestChannelVintageFormalReport:
         root = self._vintage_gate_root(tmp_path)
         self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
-            "vintage_policy": "safe-only",
+            "vintage_policy": "revision-safe",
             "channels": [],
             "missing_channels": [],
             "daily_qfq_allowed": True,
@@ -1277,7 +1277,7 @@ class TestChannelVintageFormalReport:
         ENFORCES it — the same fake that fails formal leaves rc==0 here."""
         root = self._vintage_gate_root(tmp_path)
         self._patch_vintage_report(monkeypatch, {
-            "vintage_policy": "safe-only",
+            "vintage_policy": "revision-safe",
             "channels": [],
             "missing_channels": ["fundamental"],
             "daily_qfq_allowed": True,
@@ -1301,7 +1301,7 @@ class TestChannelVintageFormalReport:
         root = self._vintage_gate_root(tmp_path)
         self._relax_formal_profile(monkeypatch)
         self._patch_vintage_report(monkeypatch, {
-            "vintage_policy": "safe-only",
+            "vintage_policy": "revision-safe",
             "channels": [],
             "missing_channels": [],
             "daily_qfq_allowed": True,
@@ -1316,7 +1316,7 @@ class TestChannelVintageFormalReport:
             (tmp_path / "report" / "data_quality_gate.json").read_text(encoding="utf-8")
         )
         assert report["passed"] is False
-        assert report["vintage_policy"] == "safe-only"
+        assert report["vintage_policy"] == "revision-safe"
         assert report["channel_vintage"] == []  # the fake was consumed
 
     def test_bootstrap_does_not_fail_on_incomplete_three_dim_declaration(self, tmp_path, monkeypatch):
@@ -1324,7 +1324,7 @@ class TestChannelVintageFormalReport:
         never ENFORCES it — the same fake that fails formal leaves rc==0 here."""
         root = self._vintage_gate_root(tmp_path)
         self._patch_vintage_report(monkeypatch, {
-            "vintage_policy": "safe-only",
+            "vintage_policy": "revision-safe",
             "channels": [],
             "missing_channels": [],
             "daily_qfq_allowed": True,

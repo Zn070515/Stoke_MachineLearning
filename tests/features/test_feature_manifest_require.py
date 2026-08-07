@@ -277,7 +277,7 @@ class TestRequireFeatureManifest:
         df.to_parquet(str(pdir / f"{code}.parquet"), index=False, compression="lz4")
 
     def test_use_fundamental_false_drops_fundamental_columns(self, tmp_path):
-        """T3 decision #1: a safe-only run (use_fundamental=False) must NOT
+        """T3 decision #1: a revision-safe run (use_fundamental=False) must NOT
         consume fundamental columns that a prebuilt parquet carries — the
         prebuilt read path drops FUNDAMENTAL_COLS exactly like topic_* columns
         (§七 pattern).  Without the fix, build_features.py's all-True build
@@ -299,7 +299,7 @@ class TestRequireFeatureManifest:
     def test_use_fundamental_true_keeps_fundamental_columns(self, tmp_path):
         """T3: the explicit ablation path (use_fundamental=True) KEEPS the
         FUNDAMENTAL_COLS — the flag is the ONLY way fundamental enters a
-        safe-only run."""
+        revision-safe run."""
         panel = _make_synthetic_panel()
         pdir, codes = _build_prebuilt_dir(tmp_path, panel)
         self._inject_fundamental_columns(pdir, codes[0])

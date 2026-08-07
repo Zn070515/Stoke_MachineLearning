@@ -1,23 +1,36 @@
-"""Vintage-based channel admission policy (§T2/T7 / v15 §六/§十, v16 §十二).
+"""Vintage-based channel admission policy (§T2/T7 / v15 §六/§十, v16 §十二,
+§T3/v17 §九).
 
 Decides which channels a training run may consume based on their declared 3-dim
 vintage classification (see ``stoke_ml.data.channel_vintage``).
 
-- ``SAFE_ONLY`` (``"safe-only"``) admits ``immutable_snapshot``-sourced
-  channels and DENIES ``latest_revised``-sourced ones (fundamental/macro/
-  earnings/valuation/pledge/shareholder/index_membership/market_env_refine/
-  sector/concept).  The default for formal headline/lockbox runs — a
-  research-correctness guard against revision leakage.  ``daily_qfq`` is
-  ``immutable_snapshot``-sourced, so the price channel stays admissible (a
-  model cannot train without it).
+- ``REVISION_SAFE`` (``"revision-safe"``; the pre-T3 ``"safe-only"`` tier,
+  renamed) admits ``immutable_snapshot``-sourced channels and DENIES
+  ``latest_revised``-sourced ones (fundamental/macro/earnings/valuation/pledge/
+  shareholder/index_membership/market_env_refine/sector/concept).  The default
+  for formal headline/lockbox runs — a research-correctness guard against
+  revision leakage.  ``daily_qfq`` is ``immutable_snapshot``-sourced, so the
+  price channel stays admissible (a model cannot train without it).
 - ``ALLOW_REVISED`` (``"allow-revised"``) additionally admits the
   ``latest_revised``-sourced channels (legacy / ablation use).
+- ``HEADLINE_STRICT`` (``"headline-strict"``, NEW) is the strictest tier: on
+  top of the source+transform check it ALSO gates on ``pit_alignment ==
+  "verified"``.  A ``proxy``-aligned channel is denied UNLESS it is on the
+  explicit scale-invariant waiver whitelist
+  (``HEADLINE_STRICT_WAIVER_CHANNELS``) — see that constant for the per-channel
+  rationale.
 
-Admission checks BOTH the source and transform layers: a channel whose
-``source_vintage`` or ``transform`` is the reserved ``"unknown"`` fallback (or
-an undeclared channel) is denied under BOTH policies — the mandatory
-deny-by-default.  ``pit_alignment`` is a RECORDING dimension and does not gate
-admission.
+Admission checks the source and transform layers under EVERY policy: a channel
+whose ``source_vintage`` or ``transform`` is the reserved ``"unknown"``
+fallback (or an undeclared channel) is denied under all tiers — the mandatory
+deny-by-default.  ``pit_alignment`` is a RECORDING dimension under
+revision-safe / allow-revised and becomes an admission gate under
+headline-strict (plus its waivers).
+
+Backward compatibility: the legacy serialized string ``"safe-only"`` (the
+pre-T3 name of the revision-safe tier) still parses to ``REVISION_SAFE`` via a
+``VintagePolicy`` alias lookup, so old store/experiment records are not all
+rejected by strict reads.
 
 This module imports ``channel_vintage`` one-way; ``channel_vintage`` never
 imports this module (no circular import).
@@ -31,8 +44,38 @@ from stoke_ml.data import channel_vintage as _cv
 
 
 class VintagePolicy(Enum):
-    SAFE_ONLY = "safe-only"
+    REVISION_SAFE = "revision-safe"
     ALLOW_REVISED = "allow-revised"
+    HEADLINE_STRICT = "headline-strict"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Legacy alias (§T3): pre-T3 stored "safe-only" strings parse to the
+        # renamed REVISION_SAFE tier — the source-layer admission semantics are
+        # UNCHANGED, so old store/experiment records keep parsing on strict reads.
+        if value == "safe-only":
+            return cls.REVISION_SAFE
+        return None
+
+
+# §T3: the scale-invariant waiver whitelist for HEADLINE_STRICT.  A channel
+# here passes headline-strict EVEN IF its declared pit_alignment is "proxy".
+# The waiver is justified ONLY by scale-invariance to the proxy-day alignment:
+# the feature a model actually consumes is unchanged by the proxy re-anchoring.
+# A non-scale-invariant proxy channel (e.g. industry, whose membership ALSO
+# derives from the historically-restructured sector classification) is NOT
+# waived and stays alignment-gated.
+HEADLINE_STRICT_WAIVER_CHANNELS: frozenset[str] = frozenset({
+    # daily_qfq: the qfq re-anchoring is a per-date UNIFORM scale factor over
+    # all history; adjusted-price RETURNS (and price ratios) cancel that factor,
+    # so the proxy alignment does not bias the price signal a model trains on.
+    "daily_qfq",
+    # market_env: market-breadth features (advance/decline, %-of-stocks above
+    # an MA, cross-sectional ranks) are computed from realized prices via
+    # scale-invariant ratios/ranks — the same qfq re-scaling cancels, so the
+    # proxy alignment does not bias the breadth signal.
+    "market_env",
+})
 
 
 def channel_allowed(
@@ -46,9 +89,15 @@ def channel_allowed(
     SOURCE-based admission with a BOTH-LAYERS check: an undeclared channel (no
     declaration), a channel whose ``source_vintage``/``transform`` is OUTSIDE
     the KNOWN_* vocabularies, OR one set to the reserved ``"unknown"`` fallback
-    is False under BOTH policies — the mandatory deny-by-default.
-    ``immutable_snapshot``-sourced channels are always allowed;
-    ``latest_revised``-sourced channels only under ``ALLOW_REVISED``.
+    is False under EVERY policy — the mandatory deny-by-default.
+    ``immutable_snapshot``-sourced channels are always allowed (for
+    revision-safe / allow-revised); ``latest_revised``-sourced channels only
+    under ``ALLOW_REVISED``.
+
+    ``HEADLINE_STRICT`` additionally gates on ``pit_alignment == "verified"``:
+    a proxy-aligned channel is False unless it is on
+    ``HEADLINE_STRICT_WAIVER_CHANNELS``.  Under revision-safe / allow-revised
+    ``pit_alignment`` remains a RECORDING dimension and does not gate.
     """
     if not isinstance(policy, VintagePolicy):
         policy = VintagePolicy(policy)
@@ -63,6 +112,9 @@ def channel_allowed(
         return False
     if entry.source_vintage == "latest_revised":
         return policy is VintagePolicy.ALLOW_REVISED
+    if policy is VintagePolicy.HEADLINE_STRICT:
+        if entry.pit_alignment != "verified":
+            return channel in HEADLINE_STRICT_WAIVER_CHANNELS
     return True
 
 
@@ -116,7 +168,8 @@ def vintage_report(
     "daily_qfq_allowed", "declaration_complete"}``.  ``declaration_complete``
     is True iff ``missing_channels`` is empty AND every declared channel has
     all three dims set to DECLARED values — a member of its KNOWN_* vocabulary
-    AND not the reserved ``"unknown"`` fallback.
+    AND not the reserved ``"unknown"`` fallback.  ``pit_alignment`` is surfaced
+    per channel so a headline-strict denial (or waiver) is auditable.
     """
     if not isinstance(policy, VintagePolicy):
         policy = VintagePolicy(policy)
@@ -171,7 +224,7 @@ class UniverseVintagePolicy:
     the CSI universe gate's membership data.  A CSI universe (csi300/csi500/
     csi800) consumes ``membership.parquet``, which is Baostock-MONTHLY-
     RECONSTRUCTED (NOT official effective-date data), so feature-vintage
-    ``safe-only`` does NOT mean the research avoided latest-reconstructed
+    ``revision-safe`` does NOT mean the research avoided latest-reconstructed
     data — the universe gate itself reads latest-reconstructed membership.
     That must be declared EXPLICITLY (in store meta / experiment summary /
     signature), never implied-bypassed.

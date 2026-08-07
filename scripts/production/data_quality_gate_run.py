@@ -82,10 +82,11 @@ def main():
                          "research run must clear: span >= 5y, stale <= 4 "
                          "trading days (behind the most recent completed "
                          "session), unreadable = 0, readable stocks >= 98%%")
-    ap.add_argument("--vintage-policy", type=str, default="safe-only",
-                    choices=["safe-only", "allow-revised"],
-                    help="§T2: vintage-admission policy recorded in the report and "
-                         "enforced in formal mode (default: safe-only).")
+    ap.add_argument("--vintage-policy", type=str, default="revision-safe",
+                    choices=["revision-safe", "allow-revised", "headline-strict"],
+                    help="§T2/§T3: vintage-admission policy recorded in the report "
+                         "and enforced in formal mode (default: revision-safe; "
+                         "the legacy name \"safe-only\" is the pre-T3 alias).")
     # §P1-7: per-requested-stock reconciliation — OPT-IN; without one of these
     # the gate runs exactly as before (the universe check never joins the run).
     ap.add_argument("--requested-universe", default=None,
