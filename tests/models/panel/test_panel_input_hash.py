@@ -547,3 +547,16 @@ class TestPanelStoreInputHashEndToEnd:
         assert "aux_asset_root_hash" in live
         assert "aux_asset_root_hash" not in prebuilt
         assert live["panel_input_hash"] != prebuilt["panel_input_hash"]
+
+    def test_required_set_is_required_keyword_param(self, tmp_path):
+        """§T6 review follow-up: ``required_set`` is a REQUIRED keyword-only
+        parameter — omitting it must raise TypeError at the call site.  A
+        defaulted set would silently bind the store to an EMPTY aux asset root
+        (``aux_asset_root_hash`` → ``channels={}``), making the §七 "changed aux
+        tomorrow" guard vacuous — the exact fake-provenance hole T6 closes."""
+        data_dir = str(tmp_path / "data")
+        os.makedirs(data_dir, exist_ok=True)
+        args = _panel_args()
+        with pytest.raises(TypeError):
+            _panel_store_meta(args, seq_len=60, stock_list=["000001"],
+                              data_dir=data_dir, prebuilt_dir=None)

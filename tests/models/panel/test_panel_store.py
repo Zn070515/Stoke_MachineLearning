@@ -716,7 +716,8 @@ class TestPanelStoreStrictExternalMeta:
             vintage_policy="allow-revised", minute=False,
         )
         meta = _panel_store_meta(args, seq_len=60, stock_list=["600000"],
-                                 data_dir=str(tmp_path), prebuilt_dir=None)
+                                 data_dir=str(tmp_path), prebuilt_dir=None,
+                                 required_set=set())
         assert "membership_hash" not in meta
         # the status hash the universe DOES consume is still recorded
         assert "universe_status_hash" in meta
@@ -848,8 +849,9 @@ class TestResolvePanelStoreSkip:
         store_path = str(tmp_path / "store")
         args = self._args(store_path)
         save_panel_memmap(panel, store_path,
-                          meta=_panel_store_meta(args, seq_len, stock_list,
-                                                 str(tmp_path), args.prebuilt))
+                          meta=_panel_store_meta(
+                              args, seq_len, stock_list, str(tmp_path),
+                              args.prebuilt, required_set=set()))
 
         # Any touch of the live K-line / aux pipeline is a regression: the
         # store path must return before DataStorage.load_daily or load_aux_data

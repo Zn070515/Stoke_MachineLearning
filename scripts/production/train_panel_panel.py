@@ -155,8 +155,11 @@ def _manifest_body_digest(path: str) -> str:
             obj = json.load(fh)
     except (OSError, ValueError):
         try:
+            h = hashlib.sha256()
             with open(path, "rb") as fh:
-                return hashlib.sha256(fh.read()).hexdigest()
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
         except OSError:
             return "<unreadable>"
     if isinstance(obj, dict):
@@ -219,9 +222,18 @@ def _panel_store_meta(
     args, seq_len: int, stock_list: list[str] | None = None,
     data_dir: str | None = None, prebuilt_dir: str | None = None,
     entry_fill_prob_mean: float | None = None,
-    *, required_set: set[str] | None = None,
+    *, required_set: set[str],
 ) -> dict:
     """Build-time fingerprint persisted in a panel store's meta.json.
+
+    ``required_set`` is a REQUIRED keyword-only parameter — the resolved set of
+    required aux channels (from ``train_panel_gates._resolve_required_set``).  It
+    must be explicit: a forgotten/omitted set would silently bind the store to an
+    EMPTY aux asset root (§T6 ``aux_asset_root_hash`` → ``channels={}``), making
+    the §七 "changed aux tomorrow" guard vacuous — exactly the fake-provenance
+    hole T6 closes.  Making it required forces every caller to state the channel
+    contract the store is bound under (``set()`` is the honest value for a
+    no-profile / no-required-channel build).
 
     Re-checked by load_panel_memmap on a store-backed re-run so a stale store
     (different horizon / universe / feature switches / date window) is refused
@@ -335,7 +347,7 @@ def _panel_store_meta(
     meta["feature_code_tree_hash"] = tree_hash
     if data_dir is not None and live_aux:
         meta["aux_asset_root_hash"] = _aux_asset_root_hash(
-            data_dir, required_set or set(), live_aux=True)
+            data_dir, required_set, live_aux=True)
     meta["panel_input_hash"] = hash_json({
         "schema_version": 1,
         "feature_code_tree_hash": tree_hash,

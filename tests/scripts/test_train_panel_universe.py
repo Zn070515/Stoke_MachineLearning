@@ -1374,8 +1374,8 @@ def test_announcement_switch_key_special_case(tp):
 def test_panel_store_meta_fingerprints_vintage_policy(tp):
     """§T2: the vintage policy enters the panel-store meta fingerprint via
     feature_switches, so a policy change auto-invalidates a stale store."""
-    allow = tp._panel_store_meta(_panel_args("allow-revised"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
-    safe = tp._panel_store_meta(_panel_args("revision-safe"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    allow = tp._panel_store_meta(_panel_args("allow-revised"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)], required_set=set())
+    safe = tp._panel_store_meta(_panel_args("revision-safe"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)], required_set=set())
     assert allow["feature_switches"] != safe["feature_switches"]
     assert allow["feature_switches"]["use_fundamental"] is True
     assert safe["feature_switches"]["use_fundamental"] is False
@@ -1399,10 +1399,11 @@ def test_allow_fundamental_ablation_changes_store_fingerprint(tp):
     """T3: the ablation flag must change the panel-store meta fingerprint — an
     ablation store must never be reused by a non-ablation run (nor vice-versa),
     exactly as a policy change does."""
-    base = tp._panel_store_meta(_panel_args("revision-safe"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+    base = tp._panel_store_meta(_panel_args("revision-safe"), seq_len=60, stock_list=[f"{i:06d}" for i in range(100)], required_set=set())
     ablated = tp._panel_store_meta(
         _panel_args("revision-safe", allow_fundamental_ablation=True),
-        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)],
+        required_set=set())
     assert base["feature_switches"] != ablated["feature_switches"]
     assert base["feature_switches"]["use_fundamental"] is False
     assert ablated["feature_switches"]["use_fundamental"] is True
@@ -1444,14 +1445,16 @@ def test_panel_store_meta_csi_marks_daily_membership_norm(tp):
     universes never carry the key."""
     csi = tp._panel_store_meta(
         _panel_args("revision-safe", universe="csi300"),
-        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)],
+        required_set=set())
     assert csi["feature_switches"].get("daily_membership_norm") is True
     # The pseudo-switch is ADDED to the real switch set, never replacing it.
     assert csi["feature_switches"]["seq_len"] == 60
     assert csi["feature_switches"]["use_sentiment"] is True
     non_csi = tp._panel_store_meta(
         _panel_args("revision-safe", universe="random"),
-        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
+        seq_len=60, stock_list=[f"{i:06d}" for i in range(100)],
+        required_set=set())
     assert "daily_membership_norm" not in non_csi["feature_switches"]
 
 
@@ -1465,11 +1468,13 @@ def test_panel_store_meta_records_universe_membership(tp, tmp_path):
           "vintage": "latest-reconstructed", "resolution": "monthly"}
     csi = tp._panel_store_meta(
         _panel_args("revision-safe", universe="csi300"), seq_len=60,
-        stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path))
+        stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path),
+        required_set=set())
     assert csi["universe_membership"] == um
     non_csi = tp._panel_store_meta(
         _panel_args("revision-safe", universe="random"), seq_len=60,
-        stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path))
+        stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path),
+        required_set=set())
     assert "universe_membership" not in non_csi
 
 
@@ -1491,12 +1496,12 @@ def test_entry_fill_prob_mean_records_in_store_meta(tp):
 
     base = tp._panel_store_meta(
         _panel_args("revision-safe"), seq_len=60,
-        stock_list=[f"{i:06d}" for i in range(100)])
+        stock_list=[f"{i:06d}" for i in range(100)], required_set=set())
     assert "entry_fill_prob_mean" not in base
     recorded = tp._panel_store_meta(
         _panel_args("revision-safe"), seq_len=60,
         stock_list=[f"{i:06d}" for i in range(100)],
-        entry_fill_prob_mean=0.5833333333)
+        entry_fill_prob_mean=0.5833333333, required_set=set())
     assert recorded["entry_fill_prob_mean"] == 0.5833333333
 
 

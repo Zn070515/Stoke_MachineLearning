@@ -99,7 +99,9 @@ def feature_code_tree_hash(root: str | None = None) -> str:
     store build is negligible.
     """
     base = os.path.abspath(root) if root is not None else _project_root()
-    entries: dict[str, str] = {}
+    # relpath → file digest; None marks an unreadable file (still recorded so it
+    # differentiates the tree from one where the file is absent).
+    entries: dict[str, str | None] = {}
     for sub in _SOURCE_DIRS:
         top = os.path.join(base, sub)
         if not os.path.isdir(top):
