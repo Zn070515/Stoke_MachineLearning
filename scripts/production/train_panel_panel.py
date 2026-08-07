@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
 from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.universe import (
@@ -507,9 +506,10 @@ def _estimate_panel_memory(
     if not parquets:
         return None
     try:
+        import pyarrow.parquet as pq  # lazy — pyarrow is an optional dependency
         cols = list(pq.read_schema(str(parquets[0])).names)
     except Exception:
-        return None  # unreadable schema — never crash the estimate path
+        return None  # unreadable schema / missing pyarrow — never crash the estimate path
     seq_len = args.seq_len or (64 if args.minute else 60)
     kwargs = _panel_pipeline_kwargs(args, seq_len)
     surviving = [
