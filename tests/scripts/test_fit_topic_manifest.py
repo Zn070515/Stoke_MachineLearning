@@ -99,8 +99,9 @@ def _setup_and_run(monkeypatch, tmp_path, argv, loaded, failed):
     def _fake_discover(data_dir, source):
         return list(_ALL_CODES)
 
-    def _fake_collect(data_dir, source, codes, cutoff):
-        # A3: _collect_silver now returns (df, loaded_codes, failed_codes).
+    def _fake_collect(calendar, data_dir, source, codes, cutoff):
+        # A3: _collect_silver now returns (df, loaded_codes, failed_codes); the
+        # calendar is constructed once by the caller and passed IN (§九).
         return (
             pd.DataFrame({
                 "title": ["a", "b", "c"],
@@ -251,41 +252,39 @@ class TestCollectSilver:
         silver.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows).to_parquet(silver / f"{code}.parquet", index=False)
 
-    def test_missing_aligned_date_raises(self, tmp_path, monkeypatch):
+    def test_missing_aligned_date_raises(self, tmp_path):
         """A2: a silver schema that dropped aligned_date must fail loudly
         instead of silently fitting on the full (un-truncated) history."""
-        monkeypatch.setattr(mod, "get_research_calendar", lambda *a, **k: object())
         self._write_silver(tmp_path, "000001", {
             "title": ["x"], "body": ["y"],
             "date": pd.to_datetime(["2024-01-01"]),  # wrong column name
         })
         with pytest.raises(ValueError, match="aligned_date"):
             mod._collect_silver(
-                str(tmp_path / "data"), "news", ["000001"], "2024-12-31"
+                object(), str(tmp_path / "data"), "news", ["000001"],
+                "2024-12-31",
             )
 
-    def test_filters_by_cutoff_and_counts_loads(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mod, "get_research_calendar", lambda *a, **k: object())
+    def test_filters_by_cutoff_and_counts_loads(self, tmp_path):
         self._write_silver(tmp_path, "000001", {
             "title": ["x", "y"], "body": ["a", "b"],
             "aligned_date": pd.to_datetime(["2024-01-01", "2025-06-01"]),
         })
         df, loaded, failed = mod._collect_silver(
-            str(tmp_path / "data"), "news", ["000001"], "2024-12-31"
+            object(), str(tmp_path / "data"), "news", ["000001"], "2024-12-31"
         )
         assert list(df["stock_code"]) == ["000001"]
         assert list(df["aligned_date"]) == [pd.Timestamp("2024-01-01")]
         assert loaded == ["000001"]
         assert failed == []
 
-    def test_corrupt_file_counts_as_failed(self, tmp_path, monkeypatch):
+    def test_corrupt_file_counts_as_failed(self, tmp_path):
         """A3: an exception during load lands in failed_codes, not a silent skip."""
-        monkeypatch.setattr(mod, "get_research_calendar", lambda *a, **k: object())
         silver = tmp_path / "data" / "a_shares" / "news_silver"
         silver.mkdir(parents=True, exist_ok=True)
         (silver / "000001.parquet").write_bytes(b"not a parquet file")
         df, loaded, failed = mod._collect_silver(
-            str(tmp_path / "data"), "news", ["000001"], "2024-12-31"
+            object(), str(tmp_path / "data"), "news", ["000001"], "2024-12-31"
         )
         assert df.empty
         assert loaded == []

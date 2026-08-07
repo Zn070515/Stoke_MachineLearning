@@ -15,7 +15,9 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.config.feature_profile import FEATURE_PROFILES, profile_for
-from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
+from stoke_ml.data.calendar import (
+    TradingCalendar, calendar_artifact_hash, get_research_calendar,
+)
 from scripts.production.data_quality_gate import (
     QUALITY_GATE_VERSION,
     contract_version,
@@ -240,6 +242,17 @@ def _require_quality_gate(
             f"calendar {report.get('calendar_version')!r} "
             f"!= {TradingCalendar.CALENDAR_VERSION!r}"
         )
+    # §八: bind the calendar artifact's CONTENT hash, not just the version
+    # string.  A content edit (holiday rows flipped) that keeps
+    # CALENDAR_VERSION would otherwise pass the version check while training
+    # reads a different calendar.  calendar_artifact_hash NEVER returns None
+    # (it falls back to the code-derived frame when the artifact is absent),
+    # so a report with a None/missing hash — an old gate report, or a gate that
+    # ran with NO calendar artifact present — is REFUSED: the gate cannot vouch
+    # for calendar content it never bound.  A None on one side is a refusal,
+    # never a skip-the-comparison escape.
+    if report.get("calendar_artifact_hash") != calendar_artifact_hash(data_dir, "a_shares"):
+        problems.append("calendar artifact changed since the gate PASS")
     if report.get("contract_version") != contract_version():
         problems.append("daily contract changed since the gate ran")
     # §七.2: a sampled-scope report is only acceptable for a formal run when
@@ -336,7 +349,7 @@ def _require_quality_gate(
         )
     return report
 
-def _check_verified_until_scope(global_dates, enforce: bool) -> str | None:
+def _check_verified_until_scope(global_dates, enforce: bool, data_dir) -> str | None:
     """§九-3: refuse a formal run whose panel axis reaches past verified_until.
 
     Forward-estimate trading days (2027+ A-share closures) are not verified
@@ -344,12 +357,15 @@ def _check_verified_until_scope(global_dates, enforce: bool) -> str | None:
     refused instead of silently mixing guessed holidays into the panel axis.
     Uses the strict calendar's own bound so the refusal is exactly the
     strict-mode contract.  ``enforce`` is False for exploratory runs that opt
-    out via --no-require-quality-gate.  Returns the refusal message (caller
-    raises SystemExit) or None when in scope.
+    out via --no-require-quality-gate.  ``data_dir`` is REQUIRED (no default) so
+    every caller is forced to thread the data root it actually reads — the
+    strict calendar must follow the frozen ``exchange_calendar`` artifact at
+    that root, never the process config default.  Returns the refusal message
+    (caller raises SystemExit) or None when in scope.
     """
     if not enforce or global_dates is None or not len(global_dates):
         return None
-    strict_cal = get_research_calendar(strict=True)
+    strict_cal = get_research_calendar(strict=True, data_dir=data_dir)
     lo = pd.Timestamp(global_dates[0]).date()
     hi = pd.Timestamp(global_dates[-1]).date()
     try:

@@ -462,7 +462,7 @@ def main():
     # calendar window (see _check_verified_until_scope).  Exploratory runs can
     # pass --no-require-quality-gate to opt out.
     refusal = _check_verified_until_scope(
-        global_dates, enforce=_gate_enforced(args))
+        global_dates, enforce=_gate_enforced(args), data_dir=data_dir)
     if refusal:
         raise SystemExit(refusal)
 

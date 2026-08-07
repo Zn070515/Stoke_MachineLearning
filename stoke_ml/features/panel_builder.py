@@ -297,7 +297,7 @@ def build_panel_features(
                 feats = feats.drop(columns=_off_cols)
             # A stale/hand-built parquet may carry a
             # weekend/duplicate bar that would pollute the UNION date axis.
-            feats = pipeline._clean_calendar_dates(feats, code)
+            feats = pipeline._clean_calendar_dates(feats, code, data_dir=data_dir)
             if feats is None:
                 drop_reasons["calendar_clean_dropped"] += 1
                 drop_examples["calendar_clean_dropped"].append(code)
@@ -320,7 +320,7 @@ def build_panel_features(
             # Drop phantom/duplicate/out-of-calendar rows before
             # feature engineering so a bad bar neither pollutes the UNION
             # date axis nor corrupts the rolling indicators around it.
-            df_stock = pipeline._clean_calendar_dates(df_stock, code)
+            df_stock = pipeline._clean_calendar_dates(df_stock, code, data_dir=data_dir)
             if df_stock is None:
                 drop_reasons["calendar_clean_dropped"] += 1
                 drop_examples["calendar_clean_dropped"].append(code)
@@ -378,7 +378,7 @@ def build_panel_features(
     # UNION signals an upstream regression — fail loudly instead of silently
     # widening column t (the global calendar column) for every stock.
     if all_dates:
-        _cal = _get_panel_calendar()
+        _cal = _get_panel_calendar(data_dir)
         _official = set(_cal.get_trading_days(
             all_dates[0].date(), all_dates[-1].date()))
         _off = [d.strftime("%Y-%m-%d") for d in all_dates

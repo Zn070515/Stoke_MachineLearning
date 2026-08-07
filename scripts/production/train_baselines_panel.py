@@ -419,7 +419,7 @@ def main():
     # spanning forward-estimate calendar days must be refused, not silently run
     # on guessed holidays (§P0-5).
     refusal = _check_verified_until_scope(
-        global_dates, enforce=not args.no_require_quality_gate)
+        global_dates, enforce=not args.no_require_quality_gate, data_dir=data_dir)
     if refusal:
         raise SystemExit(refusal)
 

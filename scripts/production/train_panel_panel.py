@@ -487,7 +487,8 @@ def _estimate_panel_memory(
     lo = pd.Timestamp(args.start).date()
     hi = pd.Timestamp(args.end).date()
     try:
-        n_timesteps = len(get_research_calendar(strict=True).get_trading_days(lo, hi))
+        n_timesteps = len(get_research_calendar(
+            strict=True, data_dir=data_dir).get_trading_days(lo, hi))
     except ValueError:
         # strict calendar extends only to verified_until — fall back to a
         # ~ trading-day fraction of the raw span for the estimate.

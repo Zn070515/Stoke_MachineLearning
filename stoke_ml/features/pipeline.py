@@ -969,7 +969,8 @@ class FeaturePipeline:
             if c not in pk_set and c not in skip and c not in _ABSOLUTE_PRICE_COLS
         ]
 
-    def _clean_calendar_dates(self, df: pd.DataFrame, stock_code: str):
+    def _clean_calendar_dates(self, df: pd.DataFrame, stock_code: str,
+                              data_dir: str | None = None):
         """Keep a stock's date axis calendar-clean before the panel
         UNION date axis is built from it.
 
@@ -980,6 +981,10 @@ class FeaturePipeline:
         overwrite semantics), drop dates that are not official trading days,
         then re-sort so the surviving dates are unique and strictly increasing.
         Returns the cleaned frame, or None when nothing valid remains.
+
+        ``data_dir`` is forwarded to :func:`_get_panel_calendar` so the strict
+        calendar follows the frozen ``exchange_calendar`` artifact at the data
+        root the caller actually reads (None → the config default).
         """
         if df is None or len(df) == 0:
             return None
@@ -995,7 +1000,7 @@ class FeaturePipeline:
             if len(df) == 0:
                 return None
         dup = d.duplicated(keep="last")
-        trading = set(_get_panel_calendar().get_trading_days(
+        trading = set(_get_panel_calendar(data_dir).get_trading_days(
             d.min().date(), d.max().date()))
         off_cal = ~np.array([x.date() in trading for x in d])
         bad = dup | off_cal

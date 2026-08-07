@@ -254,7 +254,7 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
     from stoke_ml.data.calendar import get_research_calendar
     from stoke_ml.data.storage import DataStorage
     ds = DataStorage(data_dir)
-    calendar = get_research_calendar(strict=True)
+    calendar = get_research_calendar(strict=True, data_dir=data_dir)
     trading_dates = pd.DatetimeIndex(
         calendar.get_trading_days(args.start, args.end)
     )

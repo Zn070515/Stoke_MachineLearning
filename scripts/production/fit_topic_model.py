@@ -52,8 +52,14 @@ def _discover_stocks(data_dir: str, source: str) -> list[str]:
     )
 
 
-def _collect_silver(data_dir: str, source: str, codes: list[str], cutoff: str):
+def _collect_silver(calendar, data_dir: str, source: str, codes: list[str],
+                    cutoff: str):
     """Load + combine silver text up to *cutoff* (PIT) for the given stocks.
+
+    ``calendar`` is the SAME research-calendar instance the fit's PIT mapping
+    uses (constructed once by the caller, §九) — the storage constructors bind
+    it, so the calendar the corpus was truncated by is the calendar the
+    manifest's ``calendar_hash`` vouches for.
 
     Returns ``(df, loaded_codes, failed_codes)``:
       * ``df`` — the combined posts (only rows at/before *cutoff*), each row
@@ -68,7 +74,6 @@ def _collect_silver(data_dir: str, source: str, codes: list[str], cutoff: str):
     silently absent.  A silver schema drift that drops ``aligned_date`` raises
     instead of fitting the topic model on the full (un-truncated) history.
     """
-    calendar = get_research_calendar(strict=True)
     frames = []
     loaded_codes = []
     failed_codes = []
@@ -156,17 +161,15 @@ def _config_hash(cfg) -> str:
         return "unknown"
 
 
-def _calendar_hash(data_dir: str) -> str:
+def _calendar_hash(cal) -> str:
     """SHA-1 of the research calendar identity used to map PIT dates (§十三).
 
-    Uses the same factory the fit's silver load goes through
-    (``get_research_calendar``) and hashes market + calendar version +
-    verified-until, so a calendar change is visible in the fit provenance.
+    Hashes the identity of the SAME calendar instance the fit's silver load
+    (PIT cutoff) went through — market + calendar version + verified-until —
+    so a calendar change is visible in the fit provenance and the hash can only
+    match the calendar the corpus was actually truncated by.
     """
     try:
-        cal = get_research_calendar(
-            market="a_shares", strict=False, data_dir=data_dir,
-        )
         ident = f"{cal.market}|{cal.CALENDAR_VERSION}|{cal.verified_until}"
         return hashlib.sha1(ident.encode("utf-8")).hexdigest()[:16]
     except Exception:
@@ -207,6 +210,10 @@ def main():
 
     cfg = load_config(args.config)
     data_dir = cfg.project.data_dir
+    # §九: ONE research calendar for the whole fit — the same instance feeds the
+    # PIT cutoff mapping (via the silver storage constructors) and the manifest's
+    # calendar_hash, so the hash can only match the calendar actually used.
+    calendar = get_research_calendar(strict=True, data_dir=data_dir)
 
     all_codes = _discover_stocks(data_dir, args.source)
     if not all_codes:
@@ -224,7 +231,7 @@ def main():
     )
 
     all_silver, loaded_codes, failed_codes = _collect_silver(
-        data_dir, args.source, codes, args.cutoff
+        calendar, data_dir, args.source, codes, args.cutoff
     )
     if all_silver.empty:
         logger.error("No %s posts up to %s", args.source, args.cutoff)
@@ -343,7 +350,7 @@ def main():
         "sampling_method": sampling_method,
         "stock_codes": list(codes),
         "config_hash": _config_hash(cfg),
-        "calendar_hash": _calendar_hash(data_dir),
+        "calendar_hash": _calendar_hash(calendar),
         # §二十一 A3: coverage / load-outcome accounting.  Additive — older
         # manifests without these keys remain valid.
         "requested_stocks": requested_stocks,

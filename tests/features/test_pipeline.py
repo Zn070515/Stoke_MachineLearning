@@ -361,6 +361,57 @@ class TestCleanCalendarDates:
         df = pd.DataFrame({"date": ["2020-03-21", "2020-03-22"], "x": [1, 2]})
         assert fp._clean_calendar_dates(df, "000001") is None
 
+    def test_clean_calendar_dates_forwards_data_dir(self, tmp_path, monkeypatch):
+        """§九: _clean_calendar_dates must thread the data_dir it is given into
+        _get_panel_calendar — the strict calendar follows the frozen
+        exchange_calendar artifact at the data root the caller actually reads."""
+        from stoke_ml.features.panel_helpers import _get_panel_calendar as _real
+        captured = {}
+
+        def fake_get_panel_calendar(data_dir=None):
+            captured["data_dir"] = data_dir
+            return _real(data_dir)
+
+        monkeypatch.setattr(
+            "stoke_ml.features.pipeline._get_panel_calendar", fake_get_panel_calendar)
+        fp = FeaturePipeline()
+        df = pd.DataFrame({"date": ["2020-03-16", "2020-03-17"], "x": [1, 2]})
+        out = fp._clean_calendar_dates(df, "000001", data_dir=str(tmp_path))
+        assert out is not None
+        assert captured["data_dir"] == str(tmp_path)
+
+
+class TestGetPanelCalendarDataDir:
+    """§九: _get_panel_calendar must honor an explicit data_dir — a formal flow
+    passes the data root it actually reads, so the frozen exchange_calendar
+    artifact at THAT root is authoritative (and hash-bindable), never the
+    process config default."""
+
+    def test_explicit_data_dir_reads_that_artifact(self, tmp_path):
+        import datetime as dt
+
+        from stoke_ml.data.calendar import load_calendar, save_calendar
+        from stoke_ml.features.panel_helpers import _get_panel_calendar
+        # Write a calendar artifact at tmp_path whose verified_until DIFFERS
+        # from the code default — the explicit-data_dir call must read IT.
+        save_calendar(str(tmp_path), "a_shares")
+        frame = load_calendar(str(tmp_path), "a_shares")
+        frame["verified_until"] = pd.Timestamp("2025-12-31")
+        frame.to_parquet(str(tmp_path / "exchange_calendar" / "a_shares.parquet"))
+        cal = _get_panel_calendar(str(tmp_path))
+        assert cal.verified_until == dt.date(2025, 12, 31)
+        assert cal.verified_until != dt.date(2026, 12, 31)
+
+    def test_no_arg_resolves_config_default(self):
+        import datetime as dt
+
+        from stoke_ml.features.panel_helpers import _get_panel_calendar
+        # No arg → the config default data root, whose artifact (or the code
+        # fallback) carries the verified 2026-12-31 bound — NOT the modified
+        # artifact written at the explicit test root above.
+        cal = _get_panel_calendar()
+        assert cal.verified_until == dt.date(2026, 12, 31)
+
 
 class TestPanelRowIdentity:
     """§v12-P0 regression: build_panel_features row i MUST map to the
@@ -454,7 +505,7 @@ class TestPanelCalendarDateValidity:
         # Simulate an upstream regression that bypasses the per-stock cleaner.
         monkeypatch.setattr(
             fp, "_clean_calendar_dates",
-            lambda df, code: df.sort_values("date").reset_index(drop=True))
+            lambda df, code, data_dir=None: df.sort_values("date").reset_index(drop=True))
         with pytest.raises(ValueError, match="official a_shares"):
             fp.build_panel_features(panel, aux_data={}, horizon=5)
 

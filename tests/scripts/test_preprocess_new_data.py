@@ -81,7 +81,7 @@ def _patch_deps(monkeypatch):
     monkeypatch.setattr(mod, "MarketWideStorage", _FakeStorageFactory)
     monkeypatch.setattr("stoke_ml.data.storage.DataStorage", _FakeDS)
     monkeypatch.setattr("stoke_ml.data.calendar.get_research_calendar",
-                        lambda strict=True: _FakeCalendar())
+                        lambda strict=True, data_dir=None: _FakeCalendar())
     _FakeStorageFactory.instances = []
     yield
 

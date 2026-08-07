@@ -21,6 +21,7 @@ import pandas as pd
 import pytest
 
 import stoke_ml.data.channel_vintage as cv
+from stoke_ml.data.calendar import calendar_artifact_hash
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPT = os.path.join(ROOT, "scripts", "production", "train_panel.py")
@@ -201,31 +202,60 @@ def test_save_artifacts_writes_all_files(tp, tmp_path):
 
 # ── _check_verified_until_scope (§九-3) ──────────────────────────────
 
-def test_verified_until_refuses_panel_past_2026(tp):
+def test_verified_until_refuses_panel_past_2026(tp, tmp_path):
     """A formal run whose panel axis reaches 2027 (forward-estimate closures)
     must be refused — the strict calendar raises past verified_until."""
     gd = np.array(["2024-01-02", "2027-01-04"], dtype="datetime64[D]")
-    msg = tp._check_verified_until_scope(gd, enforce=True)
+    msg = tp._check_verified_until_scope(
+        gd, enforce=True, data_dir=str(tmp_path))
     assert msg is not None
     assert "formal run refused" in msg
 
 
-def test_verified_until_accepts_within_verified_window(tp):
+def test_verified_until_accepts_within_verified_window(tp, tmp_path):
     gd = np.array(["2024-01-02", "2024-12-31"], dtype="datetime64[D]")
-    assert tp._check_verified_until_scope(gd, enforce=True) is None
+    assert tp._check_verified_until_scope(
+        gd, enforce=True, data_dir=str(tmp_path)) is None
 
 
-def test_verified_until_opt_out_not_enforced(tp):
+def test_verified_until_opt_out_not_enforced(tp, tmp_path):
     """--no-require-quality-gate (enforce=False) lets an exploratory run use a
     panel that reaches past verified_until."""
     gd = np.array(["2024-01-02", "2027-01-04"], dtype="datetime64[D]")
-    assert tp._check_verified_until_scope(gd, enforce=False) is None
+    assert tp._check_verified_until_scope(
+        gd, enforce=False, data_dir=str(tmp_path)) is None
 
 
-def test_verified_until_empty_panel_is_noop(tp):
-    assert tp._check_verified_until_scope(None, enforce=True) is None
+def test_verified_until_empty_panel_is_noop(tp, tmp_path):
+    assert tp._check_verified_until_scope(
+        None, enforce=True, data_dir=str(tmp_path)) is None
     empty = np.array([], dtype="datetime64[D]")
-    assert tp._check_verified_until_scope(empty, enforce=True) is None
+    assert tp._check_verified_until_scope(
+        empty, enforce=True, data_dir=str(tmp_path)) is None
+
+
+def test_verified_until_scope_forwards_data_dir(tp, tmp_path, monkeypatch):
+    """§九: _check_verified_until_scope must thread the data_dir it actually
+    reads into get_research_calendar — the strict calendar follows the frozen
+    exchange_calendar artifact at that root, never the process config default."""
+    captured = {}
+
+    class _Cal:
+        def get_trading_days(self, lo, hi):
+            return []
+
+    def fake_get_research_calendar(*args, **kwargs):
+        captured.update(kwargs)
+        return _Cal()
+
+    monkeypatch.setattr(
+        "scripts.production.train_panel_gates.get_research_calendar",
+        fake_get_research_calendar)
+    gd = np.array(["2024-01-02", "2024-12-31"], dtype="datetime64[D]")
+    assert tp._check_verified_until_scope(
+        gd, enforce=True, data_dir=str(tmp_path)) is None
+    assert captured.get("data_dir") == str(tmp_path)
+    assert captured.get("strict") is True
 
 
 # ── _calendar_freeze (§九-4) ──────────────────────────────────────────
@@ -589,6 +619,11 @@ def _gate_report(tp, data_dir, required, dataset_paths=None, passed=True,
         "quality_gate_version": tp.QUALITY_GATE_VERSION,
         "data_root": d,
         "calendar_version": tp.TradingCalendar.CALENDAR_VERSION,
+        # §八: the report must BIND the calendar artifact's content hash so the
+        # gate can vouch for the calendar training reads, not just its version
+        # string.  In a tmp data dir with no artifact both the fixture value and
+        # the live value are the deterministic code-derived hash.
+        "calendar_artifact_hash": calendar_artifact_hash(d, "a_shares"),
         "contract_version": tp.contract_version(),
         "required_datasets": req,
         "dataset_paths": dataset_paths or {},
@@ -644,6 +679,59 @@ def test_require_quality_gate_refuses_path_mismatch(tp, tmp_path):
     report_path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(SystemExit):
         tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+
+
+# ── §八: the gate binds the calendar artifact's CONTENT hash, not just the
+# version string.  A content edit that keeps CALENDAR_VERSION, or a report that
+# never bound a hash, must be REFUSED. ────────────────────────────────
+
+def test_require_quality_gate_refuses_calendar_content_change(tp, tmp_path):
+    """§八: a gate PASS report whose calendar artifact CONTENT changed since the
+    gate (a holiday row flipped, CALENDAR_VERSION untouched) must be refused —
+    the version check alone cannot catch a same-version content edit."""
+    from stoke_ml.data.calendar import load_calendar, save_calendar
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel"
+    report_path = tmp_path / "gate.json"
+    # Report bound the calendar as it stood when the gate PASSed — at this point
+    # no artifact exists, so the fixture records the code-derived hash.
+    report = _gate_report(tp, data_dir, ["daily", "features_panel"],
+                          dataset_paths={
+                              "daily": str((data_dir / "a_shares" / "daily").resolve()),
+                              "features_panel": str(prebuilt.resolve()),
+                          })
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    # Edit the artifact CONTENT with the SAME CALENDAR_VERSION: flip one real
+    # trading day to closed.  load_calendar still accepts the frame (no date
+    # gaps), so only the content hash changes.
+    save_calendar(str(data_dir), "a_shares")
+    frame = load_calendar(str(data_dir), "a_shares")
+    assert str(frame["version"].iloc[0]) == tp.TradingCalendar.CALENDAR_VERSION
+    frame.loc[frame["date"] == pd.Timestamp("2010-02-24"), "is_open"] = False
+    frame.to_parquet(str(data_dir / "exchange_calendar" / "a_shares.parquet"))
+    with pytest.raises(SystemExit) as ei:
+        tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+    assert "calendar artifact changed since the gate PASS" in str(ei.value)
+
+
+def test_require_quality_gate_missing_calendar_hash_refuses(tp, tmp_path):
+    """§八: a report WITHOUT a bound calendar_artifact_hash (an old gate report,
+    or a gate that ran with NO calendar artifact present) must be REFUSED — the
+    gate cannot vouch for calendar content it never bound.  A None/missing hash
+    on one side is a refusal, never a skip-the-comparison escape."""
+    data_dir = tmp_path / "data"
+    prebuilt = data_dir / "features_panel"
+    report_path = tmp_path / "gate.json"
+    report = _gate_report(tp, data_dir, ["daily", "features_panel"],
+                          dataset_paths={
+                              "daily": str((data_dir / "a_shares" / "daily").resolve()),
+                              "features_panel": str(prebuilt.resolve()),
+                          })
+    del report["calendar_artifact_hash"]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        tp._require_quality_gate(str(data_dir), str(prebuilt), str(report_path))
+    assert "calendar artifact changed since the gate PASS" in str(ei.value)
 
 
 # ── §八-2: requested-universe reconciliation is REQUIRED ──────────────

@@ -6,6 +6,7 @@ builder utilities) extracted for reuse without pulling in the full pipeline.
 This is a LEAF module: it imports nothing from ``stoke_ml.features``.
 """
 
+import os
 from datetime import datetime
 
 import numpy as np
@@ -14,20 +15,31 @@ import pandas as pd
 from stoke_ml.data.codes import normalize_stock_code
 
 
-# The official A-share trading calendar used to validate every
-# stock's date axis before it joins the panel's UNION date axis.  Lazy-loaded
-# (module-level singleton) so the panel path pays for it only when used.
+# The official A-share trading calendar used to validate every stock's date axis
+# before it joins the panel's UNION date axis.  Cached per DATA ROOT
+# (realpath-keyed) so a config-resolved call and an explicit-data_dir call
+# unify, and a formal flow that passes the data root it actually reads gets the
+# frozen exchange_calendar artifact at THAT root (hash-bindable).  Lazy-loaded
+# so the panel path pays for it only when used.
+_panel_calendars = {}
+# Legacy frozen snapshot, kept only for import-compat (pipeline.py imports the
+# name).  NEVER assigned by _get_panel_calendar anymore — callers must use
+# _get_panel_calendar(data_dir).
 _panel_calendar = None
 
 
-def _get_panel_calendar():
-    global _panel_calendar
-    if _panel_calendar is None:
+def _get_panel_calendar(data_dir: str | None = None):
+    if data_dir is None:
+        from stoke_ml.config import load_config
+        data_dir = load_config()["project"]["data_dir"]
+    key = os.path.normcase(os.path.realpath(str(data_dir)))
+    if key not in _panel_calendars:
         from stoke_ml.data.calendar import get_research_calendar
-        # Formal research path: the frozen exchange_calendar artifact, strict so
-        # any date past verified_until fails loudly instead of guessing.
-        _panel_calendar = get_research_calendar(strict=True)
-    return _panel_calendar
+        # Formal research path: the frozen exchange_calendar artifact at the
+        # given data root, strict so any date past verified_until fails loudly
+        # instead of guessing.
+        _panel_calendars[key] = get_research_calendar(strict=True, data_dir=data_dir)
+    return _panel_calendars[key]
 
 # Sparse feature policy: drop structurally-dead columns — constant on every
 # observed day of a stock's series (flat path, _prep_feature_df) or of a fold's
