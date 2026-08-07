@@ -642,7 +642,8 @@ def main():
     # re-run, so it is replaced and N does not grow.
     experiment_registry = _load_experiment_registry(_EXPERIMENT_REGISTRY_PATH)
     experiment_signature = _experiment_signature(
-        version_info, config, augmentation=bool(args.augment))
+        version_info, config, augmentation=bool(args.augment),
+        vintage_policy=args.vintage_policy, feature_profile=profile_name)
     n_trials = _distinct_trial_count(experiment_registry, experiment_signature)
     oos_dates_all: list[str] = []
     oos_stocks_all: list[str] = []

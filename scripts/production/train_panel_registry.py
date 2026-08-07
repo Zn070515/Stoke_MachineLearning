@@ -314,6 +314,8 @@ def _experiment_signature(version: dict, config: PanelConfig,
                           *,
                           augmentation: bool | None = None,
                           seq_features: bool | None = None,
+                          vintage_policy: str | None = None,
+                          feature_profile: str | None = None,
                           baseline_hyperparameter_hash: str | None = None,
                           baseline_input_recipe_hash: str | None = None,
                           training_sample_policy_hash: str | None = None,
@@ -338,6 +340,12 @@ def _experiment_signature(version: dict, config: PanelConfig,
     recipe — a baseline re-run that flips --with-seq-features, changes a
     hyperparameter, caps training rows differently, or changes the scaler is a
     NEW trial.  Each defaults to 'none' so non-baseline callers are unaffected.
+
+    §T19: the deep-run signature additionally binds the vintage-admission
+    policy (--vintage-policy: safe-only vs allow-revised) and the frozen
+    feature-profile identity — runs differing ONLY in either lever train on
+    materially different channels and MUST be distinct trials.  Both default to
+    'none' so the baseline run (which has neither switch) is unaffected.
     """
     h = hashlib.sha1()
     for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
@@ -371,6 +379,18 @@ def _experiment_signature(version: dict, config: PanelConfig,
              .encode("utf-8"))
     h.update(f"seq_features={seq_features if seq_features is not None else 'none'};"
              .encode("utf-8"))
+    # §T19 (§T2/§T7): the vintage-admission policy and the frozen feature-profile
+    # identity are part of what a deep run IS.  A safe-only run DENIES
+    # latest_revised_aligned channels (fundamental/macro/earnings/valuation/
+    # pledge/shareholder/index_membership/market_env_refine) that an
+    # allow-revised run admits, and a different frozen feature profile is a
+    # different feature recipe (required_channels + per-channel coverage
+    # minimums).  Two runs differing ONLY in either lever train on materially
+    # different channels, so they MUST be distinct trials — never conflated into
+    # one experiment.  Each defaults to 'none' so callers without the switch
+    # (the baseline script) hash a stable signature.
+    h.update(f"vintage_policy={vintage_policy or 'none'};".encode("utf-8"))
+    h.update(f"feature_profile={feature_profile or 'none'};".encode("utf-8"))
     # §十七: baseline identity levers — input recipe (with_seq + seq_len +
     # construction version), model hyperparameters, the training-sample policy
     # (max_train_rows / sampling strategy), and the feature-scaling recipe are

@@ -494,6 +494,69 @@ def test_signature_changes_with_research_choices(tp):
             != base_sig)
 
 
+def test_signature_binds_vintage_policy(tp):
+    """§T19: two runs differing ONLY in the vintage-admission policy train on
+    materially different channels — safe-only denies latest_revised_aligned
+    (fundamental/macro/earnings/valuation/pledge/shareholder/index_membership/
+    market_env_refine) that allow-revised admits — so they MUST be distinct
+    trials, never conflated into one experiment."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    s_safe = tp._experiment_signature(base, cfg, vintage_policy="safe-only")
+    assert (tp._experiment_signature(base, cfg, vintage_policy="allow-revised")
+            != s_safe)
+    # Same policy + same everything else → same signature (a re-run).
+    assert tp._experiment_signature(base, cfg, vintage_policy="safe-only") == s_safe
+
+
+def test_signature_binds_feature_profile(tp):
+    """§T19: a different frozen feature profile is a different feature recipe
+    (different required_channels + per-channel coverage minimums) — two runs
+    differing ONLY in the profile must be distinct trials."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    s_none = tp._experiment_signature(base, cfg, feature_profile="none")
+    assert (tp._experiment_signature(base, cfg, feature_profile="headline_v1")
+            != s_none)
+    # Same profile + same everything else → same signature (a re-run).
+    assert tp._experiment_signature(base, cfg, feature_profile="none") == s_none
+
+
+def test_signature_vintage_profile_default_to_none(tp):
+    """§T19: callers that omit the new levers (None defaults — the baseline
+    script) must hash exactly as if the literal 'none' were passed, so their
+    signatures stay stable across this upgrade."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    assert (tp._experiment_signature(base, cfg)
+            == tp._experiment_signature(
+                base, cfg, vintage_policy="none", feature_profile="none"))
+
+
 # ── _require_quality_gate (§九.1 custom-prebuilt binding / §八-2 universe) ──
 
 _VALID_RECON = {
