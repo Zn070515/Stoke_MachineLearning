@@ -454,6 +454,53 @@ class TestPanelStoreStrictExternalMeta:
                                    strict_external_meta=True)
         assert loaded["stock_codes"] == panel["stock_codes"]
 
+    def test_strict_non_membership_store_reuse_regression(self, tmp_path):
+        """T1 regression: a store whose meta OMITS membership_hash (non-membership
+        universe, e.g. --universe all) must REUSE in strict mode when the
+        requested meta also omits it — the key is out of scope, not a refusal."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())  # no membership_hash
+        loaded = load_panel_memmap(tmp_path, expected_meta=_meta(),
+                                   strict_external_meta=True)
+        assert loaded["stock_codes"] == panel["stock_codes"]
+
+    def test_strict_both_explicit_none_calendar_refuses(self, tmp_path):
+        """An EXPLICIT None on BOTH sides (calendar materialization failed) is
+        still refused in strict mode — the run cannot vouch for the artifact."""
+        save_panel_memmap(_storeable_panel(), tmp_path,
+                          meta=_meta(calendar_hash=None))
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path,
+                              expected_meta=_meta(calendar_hash=None),
+                              strict_external_meta=True)
+        msg = str(ei.value)
+        assert "calendar_hash" in msg
+        assert "neither side" in msg
+
+    def test_strict_both_absent_skips(self, tmp_path):
+        """Both sides ABSENT a warn key (neither context consumes the artifact)
+        skips even in strict mode — the both-absent skip the T1 fix relies on."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        loaded = load_panel_memmap(tmp_path, expected_meta=_meta(),
+                                   strict_external_meta=True)
+        assert loaded["stock_codes"] == panel["stock_codes"]
+
+    def test_panel_store_meta_omits_membership_for_non_csi(self, tmp_path):
+        """_panel_store_meta must NOT write membership_hash for a non-membership
+        universe (--universe all): the None from _universe_artifact_hashes is a
+        'membership not consumed' sentinel, and writing it as an explicit null
+        would brick strict-mode reuse of the store (T1)."""
+        args = SimpleNamespace(
+            universe="all", horizon=5, start="2024-01-01", end="2024-12-31",
+            vintage_policy="allow-revised", minute=False,
+        )
+        meta = _panel_store_meta(args, seq_len=60, stock_list=["600000"],
+                                 data_dir=str(tmp_path), prebuilt_dir=None)
+        assert "membership_hash" not in meta
+        # the status hash the universe DOES consume is still recorded
+        assert "universe_status_hash" in meta
+
 
 class TestPanelStoreSaveEdgeCases:
     def test_save_to_existing_file_raises(self, tmp_path):

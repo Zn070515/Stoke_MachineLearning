@@ -151,13 +151,20 @@ def _panel_store_meta(
                 data_dir)["calendar_artifact_hash"]
         except Exception:
             # calendar could not be materialized (neither artifact nor code
-            # frame) — record nothing so the load-side comparison skips.
+            # frame) — record an explicit None so strict-mode loads REFUSE
+            # (cannot vouch for calendar identity) instead of reusing a store
+            # whose calendar the run cannot verify (T1).
             meta["calendar_hash"] = None
         universe_status = load_universe_status(data_dir)
         universe_hashes = _universe_artifact_hashes(
             universe_status, data_dir, args.universe)
         meta["universe_status_hash"] = universe_hashes["universe_status_hash"]
-        meta["membership_hash"] = universe_hashes["membership_hash"]
+        # membership_hash is a "membership not consumed" sentinel (None) for
+        # non-csi universes, NOT a compute failure — omit it so strict-mode
+        # loads see a both-absent key (skip) instead of a both-explicit-None
+        # (refuse): a --universe all store must stay reusable, not bricked.
+        if universe_hashes["membership_hash"] is not None:
+            meta["membership_hash"] = universe_hashes["membership_hash"]
     if prebuilt_dir:
         meta["prebuilt_feature_manifest_hash"] = _dir_content_hash(
             os.path.join(prebuilt_dir, ".manifests"))
