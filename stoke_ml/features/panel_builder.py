@@ -20,6 +20,8 @@ The five builder concerns were extracted into ``stoke_ml.features.panel_builders
 import logging
 import os
 import re
+import shutil
+import tempfile
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -43,6 +45,428 @@ from stoke_ml.features.panel_helpers import (
 from stoke_ml.features.temporal import add_calendar_features
 
 logger = logging.getLogger(__name__)
+
+
+def _engineer_stock(
+    pipeline,
+    code: str,
+    prebuilt_dir: str | None,
+    panel: pd.DataFrame,
+    aux_data: dict[str, dict[str, pd.DataFrame]],
+    data_dir: str | None,
+    drop_reasons: Counter,
+    drop_examples: dict[str, list[str]],
+) -> pd.DataFrame | None:
+    """Engineer features for a single stock (prebuilt or live path).
+
+    Extracted from ``build_panel_features`` (§T5 streaming/two-pass) so both
+    the dense and streaming paths share the same per-stock body.
+
+    Returns the engineered feature DataFrame, or None if the stock is dropped.
+    Side-effects: mutates *drop_reasons* and *drop_examples* for drop
+    accounting.
+    """
+    from stoke_ml.config.feature_profile import CHANNEL_COLUMNS
+
+    if prebuilt_dir:
+        path = os.path.join(prebuilt_dir, f"{code}.parquet")
+        feats = pipeline.load_features(path)
+        feats["date"] = pd.to_datetime(feats["date"])
+        # Flat prebuilt (data/features/) carries temporal lag columns
+        # (skip_temporal=False).  Panel training uses skip_temporal=True
+        # (xLSTM learns the time structure itself), so drop *_lag{N}
+        # columns — the remainder matches a --panel-mode build.
+        lag_cols = [c for c in feats.columns if re.search(r"_lag\d+$", c)]
+        if lag_cols:
+            feats = feats.drop(columns=lag_cols)
+        # §七: topic_* columns (global_frozen topic model) are OFF by
+        # default — drop them on the PREBUILT path too, not just in
+        # _engineer_features, so a prebuilt parquet that carried them
+        # (built with use_topic=True, or a schema drift) cannot leak
+        # the non-PIT representation into a default training run.
+        if not pipeline.use_topic:
+            feats = pipeline._drop_topic_columns(feats)
+        # §T7/§十四: generic per-channel scrub.
+        _channel_switch_attr = {"announcement": "use_announcements"}
+        _off_cols: list[str] = []
+        for _channel, _cols in CHANNEL_COLUMNS.items():
+            _switch = getattr(
+                pipeline,
+                _channel_switch_attr.get(_channel, f"use_{_channel}"),
+                True,
+            )
+            if not _switch:
+                _off_cols.extend(c for c in _cols if c in feats.columns)
+        if _off_cols:
+            feats = feats.drop(columns=_off_cols)
+        # A stale/hand-built parquet may carry a
+        # weekend/duplicate bar that would pollute the UNION date axis.
+        feats = pipeline._clean_calendar_dates(feats, code, data_dir=data_dir)
+        if feats is None:
+            drop_reasons["calendar_clean_dropped"] += 1
+            drop_examples["calendar_clean_dropped"].append(code)
+            return None
+        # Calendar features are idempotent (overwrite in place); safe
+        # to re-apply even though save_features(panel_mode=True) already
+        # added them — guards against hand-built parquets.
+        feats = add_calendar_features(feats)
+    else:
+        mask = panel["stock_code"] == code
+        df_stock = panel[mask].sort_values("date").reset_index(drop=True)
+        # Drop phantom/duplicate/out-of-calendar rows before
+        # feature engineering so a bad bar neither pollutes the UNION
+        # date axis nor corrupts the rolling indicators around it.
+        df_stock = pipeline._clean_calendar_dates(df_stock, code, data_dir=data_dir)
+        if df_stock is None:
+            drop_reasons["calendar_clean_dropped"] += 1
+            drop_examples["calendar_clean_dropped"].append(code)
+            return None
+        stock_aux = aux_data.get(code, {})
+        feats = pipeline._engineer_features(
+            df_stock,
+            sentiment_df=stock_aux.get("sentiment"),
+            guba_df=stock_aux.get("guba"),
+            comment_df=stock_aux.get("comment"),
+            announcement_df=stock_aux.get("announcement"),
+            margin_df=stock_aux.get("margin"),
+            northbound_df=stock_aux.get("northbound"),
+            dragon_tiger_df=stock_aux.get("dragon_tiger"),
+            fundamental_df=stock_aux.get("fundamental"),
+            valuation_df=stock_aux.get("valuation"),
+            etf_flow_df=stock_aux.get("etf_flow"),
+            capital_flow_df=stock_aux.get("capital_flow"),
+            block_trade_df=stock_aux.get("block_trade"),
+            shareholder_df=stock_aux.get("shareholder"),
+            lockup_df=stock_aux.get("lockup"),
+            dividend_df=stock_aux.get("dividend"),
+            board_df=stock_aux.get("board"),
+            sector_df=stock_aux.get("sector"),
+            concept_df=stock_aux.get("concept"),
+            skip_temporal=True,  # xLSTM learns temporal patterns natively
+        )
+        # Calendar features are normally added by the temporal path;
+        # we still want them when skip_temporal=True (panel model benefits
+        # from day-of-week/month/quarter signals for seasonality).
+        feats = add_calendar_features(feats)
+    # Defragment after many df["col"] = ... assignments in merge methods.
+    # Without this, pandas emits PerformanceWarning and slows down
+    # subsequent operations.
+    feats = feats.copy()
+    return feats
+
+
+def _zi_align_df(
+    df: pd.DataFrame, all_cols: set,
+) -> pd.DataFrame:
+    """ZI-align a single stock's feature frame to the union column set.
+
+    Mirrors the dense-path ZI-alignment block (lines 423-444) — same
+    column-fill rules: ``has_*`` → False, ``*_count``/``*_streak`` → int16 0,
+    else float32 0.  Returns *df* with missing columns added (mutated in
+    place for the original frame reference).
+    """
+    missing = all_cols - set(df.columns)
+    if not missing:
+        return df
+    fill_data: dict[str, np.ndarray] = {}
+    n = len(df)
+    for col in missing:
+        if col == "date":
+            continue
+        elif col.startswith("has_"):
+            fill_data[col] = np.full(n, False)
+        elif col.endswith("_count") or col.endswith("_streak"):
+            fill_data[col] = np.zeros(n, dtype=np.int16)
+        else:
+            fill_data[col] = np.zeros(n, dtype=np.float32)
+    if fill_data:
+        fill_df = pd.DataFrame(fill_data, index=df.index)
+        # NOTE: pd.concat returns a new DataFrame; the caller must rebind.
+        return pd.concat([df, fill_df], axis=1)
+    return df
+
+
+def _build_panel_streaming(
+    pipeline,
+    target_col: str,
+    horizon: int,
+    prebuilt_dir: str | None,
+    panel: pd.DataFrame,
+    aux_data: dict,
+    data_dir: str | None,
+    daily_membership: pd.DataFrame | None,
+    memmap_dir: str,
+    min_history: int,
+    codes: list[str],
+    input_stocks: int,
+    drop_reasons: Counter,
+    drop_examples: dict[str, list[str]],
+) -> dict:
+    """Streaming / two-pass panel build (§T5).
+
+    Eliminates the ``all_feat_dfs`` full-residence list: each stock's
+    engineered feature frame is written to a scratch pickle in Pass 1,
+    re-read per-pass, and the scratch directory is cleaned in ``finally``.
+    The only bounded structure is the per-date normalizer-stats accumulator
+    and the (optional) cross-sectional-fundamental panel (~9 cols x total
+    rows).
+    """
+    scratch = tempfile.mkdtemp(prefix="panel_stream_scratch_")
+    try:
+        # ── Pass 1: engineer → disk + metadata ──────────────────────────
+        valid_codes: list[str] = []
+        all_cols: set = set()
+        all_dates: set = set()
+        stock_dates: list[set] = []  # per-stock date set
+        has_sector_code = False
+        N_stocks = 0
+
+        for code in codes:
+            feats = _engineer_stock(
+                pipeline, code, prebuilt_dir, panel, aux_data, data_dir,
+                drop_reasons, drop_examples,
+            )
+            if feats is None:
+                continue
+            # Collect metadata BEFORE writing to disk.
+            valid_codes.append(code)
+            all_cols.update(feats.columns)
+            sdates = {pd.Timestamp(d).date() for d in feats["date"]}
+            stock_dates.append(sdates)
+            all_dates.update(sdates)
+            if not has_sector_code and "sector_code" in feats.columns:
+                has_sector_code = True
+            # Serialize to scratch pickle.
+            pkl_path = os.path.join(scratch, f"{code}.pkl")
+            feats.to_pickle(pkl_path)
+            N_stocks += 1
+
+        if not valid_codes:
+            raise ValueError(
+                f"build_panel_features: every input stock was dropped — "
+                f"{input_stocks} input stock(s), {len(valid_codes)} survived "
+                f"cleaning.  drop_reason_counts={dict(drop_reasons)}; drop "
+                f"examples (first reason → codes): "
+                f"{dict(list(drop_examples.items())[:6])}.  Check the "
+                f"prebuilt dir / panel data / calendar alignment before "
+                f"training."
+            )
+
+        # ── Global date axis (exact same code as dense path) ────────────
+        all_dates_sorted = sorted(all_dates)
+        if all_dates_sorted:
+            _cal = _get_panel_calendar(data_dir)
+            _official = set(_cal.get_trading_days(
+                all_dates_sorted[0], all_dates_sorted[-1]))
+            _off = [d.strftime("%Y-%m-%d") for d in all_dates_sorted
+                    if d not in _official]
+            if _off:
+                raise ValueError(
+                    "panel union axis contains dates that are not in the "
+                    f"official a_shares trading calendar: "
+                    f"{_off[:10]}{' ...' if len(_off) > 10 else ''}")
+        max_T = len(all_dates_sorted)
+        global_dates = np.array(
+            [pd.Timestamp(d) for d in all_dates_sorted],
+            dtype="datetime64[ns]",
+        )
+        date_to_pos = {str(d): i for i, d in enumerate(all_dates_sorted)}
+
+        if max_T < pipeline.seq_len + 5:
+            raise ValueError(
+                f"Max timesteps ({max_T}) must be > seq_len+5 "
+                f"({pipeline.seq_len + 5})"
+            )
+
+        # ── Arrays (memmap-backed grids) ────────────────────────────────
+        arrays = PanelArrays(N_stocks, max_T, sink_dir=memmap_dir)
+
+        # ── Pass 2cs: cross-sectional fundamental (if applicable) ───────
+        cs_fund_cols = ["date", "stock_code", "sector_code",
+                        "pe_ttm", "pb_mrq", "ps_ttm", "debt_ratio",
+                        "pe_percentile_252d", "pb_percentile_252d"]
+        new_cs_cols: list[str] = []
+        cs_panel_df: pd.DataFrame | None = None
+        if (pipeline._fundamental_refiner is not None
+                and has_sector_code):
+            panel_parts: list[pd.DataFrame] = []
+            for i, code in enumerate(valid_codes):
+                pkl_path = os.path.join(scratch, f"{code}.pkl")
+                df = pd.read_pickle(pkl_path)
+                if len(df) == 0:
+                    continue
+                avail = [c for c in cs_fund_cols if c in df.columns]
+                if "sector_code" not in avail:
+                    continue
+                part = df[avail].copy()
+                panel_parts.append(part)
+            if panel_parts:
+                cs_panel = pd.concat(panel_parts, ignore_index=True)
+                cs_panel = FundamentalRefiner.add_cross_sectional(cs_panel)
+                new_cs_cols = [c for c in cs_panel.columns
+                               if c not in set(cs_fund_cols)]
+                if new_cs_cols:
+                    cs_panel_df = cs_panel  # keep for Pass 3 merges
+
+        # ── Pass 2d: column discovery (first artifact) ──────────────────
+        first_code = valid_codes[0]
+        first_path = os.path.join(scratch, f"{first_code}.pkl")
+        first_df = pd.read_pickle(first_path)
+        # ZI-align the first frame.
+        first_df = _zi_align_df(first_df, all_cols)
+        # Merge cs cols into the first frame for discovery.
+        if cs_panel_df is not None and new_cs_cols:
+            stock_cs = cs_panel_df[
+                cs_panel_df["stock_code"] == first_code
+            ]
+            if not stock_cs.empty:
+                merge_df = stock_cs[["date"] + new_cs_cols].copy()
+                first_df = first_df.merge(merge_df, on="date", how="left")
+                for col in new_cs_cols:
+                    if col not in first_df.columns:
+                        first_df[col] = np.float32(0.0)
+                    else:
+                        first_df[col] = (
+                            first_df[col].fillna(0.0).astype(np.float32)
+                        )
+            all_cols.update(new_cs_cols)
+
+        # Discover PK / PO / static columns.
+        static_cols_available = list(_PIT_STATIC_COLS)
+        pk_cols_available = pipeline._discover_pk_columns(first_df)
+        pk_set = set(pk_cols_available)
+        po_cols_available = pipeline._discover_po_columns(first_df, pk_set)
+
+        # norm_cols — same as the dense path.
+        from stoke_ml.features.panel_helpers import _CS_NORM_SKIP_COLS
+        norm_cols = [c for c in pk_cols_available + po_cols_available
+                     if c not in _CS_NORM_SKIP_COLS]
+
+        # ── Pass 2stats: dense normalizer stats over date+norm_cols ─────
+        # Load all artifacts, extract ONLY date + norm_cols (≈175 cols,
+        # 3× smaller than full frames), concat, and run the EXACT dense
+        # normalize() method.  The resulting stats are byte-identical to
+        # the dense path — the streaming accumulation alternatives all
+        # shift float summation order and produce ULP-level discrepancies.
+        # The light frames are ZI-aligned so normalize()'s concat
+        # `df[["date"] + norm_cols]` never raises KeyError on a missing
+        # norm_col.
+        _norm_col_set = frozenset(norm_cols)
+        if daily_membership is not None and not daily_membership.empty:
+            _stats_frames = []
+            for code in valid_codes:
+                pkl_path = os.path.join(scratch, f"{code}.pkl")
+                df = pd.read_pickle(pkl_path)
+                keep = ["date", "stock_code"] + [
+                    c for c in norm_cols if c in df.columns
+                ]
+                df = _zi_align_df(df[keep], _norm_col_set | {"date", "stock_code"})
+                _stats_frames.append(df)
+        else:
+            _stats_frames = []
+            for code in valid_codes:
+                pkl_path = os.path.join(scratch, f"{code}.pkl")
+                df = pd.read_pickle(pkl_path)
+                keep = ["date"] + [c for c in norm_cols if c in df.columns]
+                df = _zi_align_df(df[keep], _norm_col_set | {"date"})
+                _stats_frames.append(df)
+        normalizer = DateWiseZScoreNormalizer(daily_membership)
+        _, date_stats = normalizer.normalize(
+            _stats_frames, pk_cols_available, po_cols_available,
+        )
+        del _stats_frames
+
+        # ── Pass 3: targets + ZI-align + cs merge + z-score + scatter ──
+        target_builder = TargetBuilder(horizon, target_col)
+        static_builder = StaticContextBuilder()
+        # Pre-size stock_pos so compute_stock can assign by index.
+        arrays.stock_pos = [
+            np.empty(0, dtype=np.int32) for _ in range(N_stocks)
+        ]
+
+        for i, code in enumerate(valid_codes):
+            pkl_path = os.path.join(scratch, f"{code}.pkl")
+            df = pd.read_pickle(pkl_path)
+
+            # 3a. Targets from RAW close (before any mutation).
+            target_builder.compute_stock(
+                df, i, code, max_T, date_to_pos, arrays,
+            )
+
+            # 3b. ZI-align columns.
+            df = _zi_align_df(df, all_cols)
+
+            # 3c. Merge cross-sectional fundamental cols.
+            if cs_panel_df is not None and new_cs_cols:
+                stock_cs = cs_panel_df[
+                    cs_panel_df["stock_code"] == code
+                ]
+                if not stock_cs.empty:
+                    merge_df = stock_cs[["date"] + new_cs_cols].copy()
+                    df = df.merge(merge_df, on="date", how="left")
+                    for col in new_cs_cols:
+                        if col not in df.columns:
+                            df[col] = np.float32(0.0)
+                        else:
+                            df[col] = (
+                                df[col].fillna(0.0).astype(np.float32)
+                            )
+
+            # 3d. Apply z-score (in-place mutation of norm_cols).
+            DateWiseZScoreNormalizer.apply_zscore(
+                df, norm_cols, date_stats,
+            )
+
+            # 3e. Scatter into feature grids.
+            # First stock: allocate grids after column discovery.
+            if i == 0:
+                arrays.alloc_features(
+                    len(static_cols_available),
+                    len(pk_cols_available),
+                    len(po_cols_available),
+                )
+            static_builder.build_stock(
+                df, i, code,
+                static_cols_available, pk_cols_available,
+                po_cols_available, arrays,
+            )
+
+        # ── Post: finalize ──────────────────────────────────────────────
+        # Quantile ranks over the full static grid.
+        static_builder.compute_quantile_ranks(
+            arrays, static_cols_available,
+        )
+
+        # Fill-probability array (same as dense path).
+        fill_prob_arr = np.full(max_T, np.nan, dtype=np.float64)
+        if max_T > horizon:
+            denom = arrays.entry_counts[:-horizon]
+            numer = arrays.filled_counts[:-horizon]
+            fill_prob_arr[:max_T - horizon] = np.divide(
+                numer, denom,
+                out=np.full(max_T - horizon, np.nan),
+                where=denom > 0,
+            )
+
+        # Eligibility masks.
+        elig_builder = EligibilityBuilder(pipeline.seq_len, min_history)
+        decision_arr, history_arr, universe_eligible_arr = (
+            elig_builder.compute(
+                arrays.obs, arrays.first_col,
+                arrays.amt60_raw, arrays.has_amount,
+            )
+        )
+
+        # Sanitize + assemble.
+        arrays.sanitize()
+
+        return arrays.assemble(
+            global_dates, decision_arr, history_arr,
+            universe_eligible_arr, fill_prob_arr,
+            pk_cols_available, po_cols_available, valid_codes,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def build_panel_features(
@@ -242,6 +666,16 @@ def build_panel_features(
                 dict(reason_counts), stale_manifest[:10],
             )
 
+    # ── Streaming / two-pass branch (§T5) ──
+    if memmap_dir is not None:
+        return _build_panel_streaming(
+            pipeline, target_col, horizon,
+            prebuilt_dir, panel, aux_data, data_dir,
+            daily_membership, memmap_dir, min_history,
+            codes, input_stocks, drop_reasons, drop_examples,
+        )
+
+    # ── Dense path (byte-identical) ──
     # Engineer features per stock (reuses existing pipeline)
     all_feat_dfs = []
     # §v12-P0: valid_codes tracks the codes whose features SURVIVED cleaning
@@ -252,110 +686,12 @@ def build_panel_features(
     # OOS artifact codes) without any error being raised.
     valid_codes: list[str] = []
     for code in codes:
-        if prebuilt_dir:
-            path = os.path.join(prebuilt_dir, f"{code}.parquet")
-            feats = pipeline.load_features(path)
-            feats["date"] = pd.to_datetime(feats["date"])
-            # Flat prebuilt (data/features/) carries temporal lag columns
-            # (skip_temporal=False).  Panel training uses skip_temporal=True
-            # (xLSTM learns the time structure itself), so drop *_lag{N}
-            # columns — the remainder matches a --panel-mode build.
-            lag_cols = [c for c in feats.columns if re.search(r"_lag\d+$", c)]
-            if lag_cols:
-                feats = feats.drop(columns=lag_cols)
-            # §七: topic_* columns (global_frozen topic model) are OFF by
-            # default — drop them on the PREBUILT path too, not just in
-            # _engineer_features, so a prebuilt parquet that carried them
-            # (built with use_topic=True, or a schema drift) cannot leak
-            # the non-PIT representation into a default training run.
-            if not pipeline.use_topic:
-                feats = pipeline._drop_topic_columns(feats)
-            # §T7/§十四: generic per-channel scrub.  build_features.py
-            # --panel-mode bakes ALL channels in with all-True defaults, so a
-            # restricted run (safe-only vintage / ablation) would otherwise
-            # silently consume channels its pipeline does not request.  Drop
-            # the EXACT CHANNEL_COLUMNS set of every channel whose use_* switch
-            # is OFF (map channel → switch attr; "announcement" is the one
-            # special-cased name).  Only the exact sets are used — NO
-            # name-prefix matching, which is exactly the market_env-vs-macd /
-            # market_env_refine collision trap.  fundamental_refine is coupled
-            # to fundamental (pipeline forces it off with fundamental), so a
-            # safe-only run drops its columns too.  topic_* is handled
-            # separately above (prefix drop, frozen non-PIT topic model); a
-            # prebuilt parquet built with use_topic=True is scrubbed there.
-            _channel_switch_attr = {"announcement": "use_announcements"}
-            _off_cols: list[str] = []
-            for _channel, _cols in CHANNEL_COLUMNS.items():
-                _switch = getattr(
-                    pipeline,
-                    _channel_switch_attr.get(_channel, f"use_{_channel}"),
-                    True,
-                )
-                if not _switch:
-                    _off_cols.extend(c for c in _cols if c in feats.columns)
-            if _off_cols:
-                feats = feats.drop(columns=_off_cols)
-            # A stale/hand-built parquet may carry a
-            # weekend/duplicate bar that would pollute the UNION date axis.
-            feats = pipeline._clean_calendar_dates(feats, code, data_dir=data_dir)
-            if feats is None:
-                drop_reasons["calendar_clean_dropped"] += 1
-                drop_examples["calendar_clean_dropped"].append(code)
-                continue
-            # Calendar features are idempotent (overwrite in place); safe
-            # to re-apply even though save_features(panel_mode=True) already
-            # added them — guards against hand-built parquets.
-            feats = add_calendar_features(feats)
-            # Schema note: parquets must be built with the SAME --use-*
-            # flags (build_features.py).  Column SETS still legitimately
-            # differ per stock — merge methods skip columns when a stock
-            # has no data for a sparse aux type (block_trade, dividend,
-            # valuation, ...).  No strict equality check here: those gaps
-            # are reconciled by the all_cols ZI-alignment block after the
-            # loop, and PK/PO columns are discovered BY NAME (never by
-            # position), so a missing column simply becomes all-zero.
-        else:
-            mask = panel["stock_code"] == code
-            df_stock = panel[mask].sort_values("date").reset_index(drop=True)
-            # Drop phantom/duplicate/out-of-calendar rows before
-            # feature engineering so a bad bar neither pollutes the UNION
-            # date axis nor corrupts the rolling indicators around it.
-            df_stock = pipeline._clean_calendar_dates(df_stock, code, data_dir=data_dir)
-            if df_stock is None:
-                drop_reasons["calendar_clean_dropped"] += 1
-                drop_examples["calendar_clean_dropped"].append(code)
-                continue
-            stock_aux = aux_data.get(code, {})
-            feats = pipeline._engineer_features(
-                df_stock,
-                sentiment_df=stock_aux.get("sentiment"),
-                guba_df=stock_aux.get("guba"),
-                comment_df=stock_aux.get("comment"),
-                announcement_df=stock_aux.get("announcement"),
-                margin_df=stock_aux.get("margin"),
-                northbound_df=stock_aux.get("northbound"),
-                dragon_tiger_df=stock_aux.get("dragon_tiger"),
-                fundamental_df=stock_aux.get("fundamental"),
-                valuation_df=stock_aux.get("valuation"),
-                etf_flow_df=stock_aux.get("etf_flow"),
-                capital_flow_df=stock_aux.get("capital_flow"),
-                block_trade_df=stock_aux.get("block_trade"),
-                shareholder_df=stock_aux.get("shareholder"),
-                lockup_df=stock_aux.get("lockup"),
-                dividend_df=stock_aux.get("dividend"),
-                board_df=stock_aux.get("board"),
-                sector_df=stock_aux.get("sector"),
-                concept_df=stock_aux.get("concept"),
-                skip_temporal=True,  # xLSTM learns temporal patterns natively
-            )
-            # Calendar features are normally added by the temporal path;
-            # we still want them when skip_temporal=True (panel model benefits
-            # from day-of-week/month/quarter signals for seasonality).
-            feats = add_calendar_features(feats)
-        # Defragment after many df["col"] = ... assignments in merge methods.
-        # Without this, pandas emits PerformanceWarning and slows down
-        # subsequent operations.
-        feats = feats.copy()
+        feats = _engineer_stock(
+            pipeline, code, prebuilt_dir, panel, aux_data, data_dir,
+            drop_reasons, drop_examples,
+        )
+        if feats is None:
+            continue
         all_feat_dfs.append(feats)
         valid_codes.append(code)
 

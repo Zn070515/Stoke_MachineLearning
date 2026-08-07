@@ -45,11 +45,6 @@ class StaticContextBuilder:
         quantile ranks (``*_60d_q`` columns) — mutates ``arrays.static``
         in place.
         """
-        N_stocks, max_T = arrays.N, arrays.T
-        static_cols_available = list(static_cols)
-        pk_cols_available = list(pk_cols)
-        po_cols_available = list(po_cols)
-
         # stock_pos is written by TargetBuilder.compute(); a None here means
         # the builder was skipped — fail loudly instead of silently indexing an
         # empty list (which would scatter features onto wrong rows).
@@ -59,47 +54,80 @@ class StaticContextBuilder:
         )
 
         for i, df in enumerate(all_feat_dfs):
-            if len(df) == 0:
-                continue
-
-            df_sorted = df.sort_values("date").reset_index(drop=True)
-            pos = arrays.stock_pos[i]
-            if len(pos) == 0:
-                continue
-
-            # PIT static — per-row series scattered onto global-calendar
-            # columns.  amt_60d_q holds the RAW trailing 60d mean (captured in
-            # the target loop before z-score); its cross-sectional per-date
-            # quantile is computed over the whole (N, T) grid after the loop.
-            if len(static_cols_available) > 0:
-                s = np.zeros((len(pos), len(static_cols_available)), dtype=np.float32)
-                sidx = {c: k for k, c in enumerate(static_cols_available)}
-                if "amt_60d_q" in sidx:
-                    s[:, sidx["amt_60d_q"]] = arrays.amt60_raw[i][pos]
-                if "listing_days" in sidx:
-                    glob_col = pos.astype(np.float32)
-                    if arrays.first_col[i] >= 0:
-                        glob_col = np.maximum(glob_col - arrays.first_col[i], 0.0)
-                    s[:, sidx["listing_days"]] = glob_col / 250.0
-                bid = _board_index(valid_codes[i])
-                bcol = _BOARD_ONEHOT_COLS[bid]
-                if bcol in sidx:
-                    s[:, sidx[bcol]] = 1.0
-                arrays.static[i, pos] = s
-
-            # Past known / observed — scattered onto global-calendar columns.
-            arrays.pk[i, pos] = (
-                df_sorted[pk_cols_available].fillna(0.0).values.astype(np.float32)
-            )
-            arrays.po[i, pos] = (
-                df_sorted[po_cols_available].fillna(0.0).values.astype(np.float32)
+            self.build_stock(
+                df, i, valid_codes[i], static_cols, pk_cols, po_cols, arrays,
             )
 
-        # Cross-sectional per-date quantile for the trailing-mean
-        # size/liquidity features.  Rank within each column's cross-section of
-        # stocks that are genuinely listed there (obs True) with a nonzero
-        # trailing mean.  PIT-safe: every value in column t uses only data
-        # through close t, and the within-column rank is itself known at t.
+        self.compute_quantile_ranks(arrays, static_cols)
+
+    def build_stock(
+        self,
+        df,
+        i: int,
+        valid_code: str,
+        static_cols: list,
+        pk_cols: list,
+        po_cols: list,
+        arrays: PanelArrays,
+    ):
+        """Scatter a single stock's features into arrays.static / .pk / .po.
+
+        Extracted from ``build()`` (§T5 streaming/two-pass) so the streaming
+        path can call it directly.
+        """
+        static_cols_available = list(static_cols)
+        pk_cols_available = list(pk_cols)
+        po_cols_available = list(po_cols)
+
+        if len(df) == 0:
+            return
+
+        df_sorted = df.sort_values("date").reset_index(drop=True)
+        pos = arrays.stock_pos[i]
+        if len(pos) == 0:
+            return
+
+        # PIT static — per-row series scattered onto global-calendar
+        # columns.  amt_60d_q holds the RAW trailing 60d mean (captured in
+        # the target loop before z-score); its cross-sectional per-date
+        # quantile is computed over the whole (N, T) grid after the loop.
+        if len(static_cols_available) > 0:
+            s = np.zeros((len(pos), len(static_cols_available)), dtype=np.float32)
+            sidx = {c: k for k, c in enumerate(static_cols_available)}
+            if "amt_60d_q" in sidx:
+                s[:, sidx["amt_60d_q"]] = arrays.amt60_raw[i][pos]
+            if "listing_days" in sidx:
+                glob_col = pos.astype(np.float32)
+                if arrays.first_col[i] >= 0:
+                    glob_col = np.maximum(glob_col - arrays.first_col[i], 0.0)
+                s[:, sidx["listing_days"]] = glob_col / 250.0
+            bid = _board_index(valid_code)
+            bcol = _BOARD_ONEHOT_COLS[bid]
+            if bcol in sidx:
+                s[:, sidx[bcol]] = 1.0
+            arrays.static[i, pos] = s
+
+        # Past known / observed — scattered onto global-calendar columns.
+        arrays.pk[i, pos] = (
+            df_sorted[pk_cols_available].fillna(0.0).values.astype(np.float32)
+        )
+        arrays.po[i, pos] = (
+            df_sorted[po_cols_available].fillna(0.0).values.astype(np.float32)
+        )
+
+    def compute_quantile_ranks(
+        self,
+        arrays: PanelArrays,
+        static_cols: list,
+    ):
+        """Cross-sectional per-date quantile ranks for ``*_60d_q`` columns.
+
+        Extracted from the tail of ``build()`` (§T5 streaming/two-pass) so the
+        streaming path can run it once after the scatter pass.
+        """
+        max_T = arrays.T
+        static_cols_available = list(static_cols)
+
         for qname in static_cols_available:
             if not qname.endswith("_60d_q"):
                 continue

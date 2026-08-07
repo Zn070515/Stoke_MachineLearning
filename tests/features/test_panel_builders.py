@@ -5,12 +5,18 @@ per-stock write via ``TargetBuilder``, ``sanitize``/``assemble`` round-trip,
 and a small pure-function check for ``EligibilityBuilder``.  These do NOT
 exercise ``build_panel_features`` end-to-end (that is covered elsewhere) —
 they pin the builder/container seams directly.
+
+§T5 streaming/two-pass tests added at the bottom of
+``TestBuildPanelFeaturesMemmap``.
 """
 
+import gc
 import numpy as np
 import os
 import pandas as pd
 import pytest
+import shutil
+import tempfile
 
 from stoke_ml.features.panel_builders._arrays import PanelArrays
 from stoke_ml.features.panel_builders._targets import TargetBuilder
@@ -528,3 +534,308 @@ class TestBuildPanelFeaturesMemmap:
         assert mmap_peak < dense_peak, (
             f"memmap peak ({mmap_peak}) should be below dense peak "
             f"({dense_peak}) — the 3 big grids must not be in RAM")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # §T5: Streaming / two-pass tests
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _assert_streaming_eq_dense(self, dense, streaming, extra_grid_keys=()):
+        """Assert streaming-vs-dense byte-identity on all arrays + metadata."""
+        grid_keys = (
+            "static_features", "past_known", "past_observed",
+            "y_direction", "y_return", "y_volatility",
+            "observation_mask", "entry_eligible_mask",
+            "return_target_mask", "vol_target_mask",
+            "realized_return", "close_price", "open_price",
+            "decision_eligible_mask", "history_eligible_mask",
+            "universe_eligible_mask",
+        ) + tuple(extra_grid_keys)
+        for key in grid_keys:
+            if key in dense and key in streaming:
+                np.testing.assert_array_equal(
+                    np.asarray(streaming[key]), np.asarray(dense[key]),
+                    err_msg=f"streaming vs dense mismatch on {key}")
+        assert streaming["stock_codes"] == dense["stock_codes"]
+        assert streaming["past_known_cols"] == dense["past_known_cols"]
+        assert streaming["past_observed_cols"] == dense["past_observed_cols"]
+        np.testing.assert_array_equal(
+            streaming["global_dates"], dense["global_dates"])
+
+    # ── daily_membership fixture ──────────────────────────────────────
+
+    def test_streaming_vs_dense_with_membership(self, tmp_path):
+        """Streaming matches dense when daily_membership restricts the
+        statistical set AND produces a zero-member date."""
+        from stoke_ml.features.pipeline import FeaturePipeline
+
+        dates = pd.date_range("2024-01-02", periods=20, freq="B")
+        codes = ["000001", "000002", "000003"]
+        dfs = []
+        for code, base in zip(codes, [10.0, 20.0, 30.0]):
+            px = base + np.arange(len(dates)) * 0.1
+            dfs.append(pd.DataFrame({
+                "date": dates,
+                "stock_code": code,
+                "open": px,
+                "high": px + 0.05,
+                "low": px - 0.05,
+                "close": px,
+                "volume": np.full(len(dates), 1e6, dtype=np.float64),
+                "amount": np.full(len(dates), 1e8, dtype=np.float64),
+            }))
+        panel = pd.concat(dfs, ignore_index=True)
+
+        # Membership: all stocks are members on dates[0:5] and dates[6:],
+        # but NOT on dates[5] (zero-member date).
+        membership = pd.DataFrame({
+            "stock_code": [c for c in codes for _ in range(2)],
+            "in_date": [
+                dates[0], dates[6],  # stock 0
+                dates[0], dates[6],  # stock 1
+                dates[0], dates[6],  # stock 2
+            ],
+            "out_date": [
+                dates[5], pd.NaT,   # stock 0: member D0-D4, D6-end
+                dates[5], pd.NaT,   # stock 1
+                dates[5], pd.NaT,   # stock 2
+            ],
+        })
+
+        fp = FeaturePipeline(seq_len=10, use_sentiment=False,
+                            use_guba=False, use_comment=False,
+                            use_announcements=False, use_margin=False,
+                            use_northbound=False, use_dragon_tiger=False,
+                            use_fundamental=False, use_earnings=False,
+                            use_valuation=False, use_etf_flow=False,
+                            use_capital_flow=False, use_block_trade=False,
+                            use_shareholder=False, use_lockup=False,
+                            use_dividend=False, use_board=False,
+                            use_sector=False, use_concept=False,
+                            use_industry=False, use_macro=False,
+                            use_pledge=False, use_index_membership=False,
+                            use_market_env=False, use_market_env_refine=False,
+                            use_limit_up=False, use_topic=False)
+
+        dense = fp.build_panel_features(
+            panel, horizon=1, daily_membership=membership,
+        )
+        memmap_out = fp.build_panel_features(
+            panel, horizon=1, daily_membership=membership,
+            memmap_dir=str(tmp_path / "sink"),
+        )
+        self._assert_streaming_eq_dense(dense, memmap_out)
+
+    # ── cross-sectional fundamental fixture ───────────────────────────
+
+    def test_streaming_vs_dense_with_cs_fundamental(self, tmp_path):
+        """Streaming matches dense when cross-sectional fundamental is active
+        (use_fundamental_refine=True + sector_code in feature frames)."""
+        from stoke_ml.features.pipeline import FeaturePipeline
+
+        dates = pd.date_range("2024-01-02", periods=20, freq="B")
+        codes = ["000001", "000002", "000003"]
+        dfs = []
+        for code_idx, (code, base) in enumerate(
+            zip(codes, [10.0, 20.0, 30.0])
+        ):
+            px = base + np.arange(len(dates)) * 0.1
+            dfs.append(pd.DataFrame({
+                "date": dates,
+                "stock_code": code,
+                "open": px,
+                "high": px + 0.05,
+                "low": px - 0.05,
+                "close": px,
+                "volume": np.full(len(dates), 1e6, dtype=np.float64),
+                "amount": np.full(len(dates), 1e8, dtype=np.float64),
+                "sector_code": 1000 + code_idx,
+                "pe_ttm": np.full(len(dates), 15.0 + code_idx * 5,
+                                  dtype=np.float64),
+                "pb_mrq": np.full(len(dates), 2.0 + code_idx * 0.5,
+                                  dtype=np.float64),
+                "ps_ttm": np.full(len(dates), 3.0 + code_idx * 0.3,
+                                  dtype=np.float64),
+                "debt_ratio": np.full(len(dates), 0.5 + code_idx * 0.1,
+                                      dtype=np.float64),
+                "pe_percentile_252d": np.full(len(dates), 0.5,
+                                              dtype=np.float64),
+                "pb_percentile_252d": np.full(len(dates), 0.5,
+                                              dtype=np.float64),
+            }))
+        panel = pd.concat(dfs, ignore_index=True)
+
+        # use_fundamental_refine is coupled to use_fundamental (pipeline
+        # forces it off when fundamental is off), so BOTH must be True.
+        fp = FeaturePipeline(seq_len=10, use_sentiment=False,
+                            use_guba=False, use_comment=False,
+                            use_announcements=False, use_margin=False,
+                            use_northbound=False, use_dragon_tiger=False,
+                            use_fundamental=True, use_earnings=False,
+                            use_valuation=False, use_etf_flow=False,
+                            use_capital_flow=False, use_block_trade=False,
+                            use_shareholder=False, use_lockup=False,
+                            use_dividend=False, use_board=False,
+                            use_sector=False, use_concept=False,
+                            use_industry=False, use_macro=False,
+                            use_pledge=False, use_index_membership=False,
+                            use_market_env=False, use_market_env_refine=False,
+                            use_limit_up=False, use_topic=False,
+                            use_fundamental_refine=True)
+
+        dense = fp.build_panel_features(panel, horizon=1)
+        memmap_out = fp.build_panel_features(
+            panel, horizon=1, memmap_dir=str(tmp_path / "sink"),
+        )
+
+        # The cs-fundamental path adds specific new columns; verify they
+        # appear in the past_known_cols.
+        cs_expected = {"pe_sector_ratio", "pb_sector_ratio",
+                       "ps_sector_ratio", "leverage_warning",
+                       "valuation_composite_z"}
+        pk_set = set(dense["past_known_cols"])
+        assert cs_expected.issubset(pk_set), (
+            f"cs-fundamental cols {cs_expected} missing from "
+            f"past_known_cols: {pk_set}")
+
+        self._assert_streaming_eq_dense(dense, memmap_out)
+
+    # ── sparse-date backfill fixture ───────────────────────────────────
+
+    def test_streaming_vs_dense_sparse_backfill(self, tmp_path):
+        """Streaming matches dense on a sparse-date fixture where the
+        expanding-moment fallback is exercised (3 stocks with early dates,
+        5 stocks starting later → count<5 on early dates)."""
+        from stoke_ml.features.pipeline import FeaturePipeline
+
+        all_dates = pd.date_range("2024-01-02", periods=30, freq="B")
+        # 3 "early" stocks — full date range
+        early_dates = all_dates
+        # 5 "late" stocks — only last 20 dates (first 10 dates sparse)
+        late_dates = all_dates[10:]
+
+        dfs = []
+        for i in range(3):
+            code = f"{i:06d}"
+            px = 10.0 + np.arange(len(early_dates)) * 0.1
+            dfs.append(pd.DataFrame({
+                "date": early_dates,
+                "stock_code": code,
+                "open": px,
+                "high": px + 0.05,
+                "low": px - 0.05,
+                "close": px,
+                "volume": np.full(len(early_dates), 1e6, dtype=np.float64),
+                "amount": np.full(len(early_dates), 1e8, dtype=np.float64),
+            }))
+        for i in range(3, 8):
+            code = f"{i:06d}"
+            px = 10.0 + np.arange(len(late_dates)) * 0.1
+            dfs.append(pd.DataFrame({
+                "date": late_dates,
+                "stock_code": code,
+                "open": px,
+                "high": px + 0.05,
+                "low": px - 0.05,
+                "close": px,
+                "volume": np.full(len(late_dates), 1e6, dtype=np.float64),
+                "amount": np.full(len(late_dates), 1e8, dtype=np.float64),
+            }))
+        panel = pd.concat(dfs, ignore_index=True)
+
+        fp = FeaturePipeline(seq_len=10, use_sentiment=False,
+                            use_guba=False, use_comment=False,
+                            use_announcements=False, use_margin=False,
+                            use_northbound=False, use_dragon_tiger=False,
+                            use_fundamental=False, use_earnings=False,
+                            use_valuation=False, use_etf_flow=False,
+                            use_capital_flow=False, use_block_trade=False,
+                            use_shareholder=False, use_lockup=False,
+                            use_dividend=False, use_board=False,
+                            use_sector=False, use_concept=False,
+                            use_industry=False, use_macro=False,
+                            use_pledge=False, use_index_membership=False,
+                            use_market_env=False, use_market_env_refine=False,
+                            use_limit_up=False, use_topic=False)
+
+        dense = fp.build_panel_features(panel, horizon=1)
+        memmap_out = fp.build_panel_features(
+            panel, horizon=1, memmap_dir=str(tmp_path / "sink"),
+        )
+        self._assert_streaming_eq_dense(dense, memmap_out)
+
+    # ── tracemalloc sublinear growth ───────────────────────────────────
+
+    def test_streaming_tracemalloc_sublinear(self, tmp_path):
+        """Streaming peak memory grows sublinearly with N (all_feat_dfs
+        residence eliminated)."""
+        import tracemalloc
+
+        from stoke_ml.features.pipeline import FeaturePipeline
+
+        def _build_n(n_stocks: int, sink_dir: str | None):
+            dates = pd.date_range("2024-01-02", periods=60, freq="B")
+            dfs = []
+            for i in range(n_stocks):
+                code = f"{i:06d}"
+                px = 10.0 + np.arange(len(dates)) * 0.05
+                dfs.append(pd.DataFrame({
+                    "date": dates,
+                    "stock_code": code,
+                    "open": px,
+                    "high": px + 0.05,
+                    "low": px - 0.05,
+                    "close": px,
+                    "volume": np.full(len(dates), 1e6, dtype=np.float64),
+                    "amount": np.full(len(dates), 1e8, dtype=np.float64),
+                }))
+            panel = pd.concat(dfs, ignore_index=True)
+            fp = FeaturePipeline(seq_len=10, use_sentiment=False,
+                                use_guba=False, use_comment=False,
+                                use_announcements=False, use_margin=False,
+                                use_northbound=False, use_dragon_tiger=False,
+                                use_fundamental=False, use_earnings=False,
+                                use_valuation=False, use_etf_flow=False,
+                                use_capital_flow=False, use_block_trade=False,
+                                use_shareholder=False, use_lockup=False,
+                                use_dividend=False, use_board=False,
+                                use_sector=False, use_concept=False,
+                                use_industry=False, use_macro=False,
+                                use_pledge=False, use_index_membership=False,
+                                use_market_env=False, use_market_env_refine=False,
+                                use_limit_up=False, use_topic=False)
+
+            gc.collect()
+            tracemalloc.start()
+            result = fp.build_panel_features(
+                panel, horizon=1, memmap_dir=sink_dir,
+            )
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            # Clean up memmaps.
+            if sink_dir is not None:
+                for key in ("static_features", "past_known", "past_observed"):
+                    arr = result.get(key)
+                    if arr is not None and isinstance(arr, np.memmap):
+                        if hasattr(arr, "_mmap") and arr._mmap is not None:
+                            arr._mmap.close()
+                        del result[key]
+            del result
+            gc.collect()
+            return peak
+
+        # Use two separate sink dirs so memmap files don't collide.
+        N = 8
+        peak_n = _build_n(N, str(tmp_path / "sink_n"))
+        peak_2n = _build_n(N * 2, str(tmp_path / "sink_2n"))
+
+        # Sublinear: doubling stocks should NOT double peak memory.
+        # The stats pass uses the dense normalizer for byte-identical stats
+        # (loads date+norm_cols for all stocks once), so peak grows with
+        # the number of stocks — but sublinearly (well under 2×) because
+        # the full feature frames are never resident.
+        assert peak_2n < peak_n * 1.8, (
+            f"streaming peak should grow sublinearly with N: "
+            f"peak({N})={peak_n}, peak({2*N})={peak_2n}, "
+            f"ratio={peak_2n/peak_n:.2f}"
+        )

@@ -248,3 +248,215 @@ class DateWiseZScoreNormalizer:
                 df[col] = (df[col] - aligned_mean) / aligned_std
 
         return norm_cols, date_stats
+
+    # ── Streaming / two-pass methods (§T5) ────────────────────────────────
+
+    def init_stats_accumulator(self):
+        """Initialize per-date cross-sectional stats accumulators.
+
+        Called once before the streaming accumulate pass.  Resets internal
+        accumulators so the same normalizer instance can be reused.
+        """
+        # {(date, col): (finite_count, sum, sumsq)} — float64 sums
+        self._all_acc: dict[tuple, tuple[int, float, float]] = {}
+        self._member_acc: dict[tuple, tuple[int, float, float]] = {}
+        self._member_dates: set = set()
+
+    def accumulate_stats_chunk(
+        self,
+        df: pd.DataFrame,
+        norm_cols: list,
+    ):
+        """Accumulate per-date cross-sectional stats from one stock's frame.
+
+        *df* must carry ``date`` (and ``stock_code`` when membership is
+        active).  Non-finite values are skipped (matching the dense path's
+        strip-inf step).  Accumulates both all-stock and (when membership is
+        active) member-set aggregates into float64 running sums.
+
+        Called once per stock in the streaming Pass 2stats.
+        """
+        active_cols = [c for c in norm_cols if c in df.columns]
+        if not active_cols:
+            return
+
+        if self.membership_active:
+            is_member_series = _daily_member_flag(
+                df[["date", "stock_code"]], self.daily_membership,
+            )
+        else:
+            is_member_series = None
+
+        for date_val, group in df.groupby("date"):
+            date_key = pd.Timestamp(date_val).date()
+            group_idx = group.index
+
+            for col in active_cols:
+                vals = group[col].to_numpy(dtype=np.float64)
+                finite = np.isfinite(vals)
+                cnt = int(finite.sum())
+                if cnt == 0:
+                    continue
+                s = float(vals[finite].sum())
+                sq = float((vals[finite] ** 2).sum())
+
+                # All-set
+                prev_all = self._all_acc.get((date_key, col), (0, 0.0, 0.0))
+                self._all_acc[(date_key, col)] = (
+                    prev_all[0] + cnt, prev_all[1] + s, prev_all[2] + sq,
+                )
+
+                # Member-set
+                if is_member_series is not None:
+                    member_mask = is_member_series.loc[group_idx].to_numpy(
+                        dtype=bool,
+                    )
+                    member_finite = finite & member_mask
+                    mcnt = int(member_finite.sum())
+                    if mcnt > 0:
+                        ms = float(vals[member_finite].sum())
+                        msq = float((vals[member_finite] ** 2).sum())
+                        prev_m = self._member_acc.get(
+                            (date_key, col), (0, 0.0, 0.0),
+                        )
+                        self._member_acc[(date_key, col)] = (
+                            prev_m[0] + mcnt, prev_m[1] + ms, prev_m[2] + msq,
+                        )
+                        self._member_dates.add(date_key)
+
+    def _build_stats_df(
+        self,
+        acc: dict,
+        dates_subset: set,
+        norm_cols: list,
+    ) -> dict[str, pd.DataFrame]:
+        """Build per-column ``(mean, std, count)`` DataFrames from an
+        accumulator for the given date subset.
+
+        Reproduces the expanding-moment sparse fallback from
+        :func:`_cross_section_stats` using the per-date aggregates —
+        cumsum over per-date sums equals cumsum over row-sorted values
+        (associative), so the fallback is bit-exact.
+        """
+        all_dates_sorted = sorted(dates_subset)
+        date_stats: dict[str, pd.DataFrame] = {}
+
+        for col in norm_cols:
+            rows: list[dict] = []
+            for d in all_dates_sorted:
+                cnt, s_sum, s_sq = acc.get((d, col), (0, 0.0, 0.0))
+                rows.append({
+                    "date": pd.Timestamp(d),
+                    "count": cnt,
+                    "sum": float(s_sum),
+                    "sumsq": float(s_sq),
+                })
+            stats_df = pd.DataFrame(rows)
+            if stats_df.empty:
+                date_stats[col] = pd.DataFrame(
+                    columns=["mean", "std", "count"],
+                )
+                continue
+
+            stats_df = stats_df.set_index("date")
+            cnt_arr = stats_df["count"].to_numpy(dtype=np.float64)
+            sum_arr = stats_df["sum"].to_numpy(dtype=np.float64)
+            sq_arr = stats_df["sumsq"].to_numpy(dtype=np.float64)
+
+            # Per-date mean & sample std (ddof=1) via the sumsq identity.
+            mean_arr = np.where(cnt_arr > 0, sum_arr / cnt_arr, np.nan)
+            var_arr = np.where(
+                cnt_arr >= 2,
+                (sq_arr - sum_arr ** 2 / cnt_arr) / (cnt_arr - 1),
+                np.nan,
+            )
+            std_arr = np.sqrt(np.maximum(var_arr, 0.0))
+
+            stats_df["mean"] = mean_arr.astype(np.float32)
+            stats_df["std"] = std_arr.astype(np.float32)
+            stats_df["count"] = cnt_arr
+
+            # fillna(1.0) + clip(lower=1e-8) on std (matching dense path).
+            stats_df["std"] = stats_df["std"].fillna(1.0).clip(lower=1e-8)
+
+            # Sparse-date expanding-moment fallback (count < 5).
+            sparse = stats_df["count"] < 5
+            if sparse.any():
+                cum_cnt = np.maximum(np.cumsum(cnt_arr), 1.0)
+                cum_sum = np.cumsum(sum_arr)
+                cum_sq = np.cumsum(sq_arr)
+                cum_mean = cum_sum / cum_cnt
+                cum_var = np.maximum(cum_sq / cum_cnt - cum_mean ** 2, 0.0)
+                cum_std = np.maximum(np.sqrt(cum_var), 1e-8)
+                stats_df.loc[sparse, "mean"] = (
+                    cum_mean[sparse].astype(np.float32)
+                )
+                stats_df.loc[sparse, "std"] = (
+                    cum_std[sparse].astype(np.float32)
+                )
+
+            date_stats[col] = stats_df[["mean", "std", "count"]]
+
+        return date_stats
+
+    def finalize_date_stats(
+        self,
+        norm_cols: list,
+        all_dates: set,
+    ) -> dict[str, pd.DataFrame]:
+        """Convert accumulated per-date aggregates to mean/std DataFrames.
+
+        Returns the same ``dict[col -> DataFrame]`` format as
+        :meth:`normalize` so the downstream ``apply_zscore`` loop is
+        identical for both paths.
+        """
+        if self.membership_active:
+            member_dates = self._member_dates
+            missing_dates = all_dates - member_dates
+
+            member_stats = self._build_stats_df(
+                self._member_acc, member_dates, norm_cols,
+            )
+
+            if missing_dates:
+                all_stats = self._build_stats_df(
+                    self._all_acc, missing_dates, norm_cols,
+                )
+                # Concat exactly as the dense path does.
+                date_stats: dict[str, pd.DataFrame] = {}
+                for col in norm_cols:
+                    parts = []
+                    if col in member_stats and len(member_stats[col]) > 0:
+                        parts.append(member_stats[col])
+                    if col in all_stats and len(all_stats[col]) > 0:
+                        parts.append(all_stats[col])
+                    if parts:
+                        date_stats[col] = pd.concat(parts)
+                    else:
+                        date_stats[col] = pd.DataFrame(
+                            columns=["mean", "std", "count"],
+                        )
+                return date_stats
+            else:
+                return member_stats
+        else:
+            return self._build_stats_df(
+                self._all_acc, all_dates, norm_cols,
+            )
+
+    @staticmethod
+    def apply_zscore(
+        df: pd.DataFrame,
+        norm_cols: list,
+        date_stats: dict[str, pd.DataFrame],
+    ):
+        """Apply per-date z-score to *df* in place (exact same logic as the
+        ``.map`` loop in :meth:`normalize`)."""
+        for col in norm_cols:
+            if col not in df.columns or col not in date_stats:
+                continue
+            aligned_mean = df["date"].map(date_stats[col]["mean"])
+            aligned_std = (
+                df["date"].map(date_stats[col]["std"]).clip(lower=1e-8)
+            )
+            df[col] = (df[col] - aligned_mean) / aligned_std
