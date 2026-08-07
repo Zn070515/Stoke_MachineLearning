@@ -187,6 +187,24 @@ def test_compute_entry_fill_prob_fraction():
     assert np.isclose(prob[4], 1.0)
 
 
+def test_compute_entry_fill_prob_zero_when_all_unfillable():
+    """§十八 worst case: EVERY decision-eligible stock is suspended the next
+    day (no fillable entry open at t).  denom>0 and numer==0 → the ratio is
+    exactly 0.0, NOT NaN."""
+    N, T = 2, 3
+    decision = np.zeros((N, T), dtype=bool)
+    decision[:, 1:] = True  # a decision needs a real close at t-1
+    entry = np.ones((N, T), dtype=bool)
+    entry[:, 1] = False  # both stocks decision-eligible but unfillable at t=1
+
+    prob = compute_entry_fill_prob(decision, entry)
+
+    assert prob.shape == (T,)
+    assert np.isnan(prob[0])           # no decision-eligible stock at t=0
+    assert prob[1] == 0.0              # 0/2 → 0.0, not NaN
+    assert np.isclose(prob[2], 1.0)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # T8: Memmap sink tests (§七-P0)
 # ═══════════════════════════════════════════════════════════════════════════
