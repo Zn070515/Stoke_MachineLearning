@@ -119,6 +119,21 @@ def test_market_env_required_columns_expands_when_account_verified(monkeypatch):
     )
 
 
+def test_market_env_required_columns_empty_for_profile_without_market_env(monkeypatch):
+    """§T5 quality: the ``profile_name`` argument is LOAD-BEARING — a profile
+    that does not require the market_env channel requires none of its columns.
+    (The default/None caller — the live merge — keeps the price part required.)"""
+    import stoke_ml.config.feature_profile as _fp
+    no_menv = FeatureProfile(
+        name="no_menv", required_channels=("sentiment",),
+        coverage_contracts={}, vintage_policy="revision-safe",
+    )
+    monkeypatch.setitem(_fp.FEATURE_PROFILES, "no_menv", no_menv)
+    assert market_env_required_columns("no_menv") == frozenset()
+    # the default / None caller is unchanged: price part still required
+    assert market_env_required_columns(None) == MARKET_ENV_PRICE_COLS
+
+
 # ── headline_v1 profile ───────────────────────────────────────────────
 
 def _headline():

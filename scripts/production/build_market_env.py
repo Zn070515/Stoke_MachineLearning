@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import os
 
 import numpy as np
@@ -63,6 +64,8 @@ from stoke_ml.data.asset_contract import (
 )
 from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
 from stoke_ml.features.aux_cols import MARKET_ENV_COLS
+
+logger = logging.getLogger(__name__)
 
 # The exact consumer-facing column order (matches aux_cols.MARKET_ENV_COLS).
 OUTPUT_COLUMNS: tuple[str, ...] = tuple(MARKET_ENV_COLS)
@@ -94,7 +97,12 @@ def build_turnover_daily(base: str) -> pd.Series:
             d = pd.read_parquet(f, columns=["date", "amount"])
             d["date"] = pd.to_datetime(d["date"]).dt.normalize()
             amounts.append(d.groupby("date")["amount"].sum())
-        except Exception:
+        except Exception as e:
+            # A formal production builder must never SILENTLY skip a source file
+            # — an unreadable daily parquet produces an incomplete turnover series
+            # with no trace.  Warn with the exact path so the gap is diagnosable.
+            logger.warning("build_market_env: skipping unreadable daily file %s: %s",
+                           f, e)
             continue
     if not amounts:
         return pd.Series(dtype="float64")
@@ -132,6 +140,11 @@ def _resolve_account_dates(acc: pd.DataFrame) -> tuple[pd.Series, str]:
     for col in _PUBLISH_DATE_COLS:
         if col in acc.columns:
             return pd.to_datetime(acc[col], errors="coerce"), "verified"
+    if "数据日期" not in acc.columns:
+        # No publish-date column AND no month-label column: the source schema is
+        # not what this builder expects.  Degrade to all-NaT dates → the caller's
+        # dropna produces an empty account part (proxy) — NEVER raise KeyError.
+        return pd.Series(pd.NaT, index=acc.index), "proxy"
     return pd.to_datetime(acc["数据日期"].astype(str) + "-28", errors="coerce"), "proxy"
 
 
@@ -206,7 +219,17 @@ def build_market_env(
             series[c] = acc_part[c]
 
     out = pd.DataFrame(series).sort_index()
-    out = out.fillna(0.0)
+    # State-channel honesty (§九-4): NEVER zero-fill a missing observation.
+    #   * ACCOUNT part — a missing monthly value means "unchanged", not zero, so
+    #     forward-fill to the end of the panel (a stale carry is then flagged by
+    #     the consumer's {prefix}_staleness_days rather than read as a real 0).
+    #   * PRICE part — same-day trade data; a date one source lacks but another
+    #     covers stays NaN so the consumer's _batch_fill_shift (policy="ffill")
+    #     carries the last breadth.  A hard-coded 0 here would bypass that ffill
+    #     and inject a fake "zero breadth / zero new-investor" day.
+    for c in MARKET_ENV_ACCOUNT_COLS:
+        if c in out.columns:
+            out[c] = out[c].ffill()
     out.index.name = "date"
     out.attrs["source"] = ("derived market-breadth panel "
                            "(build_market_env.py: account_stats/highs_lows/"

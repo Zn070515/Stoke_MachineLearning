@@ -130,10 +130,15 @@ def market_env_required_columns(profile_name: str | None = None) -> frozenset[st
     A required sub-set may never include a channel part whose PIT is unverified
     — while ``MARKET_ENV_ACCOUNT_PIT == "proxy"`` the account part is excluded
     (ablation-only, mirroring ``use_topic``); only a verified account part would
-    be admitted back into the required sub-set.  ``profile_name`` is accepted
-    for call-site clarity (every shipped profile shares the same required
-    sub-set today).
+    be admitted back into the required sub-set.  ``profile_name`` is honored:
+    a profile that does NOT require the ``market_env`` channel requires none of
+    its columns (the price part is required only by a profile that declares the
+    channel).  ``None`` (the live-merge default) means "the default/verified
+    state" — the price part, plus the account part once verified.
     """
+    prof = profile_for(profile_name)
+    if prof is not None and "market_env" not in prof.required_channels:
+        return frozenset()
     cols = set(MARKET_ENV_PRICE_COLS)
     if market_env_account_is_verified():
         cols |= set(MARKET_ENV_ACCOUNT_COLS)

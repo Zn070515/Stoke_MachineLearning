@@ -224,6 +224,94 @@ def test_empty_input_dir_fails_loudly(bme, tmp_path, monkeypatch):
 
 # ── legacy script superseded marker ───────────────────────────────────────
 
+# ── quality: unreadable source files are warned, never silently skipped ─────
+
+def test_turnover_scan_logs_unreadable_file(bme, tmp_path, caplog):
+    """A corrupt daily parquet is skipped with a WARNING (not silently) so an
+    incomplete turnover series leaves a diagnosable trace."""
+    import logging
+    daily = tmp_path / "a_shares" / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    # one valid file (the glob finds something) + one corrupt file
+    pd.DataFrame({
+        "date": pd.to_datetime(["2024-07-03", "2024-07-04"]),
+        "amount": [1e9, 1.1e9],
+    }).to_parquet(daily / "000001.parquet", index=False)
+    (daily / "000002.parquet").write_bytes(b"NOT A PARQUET FILE")
+    with caplog.at_level(logging.WARNING):
+        turn = bme.build_turnover_daily(str(tmp_path / "a_shares"))
+    assert any("000002.parquet" in r.message for r in caplog.records), (
+        "the unreadable file must be named in a warning log record")
+    # the valid file's turnover still contributes to the series
+    assert not turn.empty
+
+
+# ── quality: account_stats with an unexpected schema degrades, never crashes ─
+
+def test_account_stats_missing_month_label_degrades_gracefully(bme, tmp_path):
+    """When account_stats exists but has NEITHER a real publish-date column NOR
+    the 数据日期 month-label column, the account part degrades to an empty frame
+    (proxy) — NOT a KeyError.  The PRICE part still builds."""
+    br = tmp_path / "a_shares" / "market_breadth"
+    br.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "新增投资者-数量": [497.53],
+        "沪深总市值": [563491.335],
+        "沪深户均市值": [69.4956],
+    }).to_parquet(br / "account_stats.parquet", index=False)
+    _write_highs_lows(tmp_path)
+    _write_industry(tmp_path)
+    _write_daily(tmp_path)
+    df, parts = bme.build_market_env(str(tmp_path))
+    assert parts["account"]["pit_alignment"] == "proxy"
+    for c in bme.MARKET_ENV_ACCOUNT_COLS:
+        assert c not in df.columns, f"account col {c!r} should be absent"
+    # the price part is unaffected
+    for c in bme.MARKET_ENV_PRICE_COLS:
+        assert c in df.columns, f"price col {c!r} missing"
+
+
+# ── quality: state-channel gaps forward-fill, never zero-fill ──────────────
+
+def test_account_part_forward_filled_not_zero_filled(bme, tmp_path):
+    """The ACCOUNT part is a state channel: a missing monthly value means
+    "unchanged", so a date AFTER the last monthly observation must carry the
+    last known value forward — NOT a spurious 0.0.  The panel extends into the
+    PRICE part's modern dates (2024) beyond the account part's 2015 months."""
+    _write_account_stats(tmp_path)   # monthly 2015-04..2015-06
+    _write_highs_lows(tmp_path)      # 2024-07
+    _write_industry(tmp_path)
+    _write_daily(tmp_path)
+    df, _ = bme.build_market_env(str(tmp_path))
+    assert df.index.max() >= pd.Timestamp("2024-07-03")
+    # investor_new_num on a 2024 date = the last known monthly value, not 0.0
+    last_2015 = df.loc[df.index <= "2015-12-31", "investor_new_num"].dropna().iloc[-1]
+    val_2024 = df.loc["2024-07-03", "investor_new_num"]
+    assert val_2024 == last_2015
+    assert val_2024 != 0.0
+
+
+def test_price_part_gaps_are_nan_not_zero(bme, tmp_path):
+    """A date one PRICE source lacks but another covers stays NaN in the file so
+    the consumer's _batch_fill_shift (policy='ffill') carries the last breadth —
+    a hard 0.0 would bypass that state-channel forward-fill."""
+    _write_account_stats(tmp_path)
+    _write_industry(tmp_path)   # 2024-07-03..05
+    _write_daily(tmp_path)
+    # highs_lows covers ONLY 2024-07-03 (missing 07-04 / 07-05)
+    br = tmp_path / "a_shares" / "market_breadth"
+    pd.DataFrame({
+        "date": ["2024-07-03"], "close": [2982.38],
+        "high20": [202], "low20": [886],
+    }).to_parquet(br / "highs_lows.parquet", index=False)
+    df, _ = bme.build_market_env(str(tmp_path))
+    # the union index includes 07-04 (industry + daily cover it); high_low_ratio
+    # is a genuine gap there → NaN, not 0.0
+    assert "2024-07-04" in df.index
+    assert pd.isna(df.loc["2024-07-04", "high_low_ratio"]), (
+        "a price gap must stay NaN for the consumer's ffill, not be zero-filled")
+
+
 def test_legacy_script_marked_superseded():
     """The archived script keeps its behavior but is marked superseded so a
     future agent does not treat it as the canonical builder."""

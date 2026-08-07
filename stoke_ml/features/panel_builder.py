@@ -72,11 +72,6 @@ def _engineer_stock(
     Side-effects: mutates *drop_reasons* and *drop_examples* for drop
     accounting.
     """
-    from stoke_ml.config.feature_profile import (
-        CHANNEL_COLUMNS,
-        market_env_account_is_verified,
-    )
-
     if prebuilt_dir:
         path = os.path.join(prebuilt_dir, f"{code}.parquet")
         feats = pipeline.load_features(path)
