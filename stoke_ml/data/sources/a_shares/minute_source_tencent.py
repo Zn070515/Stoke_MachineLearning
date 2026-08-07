@@ -15,7 +15,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import requests
 
 from stoke_ml.data.codes import (
     UnsupportedMarketError,
@@ -68,6 +67,7 @@ class TencentMinuteSource:
             DataFrame with [datetime, open, high, low, close, volume,
             stock_code, bar_period].
         """
+        import requests
         symbol = self._to_tencent_symbol(stock_code)
         ts = int(period)
 

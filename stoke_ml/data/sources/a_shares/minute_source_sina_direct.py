@@ -13,7 +13,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import requests
 
 from stoke_ml.data.codes import (
     UnsupportedMarketError,
@@ -71,6 +70,7 @@ class SinaDirectMinuteSource:
             does not provide turnover amount).
             Empty DataFrame if no data available.
         """
+        import requests
         symbol = self._to_sina_symbol(stock_code)
         scale = int(period)
 

@@ -6,7 +6,6 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-import akshare as ak
 import pandas as pd
 
 from stoke_ml.config import load_config
@@ -45,6 +44,7 @@ def get_stock_codes(
             from ``{data_dir}/a_shares/index_constituents_hist/membership.parquet``.
         indices: List like ['000300', '000905']. Default: CSI 300 + CSI 500.
     """
+    import akshare as ak
     if indices is None:
         indices = list(universe.DEFAULT_INDICES)
 
@@ -82,6 +82,7 @@ def get_all_a_share_codes(data_dir: str | None = None) -> list[str]:
     too, or the 2000-2026 "全 A" panel silently becomes the survivor set of
     stocks still visible today (survivorship bias).
     """
+    import akshare as ak
     logger.info("Fetching full A-share stock list (may take ~5s)...")
     df = ak.stock_info_a_code_name()
     codes = set(normalize_stock_code_series(df["code"]).dropna())

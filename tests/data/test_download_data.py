@@ -217,9 +217,9 @@ class TestFilterExisting:
         get_stock_codes falls through to the AKShare current-constituent
         default (documented behavior for indices without historical data).
         Mock the network call so this test is deterministic and offline."""
-        import scripts.production.download_data as dd
+        import akshare as ak
         monkeypatch.setattr(
-            dd.ak, "index_stock_cons_csindex",
+            ak, "index_stock_cons_csindex",
             lambda symbol: pd.DataFrame({"成分券代码": ["000001", "600519"]}),
         )
         assert get_stock_codes(str(tmp_path), ["000300"]) == ["000001", "600519"]
@@ -251,10 +251,10 @@ class TestGetAllAShareCodes:
     visible today (survivorship bias, §七-1)."""
 
     def test_unions_delisted_codes_into_download_universe(self, tmp_path, monkeypatch):
-        import scripts.production.download_data as dd
+        import akshare as ak
 
         monkeypatch.setattr(
-            dd.ak, "stock_info_a_code_name",
+            ak, "stock_info_a_code_name",
             lambda: pd.DataFrame({"code": ["000001", "600519"]}),
         )
         _write_delisted(tmp_path, ["000002", "600002"])
@@ -264,10 +264,10 @@ class TestGetAllAShareCodes:
         assert codes == ["000001", "000002", "600002", "600519"]
 
     def test_without_data_dir_only_currently_listed(self, tmp_path, monkeypatch):
-        import scripts.production.download_data as dd
+        import akshare as ak
 
         monkeypatch.setattr(
-            dd.ak, "stock_info_a_code_name",
+            ak, "stock_info_a_code_name",
             lambda: pd.DataFrame({"code": ["000001", "600519"]}),
         )
         _write_delisted(tmp_path, ["000002"])

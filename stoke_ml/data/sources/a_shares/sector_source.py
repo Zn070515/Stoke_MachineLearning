@@ -15,7 +15,6 @@ import time
 from typing import Optional
 
 import pandas as pd
-import requests
 
 from stoke_ml.data.calendar import TradingCalendar
 from stoke_ml.data.codes import (
@@ -97,6 +96,7 @@ class IndustryRankingSource:
             if calendar_dir is not None else None
         )
         self._last_call: float = 0.0
+        import requests
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": _UA, **EASTMONEY_HEADERS,
@@ -118,6 +118,7 @@ class IndustryRankingSource:
         is aggressive with rate-limiting on bursty traffic.
         """
         last_err = None
+        import requests
         for attempt in range(5):
             try:
                 r = self._session.get(url, params=params, timeout=timeout)
