@@ -387,13 +387,18 @@ class DateWiseZScoreNormalizer:
             sq_arr = stats_df["sumsq"].to_numpy(dtype=np.float64)
 
             # Per-date mean & sample std (ddof=1) via the sumsq identity.
-            mean_arr = np.where(cnt_arr > 0, sum_arr / cnt_arr, np.nan)
-            var_arr = np.where(
-                cnt_arr >= 2,
-                (sq_arr - sum_arr ** 2 / cnt_arr) / (cnt_arr - 1),
-                np.nan,
-            )
-            std_arr = np.sqrt(np.maximum(var_arr, 0.0))
+            # Dates with no (or a single) observation divide by cnt=0/1 — the
+            # np.where masks those to NaN, but the division is still evaluated
+            # for every element, so silence the resulting divide-by-zero
+            # RuntimeWarning noise.
+            with np.errstate(invalid='ignore', divide='ignore'):
+                mean_arr = np.where(cnt_arr > 0, sum_arr / cnt_arr, np.nan)
+                var_arr = np.where(
+                    cnt_arr >= 2,
+                    (sq_arr - sum_arr ** 2 / cnt_arr) / (cnt_arr - 1),
+                    np.nan,
+                )
+                std_arr = np.sqrt(np.maximum(var_arr, 0.0))
 
             stats_df["mean"] = mean_arr.astype(out_dtype)
             stats_df["std"] = std_arr.astype(out_dtype)

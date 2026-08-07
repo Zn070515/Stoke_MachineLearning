@@ -217,7 +217,6 @@ def _build_panel_streaming(
         valid_codes: list[str] = []
         all_cols: set = set()
         all_dates: set = set()
-        stock_dates: list[set] = []  # per-stock date set
         has_sector_code = False
         N_stocks = 0
 
@@ -232,7 +231,6 @@ def _build_panel_streaming(
             valid_codes.append(code)
             all_cols.update(feats.columns)
             sdates = {pd.Timestamp(d).date() for d in feats["date"]}
-            stock_dates.append(sdates)
             all_dates.update(sdates)
             if not has_sector_code and "sector_code" in feats.columns:
                 has_sector_code = True
@@ -286,6 +284,16 @@ def _build_panel_streaming(
                         "pe_ttm", "pb_mrq", "ps_ttm", "debt_ratio",
                         "pe_percentile_252d", "pb_percentile_252d"]
         new_cs_cols: list[str] = []
+        # Cross-sectional-fundamental panel.  OPTIONAL and OFF by default: it
+        # is built only when `pipeline._fundamental_refiner is not None` AND
+        # the frames carry `sector_code` (train_panel_*.py enables it via
+        # use_fundamental_refine).  It stays resident through Pass 3 because
+        # every stock's frame is left-merged against it, so it is the ONE
+        # bounded-in-size exception to the streaming residency rule.  Footprint
+        # at full-market scale: ~5530 stocks x ~5000 dates = ~27.7M rows x
+        # ~14 cols (9 source + ~5 add_cross_sectional), ~2-3 GB float64-
+        # dominated — large but fixed, NOT per-pass and NOT a list of full
+        # feature frames.
         cs_panel_df: pd.DataFrame | None = None
         if (pipeline._fundamental_refiner is not None
                 and has_sector_code):

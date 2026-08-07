@@ -871,10 +871,10 @@ class TestBuildPanelFeaturesMemmap:
         peak_2n = _build_n(N * 2, str(tmp_path / "sink_2n"))
 
         # Sublinear: doubling stocks should NOT double peak memory.
-        # The stats pass uses the dense normalizer for byte-identical stats
-        # (loads date+norm_cols for all stocks once), so peak grows with
-        # the number of stocks — but sublinearly (well under 2×) because
-        # the full feature frames are never resident.
+        # The stats pass uses the streaming per-stock accumulator; memory is
+        # bounded by O(dates × columns), so peak grows with the number of
+        # stocks — but sublinearly (well under 2×) because the full feature
+        # frames are never resident.
         assert peak_2n < peak_n * 1.8, (
             f"streaming peak should grow sublinearly with N: "
             f"peak({N})={peak_n}, peak({2*N})={peak_2n}, "
