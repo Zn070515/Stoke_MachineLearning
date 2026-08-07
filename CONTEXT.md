@@ -234,6 +234,7 @@
 **Walk-Forward 参数**: 
 - XGBoost/LSTM: 2年训练 / 3月验证 / 3月步长
 - Panel: 增长式训练窗口（[0, val_start−purge) 逐 fold 增长）/ 非重叠 fold（step=val_len）/ inner_val 选择最佳 epoch + outer_test 单次评估 / purge=seq_len（walk-backward，从最新数据倒排 + 末尾 lockbox 保留）
+- **Lockbox 前（P1 precondition）**：对每个 PanelStore 主动执行一次完整 chunk verification —— `PYTHONPATH=. ./.venv/Scripts/python scripts/production/verify_panel_store.py <panel-store-dir>`，exit 0 方可作为 lockbox 训练输入；失败 exit 非 0，store 需重建（§十九-12）
 - Panel OOS 连续账户：把全部 fold 的 OOS 预测按时间排序接到一个账户上重放（fold 边界处切换模型），最终 Sharpe/MDD/CAGR 只取该连续账户 → 产出 `oos_continuous.parquet` / `oos_continuous_ledger.parquet`（替代逐 fold 各自归一的 NAV）
 - 多重试验修正（§十五-1）：PSR（Probabilistic Sharpe，非正态 SR 显著性）/ DSR（Deflated Sharpe，按项目累计实验数 N 与试验 Sharpe 离散度折价）/ Block-bootstrap max-mean reality check（best-of-K 相对基准的重采样 p 值；非完整 Hansen SPA，§十二.4），报告同时输出 `long_psr / long_dsr / ls_psr / ls_dsr / bbmm_*`，连续 OOS 账户也带 `psr / dsr / dsr_n_trials`。实验注册表落在仓库根 `reports/experiments/experiment_registry.json`（每次训练原子追加一行，带 `experiment_signature` = SHA1(data_manifest_hash, feature_schema_hash, universe_hash, model_hash, horizon, objective)；同签名同 outdir 去重，异 outdir 各计一次；baseline 各占一个 `baseline-{name}` trial；损坏时抛错而非静默复位）。DSR 的 N = 历史注册表中**不同实验签名**的计数（当前签名不重复计），DSR 的试验 Sharpe 离散度来自历史注册表 OOS Sharpe 分布（不足 2 条时退化为文档化的 block-bootstrap 代理），来源以 `dsr_trial_variance_source` 标注
 
