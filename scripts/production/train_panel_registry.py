@@ -316,6 +316,7 @@ def _experiment_signature(version: dict, config: PanelConfig,
                           seq_features: bool | None = None,
                           vintage_policy: str | None = None,
                           feature_profile: str | None = None,
+                          universe_membership: dict | None = None,
                           baseline_hyperparameter_hash: str | None = None,
                           baseline_input_recipe_hash: str | None = None,
                           training_sample_policy_hash: str | None = None,
@@ -346,6 +347,13 @@ def _experiment_signature(version: dict, config: PanelConfig,
     feature-profile identity — runs differing ONLY in either lever train on
     materially different channels and MUST be distinct trials.  Both default to
     'none' so the baseline run (which has neither switch) is unaffected.
+
+    §十四: the signature ALSO binds the universe-membership provenance — a CSI
+    run's universe gate consumes membership.parquet (Baostock monthly
+    reconstruction, latest-reconstructed), and two runs whose membership
+    provenance differs (monthly-reconstructed vs a future official
+    effective-date artifact) are distinct trials.  Defaults to 'none' so
+    non-CSI / non-deep callers are unaffected.
     """
     h = hashlib.sha1()
     for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
@@ -390,6 +398,16 @@ def _experiment_signature(version: dict, config: PanelConfig,
     # one experiment.  Each defaults to 'none' so callers without the switch
     # (the baseline script) hash a stable signature.
     h.update(f"vintage_policy={vintage_policy or 'none'};".encode("utf-8"))
+    # §十四: the universe-membership provenance is part of what a deep run IS —
+    # a CSI universe gate consumes membership.parquet (Baostock monthly
+    # reconstruction, latest-reconstructed), so feature-vintage safe-only does
+    # NOT free the run of latest-reconstructed data in its universe gate, and
+    # a different membership provenance (e.g. a future official effective-date
+    # artifact) is a NEW trial.  None → 'none' so callers without the lever
+    # (non-CSI / baseline) hash a stable signature.
+    h.update(f"universe_membership="
+             f"{json.dumps(universe_membership, sort_keys=True) if universe_membership else 'none'};"
+             .encode("utf-8"))
     h.update(f"feature_profile={feature_profile or 'none'};".encode("utf-8"))
     # §十七: baseline identity levers — input recipe (with_seq + seq_len +
     # construction version), model hyperparameters, the training-sample policy

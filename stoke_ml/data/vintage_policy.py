@@ -21,6 +21,7 @@ imports this module (no circular import).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 from stoke_ml.data import channel_vintage as _cv
@@ -126,3 +127,53 @@ def vintage_report(
             "daily_qfq", policy, vintage_by_name=by_name
         ),
     }
+
+
+@dataclass(frozen=True)
+class UniverseVintagePolicy:
+    """§十四: declared provenance of the UNIVERSE-membership gate, SEPARATE
+    from the feature ``VintagePolicy``.
+
+    The feature policy governs which CHANNELS a run may consume; this governs
+    the CSI universe gate's membership data.  A CSI universe (csi300/csi500/
+    csi800) consumes ``membership.parquet``, which is Baostock-MONTHLY-
+    RECONSTRUCTED (NOT official effective-date data), so feature-vintage
+    ``safe-only`` does NOT mean the research avoided latest-reconstructed
+    data — the universe gate itself reads latest-reconstructed membership.
+    That must be declared EXPLICITLY (in store meta / experiment summary /
+    signature), never implied-bypassed.
+    """
+
+    source: str
+    vintage: str
+    resolution: str
+
+    def provenance(self) -> dict:
+        """The provenance dict recorded in store meta / experiment summary."""
+        return {
+            "source": self.source,
+            "vintage": self.vintage,
+            "resolution": self.resolution,
+        }
+
+
+# §T6/§十四: the CSI membership provenance — Baostock monthly reconstruction,
+# latest-reconstructed, consumed by every csi300/csi500/csi800 universe gate.
+CSI_MONTHLY_RECONSTRUCTED = UniverseVintagePolicy(
+    source="Baostock monthly reconstruction",
+    vintage="latest-reconstructed",
+    resolution="monthly",
+)
+
+# Mirrors the CSI set in train_panel_universe._is_csi_universe and
+# train_panel_folds._universe_artifact_hashes (existing duplication — the data
+# layer must not import from scripts; not consolidated here).
+CSI_UNIVERSE_NAMES = frozenset({"csi300", "csi500", "csi800"})
+
+
+def universe_membership_provenance(universe_name: str | None) -> dict | None:
+    """The membership provenance for ``universe_name``, or None when the
+    universe does not consume membership.parquet (any non-CSI universe)."""
+    if universe_name in CSI_UNIVERSE_NAMES:
+        return CSI_MONTHLY_RECONSTRUCTED.provenance()
+    return None

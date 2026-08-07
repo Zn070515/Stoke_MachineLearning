@@ -27,6 +27,7 @@ from stoke_ml.config import get_project_root, load_config
 from stoke_ml.data.calendar import (
     TradingCalendar,  # noqa: F401  re-exported for import-compat
 )
+from stoke_ml.data.vintage_policy import universe_membership_provenance
 from stoke_ml.features.pipeline import (
     _PIT_STATIC_COLS, fold_dead_feature_columns,
 )
@@ -492,6 +493,12 @@ def main():
     # delist / membership artifacts.
     universe_hashes = _universe_artifact_hashes(
         universe_status, data_dir, args.universe)
+    # §T6/§十四: the universe-membership PROVENANCE (Baostock monthly
+    # reconstruction, latest-reconstructed) for CSI universes that consume
+    # membership.parquet, None otherwise — declared EXPLICITLY in the summary
+    # and the trial signature, never implied-bypassed by feature-vintage
+    # safe-only.  Separated from the feature VintagePolicy on purpose (audit §十四).
+    universe_membership = universe_membership_provenance(args.universe)
     # §八.3: record what gates each split consumes so a run is self-describing.
     # inner_train default is the broad historical-member union (ungated);
     # --strict-index-training additionally gates its loss by per-day index
@@ -652,7 +659,8 @@ def main():
     experiment_registry = _load_experiment_registry(_EXPERIMENT_REGISTRY_PATH)
     experiment_signature = _experiment_signature(
         version_info, config, augmentation=bool(args.augment),
-        vintage_policy=args.vintage_policy, feature_profile=profile_name)
+        vintage_policy=args.vintage_policy, feature_profile=profile_name,
+        universe_membership=universe_membership)
     n_trials = _distinct_trial_count(experiment_registry, experiment_signature)
     oos_dates_all: list[str] = []
     oos_stocks_all: list[str] = []
@@ -1247,6 +1255,13 @@ def main():
             # provably tied to those artifact files.
             "universe_status_hash": universe_hashes["universe_status_hash"],
             "membership_hash": universe_hashes["membership_hash"],
+            # §T6/§十四: the feature vintage policy (what CHANNELS this run
+            # admitted) AND the universe-membership provenance (the CSI
+            # membership the universe gate consumed) are declared side by side
+            # — feature-vintage safe-only NEVER implies the universe gate
+            # avoided latest-reconstructed membership data.
+            "feature_vintage": args.vintage_policy,
+            "universe_membership": universe_membership,
             # Non-overlapping folds (step == val_len) — each
             # fold's SIGNAL windows are strictly non-overlapping (the last
             # batch's position exits may extend past a fold boundary), so

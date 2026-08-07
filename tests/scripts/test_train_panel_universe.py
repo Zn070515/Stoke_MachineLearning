@@ -569,6 +569,37 @@ def test_signature_binds_feature_profile(tp):
     assert tp._experiment_signature(base, cfg, feature_profile="none") == s_none
 
 
+def test_signature_binds_universe_membership(tp):
+    """§T6 / §十四: a CSI run's universe gate consumes membership.parquet,
+    which is Baostock-monthly-reconstructed (NOT official effective-date data) —
+    so the membership PROVENANCE binds into the trial signature, and two runs
+    whose provenance differs (monthly-reconstructed vs a future official
+    effective-date artifact) are distinct trials, never conflated."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    um = {"source": "Baostock monthly reconstruction",
+          "vintage": "latest-reconstructed", "resolution": "monthly"}
+    s_um = tp._experiment_signature(base, cfg, universe_membership=um)
+    # A DIFFERENT membership provenance is a NEW trial.
+    assert (tp._experiment_signature(
+        base, cfg,
+        universe_membership={**um, "vintage": "official-effective-date"})
+        != s_um)
+    # Same provenance + same everything else → same signature (a re-run).
+    assert tp._experiment_signature(base, cfg, universe_membership=um) == s_um
+    # No arg == explicit None — callers without the lever hash identically.
+    assert (tp._experiment_signature(base, cfg)
+            == tp._experiment_signature(base, cfg, universe_membership=None))
+
+
 def test_signature_vintage_profile_default_to_none(tp):
     """§T19: callers that omit the new levers (None defaults — the baseline
     script) must hash exactly as if the literal 'none' were passed, so their
@@ -586,6 +617,10 @@ def test_signature_vintage_profile_default_to_none(tp):
     assert (tp._experiment_signature(base, cfg)
             == tp._experiment_signature(
                 base, cfg, vintage_policy="none", feature_profile="none"))
+    # §T6 / §十四: omitting universe_membership (None) hashes identically to an
+    # explicit None — existing signatures stay stable across this upgrade.
+    assert (tp._experiment_signature(base, cfg)
+            == tp._experiment_signature(base, cfg, universe_membership=None))
 
 
 # ── _require_quality_gate (§九.1 custom-prebuilt binding / §八-2 universe) ──
@@ -1278,6 +1313,24 @@ def test_panel_store_meta_csi_marks_daily_membership_norm(tp):
         _panel_args("safe-only", universe="random"),
         seq_len=60, stock_list=[f"{i:06d}" for i in range(100)])
     assert "daily_membership_norm" not in non_csi["feature_switches"]
+
+
+def test_panel_store_meta_records_universe_membership(tp, tmp_path):
+    """§T6 / §十四: the panel-store meta records the universe-membership
+    PROVENANCE exactly when membership is consumed (a CSI universe) — a csi300
+    store self-describes that its universe gate used latest-reconstructed
+    Baostock membership (separate from the feature vintage policy), and a
+    non-CSI store stays untouched (no provenance key)."""
+    um = {"source": "Baostock monthly reconstruction",
+          "vintage": "latest-reconstructed", "resolution": "monthly"}
+    csi = tp._panel_store_meta(
+        _panel_args("safe-only", universe="csi300"), seq_len=60,
+        stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path))
+    assert csi["universe_membership"] == um
+    non_csi = tp._panel_store_meta(
+        _panel_args("safe-only", universe="random"), seq_len=60,
+        stock_list=[f"{i:06d}" for i in range(100)], data_dir=str(tmp_path))
+    assert "universe_membership" not in non_csi
 
 
 def _fake_storage():

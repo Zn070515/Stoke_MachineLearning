@@ -8,15 +8,21 @@ globals are mutated).
 """
 import dataclasses
 
+import pytest
+
 from stoke_ml.data.channel_vintage import (
     CHANNEL_VINTAGE,
     ChannelVintageStatus,
 )
 from stoke_ml.data.vintage_policy import (
+    CSI_MONTHLY_RECONSTRUCTED,
+    CSI_UNIVERSE_NAMES,
+    UniverseVintagePolicy,
     VintagePolicy,
     allowed_channels,
     channel_allowed,
     denied_channels,
+    universe_membership_provenance,
     vintage_report,
 )
 
@@ -116,3 +122,45 @@ def test_vintage_report_crafted_daily_qfq_denied_under_safe_only():
     )
     report = vintage_report(SAFE_ONLY, declaration=crafted)
     assert report["daily_qfq_allowed"] is False
+
+
+# ── §T6 / §十四: universe-membership provenance ──────────────────────────
+
+_UM_DICT = {
+    "source": "Baostock monthly reconstruction",
+    "vintage": "latest-reconstructed",
+    "resolution": "monthly",
+}
+
+
+def test_csi_monthly_reconstructed_provenance():
+    """§T6 (§十四): the CSI universe-membership provenance is declared — a CSI
+    universe gate consumes membership.parquet which is Baostock-MONTHLY-
+    RECONSTRUCTED (NOT official effective-date data), so even a feature-vintage
+    safe-only run is NOT free of latest-reconstructed data in its universe
+    gate; the provenance is declared EXPLICITLY, never implied."""
+    assert CSI_MONTHLY_RECONSTRUCTED.provenance() == _UM_DICT
+
+
+def test_csi_universe_names_is_the_strict_csi_set():
+    assert CSI_UNIVERSE_NAMES == frozenset({"csi300", "csi500", "csi800"})
+
+
+def test_universe_membership_provenance_csi_universes():
+    """Every strict-CSI universe resolves to the same declared provenance."""
+    assert universe_membership_provenance("csi300") == _UM_DICT
+    assert universe_membership_provenance("csi500") == _UM_DICT
+    assert universe_membership_provenance("csi800") == _UM_DICT
+
+
+def test_universe_membership_provenance_non_csi_returns_none():
+    """Non-CSI universes do not consume membership.parquet — no provenance."""
+    for u in ("all", "random", "first", "stratified", "", None):
+        assert universe_membership_provenance(u) is None, u
+
+
+def test_universe_vintage_policy_is_frozen():
+    """The provenance policy is immutable — a frozen dataclass, so no caller
+    can mutate the declared membership vintage after construction."""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        CSI_MONTHLY_RECONSTRUCTED.source = "other"

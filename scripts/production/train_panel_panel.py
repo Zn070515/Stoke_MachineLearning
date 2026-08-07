@@ -22,7 +22,11 @@ from stoke_ml.data.universe import (
     load_index_membership,
     load_universe_status,
 )
-from stoke_ml.data.vintage_policy import VintagePolicy, channel_allowed
+from stoke_ml.data.vintage_policy import (
+    VintagePolicy,
+    channel_allowed,
+    universe_membership_provenance,
+)
 from stoke_ml.features.aux_cols import FUNDAMENTAL_COLS
 from stoke_ml.features.cache_manifest import (
     _dir_content_hash,
@@ -165,6 +169,15 @@ def _panel_store_meta(
         # (refuse): a --universe all store must stay reusable, not bricked.
         if universe_hashes["membership_hash"] is not None:
             meta["membership_hash"] = universe_hashes["membership_hash"]
+            # §T6/§十四: when membership is consumed (a CSI universe) the store
+            # ALSO self-describes the membership PROVENANCE — Baostock monthly
+            # reconstruction (latest-reconstructed), SEPARATE from the feature
+            # vintage policy, so a feature-vintage safe-only store never
+            # silently implies its universe gate avoided latest-reconstructed
+            # data.  Non-CSI stores stay untouched (symmetric with the
+            # membership_hash conditional).
+            meta["universe_membership"] = universe_membership_provenance(
+                args.universe)
     if prebuilt_dir:
         meta["prebuilt_feature_manifest_hash"] = _dir_content_hash(
             os.path.join(prebuilt_dir, ".manifests"))
