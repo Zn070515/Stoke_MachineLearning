@@ -89,6 +89,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from stoke_ml.data import channel_vintage as _cv
+from stoke_ml.data.download_resume import read_stock_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -511,3 +512,195 @@ def check_asset_read(
         )
     logger.warning("asset_contract[%s]: manifest mismatch for %s: %s",
                    asset.data_type, parquet_path, reason)
+
+
+# ── §T8 provider-era fields (no_event vs not_observed) ─────────────────────
+#
+# A sparse channel's coverage gate must distinguish a stock that GENUINELY had
+# no events on a day (``no_event`` — legitimate) from an era we NEVER observed
+# (``not_observed`` — a data gap).  The write-end record lives in the asset
+# manifest of the channel's GOLD (daily) files:
+#
+#   provider_available_start/end — the provider era this stock needed, i.e. the
+#       downloader manifest's ``effective_start/end`` (the requested window
+#       clipped by the caller to listing/delist/latest), degenerating to
+#       ``requested_start/end``.
+#   retrieved_ranges              — the ACTUAL date ranges fetched inside that
+#       era (``[actual_start, actual_end]`` ∩ era, minus ``known_gaps``).
+#   known_gaps                    — the downloader manifest's (normalized)
+#       ``missing_intervals``.
+#
+# A stock whose gold manifest carries a provider era is ``era-observable``: a
+# calendar day inside ``retrieved_ranges`` counts as OBSERVED whether or not an
+# event happened that day — ``no_event`` is not a gap.  A stock with no gold
+# manifest / no provider era is ``not_observed`` and is excluded from the
+# era-coverage numerator (never counted as zero), reported separately.
+#
+# ``era_coverage`` is the calendar-day fraction of the provider era covered by
+# ``retrieved_ranges`` — a simple, deterministic proxy for "how much of the era
+# did we actually look at".  Calendar days (not trading days) keep the helper
+# calendar-agnostic; the aggregation to the channel-level gate metric lives in
+# the training probe (``train_panel_panel._probe_era_coverage``).
+
+
+def _iso(value) -> str | None:
+    """A value's ISO date, or None when missing / unparseable."""
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        return None
+    return ts.strftime("%Y-%m-%d")
+
+
+def _normalize_ranges(value) -> list[list[str]]:
+    """Coerce a range-ish value to a list of ``[start, end]`` ISO-date pairs.
+
+    Accepts ``None`` (→ []), a single ``[start, end]`` pair, or a list of
+    pairs; ranges with a missing / unparseable bound are dropped.
+    """
+    if not value:
+        return []
+    pairs = (
+        value
+        if isinstance(value, list) and value and isinstance(value[0], (list, tuple))
+        else [value]
+    )
+    out: list[list[str]] = []
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        lo, hi = _iso(pair[0]), _iso(pair[1])
+        if lo and hi:
+            out.append([lo, hi])
+    return out
+
+
+def _subtract_ranges(
+    ranges: list[list[str]], gaps: list[list[str]],
+) -> list[list[str]]:
+    """Subtract ``gaps`` from ``ranges`` (both ``[start, end]`` ISO lists)."""
+    result: list[list[str]] = []
+    for lo, hi in ranges:
+        segs = [(pd.Timestamp(lo), pd.Timestamp(hi))]
+        for glo, ghi in gaps:
+            g_lo, g_hi = pd.Timestamp(glo), pd.Timestamp(ghi)
+            next_segs: list = []
+            for s_lo, s_hi in segs:
+                if g_hi < s_lo or g_lo > s_hi:
+                    next_segs.append((s_lo, s_hi))
+                else:
+                    if g_lo > s_lo:
+                        next_segs.append((s_lo, g_lo - pd.Timedelta(days=1)))
+                    if g_hi < s_hi:
+                        next_segs.append((g_hi + pd.Timedelta(days=1), s_hi))
+            segs = next_segs
+        for s_lo, s_hi in segs:
+            result.append([s_lo.strftime("%Y-%m-%d"), s_hi.strftime("%Y-%m-%d")])
+    return result
+
+
+def provider_era_fields(downloader_manifest: dict | None) -> dict:
+    """Map a downloader per-stock manifest (§五, ``download_resume.py``) to the
+    three asset-manifest provider-era fields (§T8).
+
+    ``provider_available_start/end`` is the provider era this stock needed — the
+    manifest's ``effective_start/end`` (the requested window clipped by the
+    caller to listing/delist/latest), degenerating to ``requested_start/end``.
+    ``retrieved_ranges`` is what was actually fetched inside that era
+    (``[actual_start, actual_end]`` ∩ era, minus ``known_gaps``).
+    ``known_gaps`` is the normalized ``missing_intervals``.
+
+    Returns ``{}`` when the manifest is missing or carries no provider era — the
+    stock is ``not_observed`` (we cannot distinguish "no events that day" from
+    "we never observed that era").
+    """
+    if not downloader_manifest:
+        return {}
+    win_start = _iso(downloader_manifest.get("effective_start")
+                     or downloader_manifest.get("requested_start"))
+    win_end = _iso(downloader_manifest.get("effective_end")
+                   or downloader_manifest.get("requested_end"))
+    if not win_start or not win_end:
+        return {}
+    gaps = _normalize_ranges(downloader_manifest.get("missing_intervals"))
+    fetched: list[list[str]] = []
+    actual_start = _iso(downloader_manifest.get("actual_start"))
+    actual_end = _iso(downloader_manifest.get("actual_end"))
+    if actual_start and actual_end:
+        lo = max(actual_start, win_start)  # ISO strings sort chronologically
+        hi = min(actual_end, win_end)
+        if lo <= hi:
+            fetched = [[lo, hi]]
+    return {
+        "provider_available_start": win_start,
+        "provider_available_end": win_end,
+        "retrieved_ranges": _subtract_ranges(fetched, gaps),
+        "known_gaps": gaps,
+    }
+
+
+def downloader_era_fields(
+    raw_dir: str, stock_code: str, cache: dict | None = None,
+) -> dict:
+    """Provider-era fields for a stock's gold asset manifest.
+
+    Reads the stock's downloader manifest at ``<raw_dir>/.manifests/{code}.json``
+    (§五) and maps it via :func:`provider_era_fields`; ``{}`` when there is no
+    downloader manifest (the stock was never downloaded → ``not_observed``).
+    ``cache`` (a dict, typically per storage save call) avoids re-reading the
+    same manifest when one stock is written in many partitions.
+    """
+    if cache is None:
+        cache = {}
+    if stock_code not in cache:
+        cache[stock_code] = provider_era_fields(
+            read_stock_manifest(raw_dir, stock_code))
+    return cache[stock_code]
+
+
+def parse_era_coverage(asset_manifest: dict) -> dict:
+    """Parse a gold asset manifest's provider-era fields into an era-coverage
+    report (§T8)::
+
+        {
+          "provider_available_start": str | None,
+          "provider_available_end":   str | None,
+          "retrieved_ranges":         [[start, end], ...],
+          "known_gaps":               [[start, end], ...],
+          "era_covered":              float | None,  # fraction of era days retrieved
+          "not_observed":             bool,
+        }
+
+    ``era_covered`` is the calendar-day fraction of ``[provider_available_start,
+    provider_available_end]`` that ``retrieved_ranges`` covers (clamped to the
+    window).  A day inside a retrieved range is OBSERVED even when the stock had
+    no event that day — ``no_event`` is legitimate, not a gap.  ``None`` when
+    the manifest records no provider era (``not_observed=True``): such a stock is
+    excluded from the era-coverage numerator, never counted as zero.
+    """
+    win_start = asset_manifest.get("provider_available_start")
+    win_end = asset_manifest.get("provider_available_end")
+    retrieved = _normalize_ranges(asset_manifest.get("retrieved_ranges"))
+    report = {
+        "provider_available_start": win_start,
+        "provider_available_end": win_end,
+        "retrieved_ranges": retrieved,
+        "known_gaps": _normalize_ranges(asset_manifest.get("known_gaps")),
+        "era_covered": None,
+        "not_observed": True,
+    }
+    if not win_start or not win_end:
+        return report
+    total = (pd.Timestamp(win_end) - pd.Timestamp(win_start)).days + 1
+    if total <= 0:
+        return report
+    covered = 0
+    for lo, hi in retrieved:
+        lo_d = max(pd.Timestamp(lo), pd.Timestamp(win_start))
+        hi_d = min(pd.Timestamp(hi), pd.Timestamp(win_end))
+        if lo_d <= hi_d:
+            covered += (hi_d - lo_d).days + 1
+    report["era_covered"] = min(covered / total, 1.0)
+    report["not_observed"] = False
+    return report

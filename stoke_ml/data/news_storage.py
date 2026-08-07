@@ -15,6 +15,7 @@ from stoke_ml.data.asset_contract import (
     AtomicCommit,
     check_asset_read,
     contract_for_channel,
+    downloader_era_fields,
     write_asset_manifest,
 )
 from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
@@ -178,6 +179,10 @@ class NewsStorage:
         df["year"] = df["date"].dt.year
         df["month"] = df["date"].dt.month
 
+        # §T8: one stock is written in many (year, month) partitions — read the
+        # downloader manifest once per stock per call and stamp the same era
+        # fields on every partition's asset manifest (no_event vs not_observed).
+        era_cache: dict = {}
         for (year, month, code), group in df.groupby(["year", "month", "stock_code"]):
             out_dir = os.path.join(
                 self._sentiment_base(), str(year), f"{month:02d}"
@@ -187,7 +192,10 @@ class NewsStorage:
             save_df = group.drop(columns=["year", "month"])
             with AtomicCommit(out_path) as ac:
                 save_df.to_parquet(ac.tmp_path, index=False, compression='lz4')
-            write_asset_manifest(out_path, SENTIMENT_ASSET, save_df, entity=code)
+            write_asset_manifest(
+                out_path, SENTIMENT_ASSET, save_df, entity=code,
+                **downloader_era_fields(self._raw_dir(), code, era_cache),
+            )
 
     def load_daily_sentiment(
         self, stock_code: str, start_date: str, end_date: str,

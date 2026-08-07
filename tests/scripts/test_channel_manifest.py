@@ -5,6 +5,7 @@ train_panel.py must be able to tell "this aux channel is absent from disk"
 change or missing dir can no longer silently zero out a data dimension.
 """
 import importlib.util
+import json
 import os
 
 import numpy as np
@@ -464,3 +465,132 @@ def test_date_coverage_fraction_clips_at_1_0(tp, tmp_path):
     assert n_trading < 300  # 2024 has ~365 calendar days, ~242 trading days
     assert tp._date_coverage_fraction(
         300, data_dir, "2024-01-01", "2024-12-31") == 1.0
+
+
+# ── §T8 provider-era coverage probe (no_event vs not_observed) ─────────
+
+def _gold_manifest(data_dir, channel, code, win, retrieved, gaps=()):
+    """Write a synthetic gold asset manifest for a stock; return its path."""
+    base = os.path.join(data_dir, "a_shares")
+    if channel == "sentiment":
+        d = os.path.join(base, "sentiment", "2024", "01")
+    elif channel == "guba":
+        d = os.path.join(base, "guba_sentiment")
+    elif channel == "comment":
+        d = os.path.join(base, "comment_sentiment")
+    else:
+        d = os.path.join(base, "announcements", "sentiment")
+    os.makedirs(d, exist_ok=True)
+    mp = os.path.join(d, f"{code}.parquet.manifest.json")
+    with open(mp, "w", encoding="utf-8") as f:
+        json.dump({
+            "provider_available_start": win[0],
+            "provider_available_end": win[1],
+            "retrieved_ranges": list(retrieved),
+            "known_gaps": list(gaps),
+        }, f)
+    return mp
+
+
+def test_stock_era_coverage_reads_gold_manifest(tp, tmp_path):
+    """§T8 acceptance (1): a provider window FULLY covered by retrieved_ranges
+    → era_coverage 1.0 — a day inside a retrieved range is observed whether or
+    not the stock had an event that day."""
+    data_dir = str(tmp_path / "data")
+    _gold_manifest(data_dir, "sentiment", "000001",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
+    cov, no = tp._stock_era_coverage(data_dir, "sentiment", "000001")
+    assert no is False
+    assert cov == 1.0
+
+
+def test_stock_era_coverage_partial_retrieval_fraction(tp, tmp_path):
+    """§T8 acceptance (3): a window 60% retrieved → era_coverage 0.6."""
+    data_dir = str(tmp_path / "data")
+    _gold_manifest(data_dir, "guba", "000001",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-06"]])
+    cov, no = tp._stock_era_coverage(data_dir, "guba", "000001")
+    assert no is False
+    assert cov == 0.6
+
+
+def test_stock_era_coverage_no_gold_manifest_not_observed(tp, tmp_path):
+    """No gold manifest → not_observed (era_coverage None), never counted as 0."""
+    data_dir = str(tmp_path / "data")
+    cov, no = tp._stock_era_coverage(data_dir, "sentiment", "000001")
+    assert no is True
+    assert cov is None
+
+
+def test_stock_era_coverage_finds_partitioned_sentiment(tp, tmp_path):
+    """sentiment gold lives in year/month partitions — the probe globs them."""
+    data_dir = str(tmp_path / "data")
+    _gold_manifest(data_dir, "sentiment", "000001",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
+    assert len(tp._gold_manifest_paths(data_dir, "sentiment", "000001")) == 1
+    cov, no = tp._stock_era_coverage(data_dir, "sentiment", "000001")
+    assert no is False
+    assert cov == 1.0
+
+
+def test_probe_era_coverage_excludes_not_observed_from_numerator(tp, tmp_path):
+    """§T8 acceptance (2): a not_observed stock is EXCLUDED from the era
+    numerator and counted separately — never pulled down as a zero."""
+    data_dir = str(tmp_path / "data")
+    _gold_manifest(data_dir, "sentiment", "000001",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])   # 1.0
+    _gold_manifest(data_dir, "sentiment", "000002",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-06"]])   # 0.6
+    # 000003 has no gold manifest -> not_observed
+    mean, n_obs, n_not = tp._probe_era_coverage(
+        data_dir, "sentiment", ["000001", "000002", "000003"])
+    assert mean == pytest.approx(0.8)
+    assert n_obs == 2
+    assert n_not == 1
+
+
+def test_probe_era_coverage_none_when_zero_observable(tp, tmp_path):
+    """Zero era-observable stocks → mean None (the gate treats the channel as
+    UNPROBEABLE — a formal run must not proceed on an unobserved channel)."""
+    data_dir = str(tmp_path / "data")
+    mean, n_obs, n_not = tp._probe_era_coverage(
+        data_dir, "sentiment", ["000001", "000002"])
+    assert mean is None
+    assert n_obs == 0
+    assert n_not == 2
+
+
+def test_merge_era_coverage_adds_fields_only_to_present_channels(tp, tmp_path):
+    """The merge stamps era fields on the era-capable channels ALREADY present
+    and leaves non-era channels and absent channels untouched."""
+    data_dir = str(tmp_path / "data")
+    _gold_manifest(data_dir, "sentiment", "000001",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
+    _gold_manifest(data_dir, "sentiment", "000002",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-06"]])
+    _gold_manifest(data_dir, "guba", "000002",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
+    manifest = {
+        "sentiment": {"status": "OK", "coverage": 1.0},
+        "guba": {"status": "OK", "coverage": 1.0},
+        "margin": {"status": "OK", "coverage": 1.0},
+    }
+    tp._merge_era_coverage(manifest, data_dir, ["000001", "000002", "000003"])
+    assert manifest["sentiment"]["era_coverage"] == pytest.approx(0.8)
+    assert manifest["sentiment"]["era_observable_stocks"] == 2
+    assert manifest["sentiment"]["era_not_observed_stocks"] == 1
+    assert manifest["guba"]["era_coverage"] == 1.0
+    assert manifest["guba"]["era_observable_stocks"] == 1
+    assert "era_coverage" not in manifest["margin"]  # not era-capable
+    assert "announcement" not in manifest  # absent channel not created
+
+
+def test_merge_era_coverage_empty_manifest_stays_empty(tp, tmp_path):
+    """A --no-aux build's empty channel manifest stays empty — a channel not
+    actually in the panel is not probed."""
+    data_dir = str(tmp_path / "data")
+    _gold_manifest(data_dir, "sentiment", "000001",
+                   ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
+    manifest = {}
+    tp._merge_era_coverage(manifest, data_dir, ["000001"])
+    assert manifest == {}

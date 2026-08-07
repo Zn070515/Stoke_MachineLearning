@@ -1747,8 +1747,9 @@ def test_enforce_channel_coverage_unrequested_channel_ignored(tp):
 
 def _full_manifest(required_set, contracts):
     """A manifest where every required channel is present at FULL coverage under
-    its own declared metric (stock_coverage for per-stock channels, date_coverage
-    for the broadcast ones) — used to isolate one unprobeable channel."""
+    its own declared metric (era_coverage for the §T8 sparse text channels,
+    stock_coverage for the other per-stock channels, date_coverage for the
+    broadcast ones) — used to isolate one unprobeable channel."""
     manifest = {}
     for ch in required_set:
         contract = contracts.get(ch)
@@ -1756,6 +1757,7 @@ def _full_manifest(required_set, contracts):
         manifest[ch] = {"requested": True, "required": True,
                         "loaded_stocks": 100, "coverage": 1.0,
                         "stock_coverage": 1.0, "date_coverage": 1.0,
+                        "era_coverage": 1.0,
                         "errors": 0, "status": "OK"}
     return manifest
 
@@ -1812,3 +1814,82 @@ def test_enforce_channel_coverage_below_minimum_broadcast_date_metric(tp, caplog
     assert ei.value.code == 1
     assert any("market_env" in m for m in caplog.messages)
     assert any("0.5000 < minimum 0.9500" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_era_metric_below_minimum_aborts(tp, caplog):
+    """§T8: a channel contracted on era_coverage aborts below its threshold
+    against the DECLARED metric — the gate reads entry['era_coverage'] (the
+    provider-era retrieval coverage) with no logic change."""
+    import logging
+    manifest = {"sentiment": _manifest_entry(100, 0.95)}
+    manifest["sentiment"]["era_coverage"] = 0.50  # < 0.90 era contract
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage(
+                {"sentiment"}, manifest,
+                {"sentiment": CoverageContract("era_coverage", 0.90)},
+                formal=False)
+    assert ei.value.code == 1
+    assert any("sentiment" in m for m in caplog.messages)
+    assert any("0.5000 < minimum 0.9000" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_era_metric_meets_minimum_passes(tp):
+    """§T8: era_coverage at/above the contract minimum passes."""
+    manifest = {"sentiment": _manifest_entry(100, 0.95)}
+    manifest["sentiment"]["era_coverage"] = 0.95
+    tp._enforce_channel_coverage(
+        {"sentiment"}, manifest,
+        {"sentiment": CoverageContract("era_coverage", 0.90)}, formal=False)
+
+
+def test_enforce_channel_coverage_era_metric_absent_is_unprobeable(tp, caplog):
+    """§T8: a channel contracted on era_coverage whose entry lacks the metric
+    (e.g. zero era-observable stocks -> era_coverage absent) is UNPROBEABLE —
+    a stock_coverage value does NOT satisfy an era_coverage contract.  FORMAL
+    aborts, EXPLORE warns."""
+    import logging
+    manifest = {"sentiment": _manifest_entry(100, 0.95)}  # no era_coverage key
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage(
+                {"sentiment"}, manifest,
+                {"sentiment": CoverageContract("era_coverage", 0.90)},
+                formal=True)
+    assert ei.value.code == 1
+    assert any("sentiment" in m for m in caplog.messages)
+    assert any("formal mode" in m for m in caplog.messages)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        tp._enforce_channel_coverage(
+            {"sentiment"}, manifest,
+            {"sentiment": CoverageContract("era_coverage", 0.90)},
+            formal=False)
+    assert any("sentiment" in m for m in caplog.messages)
+
+
+def test_headline_v1_era_contracts_decidable_in_formal_mode(tp, caplog):
+    """§T8 acceptance (4): headline_v1's new sentiment/guba era_coverage 0.90
+    contracts are DECIDABLE by the formal gate — present at era_coverage 1.0
+    they pass; present at 0.50 the run aborts.  (Acceptance (5) regression: a
+    channel NOT declaring era_coverage is still gated on stock_coverage.)"""
+    import logging
+    args = _panel_args("revision-safe", feature_profile="headline_v1")
+    required_set, contracts, name = tp._resolve_required_set(args)
+    assert name == "headline_v1"
+    assert contracts["sentiment"].metric == "era_coverage"
+    assert contracts["guba"].metric == "era_coverage"
+
+    manifest = _full_manifest(required_set, contracts)
+    tp._enforce_channel_coverage(
+        required_set, manifest, contracts, formal=True)  # must not abort
+
+    manifest["sentiment"]["era_coverage"] = 0.50
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage(
+                required_set, manifest, contracts, formal=True)
+    assert ei.value.code == 1
+    assert any("sentiment" in m for m in caplog.messages)
+    assert any("0.5000 < minimum 0.9000" in m for m in caplog.messages)

@@ -120,6 +120,10 @@ from scripts.production.train_panel_panel import (
     _load_channel_aux,  # noqa: F401  re-exported for import-compat
     load_aux_data,  # noqa: F401  re-exported for import-compat
     _prebuilt_channel_coverage,  # noqa: F401  re-exported for import-compat
+    _gold_manifest_paths,  # noqa: F401  re-exported for import-compat
+    _stock_era_coverage,  # noqa: F401  re-exported for import-compat
+    _probe_era_coverage,  # noqa: F401  re-exported for import-compat
+    _merge_era_coverage,  # noqa: F401  re-exported for import-compat
     _trading_day_count,  # noqa: F401  re-exported for import-compat
     _date_coverage_fraction,  # noqa: F401  re-exported for import-compat
     _probe_broadcast_dates,  # noqa: F401  re-exported for import-compat

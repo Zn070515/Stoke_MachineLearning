@@ -13,7 +13,11 @@ import os
 import pandas as pd
 import pytest
 
-from stoke_ml.data.asset_contract import validate_asset_manifest
+from stoke_ml.data.asset_contract import (
+    parse_era_coverage,
+    validate_asset_manifest,
+)
+from stoke_ml.data.download_resume import write_stock_manifest
 from stoke_ml.data.news_storage import SENTIMENT_ASSET, NewsStorage
 
 
@@ -94,6 +98,61 @@ def test_sentiment_round_trip_writes_valid_manifest(tmp_path):
     loaded = storage.load_daily_sentiment("000001", "2024-01-01", "2024-01-31")
     assert len(loaded) == 2
     assert _tmp_files(str(tmp_path)) == []
+
+
+# ── §T8 write-end: provider-era fields from the downloader manifest ─────────
+
+def _news_downloader_manifest(tmp_path, code="000001", **kw):
+    """Write a news per-stock downloader manifest and return its path."""
+    raw_dir = os.path.join(str(tmp_path), "a_shares", "news_raw")
+    defaults = dict(
+        dataset="news_raw",
+        requested_start="2024-01-01", requested_end="2024-01-31",
+        effective_start="2024-01-01", effective_end="2024-01-31",
+        actual_start="2024-01-01", actual_end="2024-01-31",
+        status="COMPLETE", provider_exhausted=True,
+    )
+    defaults.update(kw)
+    return write_stock_manifest(raw_dir, code, **defaults)
+
+
+def test_sentiment_write_end_records_provider_era_fields(tmp_path):
+    """§T8 write-end round-trip: a gold sentiment manifest records the three
+    provider-era fields derived from the stock's downloader manifest — a window
+    fully retrieved over a provider era is era-covered even when the gold rows
+    are sparse (no_event is covered, not a gap)."""
+    _news_downloader_manifest(tmp_path, missing_intervals=[["2024-01-15", "2024-01-20"]])
+    storage = NewsStorage(str(tmp_path))
+    # sparse: events only on 2 days inside the fully-retrieved era window
+    storage.save_daily_sentiment(_gold_df())
+
+    path = _gold_path(tmp_path)
+    manifest = _manifest_of(path)
+    assert manifest["provider_available_start"] == "2024-01-01"
+    assert manifest["provider_available_end"] == "2024-01-31"
+    # actual [01-01, 01-31] minus the gap -> two disjoint retrieved ranges
+    assert manifest["retrieved_ranges"] == [
+        ["2024-01-01", "2024-01-14"], ["2024-01-21", "2024-01-31"]]
+    assert manifest["known_gaps"] == [["2024-01-15", "2024-01-20"]]
+
+    # the 6-day gap genuinely reduces what was retrieved: 25 of 31 era days
+    report = parse_era_coverage(manifest)
+    assert report["not_observed"] is False
+    assert report["era_covered"] == pytest.approx(25 / 31)
+
+
+def test_sentiment_write_end_without_downloader_manifest_not_observed(tmp_path):
+    """§T8: a stock with NO downloader manifest writes a gold manifest WITHOUT
+    the provider-era fields — not_observed (no crash, fields absent)."""
+    storage = NewsStorage(str(tmp_path))
+    storage.save_daily_sentiment(_gold_df())
+    path = _gold_path(tmp_path)
+    manifest = _manifest_of(path)
+    assert "provider_available_start" not in manifest
+    assert "provider_available_end" not in manifest
+    assert "retrieved_ranges" not in manifest
+    assert "known_gaps" not in manifest
+    assert parse_era_coverage(manifest)["not_observed"] is True
 
 
 # ── gold asset contract: tamper detection ──────────────────────────────────

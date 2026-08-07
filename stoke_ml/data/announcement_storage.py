@@ -12,6 +12,7 @@ from stoke_ml.data.asset_contract import (
     AtomicCommit,
     DataAssetContract,
     check_asset_read,
+    downloader_era_fields,
     write_asset_manifest,
 )
 from stoke_ml.data.calendar import get_research_calendar
@@ -49,7 +50,12 @@ class AnnouncementStorage:
         path = os.path.join(self._base, f"{stock_code}.parquet")
         with AtomicCommit(path) as ac:
             df.to_parquet(ac.tmp_path, index=False, compression='lz4')
-        write_asset_manifest(path, ANNOUNCEMENT_ASSET, df, entity=stock_code)
+        # §T8: stamp the downloader manifest's provider-era fields (the
+        # downloader manifest lives in this same a_shares/announcements dir).
+        write_asset_manifest(
+            path, ANNOUNCEMENT_ASSET, df, entity=stock_code,
+            **downloader_era_fields(self._base, stock_code),
+        )
         return path
 
     def load_raw(
@@ -109,7 +115,9 @@ class AnnouncementStorage:
             with AtomicCommit(out_path) as ac:
                 daily.to_parquet(ac.tmp_path, index=False, compression='lz4')
             write_asset_manifest(
-                out_path, ANNOUNCEMENT_SENTIMENT_ASSET, daily, entity=stock_code,
+                out_path, ANNOUNCEMENT_SENTIMENT_ASSET, daily,
+                entity=stock_code,
+                **downloader_era_fields(self._base, stock_code),
             )
 
         return daily

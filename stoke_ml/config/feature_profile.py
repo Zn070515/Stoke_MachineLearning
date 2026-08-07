@@ -209,9 +209,17 @@ del _channel, _cols, _col, _COLUMN_OWNER
 # (the meaningful metric for MARKET-WIDE broadcast channels, whose value is the
 # same for every stock per date); valid_state_cell_coverage is reserved for a
 # state-channel forward-fill metric (not currently produced).
+#
+# §T8: ERA coverage is the provider-era retrieval coverage — the calendar-day
+# fraction of a stock's provider-observable window that was actually retrieved,
+# per the gold asset manifest's provider-era fields.  It is the metric for the
+# SPARSE text event channels (sentiment / guba): it distinguishes a stock that
+# genuinely had no events (no_event, legitimate) from an era we never observed
+# (not_observed, a data gap).  ``date_availability`` is reserved for a future
+# date-presence metric (not currently produced).
 _COVERAGE_METRICS: frozenset[str] = frozenset({
     "stock_coverage", "cell_coverage", "date_coverage",
-    "valid_state_cell_coverage",
+    "valid_state_cell_coverage", "era_coverage", "date_availability",
 })
 
 
@@ -270,8 +278,12 @@ class FeatureProfile:
 # denied under revision-safe, so it is deliberately absent despite defaulting ON.
 #
 # ``coverage_contracts`` thresholds ARE the historical ``minimum_coverage``
-# values — NOT re-tuned (§T4).  The metric split: every per-stock channel
-# declares ``stock_coverage``; the MARKET-WIDE broadcast channels
+# values — NOT re-tuned (§T4).  The metric split: the SPARSE text event channels
+# (sentiment / guba) declare ``era_coverage`` (§T8) — the provider-era retrieval
+# coverage that separates a stock with genuinely no events (no_event) from an
+# era we never observed (not_observed), so a sparse-but-observed channel is not
+# falsely gated as a data gap; every other per-stock channel declares
+# ``stock_coverage``; the MARKET-WIDE broadcast channels
 # (etf_flow / industry / market_env) declare ``date_coverage`` — their value is
 # the same for every stock per date, so stock coverage is vacuous (1.0 whenever
 # the file exists) and date coverage is the meaningful metric.  dragon_tiger is
@@ -296,8 +308,8 @@ FEATURE_PROFILES: dict[str, FeatureProfile] = {
             "block_trade", "lockup", "dividend", "industry", "market_env",
         ),
         coverage_contracts={
-            "sentiment": CoverageContract("stock_coverage", 0.90),
-            "guba": CoverageContract("stock_coverage", 0.90),
+            "sentiment": CoverageContract("era_coverage", 0.90),
+            "guba": CoverageContract("era_coverage", 0.90),
             "comment": CoverageContract("stock_coverage", 0.90),
             "announcement": CoverageContract("stock_coverage", 0.70),
             "margin": CoverageContract("stock_coverage", 0.95),

@@ -6,6 +6,7 @@ panel builder (``_resolve_panel``), the universe memory guards, the aux-channel
 coverage manifest loading, and the has_* flag probe.  ``train_panel``
 re-exports these names for backward compatibility.
 """
+import glob
 import hashlib
 import json
 import logging
@@ -20,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.asset_contract import parse_era_coverage
 from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.channel_sources import CHANNEL_SOURCE, live_data_type, source_dir
 from stoke_ml.data.universe import (
@@ -403,6 +405,115 @@ def _validate_panel_store_path(path: str) -> None:
             "directory or remove the conflicting file."
         )
 
+# §T8: the era-capable text channels — the four whose gold (daily) asset
+# manifests carry the provider-era fields (provider_available_start/end,
+# retrieved_ranges, known_gaps) recorded by the storage write-end from the
+# downloader per-stock manifest.  Only these can separate no_event from
+# not_observed, so only these get an era_coverage probe.
+_ERA_CAPABLE_CHANNELS = ("sentiment", "guba", "comment", "announcement")
+
+
+def _gold_manifest_paths(data_dir: str, channel: str, code: str) -> list[str]:
+    """Candidate gold asset-manifest paths for a channel's per-stock file(s).
+
+    sentiment is partitioned (``a_shares/sentiment/{year}/{month}/{code}.parquet``)
+    with a flat ``sentiment/{code}.parquet`` fallback; the other three are flat
+    (``guba_sentiment|comment_sentiment|announcements/sentiment/{code}.parquet``).
+    Every gold file of a stock carries the SAME provider-era fields (all stamped
+    from the one downloader manifest), so parsing ANY existing candidate yields
+    the same era coverage — the first existing path wins.
+    """
+    base = os.path.join(data_dir, "a_shares")
+    if channel == "sentiment":
+        flat = os.path.join(base, "sentiment", f"{code}.parquet")
+        if os.path.isfile(flat + ".manifest.json"):
+            return [flat + ".manifest.json"]
+        return sorted(glob.glob(
+            os.path.join(base, "sentiment", "*", "*", f"{code}.parquet.manifest.json")))
+    if channel == "guba":
+        d = os.path.join(base, "guba_sentiment")
+    elif channel == "comment":
+        d = os.path.join(base, "comment_sentiment")
+    else:  # announcement — the daily SENTIMENT asset, not the raw file
+        d = os.path.join(base, "announcements", "sentiment")
+    p = os.path.join(d, f"{code}.parquet.manifest.json")
+    return [p] if os.path.isfile(p) else []
+
+
+def _stock_era_coverage(data_dir: str, channel: str, code: str) -> tuple:
+    """(era_coverage, not_observed) for one stock from its gold asset manifest.
+
+    ``era_coverage`` is None and ``not_observed`` True when there is no gold
+    manifest at all (nothing was ever built for this stock in the gold layer).
+    """
+    for mp in _gold_manifest_paths(data_dir, channel, code):
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                asset_manifest = json.load(f)
+        except (OSError, ValueError):
+            continue
+        report = parse_era_coverage(asset_manifest)
+        return report["era_covered"], report["not_observed"]
+    return None, True
+
+
+def _probe_era_coverage(data_dir: str, channel: str, stock_list: list[str]) -> tuple:
+    """Aggregate per-stock era coverage over a universe (§T8).
+
+    Returns ``(mean_coverage, era_observable_stocks, era_not_observed_stocks)``:
+    mean over the stocks whose gold manifest records a provider era.  A
+    ``not_observed`` stock (no provider era — we never looked) is excluded from
+    the numerator and counted separately: it is NOT evidence of "no events".
+    ``mean_coverage`` is ``None`` when no stock is era-observable (the channel
+    is UNPROBEABLE for the era metric, which aborts a formal gate).
+    """
+    coverages: list[float] = []
+    not_observed = 0
+    for code in stock_list:
+        cov, no = _stock_era_coverage(data_dir, channel, code)
+        if no:
+            not_observed += 1
+        elif cov is not None:
+            coverages.append(float(cov))
+    if not coverages:
+        return None, 0, not_observed
+    return sum(coverages) / len(coverages), len(coverages), not_observed
+
+
+def _merge_era_coverage(
+    channel_manifest: dict, data_dir: str, stock_list: list[str], *,
+    force: bool = True,
+) -> dict:
+    """Add the era-coverage probe to a channel manifest (§T8).
+
+    Merges ONLY the era-capable channels that are ALREADY present — a
+    ``--no-aux`` build's empty manifest stays empty (a channel not actually in
+    the panel is not probed).  For each present channel, sets
+    ``era_observable_stocks`` / ``era_not_observed_stocks`` and, when at least
+    one stock is era-observable, ``era_coverage`` (the mean).  With ZERO
+    era-observable stocks ``era_coverage`` is left ABSENT so the coverage gate
+    treats the channel as unprobeable — a formal run must not proceed on a
+    channel nothing was observed for.
+
+    ``force=False`` (the store-LOAD path) skips a channel that already carries a
+    persisted build-time ``era_coverage`` — a freshly-built store replays its
+    frozen era coverage without re-probing the gold manifests on the fast path;
+    only a LEGACY store (built before §T8) is probed.
+    """
+    for ch in _ERA_CAPABLE_CHANNELS:
+        if ch not in channel_manifest:
+            continue
+        if not force and "era_coverage" in channel_manifest[ch]:
+            continue  # persisted build-time era coverage already present
+        mean_cov, n_obs, n_not = _probe_era_coverage(data_dir, ch, stock_list)
+        entry = channel_manifest[ch]
+        entry["era_observable_stocks"] = n_obs
+        entry["era_not_observed_stocks"] = n_not
+        if mean_cov is not None:
+            entry["era_coverage"] = mean_cov
+    return channel_manifest
+
+
 def _resolve_panel(
     args, stock_list: list[str], seq_len: int, data_dir,
     required_set: set[str], _store_load: bool,
@@ -446,7 +557,12 @@ def _resolve_panel(
         stored = panel_data.get("channel_coverage_manifest")
         channel_manifest = (stored if stored is not None
                             else _prebuilt_channel_coverage(panel_data))
-        return panel_data, channel_manifest
+        # §T8: merge the provider-era coverage probe for the text channels.
+        # force=False: a store built under §T8 already persisted build-time
+        # era_coverage — replay it without re-probing the gold manifests on the
+        # fast path; only a LEGACY store (no persisted era) is probed.
+        return panel_data, _merge_era_coverage(
+            channel_manifest, data_dir, stock_list, force=False)
 
     logger.info("Loading K-line data for %d stocks from %s to %s...",
                 len(stock_list), args.start, args.end)
@@ -552,6 +668,13 @@ def _resolve_panel(
         # build the manifest is set into panel_data AFTER this block and read
         # back from the reloaded store below.)
         channel_manifest = _prebuilt_channel_coverage(panel_data)
+    # §T8: merge the provider-era coverage probe for the text channels BEFORE
+    # any persist — the store BUILD persists build-time era_coverage (so a later
+    # store-load replays it without re-probing the gold manifests), and the
+    # live/prebuilt paths record it in the returned manifest.  The merge is
+    # idempotent over the present era-capable channels, so the final return just
+    # hands the already-merged manifest out.
+    channel_manifest = _merge_era_coverage(channel_manifest, data_dir, stock_list)
     if args.panel_store:
         # §T4: persist the channel-coverage manifest into the store so a later
         # store-backed replay reads the accurate build-time coverage directly

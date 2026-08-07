@@ -182,6 +182,21 @@ def test_headline_v1_coverage_contracts_within_unit_interval():
         assert c.metric in _COVERAGE_METRICS, f"{ch}: {c.metric}"
 
 
+def test_coverage_metrics_include_era_metrics():
+    """§T8: ``era_coverage`` (provider-era retrieval coverage, the metric behind
+    the sentiment/guba contracts) and the reserved ``date_availability`` are
+    valid declared metrics; ``era_coverage`` is ACTIVE (used by a contract),
+    ``date_availability`` is reserved for a future date-presence metric."""
+    assert "era_coverage" in _COVERAGE_METRICS
+    assert "date_availability" in _COVERAGE_METRICS
+    assert any(
+        c.metric == "era_coverage"
+        for c in _headline().coverage_contracts.values())
+    assert all(
+        c.metric != "date_availability"
+        for c in _headline().coverage_contracts.values())
+
+
 def test_headline_v1_coverage_contract_keys_subset_of_required():
     """A channel with a coverage contract must also be required — a channel
     the run does not require should never be aborted on coverage.
@@ -196,16 +211,20 @@ def test_headline_v1_coverage_contract_keys_subset_of_required():
 def test_headline_v1_coverage_contracts_exact_map():
     """Pin the exact per-channel (metric, threshold) contract map (§T4).
 
-    Per-stock channels use stock_coverage; the MARKET-WIDE broadcast channels
-    (etf_flow / industry / market_env) use date_coverage — their value is the
-    same for every stock per date, so stock coverage is vacuous (1.0 whenever
-    the file exists) and date coverage is the meaningful metric.  dragon_tiger
-    is presence-only (required, NO contract).  Thresholds are the historical
-    minimum_coverage values — NOT re-tuned.
+    The SPARSE text event channels (sentiment / guba) use era_coverage (§T8) —
+    the provider-era retrieval-coverage metric that distinguishes a stock with
+    genuinely no events (no_event, legitimate) from an era we never observed
+    (not_observed, a data gap).  The remaining per-stock channels use
+    stock_coverage; the MARKET-WIDE broadcast channels (etf_flow / industry /
+    market_env) use date_coverage — their value is the same for every stock per
+    date, so stock coverage is vacuous (1.0 whenever the file exists) and date
+    coverage is the meaningful metric.  dragon_tiger is presence-only (required,
+    NO contract).  Thresholds are the historical minimum_coverage values — NOT
+    re-tuned.
     """
     assert _headline().coverage_contracts == {
-        "sentiment": CoverageContract("stock_coverage", 0.90),
-        "guba": CoverageContract("stock_coverage", 0.90),
+        "sentiment": CoverageContract("era_coverage", 0.90),
+        "guba": CoverageContract("era_coverage", 0.90),
         "comment": CoverageContract("stock_coverage", 0.90),
         "announcement": CoverageContract("stock_coverage", 0.70),
         "margin": CoverageContract("stock_coverage", 0.95),

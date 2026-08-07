@@ -159,8 +159,17 @@ def _enforce_channel_coverage(
 
     The DECLARED metric is read from the channel's ``CoverageContract`` (e.g.
     ``date_coverage`` for the market-wide broadcast channels etf_flow /
-    industry / market_env); a presence-only channel (required but no contract,
-    e.g. dragon_tiger) defaults to ``stock_coverage``.  There is NO legacy
+    industry / market_env, ``era_coverage`` for the §T8 sparse text channels
+    sentiment / guba).  ``era_coverage`` is the provider-era retrieval coverage
+    probed by ``_resolve_panel`` (``_merge_era_coverage``): the mean over the
+    era-observable stocks of each stock's calendar-day fraction of its provider
+    window that was actually retrieved — distinguishing a stock with genuinely
+    no events (no_event, covered) from an era we never observed (not_observed,
+    excluded from the numerator and reported via ``era_not_observed_stocks``).
+    A channel with ZERO era-observable stocks leaves ``era_coverage`` absent, so
+    it is UNPROBEABLE here and aborts a formal run (correct: nothing was
+    observed).  A presence-only channel (required but no contract, e.g.
+    dragon_tiger) defaults to ``stock_coverage``.  There is NO legacy
     ``entry["coverage"]`` fallback in the gate — the declared-metric key must
     be present and finite, else the channel is unprobeable.  A channel in the
     manifest but NOT in ``required_set`` is not gated at all.

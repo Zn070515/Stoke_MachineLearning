@@ -12,6 +12,7 @@ import pandas as pd
 from stoke_ml.data.asset_contract import (
     check_asset_read,
     contract_for_channel,
+    downloader_era_fields,
     write_asset_manifest,
 )
 from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
@@ -113,8 +114,13 @@ class CommentStorage:
                 if os.path.isfile(tmp_path):
                     os.unlink(tmp_path)
                 raise
-            write_asset_manifest(out_path, COMMENT_SENTIMENT_ASSET, new_rows,
-                                 entity=code)
+            # §T8: the downloader manifest lives in the SAME dir as the gold
+            # files (a_shares/comment_sentiment) — stamp its provider-era fields
+            # so the gold manifest distinguishes no_event from not_observed.
+            write_asset_manifest(
+                out_path, COMMENT_SENTIMENT_ASSET, new_rows, entity=code,
+                **downloader_era_fields(self._base_dir(), code),
+            )
 
     def load_daily(
         self, stock_code: str, start_date: str, end_date: str,
