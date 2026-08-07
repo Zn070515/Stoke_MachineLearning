@@ -12,7 +12,7 @@ import sys
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.asset_contract import write_asset_manifest
+from stoke_ml.data.asset_contract import AtomicCommit, write_asset_manifest
 from stoke_ml.data.broadcast_assets import INDUSTRY_ASSET
 from stoke_ml.data.sources.a_shares.industry_source import IndustrySource
 from stoke_ml.data.download_manifest import write_run_manifest
@@ -52,7 +52,13 @@ def main():
         returns = src.fetch_all_returns(start_date=args.start, end_date=args.end)
         returns_path = os.path.join(out_dir, "industry_returns.parquet")
         returns.attrs["source"] = "THS industry index returns (AKShare)"
-        returns.to_parquet(returns_path)
+        # Atomic write (§T9): temp + os.replace so a crash mid-write never
+        # leaves a torn industry_returns.parquet (which could then be paired
+        # with a manifest claiming it is valid).  The manifest is written
+        # separately, atomically — a crash between the two leaves a stale pair
+        # the next validated read catches.
+        with AtomicCommit(returns_path) as ac:
+            returns.to_parquet(ac.tmp_path)
         write_asset_manifest(returns_path, INDUSTRY_ASSET, returns)
         logger.info("Saved %d days × %d industries to %s",
                     len(returns), len(returns.columns), returns_path)

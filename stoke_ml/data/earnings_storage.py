@@ -23,10 +23,26 @@ import os
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.asset_contract import contract_for_channel
 from stoke_ml.data.codes import normalize_stock_code_series
 from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
+
+# File-level asset contract for the two earnings snapshot files
+# (``forecasts.parquet`` / ``express.parquet``).  **Governance-only (§T9):**
+# earnings is ``latest_revised``-sourced (channel_vintage declares earnings =
+# latest_revised / raw / proxy), so headline_v1 revision-safe does NOT require
+# it — the manifest records provenance/uniformity and never claims a formal
+# admission the channel does not have.  Written by ``download_earnings.py``'s
+# ``_accumulate`` for BOTH files; the extent bounds the ``announce_date`` span.
+EARNINGS_ASSET = contract_for_channel(
+    "earnings",
+    data_type="earnings",
+    partition="single_file",
+    extent_column="announce_date",
+    effective_date_policy="event_date",
+)
 
 SNAPSHOT_FILES = ["forecasts.parquet", "express.parquet"]
 

@@ -66,6 +66,27 @@
 
 **特征缓存 manifest** `stoke_ml/features/cache_manifest.py`（v6 §十二 / v10 §十一 / v11 §十.1）— 每个预构建特征 parquet 携带 sidecar JSON manifest（`data/features/.manifests/{code}.json`），记录 git_commit、config_hash、feature_schema_hash、horizon、seq_len、panel_mode 与逐通道源文件指纹。`config_hash` 覆盖完整特征相关 config.yaml 区块（features / preprocessing / universe / fundamental，含技术指标开关、缺失处理、阈值、横截面归一化参数与源 effective-date/persistence 策略），同一 commit 下改 config 也会使缓存失效；start/end 单独以源文件 range 校验。`build_features.py` 缓存命中必须比较这些 hash；训练侧 `FeaturePipeline` 对 prebuilt 目录做 lineage 校验，`--require-feature-manifest`（默认开）时缺失 / stale（schema 漂移、git commit 不一致、config 漂移）直接 fail。v11 §十.1 起 manifest 额外指纹化**市场级共享输入**（macro_daily / market_env_daily / industry_returns / stock_sector_cache.csv / exchange_calendar/a_shares.parquet / 整个 etf_flow 目录，目录按内容整体哈希），任一变化即失效旧特征缓存；旧版缺共享指纹的 manifest 一律视为 stale 强制重建。面板构成工件（universe/ipo、universe/delisted、index_constituents_hist/membership）不在此列——它们改变进入面板的股票/日期而非每股特征值，由 fold 级 universe/membership hash（train_panel FoldResearchContext）覆盖。
 
+### Formal Asset protocol（§十七 / §十九-9，T9 收口）
+
+文件级资产治理协议 —— `stoke_ml/data/asset_contract.py` 为辅助数据通道提供 `DataAssetContract`（文件级契约）+ 原子 manifest sidecar（`{parquet}.manifest.json`）。每份契约钉住七个方面：
+
+1. **Content identity** — `schema_hash`：列名 + dtype + 值的校验和，parquet 往返读写稳定；文件被改则不再匹配。
+2. **Source identity** — `source`：取自 `df.attrs["source"]`（未声明则 `"unknown"`），仅 provenance，不 cross-check。
+3. **Coverage** — `start`/`end`：extent 列（`date` / `report_date` / `announce_date`…）的 min/max；DatetimeIndex 广播文件（industry / market_env）回退到 index。
+4. **Effective-date policy** — `effective_date_policy`：`record_date` / `event_date` / `post_close_next_trading_day` / `index_date`。
+5. **Vintage status** — `vintage_source` / `vintage_transform` / `vintage_pit`：`contract_for_channel` 从 `channel_vintage` 声明自动填入，manifest 携带与训练 admission 相同的标签。
+6. **Schema** — `column_contract`（仅 provenance；强制是另一 gate）。
+7. **Atomic commit** — temp + `os.replace` 原子写；parquet 与 manifest 两次 rename 之间崩溃留下的 stale 对由下次 validated read 捕获。
+
+**Formal read**（`require_valid_manifest=True`，对应 `train_panel_panel._enforce_formal_manifests`）：manifest 缺失或失配即拒绝 —— `check_asset_read` 抛错；默认（lenient）读：无 manifest = legacy 文件照读（debug 日志），有 manifest 但失配 = warning + 照读。
+
+**通道采用状态（T9 收口）**：
+- `industry_returns.parquet`（`INDUSTRY_ASSET`）：`download_industry.py` 原子写 + manifest；formal gate 校验。
+- `market_env_daily.parquet`（`MARKET_ENV_ASSET`）：`build_market_env.py` 原子写 + manifest（含 price/account 分列 `parts`）；formal gate 校验。
+- `forecasts.parquet` / `express.parquet`（`EARNINGS_ASSET`，`download_earnings.py` `_accumulate` 对两个文件写 manifest）：**governance-only** —— earnings 是 `latest_revised` 源（revision-safe 不要求，manifest 只记录 provenance / 统一治理），不进 formal required 集。
+- `stock_industry_map.parquet`：无 manifest（无 consumer / formal gate 要求，T9 不改）。
+- **cninfo announcement-sentiment 路径**（`a_shares/cninfo_announcements/sentiment/`）：无 storage/manifest 支持 —— formal 模式下显式拒绝（`use --prebuilt or add a DataAssetContract writer`），T9 维持显式排除，不补 writer。
+
 ### 格式
 
 全链路 Parquet（列存，压缩，pandas 原生读写）。

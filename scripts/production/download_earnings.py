@@ -26,8 +26,10 @@ from datetime import datetime
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.asset_contract import AtomicCommit, write_asset_manifest
 from stoke_ml.data.sources.a_shares.earnings_source import EarningsSource
 from stoke_ml.data.download_manifest import write_run_manifest_or_exit
+from stoke_ml.data.earnings_storage import EARNINGS_ASSET
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -55,7 +57,14 @@ def quarter_ends(start_year: int, today: datetime) -> list[str]:
 
 
 def _accumulate(out_dir: str, name: str, new: pd.DataFrame, subset: list[str]) -> str:
-    """Append *new* rows to {name}.parquet, deduping on the announcement key."""
+    """Append *new* rows to {name}.parquet, deduping on the announcement key.
+
+    The parquet is written atomically (temp + ``os.replace``) and the sidecar
+    EARNINGS_ASSET manifest is written for the MERGED frame — the manifest
+    always describes the exact file on disk (§T9 governance; earnings is
+    ``latest_revised`` so the manifest is provenance, never a formal-required
+    admission).
+    """
     path = os.path.join(out_dir, name)
     if os.path.isfile(path):
         try:
@@ -68,7 +77,9 @@ def _accumulate(out_dir: str, name: str, new: pd.DataFrame, subset: list[str]) -
         merged = new
     merged = merged.drop_duplicates(subset=[c for c in subset if c in merged.columns],
                                     keep="last")
-    merged.to_parquet(path, index=False, compression="lz4")
+    with AtomicCommit(path) as ac:
+        merged.to_parquet(ac.tmp_path, index=False, compression="lz4")
+    write_asset_manifest(path, EARNINGS_ASSET, merged)
     return path
 
 
