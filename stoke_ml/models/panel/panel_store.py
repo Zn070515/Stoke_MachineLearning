@@ -24,6 +24,17 @@ Windows — attempts to ``os.remove``/``os.replace`` (re-saving over the same
 path, or a ``TemporaryDirectory`` cleanup while the loaded dict is still
 referenced) raise ``PermissionError``.  Drop the loaded dict and let the arrays
 be garbage-collected before removing / re-creating a store.
+
+Content integrity (§十九 / T10b): the header bindings (``stock_order_hash`` /
+``feature_schema_hash``) pin IDENTITY — they cannot detect a modified VALUE
+inside a large array whose shape/dtype are unchanged (a silent disk error /
+mid-array tamper).  Full-file SHA-256 of a 200GB grid on every load is too
+expensive, so content is bound via a **chunk manifest**: one SHA-256 per
+``_CHUNK_BYTES`` block of each array's raw data, aggregated to a root hash
+recorded in ``meta.json``.  A load only QUICKLY verifies the manifest
+(recomputed root from its own digests + the meta binding — no array I/O); the
+expensive deep re-hash of every chunk on disk is the on-demand
+:func:`verify_panel_store_chunks` (lockbox / periodic audit).
 """
 from __future__ import annotations
 
@@ -64,7 +75,12 @@ _PANEL_JSON_KEYS: tuple[str, ...] = (
 # build-time per-channel coverage probe persisted at --panel-store build time
 # (§T4) so a store-backed replay reads the accurate manifest directly instead of
 # re-probing has_* flags (which cannot cover flag-less channels).
-_OPTIONAL_PANEL_JSON_KEYS: tuple[str, ...] = ("channel_coverage_manifest",)
+# ``chunk_manifest`` (§十九 / T10b) is the per-chunk content-integrity manifest
+# written by save_panel_memmap whenever meta is given; the *.json load glob
+# round-trips it back into the loaded dict as ``data["chunk_manifest"]``.
+_OPTIONAL_PANEL_JSON_KEYS: tuple[str, ...] = (
+    "channel_coverage_manifest", "chunk_manifest",
+)
 
 # Marker written ONLY after every array has been durably replaced, so an
 # interrupted save never looks complete to a later run.
@@ -99,6 +115,19 @@ _WARN_META_KEYS: tuple[str, ...] = (
     "data_manifest_hash", "calendar_hash", "universe_status_hash",
     "membership_hash", "prebuilt_feature_manifest_hash",
 )
+
+# §十九 (T10b): chunk-content integrity.  The header bindings above bind
+# IDENTITY — they cannot detect a modified VALUE inside a large .npy array if
+# shape/dtype/cols are unchanged (a silent disk error / tamper mid-array).
+# Full-file SHA-256 on every load of a 200GB grid is too expensive, so content
+# is bound via a chunk manifest: one SHA-256 per CHUNK_BYTES block of each
+# array's raw data, aggregated to a root hash recorded in meta.json under
+# CHUNK_MANIFEST_ROOT_KEY.  A load only QUICKLY verifies the manifest
+# (recomputed root from its own digests + the meta binding — no array I/O);
+# the deep per-chunk re-hash is the on-demand verify_panel_store_chunks().
+_CHUNK_BYTES = 256 * 1024 * 1024  # 256MB per the audit recommendation
+_MANIFEST_FILE = "chunk_manifest.json"
+_CHUNK_MANIFEST_ROOT_KEY = "chunk_manifest_root_hash"
 
 
 def _atomic_npy(out: Path, name: str, arr: np.ndarray) -> None:
@@ -188,6 +217,97 @@ def _feature_schema_hash(panel_data: dict) -> str | None:
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
 
 
+def _npy_data_offset(path: Path) -> int:
+    """Byte offset where a .npy file's raw DATA begins (after its header).
+
+    Delegates to numpy's own header parse — ``np.load(mmap_mode='r')`` maps the
+    data at the true data offset, and ``.offset`` is a header-derived property
+    (no file bytes are read).  This stays correct across .npy format versions
+    (1.0 / 2.0 / 3.0) without reimplementing header parsing.  The transient
+    memmap is dropped before the caller streams the file itself.
+    """
+    arr = np.load(path, mmap_mode="r")
+    return int(arr.offset)
+
+
+def _hash_npy_chunks(
+    path: str | Path, chunk_bytes: int | None = None,
+) -> tuple[list[str], str]:
+    """Stream a .npy file's raw DATA bytes in ``chunk_bytes`` blocks, returning
+    ``(per-chunk SHA-256 hex digests, root)`` where root = SHA-256 of the
+    concatenated per-chunk digests.
+
+    Only the array's DATA is hashed — the .npy header (shape/dtype dict) is
+    identity, already bound by ``feature_schema_hash`` / ``stock_order_hash``;
+    content is what a silent disk error or tamper corrupts.  Streaming in
+    fixed-size blocks bounds memory regardless of array layout — the 200GB
+    case never materializes in RAM (the file is read in bounded blocks after
+    the npy header, not via ``arr.view(np.uint8)`` which would still need the
+    whole array resident).  ``chunk_bytes`` defaults to the module constant
+    when None so tests can pass a tiny chunk size (e.g. 8 bytes) to exercise
+    multi-chunk hashing on small fixtures cheaply.
+    """
+    if chunk_bytes is None:
+        chunk_bytes = _CHUNK_BYTES
+    offset = _npy_data_offset(path)
+    digests: list[str] = []
+    with open(Path(path), "rb") as fh:
+        fh.seek(offset)
+        while True:
+            block = fh.read(chunk_bytes)
+            if not block:
+                break
+            digests.append(hashlib.sha256(block).hexdigest())
+    root = hashlib.sha256(b"".join(d.encode("ascii") for d in digests)).hexdigest()
+    return digests, root
+
+
+def _manifest_root(arrays: dict) -> str:
+    """Root digest of a manifest's ``arrays`` section — SHA-256 of the
+    canonicalized JSON (sorted keys, compact separators), so a root recomputes
+    deterministically from a loaded manifest regardless of file formatting."""
+    return hashlib.sha256(
+        json.dumps(arrays, sort_keys=True, ensure_ascii=False,
+                   separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _build_chunk_manifest(
+    npy_paths: list[Path], chunk_bytes: int | None = None,
+) -> dict:
+    """Build the chunk-content manifest over the given ON-DISK .npy files.
+
+    Every content array written this save — the arrays in ``_PANEL_ARRAY_KEYS``
+    plus any extra diagnostics (fill_prob/entry_fill_prob) and the memmap-sunk
+    ``skip_npy`` grids; chunking ALL content arrays uniformly is simpler and
+    more testable than special-casing the big feature grids — is streamed in
+    bounded blocks and bound by per-chunk digests + a per-array root.  The
+    manifest's own top-level ``root`` canonically roots the whole ``arrays``
+    section (so a shape/dtype edit in the manifest is caught too).  ``chunk_bytes``
+    defaults to ``_CHUNK_BYTES`` read at call time, so tests can monkeypatch the
+    module constant.
+    """
+    if chunk_bytes is None:
+        chunk_bytes = _CHUNK_BYTES
+    arrays: dict = {}
+    for p in npy_paths:
+        name = p.name[:-4] if p.name.endswith(".npy") else p.name
+        digests, root = _hash_npy_chunks(p, chunk_bytes)
+        on_disk = np.load(p, mmap_mode="r")  # header-only props — no data read
+        arrays[name] = {
+            "shape": [int(s) for s in on_disk.shape],
+            "dtype": str(on_disk.dtype),
+            "n_chunks": len(digests),
+            "digests": digests,
+            "root": root,
+        }
+    return {
+        "version": 1,
+        "chunk_bytes": chunk_bytes,
+        "arrays": arrays,
+        "root": _manifest_root(arrays),
+    }
+
+
 # §八 (T4): SINGLE SOURCE OF TRUTH for the self-consistency bindings.  Hard-fail
 # keys validated by SELF-CONSISTENCY (not by the expected-vs-recorded loop
 # above): ``save_panel_memmap`` recomputes them from the ACTUAL ``panel_data``
@@ -269,8 +389,18 @@ def save_panel_memmap(
     fingerprints are still computed from the ACTUAL panel — deleting them would
     silently drop ``feature_schema_hash`` and disable T4's schema tamper guard.
 
+    When ``meta`` is given, a ``chunk_manifest.json`` (§十九 / T10b) is also
+    written — one SHA-256 per ``_CHUNK_BYTES`` block of every npy content array
+    (including the skip_npy grids), aggregated to a ``chunk_manifest_root_hash``
+    recorded in meta.json — so a load can quickly verify content integrity
+    without re-hashing the arrays; the deep re-hash is
+    :func:`verify_panel_store_chunks`.  A save WITHOUT ``meta`` writes no
+    manifest (the whole meta block is skipped), so legacy/experimental stores
+    are unaffected.
+
     Returns the sorted list of written file names (``<name>.npy`` /
-    ``<name>.json`` / ``meta.json``), including skipped-but-present arrays.
+    ``<name>.json`` / ``meta.json`` / ``chunk_manifest.json``), including
+    skipped-but-present arrays.
     """
     out = Path(out_dir)
     if out.exists() and not out.is_dir():
@@ -344,10 +474,30 @@ def save_panel_memmap(
     if meta is not None:
         meta = dict(meta)
         _merge_self_fingerprints(meta, panel_data)
+        # §十九 (T10b): content-integrity binding.  Hash every npy content array
+        # written this save (including the skip_npy memmap-sunk grids) into
+        # per-chunk SHA-256 digests + a root hash recorded in meta.json.  The
+        # manifest is built from the ON-DISK files (not the in-memory arrays —
+        # it must bind what is actually persisted) and streamed in bounded
+        # blocks so the 200GB case never materializes in RAM.  meta.json must
+        # not be written before the manifest exists (a meta that records a
+        # binding the store cannot vouch for is refused at load), so the order
+        # is manifest → meta → complete.
+        npy_files = sorted(
+            out / f"{name}.npy"
+            for name in (f[:-4] for f in written if f.endswith(".npy"))
+        )
+        manifest = _build_chunk_manifest(npy_files, _CHUNK_BYTES)
+        _atomic_json(out, "chunk_manifest", manifest)
+        meta[_CHUNK_MANIFEST_ROOT_KEY] = manifest["root"]
         _atomic_json(out, "meta", meta)
+        written.append(_MANIFEST_FILE)
         written.append(_META_FILE)
     _atomic_json(out, "complete", {"complete": True})
-    return sorted(written)
+    # A loaded-then-reshaped dict may carry chunk_manifest already (round-tripped
+    # through the optional-JSON glob), so the meta block's fresh write can add a
+    # duplicate — dedupe the reported filename list.
+    return sorted(set(written))
 
 
 def _load_meta(out: Path) -> dict | None:
@@ -512,6 +662,81 @@ def _validate_self_consistency(
         )
 
 
+def _validate_chunk_manifest(
+    out: Path, data: dict, recorded: dict | None = None,
+) -> None:
+    """QUICK chunk-manifest check at load — no array I/O.
+
+    The meta binding ``chunk_manifest_root_hash`` anchors the content-integrity
+    binding (see :func:`_build_chunk_manifest`): when a store records it,
+    1) ``chunk_manifest.json`` MUST exist (a store that claims a manifest
+    binding but lost the file is tampered/incomplete), 2) the manifest's OWN
+    root must recompute from its recorded digests (a tampered manifest), and
+    3) it must equal the meta binding (a manifest substituted from another
+    store).  All three only hash the digest STRINGS — bounded and instant even
+    for a 200GB grid; the deep per-chunk re-hash of on-disk bytes is the
+    on-demand :func:`verify_panel_store_chunks`, NOT run here.
+
+    Runs whenever the store has a meta.json, regardless of ``expected_meta`` /
+    ``strict_external_meta`` (it is a self-consistency binding, like
+    ``stock_order_hash`` — a value-tampered grid must be refused in BOTH formal
+    and explore modes; the audit's "formal load" framing is about the check
+    being cheap, not about it being mode-gated).  A legacy pre-T10b store whose
+    meta records no binding WARNS and proceeds — non-fatal, so existing
+    small-scale experiments are unaffected.  ``recorded`` is the already-loaded
+    meta.json dict when the caller has it (load_panel_memmap reads the file
+    once and threads it through); when None it is read here.  ``data`` is the
+    loaded store dict whose *.json glob already round-trips the manifest into
+    ``data["chunk_manifest"]``; it is used when present, with a direct file read
+    fallback for standalone callers.
+    """
+    if recorded is None:
+        recorded = _load_meta(out)
+    if recorded is None:
+        return
+    rec_root = recorded.get(_CHUNK_MANIFEST_ROOT_KEY)
+    if rec_root is None:
+        logger.warning(
+            "panel store %s predates the chunk-content manifest (T10b) — meta "
+            "records no %s, so per-chunk VALUE integrity cannot be verified "
+            "cheaply.  Loading proceeds; run verify_panel_store_chunks() after "
+            "a rebuild with meta to deep-check a store.", out,
+            _CHUNK_MANIFEST_ROOT_KEY,
+        )
+        return
+    manifest = data.get("chunk_manifest")
+    if manifest is None:
+        manifest_path = out / _MANIFEST_FILE
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"panel store at {out} records {_CHUNK_MANIFEST_ROOT_KEY} but "
+                f"has no {_MANIFEST_FILE} — the store claims a chunk binding it "
+                "cannot vouch for (tampered/incomplete); rebuild the store."
+            )
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    arrays = manifest.get("arrays")
+    if not isinstance(arrays, dict) or manifest.get("version") != 1:
+        raise RuntimeError(
+            f"panel store at {out}: {_MANIFEST_FILE} is malformed "
+            "(version/arrays section) — refusing to trust a corrupt manifest; "
+            "rebuild the store."
+        )
+    if manifest.get("root") != _manifest_root(arrays):
+        raise RuntimeError(
+            f"panel store at {out}: {_MANIFEST_FILE} is internally inconsistent "
+            "— its recorded root no longer recomputes from its own digests "
+            "(tampered manifest); rebuild the store."
+        )
+    if rec_root != manifest.get("root"):
+        raise RuntimeError(
+            f"panel store at {out}: {_MANIFEST_FILE} root does not match the "
+            f"recorded {_CHUNK_MANIFEST_ROOT_KEY} in meta.json (recorded="
+            f"{rec_root!r} manifest={manifest.get('root')!r}) — the manifest "
+            "was substituted from another store; rebuild the store."
+        )
+
+
 def load_panel_memmap(
     out_dir: str | Path, expected_meta: dict | None = None,
     strict_external_meta: bool = False,
@@ -541,7 +766,13 @@ def load_panel_memmap(
     self-consistency fingerprints (feature schema + stock order, see
     :func:`_validate_self_consistency`) are recomputed from the store's own
     arrays/lists whenever a meta.json exists — a tampered identity file is
-    refused rather than silently training the wrong stocks.
+    refused rather than silently training the wrong stocks.  The chunk-content
+    manifest (when meta records ``chunk_manifest_root_hash``, see
+    :func:`_validate_chunk_manifest`) is QUICKLY verified — manifest file
+    presence, its own root recomputing from its digests, and the meta binding —
+    with no array I/O; a legacy pre-T10b store without the binding warns and
+    proceeds.  Deep per-chunk re-hashing is :func:`verify_panel_store_chunks`,
+    run on demand.
 
     Raises FileNotFoundError naming every required file that is missing.
     """
@@ -577,6 +808,7 @@ def load_panel_memmap(
         _validate_meta(out, expected_meta, recorded=recorded,
                        strict_external_meta=strict_external_meta)
     _validate_self_consistency(data, out, recorded=recorded)
+    _validate_chunk_manifest(out, data, recorded=recorded)
     # §T13 / §T10a: legacy-store tolerance for the per-date fill diagnostics.
     # A store built before these arrays existed loads with NaN fill + warn
     # instead of refusing.  The semantics guard is elsewhere: reusing a pre-T13
@@ -611,6 +843,81 @@ def load_panel_memmap(
             "not a label; rebuild the store to record it.", out,
         )
     return data
+
+
+def verify_panel_store_chunks(out_dir: str | Path) -> dict:
+    """DEEP integrity check: re-hash every chunk of every npy content array on
+    disk and compare against the store's ``chunk_manifest.json``.
+
+    Expensive — it streams every array's bytes in bounded blocks — so run it ON
+    DEMAND (e.g. before a lockbox run / a periodic integrity audit), NEVER on
+    load.  Raises RuntimeError naming the array and the first mismatched chunk
+    index on any chunk whose on-disk bytes differ from the recorded digest, and
+    refuses a store with no manifest (or a manifest that cannot recompute its
+    own root / match the meta binding).  Returns a small summary dict on
+    success.  ``chunk_bytes`` is taken from the manifest itself (the only way
+    the re-hash reproduces the recorded digests).
+    """
+    out = Path(out_dir)
+    manifest_path = out / _MANIFEST_FILE
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"panel store at {out} has no {_MANIFEST_FILE} — nothing to verify "
+            "the chunks against; rebuild the store with meta to record one."
+        )
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    arrays = manifest.get("arrays")
+    if not isinstance(arrays, dict) or manifest.get("version") != 1:
+        raise RuntimeError(
+            f"panel store at {out}: {_MANIFEST_FILE} is malformed "
+            "(version/arrays section) — refusing to verify against a corrupt "
+            "manifest."
+        )
+    chunk_bytes = int(manifest.get("chunk_bytes", _CHUNK_BYTES))
+    # manifest self-consistency first (cheap — digest strings only): a manifest
+    # that cannot recompute its own root is corrupt, not worth deep-hashing.
+    if manifest.get("root") != _manifest_root(arrays):
+        raise RuntimeError(
+            f"panel store at {out}: {_MANIFEST_FILE} is internally inconsistent "
+            "— its recorded root no longer recomputes from its own digests."
+        )
+    # The meta binding anchors the manifest to THIS store — a manifest copied
+    # from another store is caught here before any array I/O.
+    recorded = _load_meta(out)
+    if (
+        recorded is not None
+        and recorded.get(_CHUNK_MANIFEST_ROOT_KEY) is not None
+        and recorded[_CHUNK_MANIFEST_ROOT_KEY] != manifest.get("root")
+    ):
+        raise RuntimeError(
+            f"panel store at {out}: {_MANIFEST_FILE} root does not match the "
+            f"recorded {_CHUNK_MANIFEST_ROOT_KEY} in meta.json — the manifest "
+            "was substituted from another store."
+        )
+    total_chunks = 0
+    for name, entry in arrays.items():
+        p = out / f"{name}.npy"
+        if not p.is_file():
+            raise RuntimeError(
+                f"panel store at {out}: {_MANIFEST_FILE} lists {name}.npy but "
+                "the file is missing — the store no longer matches its manifest."
+            )
+        digests, root = _hash_npy_chunks(p, chunk_bytes)
+        if digests != entry.get("digests") or root != entry.get("root"):
+            first_bad = next(
+                (i for i, (got, exp) in enumerate(
+                    zip(digests, entry.get("digests", []))) if got != exp),
+                len(digests),
+            )
+            raise RuntimeError(
+                f"panel store at {out}: chunk {first_bad} of {name}.npy does "
+                "not match the recorded chunk manifest — the array's VALUE "
+                "bytes were corrupted or tampered; rebuild the store."
+            )
+        total_chunks += len(digests)
+    return {"verified": True, "arrays_verified": len(arrays),
+            "chunks_verified": total_chunks}
 
 
 def panel_store_complete(out_dir: str | Path) -> bool:

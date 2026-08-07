@@ -9,8 +9,11 @@ missing required file is reported by name, and the meta.json config guard
 refuses a stale store (wrong horizon/universe/feature switches) instead of
 silently training on wrong targets.
 """
+import hashlib
 import json
 import logging
+import math
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,6 +33,7 @@ from stoke_ml.models.panel.panel_store import (
     load_panel_memmap,
     panel_store_complete,
     save_panel_memmap,
+    verify_panel_store_chunks,
 )
 
 
@@ -362,6 +366,196 @@ class TestPanelStoreSelfBinding:
         with pytest.raises(RuntimeError) as ei:
             load_panel_memmap(tmp_path)
         assert "stock_order_hash" in str(ei.value)
+
+
+class TestPanelStoreChunkManifest:
+    """§十九 (T10b): content-integrity binding via a per-chunk SHA-256 manifest.
+
+    The header bindings (stock_order_hash / feature_schema_hash) only pin
+    IDENTITY — a modified VALUE inside a large .npy array (silent disk error /
+    mid-array tamper) with unchanged shape/dtype is invisible to them.  T10b
+    adds a chunk manifest: one SHA-256 per _CHUNK_BYTES block of each array's
+    raw data, aggregated to a root hash recorded in meta.json.  A load ONLY
+    checks the manifest cheaply (recomputed root from its own digests + the
+    meta binding — no array I/O); verify_panel_store_chunks() re-hashes every
+    chunk on demand."""
+
+    def test_save_with_meta_writes_manifest_and_binds_root(self, tmp_path):
+        """save_panel_memmap with meta writes chunk_manifest.json over every
+        content array and records the manifest root in meta.json."""
+        panel = _storeable_panel(seed=9)
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        manifest = json.loads(
+            (tmp_path / "chunk_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["version"] == 1
+        assert manifest["chunk_bytes"] == panel_store._CHUNK_BYTES
+        # every content array (canonical + §T13/§T10a diagnostics) is hashed
+        assert set(manifest["arrays"]) == (
+            set(_PANEL_ARRAY_KEYS) | {"fill_prob", "entry_fill_prob"})
+        for entry in manifest["arrays"].values():
+            assert set(entry) == {"shape", "dtype", "n_chunks", "digests", "root"}
+            assert len(entry["digests"]) == entry["n_chunks"]
+        # the meta binding is the manifest root
+        recorded = json.loads((tmp_path / _META_FILE).read_text(encoding="utf-8"))
+        assert recorded["chunk_manifest_root_hash"] == manifest["root"]
+        # root recomputes canonically from the arrays section
+        assert manifest["root"] == panel_store._manifest_root(manifest["arrays"])
+        # round-trips through the optional-JSON glob on load
+        loaded = load_panel_memmap(tmp_path)
+        assert loaded["chunk_manifest"] == manifest
+
+    def test_save_without_meta_writes_no_manifest(self, tmp_path):
+        """meta=None (no meta.json) skips the entire meta block — no manifest,
+        store unaffected by T10b."""
+        save_panel_memmap(_storeable_panel(seed=10), tmp_path)
+        assert not (tmp_path / "chunk_manifest.json").exists()
+        assert not (tmp_path / _META_FILE).exists()
+        assert panel_store_complete(tmp_path) is True
+        load_panel_memmap(tmp_path)  # legacy store loads cleanly
+
+    def test_chunk_hashing_matches_independent_byte_split(self, tmp_path):
+        """_hash_npy_chunks with a tiny chunk size reproduces an independent
+        byte-level split of the file's raw data — every byte in exactly one
+        chunk, per-chunk digests exact, root = SHA-256 of the concatenated
+        digests."""
+        panel = _storeable_panel(seed=7)
+        save_panel_memmap(panel, tmp_path)
+        for name in ("past_known", "static_features", "y_return"):
+            path = tmp_path / f"{name}.npy"
+            offset = panel_store._npy_data_offset(path)
+            data = path.read_bytes()[offset:]
+            chunk = 8
+            expect = [
+                hashlib.sha256(data[i:i + chunk]).hexdigest()
+                for i in range(0, len(data), chunk)
+            ]
+            digests, root = panel_store._hash_npy_chunks(path, chunk_bytes=chunk)
+            assert digests == expect
+            assert len(digests) == math.ceil(len(data) / chunk)
+            assert root == hashlib.sha256(
+                b"".join(d.encode("ascii") for d in digests)).hexdigest()
+            # chunk_bytes works positionally too
+            assert digests == panel_store._hash_npy_chunks(path, chunk)[0]
+
+    def test_build_manifest_small_chunks_records_n_chunks(self, tmp_path):
+        """_build_chunk_manifest with a tiny chunk size records n_chunks =
+        ceil(data_bytes / chunk_bytes) plus per-array shape/dtype/root."""
+        panel = _storeable_panel(seed=8)
+        save_panel_memmap(panel, tmp_path)
+        npy_files = sorted(tmp_path.glob("*.npy"))
+        manifest = panel_store._build_chunk_manifest(npy_files, chunk_bytes=8)
+        assert manifest["chunk_bytes"] == 8
+        pk = manifest["arrays"]["past_known"]
+        off = panel_store._npy_data_offset(tmp_path / "past_known.npy")
+        data_bytes = (tmp_path / "past_known.npy").stat().st_size - off
+        assert pk["n_chunks"] == math.ceil(data_bytes / 8)
+        assert len(pk["digests"]) == pk["n_chunks"]
+        assert pk["shape"] == [10, 100, 12]
+        assert pk["dtype"] == "float32"
+        assert manifest["root"] == panel_store._manifest_root(manifest["arrays"])
+
+    def test_clean_store_deep_verify_passes(self, tmp_path):
+        """verify_panel_store_chunks returns a summary on a clean store."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        result = verify_panel_store_chunks(tmp_path)
+        assert result["verified"] is True
+        assert result["arrays_verified"] >= len(_PANEL_ARRAY_KEYS)
+        assert result["chunks_verified"] >= len(_PANEL_ARRAY_KEYS)
+
+    def test_verify_requires_manifest(self, tmp_path):
+        """A store with no chunk_manifest.json cannot be deep-verified."""
+        save_panel_memmap(_storeable_panel(), tmp_path)  # no meta → no manifest
+        with pytest.raises(RuntimeError) as ei:
+            verify_panel_store_chunks(tmp_path)
+        assert "chunk_manifest" in str(ei.value)
+
+    def test_middle_chunk_tamper_refused_by_verify(self, tmp_path, monkeypatch):
+        """A single flipped byte in the MIDDLE of an array's data region (same
+        shape/dtype — the header is untouched, so the identity bindings and the
+        cheap load check still pass) is caught by the deep chunk verify, which
+        names the array and chunk index."""
+        monkeypatch.setattr(panel_store, "_CHUNK_BYTES", 8)  # tiny chunks
+        panel = _storeable_panel(seed=3)
+        save_panel_memmap(panel, tmp_path, meta=_meta())
+        pk = tmp_path / "past_known.npy"
+        offset = panel_store._npy_data_offset(pk)
+        tamper_at = offset + 257  # chunk 32 of 8-byte chunks — inside data
+        with open(pk, "r+b") as fh:
+            fh.seek(tamper_at)
+            b = fh.read(1)
+            fh.seek(tamper_at)
+            fh.write(bytes([b[0] ^ 0xFF]))
+        # the tamper is VALUE-level: the cheap load (header bindings + manifest
+        # root) still succeeds — the grid is simply corrupted inside.
+        loaded = load_panel_memmap(tmp_path)
+        assert isinstance(loaded["past_known"], np.memmap)
+        # the deep verify refuses, naming the array + chunk index
+        with pytest.raises(RuntimeError) as ei:
+            verify_panel_store_chunks(tmp_path)
+        msg = str(ei.value)
+        assert "past_known" in msg
+        assert "chunk 32" in msg
+
+    def test_missing_manifest_with_binding_refuses(self, tmp_path):
+        """A meta that records the chunk binding but a store with no
+        chunk_manifest.json is refused — the store claims a binding it cannot
+        vouch for."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        (tmp_path / "chunk_manifest.json").unlink()
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path)
+        assert "chunk_manifest" in str(ei.value)
+
+    def test_tampered_manifest_refused_at_load(self, tmp_path):
+        """A digest string flipped in chunk_manifest.json desynchronizes the
+        manifest root from its own digests — refused at load (cheap check)."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        path = tmp_path / "chunk_manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        name = next(iter(manifest["arrays"]))
+        digests = manifest["arrays"][name]["digests"]
+        mid = len(digests) // 2
+        flipped = ("0" if digests[mid][0] != "0" else "1") + digests[mid][1:]
+        manifest["arrays"][name]["digests"][mid] = flipped
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path)
+        assert "chunk_manifest" in str(ei.value)
+
+    def test_substituted_manifest_refused_at_load(self, tmp_path):
+        """A manifest copied from another store is internally consistent but its
+        root no longer matches THIS store's meta binding — refused at load."""
+        store_a = tmp_path / "a"
+        store_b = tmp_path / "b"
+        save_panel_memmap(_storeable_panel(seed=1), store_a, meta=_meta())
+        save_panel_memmap(_storeable_panel(seed=2), store_b, meta=_meta())
+        shutil.copyfile(store_b / "chunk_manifest.json",
+                        store_a / "chunk_manifest.json")
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(store_a)
+        assert "chunk_manifest" in str(ei.value)
+
+    def test_legacy_no_binding_warns_and_loads_both_modes(self, tmp_path, caplog):
+        """A pre-T10b store (meta records no chunk binding, no manifest file)
+        loads with a warn and proceeds in BOTH explore and formal modes — the
+        audit's explicit non-disruption guarantee."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        (tmp_path / "chunk_manifest.json").unlink()
+        meta = json.loads((tmp_path / _META_FILE).read_text(encoding="utf-8"))
+        del meta["chunk_manifest_root_hash"]
+        (tmp_path / _META_FILE).write_text(json.dumps(meta), encoding="utf-8")
+        # explore mode
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(tmp_path)
+        assert loaded["stock_codes"] == _storeable_panel()["stock_codes"]
+        assert any("chunk" in r.message for r in caplog.records)
+        caplog.clear()
+        # formal mode
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(
+                tmp_path, expected_meta=_meta(), strict_external_meta=True)
+        assert loaded["stock_codes"] == _storeable_panel()["stock_codes"]
+        assert any("chunk" in r.message for r in caplog.records)
 
 
 class TestPanelStoreWarnBinding:
