@@ -418,12 +418,15 @@ def main():
     # panel live (and persists it when --panel-store is set).
     # §十四: resolved required set = explicit --require-aux-channels ∪ the
     # active frozen feature profile's required_channels (formal + gate-enforced
-    # + named profile); min_cov carries the profile's per-channel coverage
-    # minimums ({} when the profile is inactive / 'none').
-    required_set, min_cov, profile_name = _resolve_required_set(args)
+    # + named profile); coverage_contracts carries the profile's per-channel
+    # coverage contracts — each channel's (metric, threshold) — ({} when the
+    # profile is inactive / 'none').
+    required_set, coverage_contracts, profile_name = _resolve_required_set(args)
     logger.info(
-        "Feature profile: %s (required=%s, min_coverage=%s)",
-        profile_name, sorted(required_set), sorted(min_cov),
+        "Feature profile: %s (required=%s, coverage_contracts=%s)",
+        profile_name, sorted(required_set),
+        sorted({ch: f"{c.metric}:{c.threshold}"
+                for ch, c in coverage_contracts.items()}.items()),
     )
     seq_len = args.seq_len or (64 if args.minute else 60)
 
@@ -443,10 +446,13 @@ def main():
     assert len(set(panel_stocks)) == len(panel_stocks), (
         "duplicate stock codes in panel (row identity broken)")
 
-    # §十四 required-channel + minimum-coverage gate: a required channel with
-    # ZERO coverage, or a probeable required channel below its profile minimum,
-    # aborts the experiment instead of silently training on air.
-    _enforce_channel_coverage(required_set, channel_manifest, min_cov)
+    # §十四 required-channel + coverage-contract gate: a required channel with
+    # ZERO coverage, an UNPROBEABLE required channel in formal mode, or a
+    # probeable required channel below its profile contract minimum aborts the
+    # experiment instead of silently training on air.
+    _enforce_channel_coverage(
+        required_set, channel_manifest, coverage_contracts,
+        formal=_formal_mode(args))
     if channel_manifest:
         summary_bits = ", ".join(
             f"{k}={v.get('status')}({v.get('coverage')})"

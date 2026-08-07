@@ -58,6 +58,14 @@ _PANEL_JSON_KEYS: tuple[str, ...] = (
     "stock_codes", "past_known_cols", "past_observed_cols",
 )
 
+# Optional JSON metadata persisted when present but NOT required for a store to
+# load.  A legacy store without them must still load — the required-file check
+# at load only covers _PANEL_JSON_KEYS.  ``channel_coverage_manifest`` is the
+# build-time per-channel coverage probe persisted at --panel-store build time
+# (§T4) so a store-backed replay reads the accurate manifest directly instead of
+# re-probing has_* flags (which cannot cover flag-less channels).
+_OPTIONAL_PANEL_JSON_KEYS: tuple[str, ...] = ("channel_coverage_manifest",)
+
 # Marker written ONLY after every array has been durably replaced, so an
 # interrupted save never looks complete to a later run.
 _COMPLETE_MARKER = "complete.json"
@@ -314,7 +322,7 @@ def save_panel_memmap(
                 continue
             _atomic_npy(out, name, np.asarray(value))
             written.append(f"{name}.npy")
-        elif name in _PANEL_JSON_KEYS:
+        elif name in _PANEL_JSON_KEYS or name in _OPTIONAL_PANEL_JSON_KEYS:
             _atomic_json(out, name, value)
             written.append(f"{name}.json")
         else:
@@ -552,6 +560,10 @@ def load_panel_memmap(
         if path.name.endswith(".tmp"):
             continue
         data[path.name[:-4]] = np.load(path, mmap_mode="r")
+    # The *.json glob loads EVERY JSON metadata file, including the OPTIONAL
+    # keys (channel_coverage_manifest.json — the persisted build-time coverage
+    # manifest, §T4) — but the required-file missing check above only covers
+    # _PANEL_JSON_KEYS, so a legacy store without the optional files still loads.
     for path in sorted(out.glob("*.json")):
         if path.name in (_COMPLETE_MARKER, _META_FILE):
             continue

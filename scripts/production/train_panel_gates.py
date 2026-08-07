@@ -14,7 +14,9 @@ import sys
 import numpy as np
 import pandas as pd
 
-from stoke_ml.config.feature_profile import FEATURE_PROFILES, profile_for
+from stoke_ml.config.feature_profile import (
+    CoverageContract, FEATURE_PROFILES, profile_for,
+)
 from stoke_ml.data.calendar import (
     TradingCalendar, calendar_artifact_hash, get_research_calendar,
 )
@@ -97,19 +99,21 @@ def _formal_mode(args) -> bool:
     return not args.no_formal
 
 def _resolve_required_set(args) -> tuple[set[str], dict, str]:
-    """Resolve the required-channel set + minimum-coverage map (§十四).
+    """Resolve the required-channel set + per-channel coverage contracts (§十四).
 
     ``--require-aux-channels`` always feeds the set (existing behavior); the
     frozen feature profile (feature_profile.py) ADDS its ``required_channels``
     when the gate is active — a FORMAL, gate-enforced run with a named profile
     (default ``headline_v1``).  ``--feature-profile none``, ``--no-formal`` and
     ``--no-require-quality-gate`` each make the profile contribution empty, so
-    ``required_set`` is just the explicit channels and ``min_cov`` is empty.
+    ``required_set`` is just the explicit channels and ``coverage_contracts`` is
+    empty.
 
-    Returns ``(required_set, min_cov, profile_name)``; ``profile_name`` is
-    ``"none"`` when no profile is active.  An UNKNOWN named profile on an
-    active gate aborts loudly (a typo must not silently skip the coverage
-    gate).
+    Returns ``(required_set, coverage_contracts, profile_name)``;
+    ``coverage_contracts`` maps each profile channel to its CoverageContract
+    (the metric measured + the minimum), and ``profile_name`` is ``"none"`` when
+    no profile is active.  An UNKNOWN named profile on an active gate aborts
+    loudly (a typo must not silently skip the coverage gate).
     """
     extra = {
         c.strip() for c in (args.require_aux_channels or "").split(",")
@@ -128,60 +132,77 @@ def _resolve_required_set(args) -> tuple[set[str], dict, str]:
             f"unknown feature profile {profile_name!r} — --feature-profile "
             f"must be one of {sorted(FEATURE_PROFILES)} or 'none'")
     required_set = set(profile.required_channels) | extra
-    return required_set, dict(profile.minimum_coverage), profile_name
+    return required_set, dict(profile.coverage_contracts), profile_name
 
 def _enforce_channel_coverage(
     required_set: set[str],
     channel_manifest: dict,
-    min_cov: dict[str, float] | None = None,
+    coverage_contracts: dict[str, CoverageContract] | None = None,
+    formal: bool = False,
 ) -> None:
-    """§十四 required-channel + minimum-coverage gate.
+    """§十四 required-channel + per-channel coverage-contract gate (§T4).
 
-    (1) A REQUIRED channel that IS probed with ZERO coverage (manifest entry
-    present, loaded 0, coverage 0) aborts the experiment instead of silently
-    training on air.  (2) A required channel with NO coverage probe in this
-    mode (prebuilt panel without a has_* flag, e.g. margin/northbound/
-    capital_flow) warns — coverage cannot be verified.  (3) A channel with a
-    ``min_cov`` threshold that IS probeable (manifest entry present with a
-    finite float ``coverage``) must meet its threshold or the experiment
-    aborts; a ``min_cov`` channel that is NOT probeable falls through to the
-    required warn loop above (a ``min_cov`` channel is always also in
-    ``required_set`` for the shipped profiles).
+    For each required channel, in sorted order:
 
-    Note the "IS probed" scope on (1): an ABSENT channel is not "zero
-    coverage", it is not decodable in this mode — requiring e.g. margin on the
-    prebuilt path (no has_* flag) must warn, not abort, or the default
-    headline_v1 profile would refuse every prebuilt run.
+    * UNPROBEABLE — no manifest entry at all, OR a manifest entry whose DECLARED
+      metric is missing / non-finite (the strict-None-refusal: a channel cannot
+      be verified in this mode, e.g. a prebuilt panel without a has_* flag and
+      no persisted store manifest).  FORMAL mode ABORTS (coverage cannot be
+      verified, so a formal run must not proceed); EXPLORE mode warns.  This is
+      the semantic-strictness fix: the old gate only warned here, silently
+      accepting an unverifiable required channel.
+    * ZERO coverage — the declared metric is a finite number <= 0 (a required
+      channel that IS probed but delivered nothing) aborts unconditionally,
+      exactly the legacy ``loaded 0 / coverage 0`` abort.
+    * BELOW-MINIMUM — a channel with a ``CoverageContract`` whose declared-metric
+      value is below the contract's threshold aborts.
+
+    The DECLARED metric is read from the channel's ``CoverageContract`` (e.g.
+    ``date_coverage`` for the market-wide broadcast channels etf_flow /
+    industry / market_env); a presence-only channel (required but no contract,
+    e.g. dragon_tiger) defaults to ``stock_coverage``.  There is NO legacy
+    ``entry["coverage"]`` fallback in the gate — the declared-metric key must
+    be present and finite, else the channel is unprobeable.  A channel in the
+    manifest but NOT in ``required_set`` is not gated at all.
     """
-    missing_required = sorted(
-        ch for ch in required_set
-        if ch in channel_manifest
-        and channel_manifest[ch].get("loaded_stocks", 0) == 0
-        and channel_manifest[ch].get("coverage", 0.0) == 0
-    )
-    if missing_required:
-        logger.error("Required aux channels have ZERO coverage: %s — aborting",
-                     ", ".join(missing_required))
-        sys.exit(1)
+    coverage_contracts = coverage_contracts or {}
+
+    def _unprobeable(ch: str) -> None:
+        if formal:
+            logger.error(
+                "formal mode: required aux channel '%s' has no coverage probe "
+                "in this mode (prebuilt/store without a persisted manifest or "
+                "has_* flag) — cannot verify coverage; build with "
+                "--panel-store (live) or pass --no-formal", ch)
+            sys.exit(1)
+        logger.warning("Required aux channel '%s' has no coverage probe in "
+                       "this mode (prebuilt panel without has_* flag) — "
+                       "coverage cannot be verified", ch)
+
     for ch in sorted(required_set):
-        if ch not in channel_manifest:
-            logger.warning("Required aux channel '%s' has no coverage probe in "
-                           "this mode (prebuilt panel without has_* flag) — "
-                           "coverage cannot be verified", ch)
-    for ch in sorted(min_cov or {}):
         entry = channel_manifest.get(ch)
         if entry is None:
-            continue  # not probeable → covered by the required warn loop above
-        cov = entry.get("coverage")
-        if not isinstance(cov, (int, float)) or isinstance(cov, bool):
-            continue  # null / non-numeric coverage = not probeable
-        if not np.isfinite(float(cov)):
+            _unprobeable(ch)
             continue
-        if float(cov) < min_cov[ch]:
+        contract = coverage_contracts.get(ch)
+        metric = contract.metric if contract is not None else "stock_coverage"
+        cov = entry.get(metric)
+        if not (
+            isinstance(cov, (int, float))
+            and not isinstance(cov, bool)
+            and np.isfinite(float(cov))
+        ):
+            _unprobeable(ch)
+            continue
+        if float(cov) <= 0:
+            logger.error("Required aux channels have ZERO coverage: %s — "
+                         "aborting", ch)
+            sys.exit(1)
+        if contract is not None and float(cov) < contract.threshold:
             logger.error(
                 "Required aux channel '%s' coverage %.4f < minimum %.4f "
                 "(--feature-profile) — aborting",
-                ch, float(cov), min_cov[ch])
+                ch, float(cov), contract.threshold)
             sys.exit(1)
 
 def _require_quality_gate(

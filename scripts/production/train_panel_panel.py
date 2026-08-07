@@ -220,7 +220,12 @@ def _resolve_panel(
             expected_meta=_panel_store_meta(
                 args, seq_len, stock_list, data_dir, args.prebuilt),
             strict_external_meta=strict)
-        channel_manifest = _prebuilt_channel_coverage(panel_data)
+        # §T4: a store built with the manifest persisted reads the ACCURATE
+        # build-time coverage directly; a legacy store without it falls back to
+        # the has_* flag probe (which cannot cover flag-less channels).
+        stored = panel_data.get("channel_coverage_manifest")
+        channel_manifest = (stored if stored is not None
+                            else _prebuilt_channel_coverage(panel_data))
         return panel_data, channel_manifest
 
     logger.info("Loading K-line data for %d stocks from %s to %s...",
@@ -304,7 +309,25 @@ def _resolve_panel(
         daily_membership=daily_membership,
         memmap_dir=args.panel_store,
     )
+    if args.prebuilt:
+        # Live per-channel loading is skipped in prebuilt mode; probe the
+        # panel's has_* flags instead so the experiment still records what
+        # actually got in.  A persisted store manifest (already present in
+        # panel_data on a store build) is preferred — it carries the accurate
+        # build-time coverage, including channels without a has_* flag.  Done
+        # BEFORE the store save below so the accurate manifest is what persists.
+        channel_manifest = (
+            panel_data.get("channel_coverage_manifest")
+            or _prebuilt_channel_coverage(panel_data)
+        )
     if args.panel_store:
+        # §T4: persist the channel-coverage manifest into the store so a later
+        # store-backed replay reads the accurate build-time coverage directly
+        # instead of re-probing has_* flags (which cannot cover flag-less
+        # channels).  Set BEFORE the save; the value is JSON, so
+        # save_panel_memmap writes channel_coverage_manifest.json (an optional
+        # JSON key — a legacy store without it still loads).
+        panel_data["channel_coverage_manifest"] = channel_manifest
         # T8: flush + close the memmap grids so save_panel_memmap can write the
         # small arrays + metadata without file-lock collisions on Windows (open
         # memmaps keep their backing files locked).  close_memmap_grids (the
@@ -331,11 +354,11 @@ def _resolve_panel(
             expected_meta=_panel_store_meta(
                 args, seq_len, stock_list, data_dir, args.prebuilt),
             strict_external_meta=strict)
-    if args.prebuilt:
-        # Live per-channel loading is skipped in prebuilt mode; probe the
-        # panel's has_* flags instead so the experiment still records what
-        # actually got in.
-        channel_manifest = _prebuilt_channel_coverage(panel_data)
+        # Replay the persisted manifest (preferred) or fall back to the probe.
+        channel_manifest = (
+            panel_data.get("channel_coverage_manifest")
+            or _prebuilt_channel_coverage(panel_data)
+        )
     return panel_data, channel_manifest
 
 # §七-P0 universe memory guard thresholds (GB).  --universe all is refused
@@ -550,6 +573,10 @@ def _finalize_channel(entry: dict, name: str, loaded: int, errors: int, n: int) 
     entry["loaded_stocks"] = loaded
     entry["errors"] = errors
     entry["coverage"] = round(loaded / n, 4) if n else 0.0
+    # §T4: stock-level coverage — the live path's per-stock metric.  The gate
+    # reads the channel's declared metric (stock_coverage for per-stock
+    # channels), so expose it under its canonical name.
+    entry["stock_coverage"] = entry["coverage"]
     entry["status"] = (
         "FAILED" if loaded == 0 and errors > 0 else
         "MISSING" if loaded == 0 else
@@ -557,6 +584,73 @@ def _finalize_channel(entry: dict, name: str, loaded: int, errors: int, n: int) 
     )
     logger.info("[%s] loaded %d/%d stocks (errors=%d) %s",
                 name, loaded, n, errors, entry["status"])
+
+def _trading_day_count(data_dir, start_date, end_date) -> int:
+    """Trading-day denominator for broadcast date-coverage probes (§T4).
+
+    Uses the strict research calendar (data_dir-threaded); a strict-calendar
+    overflow past ``verified_until`` (forward-estimate days) falls back to a ~
+    weekday fraction of the raw span so a coverage probe never crashes.  A
+    falsy window yields 0 — the caller treats any present data as covered.
+    """
+    if not start_date or not end_date:
+        return 0
+    lo = pd.Timestamp(start_date).date()
+    hi = pd.Timestamp(end_date).date()
+    try:
+        cal = get_research_calendar(strict=True, data_dir=data_dir)
+        return len(cal.get_trading_days(lo, hi))
+    except ValueError:
+        span_days = (hi - lo).days
+        return max(1, int(round(span_days * 5 / 7)))
+
+
+def _date_coverage_fraction(n_dates_in_range, data_dir, start_date, end_date) -> float:
+    """Date coverage = n_dates_in_range / trading days, for broadcast channels.
+
+    A falsy window (no start/end) treats any present data as fully covered
+    (1.0 when ``n_dates_in_range > 0``), 0.0 otherwise.  This is the MEANINGFUL
+    metric for market-wide broadcast channels — their value is the same for
+    every stock per date, so stock coverage is vacuous.
+    """
+    if not start_date or not end_date:
+        return 1.0 if n_dates_in_range > 0 else 0.0
+    n_trading = _trading_day_count(data_dir, start_date, end_date)
+    if not n_trading:
+        return 0.0
+    return round(n_dates_in_range / n_trading, 4)
+
+
+def _probe_broadcast_dates(path, start_date, end_date, data_dir):
+    """Probe a broadcast channel's date coverage from its parquet file (§T4).
+
+    Broadcast channels (etf_flow / industry / market_env) carry the same value
+    for every stock per date, so the probe records DATE coverage — distinct
+    dates in [start_date, end_date] over trading days in range (see
+    ``_date_coverage_fraction``) — instead of the vacuous stock coverage.
+
+    Normalizes a DatetimeIndex OR a date column like ``aux_aligner``'s
+    ``_merge_industry`` / ``_merge_market_env``.  Returns ``(n_dates_in_range,
+    status)`` where status is MISSING (file absent) / FAILED (unreadable) / OK.
+    """
+    if not os.path.isfile(path):
+        return 0, "MISSING"
+    try:
+        df = pd.read_parquet(path)
+    except Exception:
+        return 0, "FAILED"
+    if "date" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index().rename(columns={"index": "date"})
+        else:
+            return 0, "FAILED"
+    dates = pd.to_datetime(df["date"]).dt.normalize()
+    if start_date:
+        dates = dates[dates >= pd.Timestamp(start_date)]
+    if end_date:
+        dates = dates[dates <= pd.Timestamp(end_date)]
+    return int(dates.nunique()), "OK"
+
 
 def _load_channel_aux(
     name: str,
@@ -710,16 +804,67 @@ def load_aux_data(
                 result[code]["etf_flow"] = etf_agg
             entry["loaded_stocks"] = len(stock_list)
             entry["coverage"] = 1.0 if stock_list else 0.0
+            # §T4: broadcast channel — stock coverage is vacuous (1.0 whenever
+            # the aggregated data exists); DATE coverage is the meaningful metric.
+            entry["stock_coverage"] = entry["coverage"]
+            entry["date_coverage"] = _date_coverage_fraction(
+                len(set(pd.to_datetime(etf_agg["date"]).dt.date)),
+                data_dir, start_date, end_date)
             entry["status"] = "OK"
             logger.info("[etf_flow] aggregated from %d sector files "
                         "(broadcast to %d stocks)", len(etf_frames), len(stock_list))
         else:
+            entry["coverage"] = 0.0
+            entry["stock_coverage"] = 0.0
+            entry["date_coverage"] = 0.0
             logger.info("[etf_flow] no sector files found — MISSING")
     except Exception as exc:
         entry["errors"] = len(stock_list)
         entry["status"] = "FAILED"
         entry["note"] = str(exc)
+        entry["stock_coverage"] = 0.0
+        entry["date_coverage"] = 0.0
         logger.warning("[etf_flow] aggregation failed — %s", exc)
+
+    # Broadcast channels (industry / market_env): market-wide per-date values,
+    # the same for every stock per date — STOCK coverage is vacuous (1.0 when
+    # the file exists); DATE coverage is the meaningful metric (§T4).  The
+    # feature pipeline loads these itself (aux_aligner), so load_aux_data only
+    # records the coverage probe in the manifest (broadcast, not per-stock).
+    for name, rel_path in (
+        ("industry", os.path.join("a_shares", "industry",
+                                  "industry_returns.parquet")),
+        ("market_env", os.path.join("a_shares", "market_breadth",
+                                    "market_env_daily.parquet")),
+    ):
+        entry = _new_channel_entry(True, name in required_set)
+        manifest[name] = entry
+        path = os.path.join(data_dir, rel_path)
+        n_dates, status = _probe_broadcast_dates(
+            path, start_date, end_date, data_dir)
+        entry["loaded_stocks"] = None  # broadcast channel, not per-stock
+        if status == "OK":
+            entry["coverage"] = 1.0
+            entry["stock_coverage"] = 1.0
+            entry["date_coverage"] = _date_coverage_fraction(
+                n_dates, data_dir, start_date, end_date)
+            entry["status"] = "OK"
+            logger.info("[%s] date coverage %.4f (%d dates in range) "
+                        "(broadcast)", name, entry["date_coverage"], n_dates)
+        elif status == "MISSING":
+            entry["coverage"] = 0.0
+            entry["stock_coverage"] = 0.0
+            entry["date_coverage"] = 0.0
+            entry["status"] = "MISSING"
+            logger.info("[%s] %s not found — MISSING", name, rel_path)
+        else:  # FAILED
+            entry["coverage"] = 0.0
+            entry["stock_coverage"] = 0.0
+            entry["date_coverage"] = 0.0
+            entry["status"] = "FAILED"
+            entry["note"] = f"unreadable broadcast parquet: {path}"
+            logger.warning("[%s] broadcast parquet unreadable — %s",
+                           name, path)
 
     loaded = sum(1 for v in result.values() if v)
     logger.info("Aux data loaded for %d/%d stocks", loaded, len(stock_list))
@@ -730,10 +875,19 @@ def _prebuilt_channel_coverage(panel_data: dict) -> dict:
 
     past_observed is (N, T, D); each has_* flag is True on exactly the
     (stock, day) cells where that aux channel delivered data (the pipeline
-    ZI-fills absent cells, so False == no data).  Coverage = fraction of grid
-    cells with the flag set, across the whole loaded panel.  Channels without
-    a has_* flag carry no presence marker in the arrays, so their coverage is
-    left null (not decodable).
+    ZI-fills absent cells, so False == no data).  §T4: coverage is reported per
+    DECLARED METRIC — the coverage gate picks the channel's contract metric:
+
+    * ``stock_coverage`` — ``mask.any(axis=1).mean()``, the fraction of STOCKS
+      with >=1 present cell;
+    * ``cell_coverage`` — ``mask.mean()``, the fraction of (stock, day) cells;
+    * ``date_coverage`` — ``mask.any(axis=0).mean()``, the fraction of DATES
+      with >=1 present cell.
+
+    ``coverage`` remains as the legacy alias for ``cell_coverage`` so external
+    readers of ``entry["coverage"]`` keep working.  Channels without a has_*
+    flag carry no presence marker in the arrays, so they are left out entirely
+    (unprobeable — the gate's formal mode aborts / explore warns on them).
     """
     po = panel_data.get("past_observed")
     col_names = panel_data.get("past_observed_cols") or []
@@ -750,11 +904,17 @@ def _prebuilt_channel_coverage(panel_data: dict) -> dict:
             continue
         mask = po[:, :, index[flag]] > 0
         present = int(np.count_nonzero(mask))
+        stock_coverage = round(float(mask.any(axis=1).mean()), 4)
+        cell_coverage = round(float(mask.mean()), 4)
+        date_coverage = round(float(mask.any(axis=0).mean()), 4)
         channels[channel] = {
             "requested": True,
             "required": False,
             "loaded_stocks": None,  # cell-level probe, not per-stock
-            "coverage": round(float(mask.mean()), 4),
+            "coverage": cell_coverage,
+            "stock_coverage": stock_coverage,
+            "cell_coverage": cell_coverage,
+            "date_coverage": date_coverage,
             "errors": 0,
             "status": "OK" if present else "MISSING",
             "cells": int(mask.size),

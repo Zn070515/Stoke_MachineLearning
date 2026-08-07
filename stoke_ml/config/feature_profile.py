@@ -12,10 +12,12 @@ Two responsibilities, both consumed by the v15 audit-fix plan:
 
 2. ``FeatureProfile`` / ``FEATURE_PROFILES`` — frozen, named feature recipes
    declaring which channels a formal run REQUIRES and each required channel's
-   minimum coverage, plus the vintage policy the profile is validated against.
-   ``headline_v1`` is the formal baseline: the safe-only-ALLOWED, default-ON
-   channels with tunable minimum-coverage thresholds.  The coverage gate in
-   ``scripts/production/train_panel.py`` enforces these thresholds per run.
+   coverage CONTRACT (the metric measured + the minimum), plus the vintage
+   policy the profile is validated against.  ``headline_v1`` is the formal
+   baseline: the safe-only-ALLOWED, default-ON channels with tunable per-channel
+   contracts.  The coverage gate in ``scripts/production/train_panel.py``
+   enforces these contracts per run, measuring the declared metric (stock-level
+   on the live path, cell-level on the prebuilt probe).
 
 The values are imported from the existing channel column constants (the single
 source of truth) rather than hand-copied, so a column rename in the feature
@@ -120,26 +122,63 @@ del _channel, _cols, _col, _COLUMN_OWNER
 
 # ── FeatureProfile ────────────────────────────────────────────────────────
 
+# The coverage METRICS a channel contract can declare (§T4, the semantic
+# unification fix).  STOCK coverage is the fraction of loaded stocks carrying
+# the channel (the live path's per-stock load); CELL coverage is the fraction
+# of (stock, day) grid cells with the channel's has_* flag set (the prebuilt
+# probe); DATE coverage is the fraction of trading days in the window covered
+# (the meaningful metric for MARKET-WIDE broadcast channels, whose value is the
+# same for every stock per date); valid_state_cell_coverage is reserved for a
+# state-channel forward-fill metric (not currently produced).
+_COVERAGE_METRICS: frozenset[str] = frozenset({
+    "stock_coverage", "cell_coverage", "date_coverage",
+    "valid_state_cell_coverage",
+})
+
+
+@dataclass(frozen=True)
+class CoverageContract:
+    """Per-channel coverage contract: which metric is measured and the minimum.
+
+    The gate measures the DECLARED metric — stock-level on the live path,
+    cell-level on the prebuilt probe, date-level for market-wide broadcasts —
+    so the same threshold means the same thing regardless of path (§T4, §十一).
+    """
+
+    metric: str
+    threshold: float
+
+    def __post_init__(self):
+        if self.metric not in _COVERAGE_METRICS:
+            raise ValueError(
+                f"CoverageContract metric {self.metric!r} not in "
+                f"{sorted(_COVERAGE_METRICS)}")
+        if not (0.0 < self.threshold <= 1.0):
+            raise ValueError(
+                f"CoverageContract threshold must be in (0,1], got "
+                f"{self.threshold}")
+
 
 @dataclass(frozen=True)
 class FeatureProfile:
-    """A frozen feature recipe: required channels + minimum coverage.
+    """A frozen feature recipe: required channels + per-channel coverage contracts.
 
     Attributes:
         name:            stable profile identifier (CLI ``--feature-profile``).
         required_channels: channels a formal run must not silently lose — a
             required channel with zero coverage aborts the run.
-        minimum_coverage: channel → minimum fraction of loaded stocks/grid
-            cells that must carry the channel; a PROBEABLE channel below its
-            minimum aborts the run.  A channel absent from this dict is
-            presence-only (must exceed zero).
+        coverage_contracts: channel → CoverageContract (the metric measured and
+            the minimum).  A PROBEABLE channel below its contract minimum aborts
+            the run.  A channel absent from this dict is presence-only (must
+            exceed zero) — dragon_tiger is the shipped profile's presence-only
+            channel.
         vintage_policy:   the VintagePolicy the profile is validated against
             (headline_v1 is the ``safe-only`` baseline).
     """
 
     name: str
     required_channels: tuple[str, ...]
-    minimum_coverage: dict[str, float]
+    coverage_contracts: dict[str, CoverageContract]
     vintage_policy: str
 
 
@@ -150,8 +189,15 @@ class FeatureProfile:
 # pledge/shareholder/index_membership/market_env_refine/sector/concept) and the
 # default-off board/sector/concept/limit_up/topic dimensions.  ``macro`` is
 # denied under safe-only, so it is deliberately absent despite defaulting ON.
-# ``minimum_coverage`` thresholds are the formal baseline; each is tunable per
-# experiment and a channel absent from the dict is presence-only.
+#
+# ``coverage_contracts`` thresholds ARE the historical ``minimum_coverage``
+# values — NOT re-tuned (§T4).  The metric split: every per-stock channel
+# declares ``stock_coverage``; the MARKET-WIDE broadcast channels
+# (etf_flow / industry / market_env) declare ``date_coverage`` — their value is
+# the same for every stock per date, so stock coverage is vacuous (1.0 whenever
+# the file exists) and date coverage is the meaningful metric.  dragon_tiger is
+# deliberately absent from the map (presence-only), preserving the convention
+# that a required channel absent from the contract map is presence-only.
 FEATURE_PROFILES: dict[str, FeatureProfile] = {
     "headline_v1": FeatureProfile(
         name="headline_v1",
@@ -160,12 +206,20 @@ FEATURE_PROFILES: dict[str, FeatureProfile] = {
             "northbound", "dragon_tiger", "capital_flow", "etf_flow",
             "block_trade", "lockup", "dividend", "industry", "market_env",
         ),
-        minimum_coverage={
-            "sentiment": 0.90, "guba": 0.90, "comment": 0.90,
-            "announcement": 0.70, "margin": 0.95, "northbound": 0.90,
-            "capital_flow": 0.90, "etf_flow": 0.80, "block_trade": 0.30,
-            "lockup": 0.30, "dividend": 0.30, "industry": 0.95,
-            "market_env": 0.95,
+        coverage_contracts={
+            "sentiment": CoverageContract("stock_coverage", 0.90),
+            "guba": CoverageContract("stock_coverage", 0.90),
+            "comment": CoverageContract("stock_coverage", 0.90),
+            "announcement": CoverageContract("stock_coverage", 0.70),
+            "margin": CoverageContract("stock_coverage", 0.95),
+            "northbound": CoverageContract("stock_coverage", 0.90),
+            "capital_flow": CoverageContract("stock_coverage", 0.90),
+            "block_trade": CoverageContract("stock_coverage", 0.30),
+            "lockup": CoverageContract("stock_coverage", 0.30),
+            "dividend": CoverageContract("stock_coverage", 0.30),
+            "etf_flow": CoverageContract("date_coverage", 0.80),
+            "industry": CoverageContract("date_coverage", 0.95),
+            "market_env": CoverageContract("date_coverage", 0.95),
         },
         vintage_policy="safe-only",
     ),
@@ -200,6 +254,14 @@ def resolve_required_channels(
 
 
 def minimum_coverage(profile_name: str | None) -> dict[str, float]:
-    """The minimum-coverage thresholds for ``profile_name``; {} when none."""
+    """The minimum-coverage THRESHOLDS for ``profile_name``; {} when none.
+
+    A projection of each channel's ``CoverageContract.threshold``, kept as a
+    ``dict[str, float]`` so callers that only need the threshold (not the
+    declared metric) keep working.  The gate itself reads the full contracts
+    via ``FeatureProfile.coverage_contracts``.
+    """
     prof = profile_for(profile_name)
-    return dict(prof.minimum_coverage) if prof is not None else {}
+    if prof is None:
+        return {}
+    return {ch: c.threshold for ch, c in prof.coverage_contracts.items()}

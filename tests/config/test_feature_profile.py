@@ -14,7 +14,9 @@ import pytest
 from stoke_ml.config.feature_profile import (
     CHANNEL_COLUMNS,
     FEATURE_PROFILES,
+    CoverageContract,
     FeatureProfile,
+    _COVERAGE_METRICS,
     minimum_coverage,
     profile_for,
     resolve_required_channels,
@@ -116,16 +118,48 @@ def test_headline_v1_excludes_policy_denied_and_default_off_dims():
         assert denied not in required, denied
 
 
-def test_headline_v1_minimum_coverage_within_unit_interval():
-    for ch, m in _headline().minimum_coverage.items():
-        assert 0.0 < m <= 1.0, f"{ch}: {m}"
+def test_headline_v1_coverage_contracts_within_unit_interval():
+    for ch, c in _headline().coverage_contracts.items():
+        assert 0.0 < c.threshold <= 1.0, f"{ch}: {c.threshold}"
+        assert c.metric in _COVERAGE_METRICS, f"{ch}: {c.metric}"
 
 
-def test_headline_v1_minimum_coverage_keys_subset_of_required():
-    """A channel with a coverage threshold must also be required — a channel
-    the run does not require should never be aborted on coverage."""
+def test_headline_v1_coverage_contract_keys_subset_of_required():
+    """A channel with a coverage contract must also be required — a channel
+    the run does not require should never be aborted on coverage.
+    dragon_tiger is REQUIRED but presence-only (no contract) — its presence
+    convention is exactly what the absense from the contract map preserves."""
     p = _headline()
-    assert set(p.minimum_coverage) <= set(p.required_channels)
+    assert set(p.coverage_contracts) <= set(p.required_channels)
+    assert "dragon_tiger" in p.required_channels
+    assert "dragon_tiger" not in p.coverage_contracts
+
+
+def test_headline_v1_coverage_contracts_exact_map():
+    """Pin the exact per-channel (metric, threshold) contract map (§T4).
+
+    Per-stock channels use stock_coverage; the MARKET-WIDE broadcast channels
+    (etf_flow / industry / market_env) use date_coverage — their value is the
+    same for every stock per date, so stock coverage is vacuous (1.0 whenever
+    the file exists) and date coverage is the meaningful metric.  dragon_tiger
+    is presence-only (required, NO contract).  Thresholds are the historical
+    minimum_coverage values — NOT re-tuned.
+    """
+    assert _headline().coverage_contracts == {
+        "sentiment": CoverageContract("stock_coverage", 0.90),
+        "guba": CoverageContract("stock_coverage", 0.90),
+        "comment": CoverageContract("stock_coverage", 0.90),
+        "announcement": CoverageContract("stock_coverage", 0.70),
+        "margin": CoverageContract("stock_coverage", 0.95),
+        "northbound": CoverageContract("stock_coverage", 0.90),
+        "capital_flow": CoverageContract("stock_coverage", 0.90),
+        "block_trade": CoverageContract("stock_coverage", 0.30),
+        "lockup": CoverageContract("stock_coverage", 0.30),
+        "dividend": CoverageContract("stock_coverage", 0.30),
+        "etf_flow": CoverageContract("date_coverage", 0.80),
+        "industry": CoverageContract("date_coverage", 0.95),
+        "market_env": CoverageContract("date_coverage", 0.95),
+    }
 
 
 def test_headline_v1_vintage_policy_is_safe_only():
@@ -155,8 +189,10 @@ def test_resolve_required_channels_no_extra_returns_profile():
 
 
 def test_minimum_coverage_returns_profile_thresholds():
-    assert minimum_coverage("headline_v1") == dict(
-        _headline().minimum_coverage)
+    """The minimum_coverage() helper stays a dict[str, float] — it projects each
+    contract's threshold, so callers that only need thresholds keep working."""
+    assert minimum_coverage("headline_v1") == {
+        ch: c.threshold for ch, c in _headline().coverage_contracts.items()}
 
 
 def test_minimum_coverage_empty_without_profile():

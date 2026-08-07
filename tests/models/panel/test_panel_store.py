@@ -120,6 +120,30 @@ class TestPanelStoreRoundTrip:
             + ["fill_prob.npy"])
         assert panel_store_complete(tmp_path) is True
 
+    def test_channel_coverage_manifest_optional_roundtrip(self, tmp_path):
+        """A channel_coverage_manifest persisted alongside the panel round-trips
+        through the store, and a store saved WITHOUT it (legacy) still loads —
+        it is an OPTIONAL JSON key, not part of the required-file contract."""
+        panel = _storeable_panel(seed=1)
+        panel["channel_coverage_manifest"] = {
+            "sentiment": {"stock_coverage": 0.9, "cell_coverage": 0.8,
+                          "status": "OK"},
+            "industry": {"date_coverage": 0.95, "status": "OK"},
+        }
+        written = save_panel_memmap(panel, tmp_path)
+        loaded = load_panel_memmap(tmp_path)
+        assert loaded["channel_coverage_manifest"] == panel["channel_coverage_manifest"]
+        assert "channel_coverage_manifest.json" in written
+        assert panel_store_complete(tmp_path) is True
+
+        # A store saved WITHOUT the manifest (legacy) still loads — the required
+        # file check at load does NOT include the optional key.
+        legacy_dir = tmp_path / "legacy"
+        save_panel_memmap(_storeable_panel(seed=2), legacy_dir)
+        legacy = load_panel_memmap(legacy_dir)
+        assert "channel_coverage_manifest" not in legacy
+        assert panel_store_complete(legacy_dir) is True
+
     def test_complete_marker_absent_on_empty(self, tmp_path):
         """A fresh/empty dir is never a complete store."""
         assert panel_store_complete(tmp_path) is False
