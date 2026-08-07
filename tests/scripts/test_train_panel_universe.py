@@ -1221,6 +1221,11 @@ def test_streaming_host_available_refuse_still_fires(tp):
     assert "universe=all" in msg
     assert "available" in msg
     assert "--allow-high-risk-universe" in msg
+    # The streaming refusal is host-RAM-bound, NOT universe-size-bound — the
+    # resident peak is roughly n_stocks-independent, so the advice must point
+    # at freeing RAM, never at a "--stocks cap" (which cannot help).
+    assert "Free up host RAM" in msg
+    assert "--stocks" not in msg
 
 
 def test_early_guard_streaming_first_build_not_refused(tp, tmp_path, monkeypatch):

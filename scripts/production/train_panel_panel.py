@@ -513,9 +513,8 @@ def _enforce_universe_memory(
                 f"{est_gb:.1f} GB (n_timesteps={n_timesteps} x "
                 f"n_features={n_features}; the (N,T,D) grids are memmap-sunk "
                 f"to disk) {avail} — the bounded streaming build cannot fit "
-                f"the host's available memory (§七-P0).  Re-scope with a "
-                f"smaller --stocks cap or pass --allow-high-risk-universe to "
-                f"run it anyway."
+                f"the host's available memory (§七-P0).  Free up host RAM or "
+                f"pass --allow-high-risk-universe to run it anyway."
             )
         if action in ("warn", "refuse"):
             logger.warning(
