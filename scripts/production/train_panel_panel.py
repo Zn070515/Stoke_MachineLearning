@@ -37,6 +37,7 @@ from stoke_ml.models.panel.panel_store import (
 )
 from scripts.production.data_quality_gate import dataset_fingerprint
 from scripts.production.train_panel_folds import _universe_artifact_hashes
+from scripts.production.train_panel_gates import _formal_mode
 from scripts.production.train_panel_registry import _calendar_freeze
 from scripts.production.train_panel_universe import _is_csi_universe
 
@@ -196,14 +197,22 @@ def _resolve_panel(
     channel-coverage dict for the required-channel gate; the store path probes
     it from the stored panel's ``has_*`` flags (prebuilt semantics), the live
     path from ``load_aux_data`` (or the same flag probe under ``--prebuilt``).
+
+    T1: the store's external-artifact hashes are a HARD-FAIL in formal mode —
+    a store built from upstream data (manifest / calendar / membership /
+    prebuilt features) that no longer matches this run is refused, not reused.
+    ``strict_external_meta`` is threaded from ``_formal_mode(args)``, so
+    ``--no-formal`` (exploratory) keeps the legacy warn-and-proceed.
     """
+    strict = _formal_mode(args)
     if _store_load:
         logger.info("Loading panel memmap store from %s (skipping K-line load "
                     "+ feature build)", args.panel_store)
         panel_data = load_panel_memmap(
             args.panel_store,
             expected_meta=_panel_store_meta(
-                args, seq_len, stock_list, data_dir, args.prebuilt))
+                args, seq_len, stock_list, data_dir, args.prebuilt),
+            strict_external_meta=strict)
         channel_manifest = _prebuilt_channel_coverage(panel_data)
         return panel_data, channel_manifest
 
@@ -313,7 +322,8 @@ def _resolve_panel(
         panel_data = load_panel_memmap(
             args.panel_store,
             expected_meta=_panel_store_meta(
-                args, seq_len, stock_list, data_dir, args.prebuilt))
+                args, seq_len, stock_list, data_dir, args.prebuilt),
+            strict_external_meta=strict)
     if args.prebuilt:
         # Live per-channel loading is skipped in prebuilt mode; probe the
         # panel's has_* flags instead so the experiment still records what

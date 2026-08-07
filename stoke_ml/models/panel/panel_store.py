@@ -80,11 +80,13 @@ _CRITICAL_META_KEYS: tuple[str, ...] = (
 
 # Warn-and-proceed keys (T4 §八): bind the store to the EXTERNAL data
 # artifacts it was built from — data manifest, calendar, universe
-# status/delist, index membership, prebuilt feature manifest.  A mismatch
-# warns loudly but proceeds (each is re-derivable by rebuilding the store), so
-# stale is suspicious, not fatal.  Compared recorded-meta-vs-expected ONLY
-# when BOTH sides carry a value (None on either side = skip), mirroring
-# config_hash.
+# status/delist, index membership, prebuilt feature manifest.  In EXPLORE mode
+# (strict_external_meta=False) a mismatch warns loudly but proceeds (each is
+# re-derivable by rebuilding the store), so stale is suspicious, not fatal;
+# one side missing the key skips the comparison, mirroring config_hash.  In
+# FORMAL mode (strict_external_meta=True) the same keys HARD-FAIL (T1): if
+# upstream data/calendar/membership changed — or either side cannot be vouched
+# for — the stored panel is stale and must be rebuilt, never reused.
 _WARN_META_KEYS: tuple[str, ...] = (
     "data_manifest_hash", "calendar_hash", "universe_status_hash",
     "membership_hash", "prebuilt_feature_manifest_hash",
@@ -351,6 +353,7 @@ def _load_meta(out: Path) -> dict | None:
 
 def _validate_meta(
     out: Path, expected_meta: dict, recorded: dict | None = None,
+    strict_external_meta: bool = False,
 ) -> None:
     """Refuse a store whose meta fingerprint disagrees with the current build.
 
@@ -358,13 +361,17 @@ def _validate_meta(
     is refused — the stored panel's targets / column set / calendar would be
     stale.  ``_WARN_META_KEYS`` (external-artifact hashes: data manifest,
     calendar, universe status/delist, membership, prebuilt feature manifest)
-    warn-and-proceed on mismatch, compared only when BOTH sides carry a value
-    (each is re-derivable by rebuilding the store, so stale is suspicious, not
-    fatal).  Non-critical fields (git_commit) drift with a loud warning and a
-    proceed, mirroring cache_manifest's stale-manifest logic.  ``config_hash``
-    is compared only when BOTH sides have it (None means config could not
-    load).  A store with no meta.json at all cannot vouch for its config and
-    is refused rather than trusted.
+    warn-and-proceed on mismatch in explore mode (``strict_external_meta``
+    False), compared only when BOTH sides carry a value (each is re-derivable
+    by rebuilding the store, so stale is suspicious, not fatal).  In formal
+    mode (``strict_external_meta`` True) the same keys HARD-FAIL (T1): an
+    upstream data/calendar/membership change — or a key one side cannot vouch
+    for — means the stored panel is stale and must be rebuilt, never reused.
+    Non-critical fields (git_commit) drift with a loud warning and a proceed,
+    mirroring cache_manifest's stale-manifest logic.  ``config_hash`` is
+    compared only when BOTH sides have it (None means config could not load).
+    A store with no meta.json at all cannot vouch for its config and is
+    refused rather than trusted.
 
     ``recorded`` is the already-loaded meta.json dict when the caller has it
     (load_panel_memmap reads the file once and threads it through to both
@@ -394,9 +401,31 @@ def _validate_meta(
             ".  Rebuild the store for this configuration "
             "(--panel-store DIR with the current flags)."
         )
+    strict_violations: list[str] = []
     for key in _WARN_META_KEYS:
         rec = recorded.get(key)
         exp = expected_meta.get(key)
+        if strict_external_meta:
+            # formal mode (T1): a binding this run must vouch for is missing or
+            # drifted → refuse reuse.  A key ABSENT on BOTH sides is out of
+            # scope (neither the stored build nor this run consumes that
+            # artifact — e.g. no --prebuilt, non-membership universe) and is
+            # skipped; an EXPLICIT None on either side (e.g. calendar
+            # materialization failed) is still refused.
+            if rec != exp:
+                if rec is None or exp is None:
+                    side = "recorded" if rec is None else "requested"
+                    strict_violations.append(
+                        f"{key}: {side} side missing — cannot vouch for the "
+                        f"external artifact (stored={rec!r} requested={exp!r})")
+                else:
+                    strict_violations.append(
+                        f"{key}: stored={rec!r} requested={exp!r}")
+            elif rec is None and (key in recorded or key in expected_meta):
+                strict_violations.append(
+                    f"{key}: neither side can vouch for the external artifact "
+                    "(stored=None requested=None)")
+            continue
         if rec is None or exp is None:
             continue  # either side lacks the binding — nothing to compare
         if rec != exp:
@@ -406,6 +435,14 @@ def _validate_meta(
                 "a persistent mismatch is suspicious and worth investigating",
                 out, key, rec, exp,
             )
+    if strict_violations:
+        raise RuntimeError(
+            f"panel store at {out} was built from external data artifacts that "
+            "differ from this run's — refusing to reuse a stale store in "
+            "formal mode: " + "; ".join(strict_violations)
+            + ".  Rebuild the store for this configuration "
+            "(--panel-store DIR with the current flags)."
+        )
     exp_git = expected_meta.get("git_commit")
     rec_git = recorded.get("git_commit")
     if exp_git and rec_git and exp_git != rec_git:
@@ -469,6 +506,7 @@ def _validate_self_consistency(
 
 def load_panel_memmap(
     out_dir: str | Path, expected_meta: dict | None = None,
+    strict_external_meta: bool = False,
 ) -> dict:
     """Load a store written by :func:`save_panel_memmap` back into a dict
     matching the build_panel_features contract.
@@ -486,9 +524,13 @@ def load_panel_memmap(
     switches, config_hash) raises RuntimeError naming the mismatch, so a stale
     store can never silently feed wrong targets.  git_commit drift only warns,
     and ``_WARN_META_KEYS`` (external-artifact hashes) drift with a loud
-    warning and a proceed (each is re-derivable by rebuilding the store).
-    Independently of ``expected_meta``, the store's self-consistency
-    fingerprints (feature schema + stock order, see
+    warning and a proceed in explore mode — or, when ``strict_external_meta``
+    is True (formal mode, T1), are a HARD-FAIL: a drifted or one-side-missing
+    external hash means the stored panel was built from upstream data that no
+    longer matches this run, so it is refused and must be rebuilt.  It is the
+    caller's job to pass the formal/explore flag (train_panel threads
+    ``_formal_mode(args)``).  Independently of ``expected_meta``, the store's
+    self-consistency fingerprints (feature schema + stock order, see
     :func:`_validate_self_consistency`) are recomputed from the store's own
     arrays/lists whenever a meta.json exists — a tampered identity file is
     refused rather than silently training the wrong stocks.
@@ -520,7 +562,8 @@ def load_panel_memmap(
     # load never re-reads the file a second time.
     recorded = _load_meta(out)
     if expected_meta is not None:
-        _validate_meta(out, expected_meta, recorded=recorded)
+        _validate_meta(out, expected_meta, recorded=recorded,
+                       strict_external_meta=strict_external_meta)
     _validate_self_consistency(data, out, recorded=recorded)
     # §T13: a store built before the carried-return label era predates the
     # per-date exit-fill array.  Tolerate its absence — fill NaN and warn —

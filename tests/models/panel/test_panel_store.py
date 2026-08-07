@@ -383,6 +383,78 @@ class TestPanelStoreWarnBinding:
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
+class TestPanelStoreStrictExternalMeta:
+    """T1: formal mode (strict_external_meta=True) must REFUSE a store whose
+    external-artifact hashes (data manifest / calendar / universe status /
+    membership / prebuilt feature manifest) drifted OR cannot be vouched for
+    on either side — upstream data changed means the stored panel is stale and
+    must be rebuilt, never reused.  Explore mode keeps warn-and-proceed."""
+
+    def test_strict_mismatch_refuses(self, tmp_path):
+        """A drifted external hash is a hard-fail in formal mode, naming the
+        key and both values (stored vs requested)."""
+        save_panel_memmap(_storeable_panel(), tmp_path,
+                          meta=_meta(membership_hash="old"))
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path,
+                              expected_meta=_meta(membership_hash="new"),
+                              strict_external_meta=True)
+        msg = str(ei.value)
+        assert "membership_hash" in msg
+        assert "old" in msg and "new" in msg
+
+    def test_strict_recorded_has_expected_missing_refuses(self, tmp_path):
+        """Formal mode forbids the None-skip: a key the recorded store carries
+        but the requested run does not cannot be vouched for — refused."""
+        save_panel_memmap(_storeable_panel(), tmp_path,
+                          meta=_meta(membership_hash="abc"))
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path, expected_meta=_meta(),
+                              strict_external_meta=True)
+        msg = str(ei.value)
+        assert "membership_hash" in msg
+        assert "requested" in msg  # the missing side is named
+
+    def test_strict_expected_has_recorded_missing_refuses(self, tmp_path):
+        """Formal mode forbids the None-skip the other way: a key the requested
+        run carries but the store never recorded is refused, not skipped."""
+        save_panel_memmap(_storeable_panel(), tmp_path, meta=_meta())
+        with pytest.raises(RuntimeError) as ei:
+            load_panel_memmap(tmp_path,
+                              expected_meta=_meta(membership_hash="abc"),
+                              strict_external_meta=True)
+        msg = str(ei.value)
+        assert "membership_hash" in msg
+        assert "recorded" in msg  # the missing side is named
+
+    def test_explore_mode_mismatch_warns_and_proceeds(self, tmp_path, caplog):
+        """Default (explore) mode keeps warn-and-proceed on the SAME drift."""
+        panel = _storeable_panel()
+        save_panel_memmap(panel, tmp_path,
+                          meta=_meta(membership_hash="old"))
+        with caplog.at_level(logging.WARNING):
+            loaded = load_panel_memmap(tmp_path,
+                                       expected_meta=_meta(membership_hash="new"))
+        assert loaded["stock_codes"] == panel["stock_codes"]
+        assert any("membership_hash" in r.message for r in caplog.records)
+
+    def test_strict_clean_store_loads(self, tmp_path):
+        """Strict mode does not reject a VALID store: matching external hashes
+        on both sides load fine."""
+        panel = _storeable_panel()
+        m = _meta(
+            data_manifest_hash="manifest-abc",
+            calendar_hash="cal-abc",
+            universe_status_hash="uni-abc",
+            membership_hash="mem-abc",
+            prebuilt_feature_manifest_hash="pre-abc",
+        )
+        save_panel_memmap(panel, tmp_path, meta=m)
+        loaded = load_panel_memmap(tmp_path, expected_meta=m,
+                                   strict_external_meta=True)
+        assert loaded["stock_codes"] == panel["stock_codes"]
+
+
 class TestPanelStoreSaveEdgeCases:
     def test_save_to_existing_file_raises(self, tmp_path):
         """--panel-store pointing at an existing FILE is a clear error."""
@@ -472,6 +544,7 @@ class TestResolvePanelStoreSkip:
             no_aux=False, prebuilt=None, require_feature_manifest=False,
             require_aux_channels=None,
             vintage_policy="allow-revised",  # §T2: reproduces the pre-T2 switch set
+            no_formal=False,  # T1: _resolve_panel threads _formal_mode(args)
         )
 
     def test_complete_store_skips_kline_load(self, tmp_path, monkeypatch):
