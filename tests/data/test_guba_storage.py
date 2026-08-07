@@ -1,11 +1,39 @@
 """Tests for GubaStorage — 3-layer medallion storage for Guba forum posts."""
+import json
+import os
 import tempfile
 
 import pandas as pd
 import pytest
 
+from stoke_ml.data.asset_contract import validate_asset_manifest
 from stoke_ml.data.calendar import TradingCalendar
-from stoke_ml.data.guba_storage import GubaStorage, GUBA_COLS
+from stoke_ml.data.guba_storage import GUBA_SENTIMENT_ASSET, GubaStorage, GUBA_COLS
+
+
+def _manifest_of(parquet_path: str) -> dict:
+    with open(parquet_path + ".manifest.json", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _rewrite_manifest(path: str, mutator) -> None:
+    manifest = _manifest_of(path)
+    mutator(manifest)
+    with open(path + ".manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+
+def _gold_df():
+    return pd.DataFrame({
+        "date": pd.to_datetime(["2026-06-23", "2026-06-24"]),
+        "stock_code": ["600519"] * 2,
+        "guba_sentiment_mean": [0.5, -0.3],
+        "guba_sentiment_std": [0.2, 0.1],
+        "guba_post_count": [5, 3],
+        "guba_positive_ratio": [0.6, 0.0],
+        "guba_negative_ratio": [0.0, 0.5],
+        "has_guba_post": [True, True],
+    })
 
 
 class TestGubaStorage:
@@ -129,3 +157,55 @@ class TestGubaStorage:
             assert pd.Timestamp("2026-06-23").date() in dates
             assert pd.Timestamp("2026-06-24").date() in dates
             assert pd.Timestamp("2026-06-25").date() not in dates
+
+
+class TestGoldAssetContract:
+    """The gold ``guba`` channel carries a file-level asset manifest (§十七)."""
+
+    def test_gold_round_trip_writes_valid_manifest(self, tmp_path):
+        storage = GubaStorage(str(tmp_path))
+        storage.save_daily_sentiment(_gold_df())
+
+        path = os.path.join(str(tmp_path), "a_shares", "guba_sentiment",
+                            "600519.parquet")
+        assert os.path.isfile(path + ".manifest.json")
+        report = validate_asset_manifest(path, GUBA_SENTIMENT_ASSET)
+        assert report["ok"], report
+
+        manifest = _manifest_of(path)
+        assert manifest["data_type"] == "guba_sentiment"
+        assert manifest["effective_date_policy"] == "post_close_next_trading_day"
+        assert manifest["vintage_source"] == "immutable_snapshot"
+        assert manifest["vintage_transform"] == "model_versioned"
+        assert manifest["vintage_pit"] == "verified"
+
+        loaded = storage.load_daily_sentiment("600519", "2026-06-01", "2026-06-30")
+        assert len(loaded) == 2
+
+    def test_gold_tampered_rows_detected(self, tmp_path):
+        storage = GubaStorage(str(tmp_path))
+        storage.save_daily_sentiment(_gold_df())
+        path = os.path.join(str(tmp_path), "a_shares", "guba_sentiment",
+                            "600519.parquet")
+        _rewrite_manifest(path, lambda m: m.update(rows=999))
+
+        report = validate_asset_manifest(path, GUBA_SENTIMENT_ASSET)
+        assert not report["ok"]
+        assert any("rows" in s for s in report["mismatches"])
+
+    def test_gold_require_valid_manifest_raises(self, tmp_path):
+        storage = GubaStorage(str(tmp_path))
+        storage.save_daily_sentiment(_gold_df())
+        path = os.path.join(str(tmp_path), "a_shares", "guba_sentiment",
+                            "600519.parquet")
+        os.remove(path + ".manifest.json")
+
+        # lenient read still serves the legacy (manifest-less) file
+        assert len(storage.load_daily_sentiment(
+            "600519", "2026-06-01", "2026-06-30")) == 2
+        # formal read refuses it
+        with pytest.raises(ValueError, match="manifest missing"):
+            storage.load_daily_sentiment(
+                "600519", "2026-06-01", "2026-06-30",
+                require_valid_manifest=True,
+            )

@@ -11,9 +11,28 @@ import os
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.asset_contract import (
+    AtomicCommit,
+    check_asset_read,
+    contract_for_channel,
+    write_asset_manifest,
+)
 from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
 
 logger = logging.getLogger(__name__)
+
+# The GOLD sentiment layer — the ``sentiment`` channel's file-level asset
+# (§十七).  The effective date is the PIT-aligned trading day (post-close news
+# is mapped to the next trading day at the silver layer), so the policy is
+# ``post_close_next_trading_day`` even though the ``date`` column already holds
+# the aligned date.
+SENTIMENT_ASSET = contract_for_channel(
+    "sentiment",
+    data_type="sentiment",
+    partition="year/month/stock_code",
+    extent_column="date",
+    effective_date_policy="post_close_next_trading_day",
+)
 
 
 class NewsStorage:
@@ -166,14 +185,20 @@ class NewsStorage:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{code}.parquet")
             save_df = group.drop(columns=["year", "month"])
-            save_df.to_parquet(out_path, index=False, compression='lz4')
+            with AtomicCommit(out_path) as ac:
+                save_df.to_parquet(ac.tmp_path, index=False, compression='lz4')
+            write_asset_manifest(out_path, SENTIMENT_ASSET, save_df, entity=code)
 
     def load_daily_sentiment(
-        self, stock_code: str, start_date: str, end_date: str
+        self, stock_code: str, start_date: str, end_date: str,
+        *, require_valid_manifest: bool = False,
     ) -> pd.DataFrame:
         """Load daily sentiment for a stock in a date range.
 
         Prefers consolidated flat file; falls back to year/month partitions.
+        Every file read is cross-checked against its asset manifest
+        (``check_asset_read``); pass ``require_valid_manifest=True`` to raise
+        instead of read when the manifest is missing or mismatched.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -186,6 +211,8 @@ class NewsStorage:
         flat_path = os.path.join(base, f"{stock_code}.parquet")
         if os.path.isfile(flat_path):
             df = pd.read_parquet(flat_path)
+            check_asset_read(flat_path, SENTIMENT_ASSET, df,
+                             require_valid_manifest=require_valid_manifest)
             df["date"] = pd.to_datetime(df["date"])
             mask = (df["date"] >= start) & (df["date"] <= end)
             return df[mask].sort_values("date").reset_index(drop=True)
@@ -197,6 +224,8 @@ class NewsStorage:
                 if f == f"{stock_code}.parquet":
                     path = os.path.join(root, f)
                     df = pd.read_parquet(path)
+                    check_asset_read(path, SENTIMENT_ASSET, df,
+                                     require_valid_manifest=require_valid_manifest)
                     df["date"] = pd.to_datetime(df["date"])
                     mask = (df["date"] >= start) & (df["date"] <= end)
                     frames.append(df[mask])

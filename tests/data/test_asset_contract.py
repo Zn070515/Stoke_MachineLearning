@@ -22,7 +22,12 @@ from stoke_ml.data.announcement_storage import (
     ANNOUNCEMENT_SENTIMENT_ASSET,
     AnnouncementStorage,
 )
-from stoke_ml.data.asset_contract import validate_asset_manifest
+from stoke_ml.data.asset_contract import (
+    DataAssetContract,
+    contract_for_channel,
+    validate_asset_manifest,
+    write_asset_manifest,
+)
 from stoke_ml.data.etf_storage import ETF_FLOW_ASSET, ETFStorage
 from stoke_ml.data.fundamental_storage import FUNDAMENTAL_ASSET, FundamentalStorage
 
@@ -273,3 +278,113 @@ def test_require_valid_manifest_raises_on_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="require_valid_manifest=True"):
         storage.load_raw("000001", require_valid_manifest=True)
+
+
+# ── §十七 interface extension: effective-date policy + vintage status ──────
+
+def test_contract_for_channel_fills_declared_vintage():
+    asset = contract_for_channel(
+        "margin",
+        data_type="margin",
+        partition="year/month/stock_code",
+        extent_column="date",
+        column_contract="margin",
+        effective_date_policy="record_date",
+    )
+    assert asset.vintage_source == "immutable_snapshot"
+    assert asset.vintage_transform == "raw"
+    assert asset.vintage_pit == "verified"
+
+
+def test_contract_for_channel_undeclared_falls_back_to_unknown():
+    asset = contract_for_channel(
+        "no_such_channel", data_type="x", partition="y",
+    )
+    assert asset.vintage_source == "unknown"
+    assert asset.vintage_transform == "unknown"
+    assert asset.vintage_pit == "unknown"
+
+
+def test_new_fields_land_in_manifest_and_validate(tmp_path):
+    asset = contract_for_channel(
+        "capital_flow",
+        data_type="capital_flow",
+        partition="year/month/stock_code",
+        extent_column="date",
+        effective_date_policy="record_date",
+    )
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "stock_code": ["000001"] * 2,
+        "net_inflow": [1.0, 2.0],
+    })
+    path = os.path.join(str(tmp_path), "000001.parquet")
+    df.to_parquet(path, index=False)
+    write_asset_manifest(path, asset, df, entity="000001")
+
+    m = _manifest_of(path)
+    assert m["effective_date_policy"] == "record_date"
+    assert m["vintage_source"] == "immutable_snapshot"
+    assert m["vintage_transform"] == "formula_versioned"
+    assert m["vintage_pit"] == "verified"
+
+    assert validate_asset_manifest(path, asset)["ok"]
+
+
+def test_validate_cross_checks_vintage_tamper(tmp_path):
+    asset = contract_for_channel(
+        "margin", data_type="margin", partition="year/month/stock_code",
+        extent_column="date", effective_date_policy="record_date",
+    )
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"]),
+        "stock_code": ["000001"],
+        "margin_balance": [1.0],
+    })
+    path = os.path.join(str(tmp_path), "000001.parquet")
+    df.to_parquet(path, index=False)
+    write_asset_manifest(path, asset, df, entity="000001")
+
+    _rewrite_manifest(path, lambda m: m.update(
+        vintage_source="latest_revised", effective_date_policy="event_date"))
+
+    report = validate_asset_manifest(path, asset)
+    assert not report["ok"]
+    assert any("vintage_source" in s for s in report["mismatches"])
+    assert any("effective_date_policy" in s for s in report["mismatches"])
+
+
+def test_vintage_extension_leaves_original_contracts_untouched(tmp_path):
+    """The v15 T9 assets (None vintage) keep OLD manifest shape + validate."""
+    storage = FundamentalStorage(str(tmp_path))
+    storage.save(pd.DataFrame({
+        "stock_code": ["000001"],
+        "report_date": pd.to_datetime(["2024-06-30"]),
+        "disclose_date": pd.to_datetime(["2024-08-31"]),
+        "roe": [11.0],
+    }))
+    path = os.path.join(str(tmp_path), "a_shares", "fundamentals", "2024",
+                        "Q2", "000001.parquet")
+    m = _manifest_of(path)
+    assert "vintage_source" not in m
+    assert "effective_date_policy" not in m
+    assert FUNDAMENTAL_ASSET.vintage_source is None
+    assert validate_asset_manifest(path, FUNDAMENTAL_ASSET)["ok"]
+
+
+def test_validate_skips_new_aspects_when_asset_does_not_declare_them(tmp_path):
+    """A legacy-format manifest + a None-vintage asset still validates OK —
+    the new aspects are only cross-checked when the asset declares them."""
+    asset = DataAssetContract(data_type="sentiment", partition="stock_code")
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"]),
+        "stock_code": ["000001"],
+        "score": [0.5],
+    })
+    path = os.path.join(str(tmp_path), "000001.parquet")
+    df.to_parquet(path, index=False)
+    write_asset_manifest(path, asset, df, entity="000001")
+
+    m = _manifest_of(path)
+    assert "vintage_source" not in m
+    assert validate_asset_manifest(path, asset)["ok"]

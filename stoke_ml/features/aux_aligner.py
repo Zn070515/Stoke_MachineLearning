@@ -15,6 +15,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.asset_contract import check_asset_read
+from stoke_ml.data.broadcast_assets import INDUSTRY_ASSET, MARKET_ENV_ASSET
 from stoke_ml.features.aux_cols import (
     SENTIMENT_COLS,
     MARGIN_COLS,
@@ -588,6 +590,10 @@ class AuxAligner:
                     self._warn_if_missing("market_env")
                     return df
                 market_env_df = pd.read_parquet(path)
+                # Lenient broadcast asset check: a manifest-less legacy file
+                # still reads (debug); a present-but-mismatched manifest is
+                # flagged (warning) but the data is still returned.
+                check_asset_read(path, MARKET_ENV_ASSET, market_env_df)
                 self._market_env_cache = market_env_df
         if market_env_df is None or market_env_df.empty:
             return df
@@ -636,6 +642,8 @@ class AuxAligner:
                     self._warn_if_missing("industry")
                     return df
                 raw = pd.read_parquet(path)
+                # Lenient broadcast asset check (see _merge_market_env).
+                check_asset_read(path, INDUSTRY_ASSET, raw)
                 # Compute cross-sectional stats from 90 industry returns
                 industry_df = pd.DataFrame({
                     "date": pd.to_datetime(raw.index),

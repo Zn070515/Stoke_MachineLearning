@@ -32,6 +32,43 @@ itself untouched:
   that flags a tampered file: a parquet whose content hash / row count / data
   type no longer matches its manifest is ``ok=False``.
 
+The Formal Asset Interface (§十七)
+----------------------------------
+A manifest pins SEVEN aspects of the file it guards.  Six are recorded at write
+and cross-checked at read; ``source`` is provenance (reported, not re-derivable
+from the file, so not cross-checked):
+
+1. **Content identity** — ``schema_hash``, a value-level checksum of every
+   column (stable across parquet round-trip rewrites).
+2. **Source identity** — ``source``, drawn from ``df.attrs["source"]``
+   (default ``"unknown"`` when the writing code did not declare it).
+3. **Coverage** — ``start`` / ``end``, the ``extent_column``'s min/max
+   (``"date"``, ``"report_date"``, ...).  A single-file asset whose dates live
+   in the row **index** (broadcast industry / market-env files) is covered the
+   same way: ``_extent`` falls back to a DatetimeIndex when the named column is
+   absent.
+4. **Effective-date policy** — ``effective_date_policy``, HOW the effective
+   date of a stored value is determined.  Vocabulary: ``"record_date"`` (value
+   recorded for a trading day), ``"event_date"`` (schedule/event-list rows
+   keyed by event date), ``"post_close_next_trading_day"`` (post-close text
+   events PIT-mapped to the next trading day at storage),
+   ``"index_date"`` (dates live in the file's DatetimeIndex).
+5. **Vintage status** — ``vintage_source`` / ``vintage_transform`` /
+   ``vintage_pit``, the channel's 3-dim classification drawn from
+   ``channel_vintage.declaration_of`` (:func:`contract_for_channel` fills them
+   automatically).  The manifest of a channel carries the SAME labels its
+   training admission is judged against — a vintage re-declaration is a
+   manifest-visible event, not a silent re-label.
+6. **Schema** — ``column_contract``, the name of a column-schema contract in
+   ``contract.py`` (recorded for provenance; enforcement is a separate gate).
+7. **Atomic commit** — write via temp + ``os.replace``; the manifest itself is
+   written atomically with ``atomic_write_json``.
+
+The original three assets (fundamentals / announcement / ETF flow, v15 T9)
+declare only the first three aspects; the new fields default to ``None`` and
+stay out of their manifests, so nothing written before this extension is
+re-validated differently.
+
 Backward compatibility: existing on-disk aux data has NO manifests, so default
 reads are lenient — a manifest-less file is read (logged at debug) and only a
 PRESENT-but-mismatched manifest is flagged (warning).  ``require_valid_manifest=True``
@@ -50,6 +87,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import pandas as pd
+
+from stoke_ml.data import channel_vintage as _cv
 
 logger = logging.getLogger(__name__)
 
@@ -170,18 +209,71 @@ class DataAssetContract:
 
     Complements the column-schema :class:`stoke_ml.data.contract.DataContract`
     (what columns a dataset must carry) with the FILE-level facts a manifest
-    pins: rows, primary-key extent, schema hash, source, written_at.
+    pins: rows, primary-key extent, schema hash, source, written_at — plus,
+    for headline_v1-adopted channels (§十七), the effective-date policy and the
+    channel's 3-dim vintage status (see the module docstring for the full
+    seven-aspect interface).
     """
 
     data_type: str
     partition: str
     #: Column whose values bound the manifest's start/end (e.g. "date",
-    #: "report_date").  None when the asset has no meaningful extent.
+    #: "report_date").  None when the asset has no meaningful extent.  For a
+    #: single-file asset whose dates live in the row INDEX (broadcast
+    #: industry / market-env), name the index — ``_extent`` falls back to a
+    #: DatetimeIndex when the column is absent.
     extent_column: str | None = None
     #: Name of a column-schema contract in ``contract.py`` governing this
     #: asset.  Recorded in the manifest for provenance; schema enforcement is
     #: a separate gate and is deliberately NOT applied here.
     column_contract: str | None = None
+    #: HOW the effective date of a stored value is determined — one of
+    #: ``"record_date"`` / ``"event_date"`` / ``"post_close_next_trading_day"``
+    #: / ``"index_date"`` (see module docstring).  Recorded in the manifest for
+    #: provenance; ``None`` (the v15 T9 assets) stays out of the manifest.
+    effective_date_policy: str | None = None
+    #: The channel's declared ``source_vintage`` (``immutable_snapshot`` /
+    #: ``latest_revised``) per ``channel_vintage``.  Filled by
+    #: :func:`contract_for_channel`; ``None`` for assets that predate the
+    #: vintage extension.
+    vintage_source: str | None = None
+    #: The channel's declared ``transform`` (``raw`` / ``model_versioned`` /
+    #: ``formula_versioned``).  A RECORDING dimension, not a deny axis.
+    vintage_transform: str | None = None
+    #: The channel's declared ``pit_alignment`` (``verified`` / ``proxy``).
+    #: A RECORDING dimension; does not gate admission.
+    vintage_pit: str | None = None
+
+
+def contract_for_channel(
+    channel: str,
+    *,
+    data_type: str,
+    partition: str,
+    extent_column: str | None = None,
+    column_contract: str | None = None,
+    effective_date_policy: str | None = None,
+) -> DataAssetContract:
+    """A ``DataAssetContract`` for ``channel`` with its 3-dim vintage filled.
+
+    The vintage fields (``vintage_source`` / ``vintage_transform`` /
+    ``vintage_pit``) are drawn from ``channel_vintage.declaration_of(channel)``
+    — the T7 curated declaration — so the manifest of a channel carries the
+    SAME labels its training admission is judged against.  An undeclared
+    channel falls back to the reserved ``"unknown"`` label on each axis
+    (recorded in the manifest, never silently omitted), matching the
+    deny-by-default policy.
+    """
+    return DataAssetContract(
+        data_type=data_type,
+        partition=partition,
+        extent_column=extent_column,
+        column_contract=column_contract,
+        effective_date_policy=effective_date_policy,
+        vintage_source=_cv.source_vintage_of(channel),
+        vintage_transform=_cv.transform_of(channel),
+        vintage_pit=_cv.pit_alignment_of(channel),
+    )
 
 
 def _canonical_dtype(dtype) -> str:
@@ -245,10 +337,22 @@ def schema_hash(df: pd.DataFrame) -> str:
 
 
 def _extent(df: pd.DataFrame, column: str | None) -> dict:
-    """{start, end} iso-date extent of ``column``; empty when not derivable."""
-    if not column or column not in df.columns or not len(df):
+    """{start, end} iso-date extent of ``column``; empty when not derivable.
+
+    When the named column is absent but the frame carries a DatetimeIndex
+    (single-file broadcast assets like industry / market-env whose dates live
+    in the index), the index bounds the extent instead — a documented, strictly
+    additive fallback that does not change column-based assets' behavior.
+    """
+    if not column or not len(df):
         return {}
-    extent = pd.to_datetime(df[column], errors="coerce").dropna()
+    if column in df.columns:
+        values = df[column]
+    elif isinstance(df.index, pd.DatetimeIndex):
+        values = df.index
+    else:
+        return {}
+    extent = pd.to_datetime(values, errors="coerce").dropna()
     if not len(extent):
         return {}
     return {
@@ -283,6 +387,15 @@ def write_asset_manifest(
     manifest.update(_extent(df, asset.extent_column))
     if asset.column_contract:
         manifest["column_contract"] = asset.column_contract
+    for key in (
+        "effective_date_policy",
+        "vintage_source",
+        "vintage_transform",
+        "vintage_pit",
+    ):
+        value = getattr(asset, key)
+        if value:
+            manifest[key] = value
     manifest.update(extra)
     atomic_write_json(asset_manifest_path(parquet_path), manifest)
     return manifest
@@ -336,6 +449,19 @@ def validate_asset_manifest(
     ]
     for key in ("data_type", "partition"):
         expected = getattr(asset, key)
+        if manifest.get(key) != expected:
+            mismatches.append(
+                f"{key}: manifest={manifest.get(key)!r} expected={expected!r}"
+            )
+    for key in (
+        "effective_date_policy",
+        "vintage_source",
+        "vintage_transform",
+        "vintage_pit",
+    ):
+        expected = getattr(asset, key)
+        if expected is None:
+            continue  # asset predates / does not declare this aspect
         if manifest.get(key) != expected:
             mismatches.append(
                 f"{key}: manifest={manifest.get(key)!r} expected={expected!r}"

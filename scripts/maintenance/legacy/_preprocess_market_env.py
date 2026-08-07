@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.asset_contract import write_asset_manifest
+from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
 
 
 def _z(s: pd.Series, win: int = 20) -> pd.Series:
@@ -100,7 +102,10 @@ def main():
     out = pd.DataFrame(series).sort_index()
     out = out.fillna(0.0)
     out.index.name = "date"
-    out.to_parquet(os.path.join(br, "market_env_daily.parquet"), compression="lz4")
+    out.attrs["source"] = "derived market-breadth panel (account_stats/highs_lows/industry advance/turnover)"
+    out_path = os.path.join(br, "market_env_daily.parquet")
+    out.to_parquet(out_path, compression="lz4")
+    write_asset_manifest(out_path, MARKET_ENV_ASSET, out)
     print(f"market_env_daily: {len(out)} dates "
           f"({out.index.min().date()} ~ {out.index.max().date()}), "
           f"{len(out.columns)} cols")

@@ -10,9 +10,13 @@ import pandas as pd
 
 from stoke_ml.data.asset_contract import (
     AtomicCommit,
+    DataAssetContract,
     acquire_lock as _acquire_lock,
     atomic_write_json,
+    check_asset_read,
+    contract_for_channel,
     release_lock as _release_lock,
+    write_asset_manifest,
 )
 from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
@@ -36,6 +40,74 @@ MARKET_DATA_TYPES = [
     "lockup_processed", "dividend_processed", "industry_ranking_processed",
     "concept_blocks_processed", "board_processed", "valuation",
 ]
+
+# File-level asset contracts for the headline_v1 channels that persist through
+# MarketWideStorage (§十七).  Only the 7 safe-only-ALLOWED headline channels are
+# adopted here; every other MARKET_DATA_TYPES value (limit_up_*, shareholder,
+# industry_ranking, the *_processed variants, valuation) is NOT in scope and
+# gets no contract — its files stay manifest-less and read leniently, exactly
+# as before.  ``_asset_for`` returns None for those, so the manifest hooks are
+# strict no-ops outside the adopted set.  ``lockup`` / ``dividend`` are
+# schedule/event lists keyed by date, hence ``effective_date_policy="event_date"``.
+MARKET_WIDE_ASSETS: dict[str, DataAssetContract] = {
+    "margin": contract_for_channel(
+        "margin",
+        data_type="margin",
+        partition="year/month/stock_code",
+        extent_column="date",
+        column_contract="margin",
+        effective_date_policy="record_date",
+    ),
+    "northbound": contract_for_channel(
+        "northbound",
+        data_type="northbound",
+        partition="year/month/stock_code",
+        extent_column="date",
+        column_contract="northbound",
+        effective_date_policy="record_date",
+    ),
+    "dragon_tiger": contract_for_channel(
+        "dragon_tiger",
+        data_type="dragon_tiger",
+        partition="year/month/stock_code",
+        extent_column="date",
+        column_contract="dragon_tiger",
+        effective_date_policy="record_date",
+    ),
+    "capital_flow": contract_for_channel(
+        "capital_flow",
+        data_type="capital_flow",
+        partition="year/month/stock_code",
+        extent_column="date",
+        effective_date_policy="record_date",
+    ),
+    "block_trade": contract_for_channel(
+        "block_trade",
+        data_type="block_trade",
+        partition="year/month/stock_code",
+        extent_column="date",
+        effective_date_policy="record_date",
+    ),
+    "lockup": contract_for_channel(
+        "lockup",
+        data_type="lockup",
+        partition="year/month/stock_code",
+        extent_column="date",
+        effective_date_policy="event_date",
+    ),
+    "dividend": contract_for_channel(
+        "dividend",
+        data_type="dividend",
+        partition="year/month/stock_code",
+        extent_column="date",
+        effective_date_policy="event_date",
+    ),
+}
+
+
+def _asset_for(data_type: str) -> DataAssetContract | None:
+    """The file-level asset contract for ``data_type``, or None when unadopted."""
+    return MARKET_WIDE_ASSETS.get(data_type)
 
 
 class MarketWideStorage:
@@ -160,6 +232,10 @@ class MarketWideStorage:
                     with AtomicCommit(out_path) as ac:
                         new_rows.to_parquet(ac.tmp_path, index=False,
                                             compression='lz4')
+                    asset = _asset_for(self._data_type)
+                    if asset is not None:
+                        write_asset_manifest(out_path, asset, new_rows,
+                                             entity=code)
                 if provenance is not None:
                     self._write_manifest(code, provenance, report, decision, new_rows)
             finally:
@@ -238,15 +314,20 @@ class MarketWideStorage:
         atomic_write_json(path, payload)
 
     def load(
-        self, stock_code: str, start_date: str, end_date: str
+        self, stock_code: str, start_date: str, end_date: str,
+        *, require_valid_manifest: bool = False,
     ) -> pd.DataFrame:
         """Load market data for a single stock in a date range.
 
         Prefers consolidated flat file; falls back to year/month partitions.
+        Every file read is cross-checked against its asset manifest
+        (``check_asset_read``); pass ``require_valid_manifest=True`` to raise
+        instead of read when the manifest is missing or mismatched.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
         base = self._base_dir()
+        asset = _asset_for(self._data_type)
 
         if not os.path.exists(base):
             return pd.DataFrame()
@@ -255,6 +336,9 @@ class MarketWideStorage:
         flat_path = os.path.join(base, f"{stock_code}.parquet")
         if os.path.isfile(flat_path):
             df = pd.read_parquet(flat_path)
+            if asset is not None:
+                check_asset_read(flat_path, asset, df,
+                                 require_valid_manifest=require_valid_manifest)
             df["date"] = pd.to_datetime(df["date"])
             mask = (df["date"] >= start) & (df["date"] <= end)
             return df[mask].sort_values("date").reset_index(drop=True)
@@ -276,6 +360,9 @@ class MarketWideStorage:
                 if not os.path.exists(file_path):
                     continue
                 df = pd.read_parquet(file_path)
+                if asset is not None:
+                    check_asset_read(file_path, asset, df,
+                                     require_valid_manifest=require_valid_manifest)
                 df["date"] = pd.to_datetime(df["date"])
                 mask = (df["date"] >= start) & (df["date"] <= end)
                 frames.append(df[mask])

@@ -12,7 +12,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from stoke_ml.data.market_wide_storage import MarketWideStorage
+from stoke_ml.data.asset_contract import validate_asset_manifest
+from stoke_ml.data.market_wide_storage import MARKET_WIDE_ASSETS, MarketWideStorage
 
 
 def _frame(dates, code="000001", extra=None):
@@ -45,6 +46,85 @@ def _read_manifest(tmp_path, code="000001", data_type="margin"):
     )
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _asset_manifest_of(parquet_path: str) -> dict:
+    with open(parquet_path + ".manifest.json", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _rewrite_asset_manifest(path: str, mutator) -> None:
+    manifest = _asset_manifest_of(path)
+    mutator(manifest)
+    with open(path + ".manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+
+ADOPTED_HEADLINE_CHANNELS = sorted(MARKET_WIDE_ASSETS)
+
+
+class TestAssetContract:
+    """§十七: the 7 headline channels persisted through MarketWideStorage carry
+    a file-level asset manifest alongside the provenance sidecar."""
+
+    @pytest.mark.parametrize("data_type", ADOPTED_HEADLINE_CHANNELS)
+    def test_adopted_channel_round_trip_writes_valid_manifest(self, tmp_path,
+                                                              data_type):
+        s = _storage(tmp_path, data_type)
+        s.save(_frame(["2024-01-02", "2024-01-03"], extra={"v2": 1.0}))
+
+        path = os.path.join(str(tmp_path), "a_shares", data_type,
+                            "000001.parquet")
+        assert os.path.isfile(path + ".manifest.json")
+        report = validate_asset_manifest(path, MARKET_WIDE_ASSETS[data_type])
+        assert report["ok"], report
+
+        manifest = _asset_manifest_of(path)
+        assert manifest["data_type"] == data_type
+        assert manifest["vintage_source"] == "immutable_snapshot"
+        assert manifest["start"] == "2024-01-02"
+        assert manifest["end"] == "2024-01-03"
+
+        out = s.load("000001", "2024-01-01", "2024-01-31")
+        assert len(out) == 2
+
+    @pytest.mark.parametrize("data_type", ADOPTED_HEADLINE_CHANNELS)
+    def test_adopted_channel_tamper_raises_when_required(self, tmp_path,
+                                                         data_type):
+        s = _storage(tmp_path, data_type)
+        s.save(_frame(["2024-01-02", "2024-01-03"]))
+        path = os.path.join(str(tmp_path), "a_shares", data_type,
+                            "000001.parquet")
+        _rewrite_asset_manifest(path, lambda m: m.update(rows=999))
+
+        # lenient read still returns the data
+        assert len(s.load("000001", "2024-01-01", "2024-01-31")) == 2
+        # formal read refuses it
+        with pytest.raises(ValueError, match="require_valid_manifest=True"):
+            s.load("000001", "2024-01-01", "2024-01-31",
+                   require_valid_manifest=True)
+
+    def test_unadopted_data_type_gets_no_manifest(self, tmp_path):
+        """A MARKET_DATA_TYPES value outside the headline set stays
+        manifest-less (non-breaking) — e.g. ``shareholder``."""
+        s = _storage(tmp_path, "shareholder")
+        s.save(_frame(["2024-01-02"]))
+        path = os.path.join(str(tmp_path), "a_shares", "shareholder",
+                            "000001.parquet")
+        assert os.path.isfile(path)  # parquet written
+        assert not os.path.isfile(path + ".manifest.json")  # no asset manifest
+        assert MARKET_WIDE_ASSETS.get("shareholder") is None
+
+    def test_vintage_tamper_detected(self, tmp_path):
+        s = _storage(tmp_path, "margin")
+        s.save(_frame(["2024-01-02"]))
+        path = os.path.join(str(tmp_path), "a_shares", "margin",
+                            "000001.parquet")
+        _rewrite_asset_manifest(path, lambda m: m.update(vintage_source="unknown"))
+
+        report = validate_asset_manifest(path, MARKET_WIDE_ASSETS["margin"])
+        assert not report["ok"]
+        assert any("vintage_source" in s_ for s_ in report["mismatches"])
 
 
 class TestReplaceRangeGuard:
