@@ -342,39 +342,29 @@ def _build_panel_streaming(
         norm_cols = [c for c in pk_cols_available + po_cols_available
                      if c not in _CS_NORM_SKIP_COLS]
 
-        # ── Pass 2stats: dense normalizer stats over date+norm_cols ─────
-        # Load all artifacts, extract ONLY date + norm_cols (≈175 cols,
-        # 3× smaller than full frames), concat, and run the EXACT dense
-        # normalize() method.  The resulting stats are byte-identical to
-        # the dense path — the streaming accumulation alternatives all
-        # shift float summation order and produce ULP-level discrepancies.
-        # The light frames are ZI-aligned so normalize()'s concat
-        # `df[["date"] + norm_cols]` never raises KeyError on a missing
-        # norm_col.
-        _norm_col_set = frozenset(norm_cols)
-        if daily_membership is not None and not daily_membership.empty:
-            _stats_frames = []
-            for code in valid_codes:
-                pkl_path = os.path.join(scratch, f"{code}.pkl")
-                df = pd.read_pickle(pkl_path)
-                keep = ["date", "stock_code"] + [
-                    c for c in norm_cols if c in df.columns
-                ]
-                df = _zi_align_df(df[keep], _norm_col_set | {"date", "stock_code"})
-                _stats_frames.append(df)
-        else:
-            _stats_frames = []
-            for code in valid_codes:
-                pkl_path = os.path.join(scratch, f"{code}.pkl")
-                df = pd.read_pickle(pkl_path)
-                keep = ["date"] + [c for c in norm_cols if c in df.columns]
-                df = _zi_align_df(df[keep], _norm_col_set | {"date"})
-                _stats_frames.append(df)
+        # ── Pass 2stats: streaming per-date cross-section stats (§T5) ────
+        # Accumulate per-date (count/sum/sumsq) aggregates one stock frame
+        # at a time instead of concat-ing all light frames — the old
+        # _stats_frames list (~23-46GB at full-market scale) is eliminated,
+        # keeping peak memory bounded (tracemalloc-verified sublinear growth).
+        # Each chunk is ZI-aligned to all_cols FIRST so a norm column absent
+        # from a stock contributes 0 exactly like the dense path's ZI-fill
+        # (accumulate_stats_chunk skips columns that are missing from the
+        # chunk, so the frame must already carry every norm_col).  Streaming
+        # float64 accumulation vs the dense pandas groupby over the concat
+        # frame shifts float summation order, so the z-scored grids differ at
+        # ULP level — a CONTROLLED diff (§T5) asserted with
+        # rtol=1e-5/atol=1e-6 in tests/features/test_panel_builders.py for
+        # past_known/past_observed ONLY.
         normalizer = DateWiseZScoreNormalizer(daily_membership)
-        _, date_stats = normalizer.normalize(
-            _stats_frames, pk_cols_available, po_cols_available,
-        )
-        del _stats_frames
+        normalizer.init_stats_accumulator()
+        for code in valid_codes:
+            pkl_path = os.path.join(scratch, f"{code}.pkl")
+            df = pd.read_pickle(pkl_path)
+            df = _zi_align_df(df, all_cols)
+            normalizer.accumulate_stats_chunk(df, norm_cols)
+            del df
+        date_stats = normalizer.finalize_date_stats(norm_cols, all_dates)
 
         # ── Pass 3: targets + ZI-align + cs merge + z-score + scatter ──
         target_builder = TargetBuilder(horizon, target_col)

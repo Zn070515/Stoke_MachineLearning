@@ -261,6 +261,13 @@ class DateWiseZScoreNormalizer:
         self._all_acc: dict[tuple, tuple[int, float, float]] = {}
         self._member_acc: dict[tuple, tuple[int, float, float]] = {}
         self._member_dates: set = set()
+        # Per-column source dtype (§T5): the dense path stores mean/std in the
+        # concat frame's dtype (float64 if ANY engineered frame carries the col
+        # as float64, else float32).  The streaming stats must cast to the SAME
+        # dtype — a near-constant column (std clipped to 1e-8) amplifies a
+        # float32-vs-float64 mean rounding (~2.5e-6 at magnitude ~126) into a
+        # ±10 z-score flip.  Track whether any accumulated chunk is float64.
+        self._col_is_f64: dict[str, bool] = {}
 
     def accumulate_stats_chunk(
         self,
@@ -279,6 +286,10 @@ class DateWiseZScoreNormalizer:
         active_cols = [c for c in norm_cols if c in df.columns]
         if not active_cols:
             return
+
+        for col in active_cols:
+            if not self._col_is_f64.get(col, False) and df[col].dtype == np.float64:
+                self._col_is_f64[col] = True
 
         if self.membership_active:
             is_member_series = _daily_member_flag(
@@ -334,14 +345,26 @@ class DateWiseZScoreNormalizer:
         accumulator for the given date subset.
 
         Reproduces the expanding-moment sparse fallback from
-        :func:`_cross_section_stats` using the per-date aggregates —
-        cumsum over per-date sums equals cumsum over row-sorted values
-        (associative), so the fallback is bit-exact.
+        :func:`_cross_section_stats` using the per-date aggregates.  The
+        sparse fallback is NOT bit-exact against the dense path: the dense
+        path cumsums individual rows in concat order while this path cumsums
+        per-date sums (associative in exact arithmetic, but float rounding
+        differs) — a controlled ~1e-13 float64 summation-order diff.
+
+        §T5 amplification edge: on a NEAR-CONSTANT cross-section (every stock
+        identical on a date) the per-date std is 0 and clips to the 1e-8
+        floor, amplifying that ~1e-13 mean diff to a ~1e-5..1e-4 absolute
+        z-diff.  Immaterial in production (real cross-sections are
+        non-constant, std >> 1e-8), which is why the panel_builder test
+        fixtures use seeded per-stock price noise to keep compared columns
+        non-constant.
         """
         all_dates_sorted = sorted(dates_subset)
         date_stats: dict[str, pd.DataFrame] = {}
 
         for col in norm_cols:
+            # Match the dense path's stored dtype for this column (§T5).
+            out_dtype = np.float64 if self._col_is_f64.get(col, False) else np.float32
             rows: list[dict] = []
             for d in all_dates_sorted:
                 cnt, s_sum, s_sq = acc.get((d, col), (0, 0.0, 0.0))
@@ -372,8 +395,8 @@ class DateWiseZScoreNormalizer:
             )
             std_arr = np.sqrt(np.maximum(var_arr, 0.0))
 
-            stats_df["mean"] = mean_arr.astype(np.float32)
-            stats_df["std"] = std_arr.astype(np.float32)
+            stats_df["mean"] = mean_arr.astype(out_dtype)
+            stats_df["std"] = std_arr.astype(out_dtype)
             stats_df["count"] = cnt_arr
 
             # fillna(1.0) + clip(lower=1e-8) on std (matching dense path).
@@ -389,10 +412,10 @@ class DateWiseZScoreNormalizer:
                 cum_var = np.maximum(cum_sq / cum_cnt - cum_mean ** 2, 0.0)
                 cum_std = np.maximum(np.sqrt(cum_var), 1e-8)
                 stats_df.loc[sparse, "mean"] = (
-                    cum_mean[sparse].astype(np.float32)
+                    cum_mean[sparse].astype(out_dtype)
                 )
                 stats_df.loc[sparse, "std"] = (
-                    cum_std[sparse].astype(np.float32)
+                    cum_std[sparse].astype(out_dtype)
                 )
 
             date_stats[col] = stats_df[["mean", "std", "count"]]

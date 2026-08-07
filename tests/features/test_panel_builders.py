@@ -22,6 +22,23 @@ from stoke_ml.features.panel_builders._arrays import PanelArrays
 from stoke_ml.features.panel_builders._targets import TargetBuilder
 
 
+def _noisy_px(base, n_dates, code):
+    """Deterministic per-stock close price noise (seeded by stock code).
+
+    §T5: a fixture where every stock shares the SAME linear price sequence
+    makes the cross-sectional oscillator columns (cci/rsi/kdj/wr) identical
+    across stocks.  On the all-sparse fixtures (count<5 on every date) the
+    sparse fallback's per-date std is 0 and clips to the 1e-8 floor, which
+    amplifies the ~1e-13 float64 summation-order diff between the dense
+    row-level cumsum and the streaming per-date-sum cumsum to a ~1e-5
+    absolute z-diff.  Adding seeded noise keeps the cross-sections
+    non-constant so the amplification cannot occur (production cross-sections
+    are never constant).
+    """
+    return (base + np.arange(n_dates) * 0.1
+            + np.random.RandomState(int(code)).normal(0, 0.2, n_dates))
+
+
 def _tiny_panel():
     """Two stocks, 8 trading days, monotone prices -> predictable targets."""
     dates = pd.to_datetime([
@@ -313,7 +330,7 @@ class TestBuildPanelFeaturesMemmap:
         dates = pd.date_range("2024-01-02", periods=20, freq="B")
         dfs = []
         for code, base in [("000001", 10.0), ("000002", 20.0), ("000003", 30.0)]:
-            px = base + np.arange(len(dates)) * 0.1
+            px = _noisy_px(base, len(dates), code)
             dfs.append(pd.DataFrame({
                 "date": dates,
                 "stock_code": code,
@@ -342,6 +359,26 @@ class TestBuildPanelFeaturesMemmap:
         return fp.build_panel_features(
             panel, horizon=1, memmap_dir=memmap_dir)
 
+    def _assert_grid_matches(self, key, actual, expected):
+        """Byte-identity on every grid except the §T5 controlled ULP diff.
+
+        past_known / past_observed carry the per-date z-scored columns.  The
+        streaming path accumulates stats per stock with float64 running sums
+        while the dense path concats all frames then runs a pandas groupby —
+        float summation order differs, so those two grids match only within
+        rtol=1e-5/atol=1e-6 (§T5).  Every other grid (static features, masks,
+        prices, quantile ranks) must stay bit-identical.
+        """
+        if key in ("past_known", "past_observed"):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected),
+                rtol=1e-5, atol=1e-6,
+                err_msg=f"z-scored grid mismatch on {key}")
+        else:
+            np.testing.assert_array_equal(
+                np.asarray(actual), np.asarray(expected),
+                err_msg=f"grid mismatch on {key}")
+
     def test_dense_vs_memmap_identical(self, tmp_path):
         """Both paths produce element-identical arrays."""
         dense = self._build_fixture(tmp_path, memmap_dir=None)
@@ -355,9 +392,9 @@ class TestBuildPanelFeaturesMemmap:
                     "realized_return", "close_price", "open_price",
                     "decision_eligible_mask", "history_eligible_mask",
                     "universe_eligible_mask"):
-            np.testing.assert_array_equal(
-                np.asarray(memmap_out[key]), np.asarray(dense[key]),
-                err_msg=f"memmap vs dense mismatch on {key}")
+            self._assert_grid_matches(
+                key, memmap_out[key], dense[key],
+            )
         # Metadata identical
         assert memmap_out["stock_codes"] == dense["stock_codes"]
         assert memmap_out["past_known_cols"] == dense["past_known_cols"]
@@ -435,9 +472,9 @@ class TestBuildPanelFeaturesMemmap:
                     "observation_mask", "entry_eligible_mask",
                     "return_target_mask", "vol_target_mask",
                     "realized_return", "close_price", "open_price"):
-            np.testing.assert_array_equal(
-                np.asarray(loaded[key]), np.asarray(dense[key]),
-                err_msg=f"round-trip mismatch on {key}")
+            self._assert_grid_matches(
+                key, loaded[key], dense[key],
+            )
         assert loaded["stock_codes"] == dense["stock_codes"]
 
     def test_sink_store_records_schema_binding_tamper_refused(self, tmp_path):
@@ -540,7 +577,11 @@ class TestBuildPanelFeaturesMemmap:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _assert_streaming_eq_dense(self, dense, streaming, extra_grid_keys=()):
-        """Assert streaming-vs-dense byte-identity on all arrays + metadata."""
+        """Assert streaming-vs-dense identity on all arrays + metadata.
+
+        past_known / past_observed are compared with the §T5 controlled-ULP
+        tolerance (rtol=1e-5/atol=1e-6); every other grid stays byte-exact
+        (see _assert_grid_matches)."""
         grid_keys = (
             "static_features", "past_known", "past_observed",
             "y_direction", "y_return", "y_volatility",
@@ -552,9 +593,9 @@ class TestBuildPanelFeaturesMemmap:
         ) + tuple(extra_grid_keys)
         for key in grid_keys:
             if key in dense and key in streaming:
-                np.testing.assert_array_equal(
-                    np.asarray(streaming[key]), np.asarray(dense[key]),
-                    err_msg=f"streaming vs dense mismatch on {key}")
+                self._assert_grid_matches(
+                    key, streaming[key], dense[key],
+                )
         assert streaming["stock_codes"] == dense["stock_codes"]
         assert streaming["past_known_cols"] == dense["past_known_cols"]
         assert streaming["past_observed_cols"] == dense["past_observed_cols"]
@@ -572,7 +613,7 @@ class TestBuildPanelFeaturesMemmap:
         codes = ["000001", "000002", "000003"]
         dfs = []
         for code, base in zip(codes, [10.0, 20.0, 30.0]):
-            px = base + np.arange(len(dates)) * 0.1
+            px = _noisy_px(base, len(dates), code)
             dfs.append(pd.DataFrame({
                 "date": dates,
                 "stock_code": code,
@@ -638,7 +679,7 @@ class TestBuildPanelFeaturesMemmap:
         for code_idx, (code, base) in enumerate(
             zip(codes, [10.0, 20.0, 30.0])
         ):
-            px = base + np.arange(len(dates)) * 0.1
+            px = _noisy_px(base, len(dates), code)
             dfs.append(pd.DataFrame({
                 "date": dates,
                 "stock_code": code,
@@ -716,7 +757,7 @@ class TestBuildPanelFeaturesMemmap:
         dfs = []
         for i in range(3):
             code = f"{i:06d}"
-            px = 10.0 + np.arange(len(early_dates)) * 0.1
+            px = _noisy_px(10.0, len(early_dates), code)
             dfs.append(pd.DataFrame({
                 "date": early_dates,
                 "stock_code": code,
@@ -729,7 +770,7 @@ class TestBuildPanelFeaturesMemmap:
             }))
         for i in range(3, 8):
             code = f"{i:06d}"
-            px = 10.0 + np.arange(len(late_dates)) * 0.1
+            px = _noisy_px(10.0, len(late_dates), code)
             dfs.append(pd.DataFrame({
                 "date": late_dates,
                 "stock_code": code,
