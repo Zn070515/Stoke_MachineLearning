@@ -321,9 +321,13 @@ def _resolve_panel(
     if not args.no_aux and not args.prebuilt:
         logger.info("Loading auxiliary data...")
         t_aux = time.time()
+        # §T4: formal mode threads the formal flag into load_aux_data so the
+        # required channels' Asset Manifests are ENFORCED (fail-hard), not just
+        # warned on.  --no-formal (explore) keeps the legacy warn-and-proceed.
         aux_data, channel_manifest = load_aux_data(
             stock_list, data_dir, args.start, args.end,
             required_channels=required_set,
+            formal=_formal_mode(args),
         )
         logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
 
@@ -864,14 +868,160 @@ def _load_channel_aux(
             errors += 1
     _finalize_channel(entry, name, loaded, errors, n)
 
+def _fmt_manifest_problem(path: str, report: dict) -> str:
+    """Human-readable problem string from a ``validate_asset_manifest`` report."""
+    if report.get("reason"):
+        return f"{path}: {report['reason']}"
+    return f"{path}: " + "; ".join(report.get("mismatches") or ["manifest mismatch"])
+
+
+def _enforce_formal_manifests(
+    stock_list: list[str],
+    data_dir: str,
+    start_date: str,
+    end_date: str,
+    required_set: set[str],
+) -> None:
+    """§T4/§十九-9: formal-mode asset-manifest gate for the required aux channels.
+
+    Runs once, BEFORE the lenient per-channel load, when ``formal=True``.  For
+    every required channel with data on disk, the channel's asset manifest(s)
+    must be present AND match the parquet they guard (content ``schema_hash`` /
+    ``rows`` / ``start``-``end`` extent / ``data_type`` / ``partition`` / vintage
+    declaration).  A channel whose data file exists but whose manifest is
+    missing or mismatched — or a required channel with NO manifest support at
+    all (the cninfo announcement-sentiment path, and the unadopted
+    MarketWideStorage types shareholder/valuation) — FAILS HARD (SystemExit)
+    instead of the explore-mode warn-and-proceed.
+
+    Channels with NO data on disk are NOT checked here: the coverage gate
+    (``train_panel_gates._enforce_channel_coverage``) already aborts a required
+    channel at zero coverage.  This gate is the MANIFEST side of §十九-9 only.
+    """
+    from stoke_ml.data.news_storage import NewsStorage
+    from stoke_ml.data.guba_storage import GubaStorage
+    from stoke_ml.data.market_wide_storage import (
+        MARKET_WIDE_ASSETS, MarketWideStorage,
+    )
+    from stoke_ml.data.fundamental_storage import FundamentalStorage
+    from stoke_ml.data.comment_storage import CommentStorage
+    from stoke_ml.data.announcement_storage import AnnouncementStorage
+    from stoke_ml.data.broadcast_assets import INDUSTRY_ASSET, MARKET_ENV_ASSET
+    from stoke_ml.data.etf_storage import ETF_FLOW_ASSET
+    from stoke_ml.data.asset_contract import validate_asset_manifest
+
+    problems: list[str] = []
+    code_set = set(stock_list)
+
+    def _per_stock(ch: str, storage, load_name: str) -> None:
+        """Formal per-stock read of one channel; first failure is fatal.
+
+        The storage's ``load_*(..., require_valid_manifest=True)`` raises
+        ``ValueError`` (via ``asset_contract.check_asset_read``) the moment a
+        present parquet's manifest is missing or mismatched; a stock with no
+        file on disk returns an empty frame without raising (its absence is the
+        coverage gate's concern).  One representative failure per channel is
+        enough to abort it — the same channel-wide defect hits every stock.
+        """
+        load = getattr(storage, load_name)
+        for code in stock_list:
+            try:
+                load(code, start_date, end_date, require_valid_manifest=True)
+            except Exception as exc:
+                problems.append(f"{ch}[{code}]: {exc}")
+                return
+
+    for ch in sorted(required_set):
+        if ch == "sentiment":
+            _per_stock(ch, NewsStorage(data_dir), "load_daily_sentiment")
+        elif ch == "guba":
+            _per_stock(ch, GubaStorage(data_dir), "load_daily_sentiment")
+        elif ch == "comment":
+            _per_stock(ch, CommentStorage(data_dir), "load_daily")
+        elif ch == "fundamental":
+            _per_stock(ch, FundamentalStorage(data_dir), "load")
+        elif ch == "announcement":
+            # The loader PREFERS the cninfo announcement-sentiment path, which
+            # has NO storage/manifest support — under formal it must fail loudly
+            # (use --prebuilt or add a DataAssetContract writer; T5/T9).
+            cninfo_dir = os.path.join(
+                data_dir, "a_shares", "cninfo_announcements", "sentiment")
+            cninfo_hits = []
+            if os.path.isdir(cninfo_dir):
+                cninfo_hits = [
+                    f for f in os.listdir(cninfo_dir)
+                    if f.endswith(".parquet")
+                    and os.path.splitext(f)[0] in code_set
+                ]
+            if cninfo_hits:
+                problems.append(
+                    "announcement: cninfo announcement-sentiment "
+                    f"({cninfo_dir}/) has no asset-manifest support — use "
+                    "--prebuilt or add a DataAssetContract writer for it "
+                    "(T5/T9)")
+            else:
+                _per_stock(ch, AnnouncementStorage(data_dir),
+                           "load_daily_sentiment")
+        elif ch in _MARKET_WIDE_CHANNELS:
+            data_type = live_data_type(CHANNEL_SOURCE[ch])
+            if data_type not in MARKET_WIDE_ASSETS:
+                problems.append(
+                    f"{ch}: MarketWideStorage data_type {data_type!r} has no "
+                    "asset-manifest contract — use --prebuilt or adopt a "
+                    "DataAssetContract for it (T9)")
+            else:
+                _per_stock(ch, MarketWideStorage(data_dir, data_type), "load")
+        elif ch == "etf_flow":
+            etf_base = os.path.join(data_dir, "a_shares", "etf_flow")
+            if os.path.isdir(etf_base):
+                for f in sorted(os.listdir(etf_base)):
+                    if f.startswith("sector_") and f.endswith(".parquet"):
+                        path = os.path.join(etf_base, f)
+                        report = validate_asset_manifest(path, ETF_FLOW_ASSET)
+                        if not report["ok"]:
+                            problems.append(_fmt_manifest_problem(path, report))
+                            break
+        elif ch in ("industry", "market_env"):
+            fname = ("industry_returns.parquet" if ch == "industry"
+                     else "market_env_daily.parquet")
+            asset = INDUSTRY_ASSET if ch == "industry" else MARKET_ENV_ASSET
+            rel = os.path.join(*source_dir(CHANNEL_SOURCE[ch]).split("/"), fname)
+            path = os.path.join(data_dir, rel)
+            if os.path.isfile(path):
+                report = validate_asset_manifest(path, asset)
+                if not report["ok"]:
+                    problems.append(_fmt_manifest_problem(path, report))
+        else:
+            problems.append(
+                f"{ch}: required channel is not loaded by load_aux_data and "
+                "has no manifest checker — cannot verify in formal mode; use "
+                "--prebuilt")
+    if problems:
+        for p in problems:
+            logger.error("formal manifest gate: %s", p)
+        raise SystemExit(
+            "formal mode: required aux-channel asset-manifest gate FAILED — "
+            "refusing to train on unverified data (§T4/§十九-9): "
+            + "; ".join(problems))
+
+
 def load_aux_data(
     stock_list: list[str],
     data_dir: str,
     start_date: str,
     end_date: str,
     required_channels: set[str] | None = None,
+    formal: bool = False,
 ) -> tuple[dict[str, dict[str, pd.DataFrame]], dict]:
     """Load auxiliary data (sentiment, guba, margin, etc.) per stock.
+
+    ``formal`` (§T4): a FORMAL run (``formal=True``, threaded from
+    ``_formal_mode(args)`` in the live branch of ``_resolve_panel``) runs
+    :func:`_enforce_formal_manifests` first — every required channel's asset
+    manifest must be present + matching, else the run aborts (SystemExit).  The
+    default ``formal=False`` (explore / legacy) keeps the warn-and-proceed
+    behavior byte-for-byte: lenient reads, a present-but-mismatched manifest
+    logs a warning, a manifest-less file reads as legacy data.
 
     Returns (result, manifest):
       result   — {stock_code: {"sentiment": df, "guba": df, ...}}
@@ -888,6 +1038,13 @@ def load_aux_data(
     result: dict[str, dict[str, pd.DataFrame]] = {c: {} for c in stock_list}
     manifest: dict[str, dict] = {}
     required_set = set(required_channels or ())
+
+    # §T4/§十九-9: formal mode — every required channel's asset manifest must
+    # be present + matching BEFORE any lenient load proceeds.  Explore mode
+    # (formal=False) skips this entirely and keeps the legacy warn-and-proceed.
+    if formal and required_set:
+        _enforce_formal_manifests(
+            stock_list, data_dir, start_date, end_date, required_set)
 
     # Sentiment (news)
     _load_channel_aux(
