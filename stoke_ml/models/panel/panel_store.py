@@ -125,6 +125,8 @@ _WARN_META_KEYS: tuple[str, ...] = (
 # CHUNK_MANIFEST_ROOT_KEY.  A load only QUICKLY verifies the manifest
 # (recomputed root from its own digests + the meta binding — no array I/O);
 # the deep per-chunk re-hash is the on-demand verify_panel_store_chunks().
+# Chunk CONTENT digests use FULL SHA-256 (unlike the 16-hex SHA-1 used for the
+# header identity bindings above) — the audit names SHA-256 for content.
 _CHUNK_BYTES = 256 * 1024 * 1024  # 256MB per the audit recommendation
 _MANIFEST_FILE = "chunk_manifest.json"
 _CHUNK_MANIFEST_ROOT_KEY = "chunk_manifest_root_hash"
@@ -227,7 +229,12 @@ def _npy_data_offset(path: Path) -> int:
     memmap is dropped before the caller streams the file itself.
     """
     arr = np.load(path, mmap_mode="r")
-    return int(arr.offset)
+    offset = int(arr.offset)
+    # Explicitly release the transient memmap before the caller streams the file
+    # (Windows keeps an open memmap's backing file locked; refcount would free it
+    # on CPython, but del makes the intent explicit and robust on other runtimes).
+    del arr
+    return offset
 
 
 def _hash_npy_chunks(
@@ -662,6 +669,10 @@ def _validate_self_consistency(
         )
 
 
+# §十九 (T10b): a self-consistency binding like stock_order_hash, but it lives
+# OUTSIDE _SELF_CONSISTENCY_RECOMPUTE because its recompute needs the ON-DISK
+# files (chunk_manifest.json), not the in-memory panel_data dict — so it is
+# recorded/validated via its own dedicated path instead of the recompute table.
 def _validate_chunk_manifest(
     out: Path, data: dict, recorded: dict | None = None,
 ) -> None:
@@ -903,11 +914,19 @@ def verify_panel_store_chunks(out_dir: str | Path) -> dict:
                 f"panel store at {out}: {_MANIFEST_FILE} lists {name}.npy but "
                 "the file is missing — the store no longer matches its manifest."
             )
+        recorded_digests = entry.get("digests", [])
         digests, root = _hash_npy_chunks(p, chunk_bytes)
-        if digests != entry.get("digests") or root != entry.get("root"):
+        if len(digests) != len(recorded_digests):
+            raise RuntimeError(
+                f"panel store at {out}: {name}.npy has {len(digests)} chunks "
+                f"but the recorded chunk manifest lists {len(recorded_digests)} "
+                "— the chunk count no longer matches (file replaced or truncated); "
+                "rebuild the store."
+            )
+        if digests != recorded_digests or root != entry.get("root"):
             first_bad = next(
-                (i for i, (got, exp) in enumerate(
-                    zip(digests, entry.get("digests", []))) if got != exp),
+                (i for i, (got, exp) in enumerate(zip(digests, recorded_digests))
+                 if got != exp),
                 len(digests),
             )
             raise RuntimeError(
