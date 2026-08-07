@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from stoke_ml.config import feature_profile as _fp
 from stoke_ml.data.asset_contract import parse_era_coverage
 from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.channel_sources import CHANNEL_SOURCE, live_data_type, source_dir
@@ -405,12 +406,37 @@ def _validate_panel_store_path(path: str) -> None:
             "directory or remove the conflicting file."
         )
 
-# §T8: the era-capable text channels — the four whose gold (daily) asset
+# §T8: the era-capable text channels — the channels whose gold (daily) asset
 # manifests carry the provider-era fields (provider_available_start/end,
 # retrieved_ranges, known_gaps) recorded by the storage write-end from the
 # downloader per-stock manifest.  Only these can separate no_event from
-# not_observed, so only these get an era_coverage probe.
-_ERA_CAPABLE_CHANNELS = ("sentiment", "guba", "comment", "announcement")
+# not_observed, so only these get an era_coverage probe.  The SET is DERIVED
+# from the feature profiles' ``era_coverage`` contracts (single source of
+# truth) rather than hard-coded, so a channel that gains an era_coverage
+# contract is automatically probed (and one that drops it stops being probed).
+
+
+def _era_capable_channels() -> frozenset[str]:
+    """Channels with an ``era_coverage`` contract in ANY feature profile (§T8).
+
+    Derived from ``feature_profile.FEATURE_PROFILES`` — the single source of
+    truth for which channels are gated on provider-era retrieval coverage —
+    instead of a hard-coded list that must be kept in sync by hand.  The UNION
+    is taken over ALL profiles, not just the run's active profile: the probe is
+    a data-capability read of the gold manifests, and it must not silently
+    collapse to an empty set when ``profile_name`` is None (the live default,
+    where no profile is active but sentiment/guba era contracts still gate
+    headline_v1 formal runs).  Read via the module attribute (not a captured
+    binding) so tests that mutate the profile registry are observed at call
+    time.
+    """
+    channels = {
+        ch
+        for prof in _fp.FEATURE_PROFILES.values()
+        for ch, contract in prof.coverage_contracts.items()
+        if contract.metric == "era_coverage"
+    }
+    return frozenset(channels)
 
 
 def _gold_manifest_paths(data_dir: str, channel: str, code: str) -> list[str]:
@@ -451,6 +477,11 @@ def _stock_era_coverage(data_dir: str, channel: str, code: str) -> tuple:
             with open(mp, "r", encoding="utf-8") as f:
                 asset_manifest = json.load(f)
         except (OSError, ValueError):
+            # A PRESENT but unreadable manifest is diagnostically different from
+            # a MISSING one — a broken manifest is a tamper/format signal, not
+            # "this stock was never observed".
+            logger.debug("_stock_era_coverage: unreadable gold manifest %s",
+                         mp)
             continue
         report = parse_era_coverage(asset_manifest)
         return report["era_covered"], report["not_observed"]
@@ -500,7 +531,7 @@ def _merge_era_coverage(
     frozen era coverage without re-probing the gold manifests on the fast path;
     only a LEGACY store (built before §T8) is probed.
     """
-    for ch in _ERA_CAPABLE_CHANNELS:
+    for ch in _era_capable_channels():
         if ch not in channel_manifest:
             continue
         if not force and "era_coverage" in channel_manifest[ch]:

@@ -45,16 +45,33 @@ class AnnouncementStorage:
         # Artifact-backed calendar from this storage's own data root.
         self._calendar = get_research_calendar(data_dir=self._root)
 
+    def _manifest_dir(self) -> str:
+        """The downloader's per-stock manifest dir for the ``announcement``
+        channel.
+
+        download_announcements.py writes ``mark_stock_result(a_shares/
+        announcements, ...)`` — today the SAME dir raw announcements live in.
+        The coupling to the downloader's output dir is made EXPLICIT here so
+        ``downloader_era_fields`` reads the right per-stock manifest even if the
+        raw/gold layout later diverges — change it in BOTH the downloader and
+        here.
+        """
+        p = os.path.join(self._root, "a_shares", "announcements")
+        os.makedirs(p, exist_ok=True)
+        return p
+
     def save_raw(self, stock_code: str, df: pd.DataFrame) -> str:
         """Save raw announcements to {code}.parquet."""
         path = os.path.join(self._base, f"{stock_code}.parquet")
         with AtomicCommit(path) as ac:
             df.to_parquet(ac.tmp_path, index=False, compression='lz4')
-        # §T8: stamp the downloader manifest's provider-era fields (the
-        # downloader manifest lives in this same a_shares/announcements dir).
+        # §T8: stamp the raw manifest with the downloader manifest's
+        # provider-era fields (read via _manifest_dir, the explicit coupling to
+        # download_announcements.py).  `**{}` when there is no downloader
+        # manifest → the stock is not_observed.
         write_asset_manifest(
             path, ANNOUNCEMENT_ASSET, df, entity=stock_code,
-            **downloader_era_fields(self._base, stock_code),
+            **downloader_era_fields(self._manifest_dir(), stock_code),
         )
         return path
 
@@ -117,7 +134,7 @@ class AnnouncementStorage:
             write_asset_manifest(
                 out_path, ANNOUNCEMENT_SENTIMENT_ASSET, daily,
                 entity=stock_code,
-                **downloader_era_fields(self._base, stock_code),
+                **downloader_era_fields(self._manifest_dir(), stock_code),
             )
 
         return daily

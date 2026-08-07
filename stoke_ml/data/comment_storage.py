@@ -57,6 +57,20 @@ class CommentStorage:
         os.makedirs(p, exist_ok=True)
         return p
 
+    def _manifest_dir(self) -> str:
+        """The downloader's per-stock manifest dir for the ``comment`` channel.
+
+        download_comment.py writes ``mark_stock_result(a_shares/comment_sentiment,
+        ...)`` — today the SAME dir the gold daily files live in (comments are
+        numeric, so gold IS the raw layer: there is no separate bronze).  The
+        coupling to the downloader's output dir is made EXPLICIT here so
+        ``downloader_era_fields`` reads the right per-stock manifest even if the
+        gold layout later diverges — change it in BOTH the downloader and here.
+        """
+        p = os.path.join(self._root, "a_shares", "comment_sentiment")
+        os.makedirs(p, exist_ok=True)
+        return p
+
     def save_snapshot(self, df: pd.DataFrame) -> None:
         """Save a full-market snapshot (from stock_comment_em)."""
         if df.empty:
@@ -114,12 +128,14 @@ class CommentStorage:
                 if os.path.isfile(tmp_path):
                     os.unlink(tmp_path)
                 raise
-            # §T8: the downloader manifest lives in the SAME dir as the gold
-            # files (a_shares/comment_sentiment) — stamp its provider-era fields
-            # so the gold manifest distinguishes no_event from not_observed.
+            # §T8: stamp the gold manifest with the provider-era fields read
+            # from the downloader's per-stock manifest via _manifest_dir (the
+            # explicit coupling to download_comment.py).  `**{}` when there is
+            # no downloader manifest → the stock is not_observed (no provider
+            # era) — never counted as a zero-coverage event gap.
             write_asset_manifest(
                 out_path, COMMENT_SENTIMENT_ASSET, new_rows, entity=code,
-                **downloader_era_fields(self._base_dir(), code),
+                **downloader_era_fields(self._manifest_dir(), code),
             )
 
     def load_daily(

@@ -179,6 +179,40 @@ def test_announcement_write_end_without_downloader_manifest_not_observed(tmp_pat
     assert parse_era_coverage(raw_manifest)["not_observed"] is True
 
 
+def test_announcement_write_end_reads_manifest_dir_not_gold_base(tmp_path, monkeypatch):
+    """§T8 review (Important 1): the era fields must come from the EXPLICIT
+    downloader-manifest dir (_manifest_dir), NOT coincidentally from the
+    announcements base dir.  If download_announcements.py ever moves its
+    manifests, the storage follows _manifest_dir(); a regression to reading
+    _base would silently record era-less (not_observed) manifests."""
+    manifest_dir = os.path.join(str(tmp_path), "a_shares", "ann_manifests")
+    write_stock_manifest(
+        manifest_dir, "000001", dataset="announcements",
+        requested_start="2024-01-01", requested_end="2024-01-31",
+        effective_start="2024-01-01", effective_end="2024-01-31",
+        actual_start="2024-01-02", actual_end="2024-01-03",
+        status="COMPLETE", provider_exhausted=True,
+    )
+    storage = AnnouncementStorage(str(tmp_path))
+    monkeypatch.setattr(storage, "_manifest_dir", lambda: manifest_dir)
+    storage.save_raw("000001", pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"]),
+        "stock_code": ["000001"],
+        "title": ["A"],
+        "sentiment_title": [0.1],
+    }))
+    storage.build_daily_sentiment("000001", save=True)
+
+    base = os.path.join(str(tmp_path), "a_shares", "announcements")
+    raw_manifest = _manifest_of(os.path.join(base, "000001.parquet"))
+    assert raw_manifest["provider_available_start"] == "2024-01-01"
+    assert raw_manifest["retrieved_ranges"] == [["2024-01-02", "2024-01-03"]]
+    sent_manifest = _manifest_of(
+        os.path.join(base, "sentiment", "000001.parquet"))
+    assert sent_manifest["provider_available_start"] == "2024-01-01"
+    assert parse_era_coverage(sent_manifest)["era_covered"] == 2 / 31
+
+
 # ── tamper detection ───────────────────────────────────────────────────────
 
 def test_tampered_schema_hash_detected(tmp_path):

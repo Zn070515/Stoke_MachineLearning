@@ -594,3 +594,67 @@ def test_merge_era_coverage_empty_manifest_stays_empty(tp, tmp_path):
     manifest = {}
     tp._merge_era_coverage(manifest, data_dir, ["000001"])
     assert manifest == {}
+
+
+def test_era_capable_channels_derives_from_profile_contracts(tp, monkeypatch):
+    """§T8 review (Important 2): the era-probe channel set is DERIVED from the
+    feature profiles' era_coverage contracts — adding an era contract to a
+    profile automatically adds that channel to the probe, so there is NO
+    hard-coded list to keep in sync.  A stock_coverage-contracted channel
+    (comment) is not probed until it declares era_coverage; the union over all
+    profiles keeps the live-default (profile_name=None) probe non-empty."""
+    import dataclasses
+    from stoke_ml.config.feature_profile import (
+        FEATURE_PROFILES,
+        CoverageContract,
+    )
+
+    base = tp._era_capable_channels()
+    assert "sentiment" in base and "guba" in base
+    assert base == frozenset({"sentiment", "guba"})   # only era-contracted
+    assert "comment" not in base                      # stock_coverage, not era
+
+    # Give comment an era_coverage contract → the probe must now cover it.
+    updated = dataclasses.replace(
+        FEATURE_PROFILES["headline_v1"],
+        coverage_contracts={
+            **FEATURE_PROFILES["headline_v1"].coverage_contracts,
+            "comment": CoverageContract("era_coverage", 0.90),
+        },
+    )
+    monkeypatch.setattr(
+        "stoke_ml.config.feature_profile.FEATURE_PROFILES",
+        {"headline_v1": updated})
+    assert "comment" in tp._era_capable_channels()
+    assert "sentiment" in tp._era_capable_channels()
+
+
+def test_stock_era_coverage_first_existing_partition_wins(tp, tmp_path):
+    """§T8 review (Minor 5): a stock with gold manifests in MULTIPLE year/month
+    partitions is probed from the FIRST existing candidate (sorted glob order) —
+    every partition was stamped from the SAME downloader manifest, so the
+    "first existing path wins" invariant holds (never a merge / full scan)."""
+    data_dir = str(tmp_path / "data")
+    base = os.path.join(data_dir, "a_shares", "sentiment")
+    # 2024/01 is fully retrieved (1.0); 2024/02 half-retrieved (0.6).  Both are
+    # legitimate candidates; the sorted glob picks 2024/01 first.
+    for y, m, retrieved in (
+        ("2024", "01", [["2024-01-01", "2024-01-10"]]),
+        ("2024", "02", [["2024-01-01", "2024-01-06"]]),
+    ):
+        d = os.path.join(base, y, m)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "000001.parquet.manifest.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({
+                "provider_available_start": "2024-01-01",
+                "provider_available_end": "2024-01-10",
+                "retrieved_ranges": retrieved,
+                "known_gaps": [],
+            }, f)
+    paths = tp._gold_manifest_paths(data_dir, "sentiment", "000001")
+    assert len(paths) == 2
+    assert os.path.basename(os.path.dirname(paths[0])) == "01"  # first is 2024/01
+    cov, no = tp._stock_era_coverage(data_dir, "sentiment", "000001")
+    assert no is False
+    assert cov == 1.0   # 2024/01's full retrieval — NOT a merge with 2024/02

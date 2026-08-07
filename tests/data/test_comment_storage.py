@@ -150,6 +150,32 @@ def test_comment_write_end_without_downloader_manifest_not_observed(tmp_path):
     assert parse_era_coverage(manifest)["not_observed"] is True
 
 
+def test_comment_write_end_reads_manifest_dir_not_gold_base(tmp_path, monkeypatch):
+    """§T8 review (Important 1): the era fields must come from the EXPLICIT
+    downloader-manifest dir (_manifest_dir), NOT coincidentally from the gold
+    base dir.  If download_comment.py ever moves its manifests, the storage
+    follows _manifest_dir(); a regression to reading _base_dir would silently
+    record era-less (not_observed) manifests."""
+    # The downloader writes its per-stock manifest to a dedicated dir (not the
+    # gold dir the storage writes files to).
+    manifest_dir = os.path.join(str(tmp_path), "a_shares", "comment_manifests")
+    write_stock_manifest(
+        manifest_dir, "000001", dataset="comment_sentiment",
+        requested_start="2024-01-01", requested_end="2024-01-31",
+        effective_start="2024-01-01", effective_end="2024-01-31",
+        actual_start="2024-01-02", actual_end="2024-01-03",
+        status="COMPLETE", provider_range_guaranteed=True,
+    )
+    storage = CommentStorage(str(tmp_path))
+    monkeypatch.setattr(storage, "_manifest_dir", lambda: manifest_dir)
+    storage.save_daily(_daily_df())
+
+    manifest = _manifest_of(_daily_path(tmp_path))
+    assert manifest["provider_available_start"] == "2024-01-01"
+    assert manifest["retrieved_ranges"] == [["2024-01-02", "2024-01-03"]]
+    assert parse_era_coverage(manifest)["era_covered"] == 2 / 31
+
+
 def test_comment_require_valid_manifest_raises(tmp_path):
     storage = CommentStorage(str(tmp_path))
     storage.save_daily(_daily_df())

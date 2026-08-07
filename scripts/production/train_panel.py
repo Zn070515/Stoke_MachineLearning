@@ -124,6 +124,7 @@ from scripts.production.train_panel_panel import (
     _stock_era_coverage,  # noqa: F401  re-exported for import-compat
     _probe_era_coverage,  # noqa: F401  re-exported for import-compat
     _merge_era_coverage,  # noqa: F401  re-exported for import-compat
+    _era_capable_channels,  # noqa: F401  re-exported for import-compat
     _trading_day_count,  # noqa: F401  re-exported for import-compat
     _date_coverage_fraction,  # noqa: F401  re-exported for import-compat
     _probe_broadcast_dates,  # noqa: F401  re-exported for import-compat
