@@ -37,4 +37,5 @@ MARKET_ENV_ASSET: DataAssetContract = contract_for_channel(
     partition="single_file",
     extent_column="date",  # DatetimeIndex-backed
     effective_date_policy="index_date",
+    column_contract="market_env_daily",
 )

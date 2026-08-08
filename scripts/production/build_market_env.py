@@ -111,22 +111,27 @@ def build_turnover_daily(base: str) -> pd.Series:
 
 
 def build_industry_advance(base: str) -> pd.Series:
-    """Fraction of industries with positive ind_return per date (long format).
+    """Fraction of sectors with positive change_pct per date (§v18-5).
 
-    ``base`` is the ``a_shares`` dir.  Same-day trade data → VERIFIED price part.
+    ``base`` is the ``a_shares`` dir.  The real upstream is
+    ``download_industry_ranking.py``'s ``a_shares/industry_ranking.parquet``
+    (date/sector_code/change_pct — sector equal-weighted return), NOT the
+    legacy ``industry/industry_ranking_computed.parquet`` (date/ind_return)
+    that no production pipeline writes.  Same-day trade data → VERIFIED part.
     """
-    path = os.path.join(base, "industry", "industry_ranking_computed.parquet")
+    path = os.path.join(base, "industry_ranking.parquet")
     if not os.path.exists(path):
         return pd.Series(dtype="float64")
     raw = pd.read_parquet(path)
-    if "date" not in raw.columns or "ind_return" not in raw.columns:
+    if "date" not in raw.columns or "change_pct" not in raw.columns:
         return pd.Series(dtype="float64")
-    d = raw[["date", "ind_return"]].copy()
+    d = raw[["date", "change_pct"]].copy()
     d["date"] = pd.to_datetime(d["date"]).dt.normalize()
-    d = d.dropna(subset=["ind_return"])
+    d = d.dropna(subset=["change_pct"])
     if d.empty:
         return pd.Series(dtype="float64")
-    adv = d.groupby("date")["ind_return"].apply(lambda x: float((x > 0).mean()))
+    adv = d.groupby("date")["change_pct"].apply(
+        lambda x: float((x > 0).mean()))
     return adv.rename("market_adv_ratio")
 
 
@@ -219,6 +224,17 @@ def build_market_env(
             series[c] = acc_part[c]
 
     out = pd.DataFrame(series).sort_index()
+    # §v18-5: the required PRICE part is atomic — a build that cannot produce
+    # every MARKET_ENV_PRICE_COLS column must FAIL, never write a partial asset
+    # that still earns a valid manifest (the §二十-5 failure mode).  The account
+    # part stays optional (ablation-only).
+    missing_price = sorted(MARKET_ENV_PRICE_COLS - set(out.columns))
+    if missing_price:
+        raise ValueError(
+            "build_market_env: market_env PRICE columns missing: "
+            f"{missing_price} — the market_env required channel must carry the "
+            f"full {sorted(MARKET_ENV_PRICE_COLS)} set.  Fix the upstream "
+            "sources (highs_lows.parquet / industry_ranking.parquet / daily).")
     # State-channel honesty (§九-4): NEVER zero-fill a missing observation.
     #   * ACCOUNT part — a missing monthly value means "unchanged", not zero, so
     #     forward-fill to the end of the panel (a stale carry is then flagged by

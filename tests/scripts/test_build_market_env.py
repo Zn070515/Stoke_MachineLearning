@@ -68,12 +68,18 @@ def _write_highs_lows(tmp_path):
 
 
 def _write_industry(tmp_path):
-    ind = tmp_path / "a_shares" / "industry"
-    ind.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({
-        "date": ["2024-07-03", "2024-07-04", "2024-07-05"],
-        "ind_return": [0.01, -0.02, 0.03],
-    }).to_parquet(ind / "industry_ranking_computed.parquet", index=False)
+    """§v18-5: the REAL market_adv_ratio upstream is download_industry_ranking.py's
+    a_shares/industry_ranking.parquet (date/sector_code/change_pct), not the
+    legacy industry/industry_ranking_computed.parquet (date/ind_return)."""
+    daily = tmp_path / "a_shares"
+    daily.mkdir(parents=True, exist_ok=True)
+    rows = pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-02", "2024-01-03", "2024-01-03"],
+        "sector_code": ["SEC0000", "SEC0001", "SEC0000", "SEC0001"],
+        "change_pct": [0.01, -0.02, 0.00, 0.03],
+    })
+    rows.to_parquet(daily / "industry_ranking.parquet", index=False)
+    return daily
 
 
 def _write_daily(tmp_path):
@@ -105,6 +111,35 @@ def test_price_part_declared_verified(bme, tmp_path):
         "high_low_ratio", "market_adv_ratio", "market_turnover_z"}
     for c in ("high_low_ratio", "market_adv_ratio", "market_turnover_z"):
         assert c in df.columns
+
+
+def test_build_market_env_asserts_full_price_cols(bme, tmp_path):
+    """§v18-5: a builder that cannot produce the full MARKET_ENV_PRICE_COLS set
+    must FAIL, not write a partial asset with a valid manifest."""
+    _write_industry(tmp_path)
+    with pytest.raises(ValueError):
+        bme.build_market_env(str(tmp_path))
+
+
+def test_build_market_env_price_cols_from_real_upstream(bme, tmp_path):
+    """§v18-5: with all three price sources present, market_adv_ratio is computed
+    from a_shares/industry_ranking.parquet (fraction of sectors with change_pct>0
+    per date) and the full PRICE column set is asserted present."""
+    daily = _write_industry(tmp_path)
+    (daily / "market_breadth").mkdir(exist_ok=True)
+    hl = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"],
+                       "high20": [10.0, 12.0], "low20": [8.0, 9.0]})
+    hl.to_parquet(daily / "market_breadth" / "highs_lows.parquet", index=False)
+    d = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"],
+                      "amount": [1e6, 2e6], "open": [10.0, 10.5],
+                      "high": [11.0, 11.5], "low": [9.0, 9.5],
+                      "close": [10.5, 11.0], "volume": [1e5, 1.2e5]})
+    (daily / "daily").mkdir(exist_ok=True)
+    d.to_parquet(daily / "daily" / "000001.parquet", index=False)
+    df, parts = bme.build_market_env(str(tmp_path))
+    assert set(bme.MARKET_ENV_PRICE_COLS) <= set(df.columns)
+    # 2024-01-02: sector0 +0.01 (adv), sector1 -0.02 (decl) → 0.5
+    assert abs(df.loc["2024-01-02", "market_adv_ratio"] - 0.5) < 1e-9
 
 
 # ── (b) account part: proxy when no real publish date ─────────────────────
@@ -209,15 +244,18 @@ def test_headline_v1_required_set_reflects_split():
 
 def test_empty_input_dir_fails_loudly(bme, tmp_path, monkeypatch):
     """A formal builder must not silently write an empty rows:0 manifest: with
-    no usable inputs the CLI path raises instead of producing an empty asset."""
+    no usable inputs the CLI path raises instead of producing an empty asset.
+    §v18-5: an empty dir now trips the PRICE-atomicity ValueError (all three
+    MARKET_ENV_PRICE_COLS missing) BEFORE main()'s empty-panel SystemExit, so the
+    ValueError propagates out of the CLI — still an honest loud failure."""
     import sys
     empty = tmp_path / "empty_data"
     empty.mkdir()
     monkeypatch.setattr(sys, "argv", [
         "build_market_env.py", "--data-dir", str(empty), "--skip-turnover"])
-    with pytest.raises(SystemExit) as ei:
+    with pytest.raises(ValueError) as ei:
         bme.main()
-    assert "EMPTY panel" in str(ei.value)
+    assert "PRICE columns missing" in str(ei.value)
     assert not os.path.exists(os.path.join(
         str(empty), "a_shares", "market_breadth", "market_env_daily.parquet"))
 

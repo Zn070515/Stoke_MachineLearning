@@ -636,6 +636,26 @@ FUNDAMENTALS = DataContract(
     },
 )
 
+MARKET_ENV = DataContract(
+    dataset_name="market_env_daily",
+    primary_key=("date",),  # DatetimeIndex-backed broadcast file
+    required_columns=(
+        "high_low_ratio", "market_adv_ratio", "market_turnover_z",
+        "mkt_cap_total_z", "avg_account_cap_z",
+        "investor_new_num", "investor_new_z",
+    ),
+    units={},
+    price_basis="n/a",
+    timezone="Asia/Shanghai",
+    calendar="SSE_SZSE",
+    allowed_missingness={
+        "mkt_cap_total_z": "account part absent before account_stats coverage",
+        "avg_account_cap_z": "account part absent before account_stats coverage",
+        "investor_new_num": "account part absent before account_stats coverage",
+        "investor_new_z": "account part absent before account_stats coverage",
+    },
+)
+
 CONTRACTS = {
     RESEARCH_QFQ_DAILY.dataset_name: RESEARCH_QFQ_DAILY,
     "daily_equity": RESEARCH_QFQ_DAILY,  # alias
@@ -645,6 +665,7 @@ CONTRACTS = {
     NORTHBOUND.dataset_name: NORTHBOUND,
     DRAGON_TIGER.dataset_name: DRAGON_TIGER,
     FUNDAMENTALS.dataset_name: FUNDAMENTALS,
+    MARKET_ENV.dataset_name: MARKET_ENV,
 }
 
 
