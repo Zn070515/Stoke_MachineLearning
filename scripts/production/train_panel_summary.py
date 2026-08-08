@@ -19,7 +19,9 @@ import pandas as pd
 from stoke_ml.models.panel import PanelConfig
 
 from scripts.production.train_panel_oos import _replay_continuous_oos
-from scripts.production.train_panel_folds import _fmt_date, _save_artifacts
+from scripts.production.train_panel_folds import (
+    _FoldLoopResult, _fmt_date, _save_artifacts,
+)
 from scripts.production.train_panel_registry import (
     _EXPERIMENT_REGISTRY_PATH,
     _ablation_desc,
@@ -34,27 +36,20 @@ logger = logging.getLogger(__name__)
 class _SummaryInputs:
     """All ``main()`` locals the OOS/summary finalization consumes.
 
-    One frozen dataclass keeps the ~30-input boundary explicit and documented
-    instead of a 30-position call at the call site.  The accumulated fold-loop
-    lists (``oos_*`` / ``all_sharpes`` / ``fold_histories``) travel here from
-    the fold loop's result; the remaining fields are run context main() built
-    before and after the loop.
+    One frozen dataclass keeps the input boundary explicit and documented
+    instead of a ~30-position call at the call site.  The fold loop's
+    accumulated output travels here as a single ``fold_result``
+    (:class:`_FoldLoopResult`) so its nine lists are defined once, not
+    duplicated between two dataclasses (a drift bug source); the remaining
+    fields are run context main() built before and after the loop.
     """
-    oos_preds_all: list[np.ndarray]
-    oos_dates_all: list[str]
-    oos_stocks_all: list[str]
-    oos_pool_all: list[np.ndarray]
-    oos_fold_all: list[int]
-    oos_weight_hash_all: list[str]
-    oos_ledgers: list[pd.DataFrame]
+    fold_result: _FoldLoopResult
     version_info: dict
     outdir: str
     oos_dir: str
     n_trials: int
     experiment_registry: list[dict]
     experiment_signature: str
-    all_sharpes: list[float]
-    fold_histories: list[dict]
     universe_desc: str
     args: argparse.Namespace
     profile_name: str
@@ -84,21 +79,21 @@ def _finalize_summary(inp: _SummaryInputs) -> None:
     multiplicity counts it (written even when no fold completed — an aborted /
     short run is still a research trial).
     """
-    oos_preds_all = inp.oos_preds_all
-    oos_dates_all = inp.oos_dates_all
-    oos_stocks_all = inp.oos_stocks_all
-    oos_pool_all = inp.oos_pool_all
-    oos_fold_all = inp.oos_fold_all
-    oos_weight_hash_all = inp.oos_weight_hash_all
-    oos_ledgers = inp.oos_ledgers
+    oos_preds_all = inp.fold_result.oos_preds_all
+    oos_dates_all = inp.fold_result.oos_dates_all
+    oos_stocks_all = inp.fold_result.oos_stocks_all
+    oos_pool_all = inp.fold_result.oos_pool_all
+    oos_fold_all = inp.fold_result.oos_fold_all
+    oos_weight_hash_all = inp.fold_result.oos_weight_hash_all
+    oos_ledgers = inp.fold_result.oos_ledgers
     version_info = inp.version_info
     outdir = inp.outdir
     oos_dir = inp.oos_dir
     n_trials = inp.n_trials
     experiment_registry = inp.experiment_registry
     experiment_signature = inp.experiment_signature
-    all_sharpes = inp.all_sharpes
-    fold_histories = inp.fold_histories
+    all_sharpes = inp.fold_result.all_sharpes
+    fold_histories = inp.fold_result.fold_histories
     universe_desc = inp.universe_desc
     args = inp.args
     profile_name = inp.profile_name

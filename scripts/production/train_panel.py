@@ -497,21 +497,13 @@ def main():
     )
 
     _finalize_summary(_SummaryInputs(
-        oos_preds_all=fold_result.oos_preds_all,
-        oos_dates_all=fold_result.oos_dates_all,
-        oos_stocks_all=fold_result.oos_stocks_all,
-        oos_pool_all=fold_result.oos_pool_all,
-        oos_fold_all=fold_result.oos_fold_all,
-        oos_weight_hash_all=fold_result.oos_weight_hash_all,
-        oos_ledgers=fold_result.oos_ledgers,
+        fold_result=fold_result,
         version_info=version_info,
         outdir=outdir,
         oos_dir=oos_dir,
         n_trials=n_trials,
         experiment_registry=experiment_registry,
         experiment_signature=experiment_signature,
-        all_sharpes=fold_result.all_sharpes,
-        fold_histories=fold_result.fold_histories,
         universe_desc=universe_desc,
         args=args,
         profile_name=profile_name,
