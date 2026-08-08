@@ -97,6 +97,21 @@
 
 门禁规则（`_require_prebuilt_mainline`，T14）：**formal 研究**（quality gate 强制 且 非 `--no-formal`）且**解析后股票数 > 1000** 且 无 `--prebuilt` / 无完整 `--panel-store` → 启动即拒绝，提示先构建 prebuilt 特征。`--universe all` 无论模式一律拒绝（5530 只无法在 RAM 内做特征工程，§七-P0）。在线特征工程保留给 debug / smoke / 小宇宙 / 特征开发；逃生口是 `--no-formal`（探索性）/ `--no-require-quality-gate`（dev smoke）。minute 模式无 prebuilt 产物，豁免计数门禁。
 
+### Formal 训练主线（v18 §二十-4 声明）
+
+Formal 研究统一走 Prebuilt Feature → PanelStore → Training 主线
+（Raw Assets → Formal Asset Gate → Prebuilt Feature Artifact → Feature
+Manifest → Streaming PanelStore → Train）。Live FeaturePipeline 保留为
+Feature 开发 / Debug / Smoke / 小规模快速实验路径。
+
+- `--universe all`（全市场）与 formal 研究 >1000 股票（`_PREBUILT_MAINLINE_THRESHOLD`）
+  强制 `--prebuilt`：live 数学输入（raw → in-memory transform）与 prebuilt
+  （raw → preprocess_new_data → processed → build_features）不是同一套输入，
+  formal 大实验不维护两套 Feature Source 语义。
+- 阈值以下的 formal 小 universe / smoke 允许 live，作为开发路径；正式
+  Lockbox 主结论一律 prebuilt。
+- 不删除 live 路径——只做门禁 + 文档。
+
 ### 格式
 
 全链路 Parquet（列存，压缩，pandas 原生读写）。
