@@ -544,8 +544,8 @@ def test_exact_disk_backstop_refuses(monkeypatch, tmp_path):
 
 def test_exact_disk_backstop_sizes_volumes_independently(monkeypatch, tmp_path):
     """§v18-6: the exact backstop sizes the panel volume separately from the
-    scratch volume — a panel volume that fits the grids (but not grids+scratch)
-    passes the per-fs net where the old combined net would have refused."""
+    scratch volume — a sink that fits the final grids but NOT grids+scratch
+    pickles passes the per-fs net where the old combined net would refuse."""
     import stoke_ml.features.panel_builder as pb
     scratch = str(tmp_path / "scratch")
     sink = str(tmp_path / "sink")
@@ -572,17 +572,72 @@ def test_exact_disk_backstop_sizes_volumes_independently(monkeypatch, tmp_path):
         return real_stat(p, *a, **k)
 
     monkeypatch.setattr(pb.os, "stat", fake_stat)
-    # scratch huge; sink fits grids+margin but not grids+scratch+margin
+    # margin 0 so the grid/scratch bytes dominate (default 5 GB would swamp them)
+    monkeypatch.setattr(pb, "_DEFAULT_SCRATCH_SAFETY_MARGIN_GB", 0.0)
+    # Pad each per-stock pickle to 10 MB → scratch_bytes ≈ 30 MB (≫ grid_bytes).
+    # Only the three pickles under scratch are padded; everything else is real.
+    real_getsize = os.path.getsize
+    scratch_real = os.path.realpath(scratch)
+
+    def fake_getsize(p):
+        rp = os.path.realpath(str(p))
+        if rp.startswith(scratch_real + os.sep) and rp.endswith(".pkl"):
+            return 10 * 1024 * 1024
+        return real_getsize(p)
+
+    monkeypatch.setattr(pb.os.path, "getsize", fake_getsize)
+    scratch_bytes = 3 * 10 * 1024 * 1024            # 30 MB — what the backstop sees
+    usage = {os.path.realpath(scratch): scratch_bytes,      # scratch: only fits the pickles
+             os.path.realpath(sink): 1 * 1024 * 1024}       # sink: 1 MB — fits grids
     monkeypatch.setattr(
         pb.shutil, "disk_usage",
-        lambda p: SimpleNamespace(free=10 ** 15))
-    # NOTE: use a TINY panel so grid_bytes is small and the exact numbers are
-    # not the point — the point is the code path (cross-fs branch) runs and
-    # does not raise. The build succeeds.
+        lambda p: SimpleNamespace(free=usage[os.path.realpath(str(p))]))
+    # per-fs: scratch 30MB ≤ 30MB ✓, grids (~KB) < 1MB ✓ → build succeeds.  Old
+    # combined sum-vs-scratch-only: 30MB + grids > 30MB → would have refused.
     out = _tiny_pipeline().build_panel_features(
         _tiny_panel(), horizon=1, memmap_dir=sink,
         scratch_dir=scratch, run_id="r1")
     assert len(out["stock_codes"]) == 3
+
+
+def test_exact_disk_backstop_refuses_when_panel_volume_small(monkeypatch, tmp_path):
+    """§v18-6: the cross-fs exact backstop refuses when the PANEL (sink) volume
+    alone is too full — the panel volume is checked independently, not only the
+    scratch drive."""
+    import stoke_ml.features.panel_builder as pb
+    scratch = str(tmp_path / "scratch")
+    sink = str(tmp_path / "sink")
+    os.makedirs(scratch)
+    os.makedirs(sink)
+    real_stat = os.stat
+
+    def _stat_with_dev(p, dev):
+        r = real_stat(p)
+        return os.stat_result((
+            r.st_mode, r.st_ino, dev, r.st_nlink,
+            r.st_uid, r.st_gid, r.st_size,
+            r.st_atime, r.st_mtime, r.st_ctime,
+        ))
+
+    def fake_stat(p, *a, **k):
+        p = os.path.realpath(str(p))
+        if p == os.path.realpath(scratch):
+            return _stat_with_dev(p, 1)
+        if p == os.path.realpath(sink):
+            return _stat_with_dev(p, 2)
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(pb.os, "stat", fake_stat)
+    monkeypatch.setattr(pb, "_DEFAULT_SCRATCH_SAFETY_MARGIN_GB", 0.0)
+    usage = {os.path.realpath(scratch): 10 ** 15,   # scratch: huge
+             os.path.realpath(sink): 1}              # sink: 1 byte → grid problem
+    monkeypatch.setattr(
+        pb.shutil, "disk_usage",
+        lambda p: SimpleNamespace(free=usage[os.path.realpath(str(p))]))
+    with pytest.raises(RuntimeError, match="final grids"):
+        _tiny_pipeline().build_panel_features(
+            _tiny_panel(), horizon=1, memmap_dir=sink,
+            scratch_dir=scratch, run_id="r1")
 
 
 # ── _resolve_panel threads the scratch spec into the builder ───────────────

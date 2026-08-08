@@ -715,10 +715,12 @@ def _resolve_panel(
     # save_panel_memmap can safely write the remaining small arrays + metadata
     # into the same directory (Windows locks open memmap files).  The store is
     # then re-loaded to get lazy read-only memmaps for downstream training.
-    # §T7: resolve the streaming scratch dir (explicit --scratch-dir >
+    # §T7/§v18-6: resolve the streaming scratch dir (explicit --scratch-dir >
     # <panel-store>/scratch/<run_id>/ > system temp) and refuse up front when
-    # the estimate-based disk footprint cannot fit the scratch drive.  The
-    # scratch spec is threaded into the builder for crash-resume + stale sweep.
+    # the estimate-based disk footprint cannot fit — the panel_store and scratch
+    # volumes are sized independently when they differ, summed when they share a
+    # drive.  The scratch spec is threaded into the builder for crash-resume +
+    # stale sweep.
     scratch_dir, scratch_run_id, cleanup_root, cleanup_prefix = _resolve_scratch_dir(args)
     _enforce_streaming_disk_space(args, stock_list, data_dir, scratch_dir)
     panel_data = fp.build_panel_features(
@@ -1164,7 +1166,9 @@ def _same_filesystem(a: str, b: str) -> bool:
 
     Windows and POSIX both expose the volume/device via ``st_dev``.  An
     un-stat-able path (not yet created) degrades to True (same) so the
-    conservative COMBINED check applies.
+    conservative COMBINED check applies.  On Windows, a junction/mount-point may
+    report the HOST volume's ``st_dev``, misclassifying a cross-volume pair as
+    same-fs → combined check → false-refuse, never false-pass (conservative).
     """
     try:
         return os.stat(a).st_dev == os.stat(b).st_dev
@@ -1220,6 +1224,10 @@ def _enforce_streaming_disk_space(
         return need, free
     scratch_free = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
     panel_free = shutil.disk_usage(args.panel_store).free / (1024 ** 3)
+    # Margin is applied PER VOLUME deliberately: the scratch pickles persist on
+    # the scratch volume while the final grids are written on the panel_store
+    # volume, so reserving margin on both is conservative — do NOT "simplify"
+    # this into a single shared margin.
     problems = []
     if scratch_gb + margin_gb > scratch_free:
         problems.append(

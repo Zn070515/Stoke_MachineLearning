@@ -621,6 +621,10 @@ def _build_panel_streaming(
             else:
                 scratch_free = shutil.disk_usage(scratch).free
                 panel_free = shutil.disk_usage(memmap_dir).free
+                # Margin is applied PER VOLUME deliberately: the scratch pickles
+                # persist on the scratch volume while the grids are written on
+                # the panel volume, so reserving margin on both is conservative
+                # — do NOT "simplify" into a single shared margin.
                 problems = []
                 if scratch_bytes + margin > scratch_free:
                     problems.append(
