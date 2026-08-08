@@ -787,16 +787,39 @@ class TestFingerprints:
         h_with_manifest = dataset_fingerprint(root, ["daily"])
         assert h_no_manifest != h_with_manifest
 
+    def test_dataset_fingerprint_noop_resave_is_stable(self, tmp_path):
+        """§v18-8: a content-identical re-save (a no-op re-download) bumps only
+        the per-write bookkeeping (run_id / updated) — the fingerprint must NOT
+        flip.  The daily store writes run_id + updated on every save, so
+        production stability requires the digest to ignore write-event noise."""
+        root = tmp_path
+        daily = root / "a_shares" / "daily"
+        daily.mkdir(parents=True)
+        self._write_daily_with_manifest(
+            daily, "000001", TRADE_DATES, [10.0] * 5,
+            run_id="r1", updated="2026-08-08T00:00:00+00:00")
+        h1 = dataset_fingerprint(root, ["daily"])
+        self._write_daily_with_manifest(
+            daily, "000001", TRADE_DATES, [10.0] * 5,
+            run_id="r2", updated="2026-08-09T00:00:00+00:00")
+        assert dataset_fingerprint(root, ["daily"]) == h1
+
     @staticmethod
-    def _write_daily_with_manifest(daily_dir, code, dates, closes):
+    def _write_daily_with_manifest(daily_dir, code, dates, closes,
+                                   *, run_id="run-1",
+                                   updated="2026-08-08T00:00:00+00:00"):
+        """Production-shaped daily write: parquet + manifest sidecar carrying
+        the per-write bookkeeping (run_id / updated) the real store emits — no
+        written_at.  §v18-8: the fingerprint binds the manifest content with
+        the per-write keys excluded."""
         from stoke_ml.data.asset_contract import schema_hash
         df = _daily(dates, closes)
         df.to_parquet(daily_dir / f"{code}.parquet", index=False)
         with open(daily_dir / f"{code}.manifest.json", "w", encoding="utf-8") as f:
             json.dump({
-                "code": code, "rows": len(df), "schema_hash": schema_hash(df),
+                "stock": code, "rows": len(df), "schema_hash": schema_hash(df),
                 "source": "test", "start": dates[0], "end": dates[-1],
-                "written_at": "2026-08-08T00:00:00Z",
+                "run_id": run_id, "updated": updated,
             }, f)
 
     def test_dataset_fingerprint_missing_dir_is_stable(self, tmp_path):

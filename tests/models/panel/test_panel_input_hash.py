@@ -236,10 +236,12 @@ class TestAuxAssetRootHash:
         os.makedirs(root, exist_ok=True)
         return root
 
-    def _write(self, path, rows, written_at="2026-01-01T00:00:00+00:00"):
+    def _write(self, path, rows, written_at="2026-01-01T00:00:00+00:00", **extra):
+        manifest = {"data_type": "sentiment", "rows": rows,
+                    "schema_hash": "abc", "written_at": written_at}
+        manifest.update(extra)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"data_type": "sentiment", "rows": rows,
-                       "schema_hash": "abc", "written_at": written_at}, fh)
+            json.dump(manifest, fh)
 
     def test_empty_required_set_deterministic(self, tmp_path):
         h1 = _aux_asset_root_hash(self._data(tmp_path), set(), live_aux=True)
@@ -266,6 +268,23 @@ class TestAuxAssetRootHash:
         h1 = _aux_asset_root_hash(self._data(tmp_path), {"sentiment"},
                                   live_aux=True)
         self._write(p, rows=100, written_at="2026-01-02T00:00:00+00:00")
+        h2 = _aux_asset_root_hash(self._data(tmp_path), {"sentiment"},
+                                  live_aux=True)
+        assert h1 == h2
+
+    def test_updated_and_run_id_excluded(self, tmp_path):
+        """Mirror of test_written_at_excluded for the OTHER per-write
+        bookkeeping keys the daily store writes (updated / run_id): a
+        content-identical rewrite that bumps only them must NOT change the hash
+        — they are write-event identity, not data identity."""
+        root = self._sent_dir(tmp_path)
+        p = os.path.join(root, "000001.parquet.manifest.json")
+        self._write(p, rows=100, updated="2026-01-01T00:00:00+00:00",
+                    run_id="abc123")
+        h1 = _aux_asset_root_hash(self._data(tmp_path), {"sentiment"},
+                                  live_aux=True)
+        self._write(p, rows=100, updated="2026-01-02T00:00:00+00:00",
+                    run_id="def456")
         h2 = _aux_asset_root_hash(self._data(tmp_path), {"sentiment"},
                                   live_aux=True)
         assert h1 == h2

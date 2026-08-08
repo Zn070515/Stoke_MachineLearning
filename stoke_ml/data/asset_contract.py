@@ -95,6 +95,13 @@ logger = logging.getLogger(__name__)
 
 _ASSET_MANIFEST_SUFFIX = ".manifest.json"
 
+#: Manifest keys that identify the WRITE EVENT, not the data — excluded from
+#: ``manifest_body_digest`` so a content-identical re-save (a no-op re-download
+#: that only bumps these) does not change any hash built from the sidecar.
+#: The daily store writes ``run_id`` (uuid) + ``updated`` (UTC timestamp); the
+#: aux asset manifests carry ``written_at``.  All three are write-event noise.
+_PER_WRITE_MANIFEST_KEYS = {"written_at", "updated", "run_id"}
+
 
 class AtomicCommit:
     """Same-directory temp + ``os.replace`` atomic file writer.
@@ -143,17 +150,19 @@ def atomic_write_json(path: str, payload: dict) -> None:
 
 
 def manifest_body_digest(path: str) -> str:
-    """Content digest of ONE ``*.manifest.json`` sidecar, ``written_at`` excluded.
+    """Content digest of ONE ``*.manifest.json`` sidecar, per-write bookkeeping
+    keys excluded.
 
-    ``written_at`` is a per-write TIMESTAMP, so a content-identical rewrite of
-    the same data (a re-download that changed nothing) must NOT change any
-    hash built from this sidecar — the binding is WHAT the data is, not when it
-    was written.  The sidecar is parsed as JSON and the timestamp key dropped
-    before the canonical digest; a non-JSON / unreadable sidecar degrades to
-    hashing its RAW BYTES (a partial rewrite still visible, and a JSON-level
-    nicety like written_at exclusion is moot when the file is not JSON anyway).
-    Returns the hex digest — never None: an unreadable sidecar maps to
-    ``"<unreadable>"`` so the entry stays present (fail-closed).
+    ``written_at`` / ``updated`` / ``run_id`` are per-WRITE bookkeeping — a
+    content-identical rewrite of the same data (a re-download that changed
+    nothing) must NOT change any hash built from this sidecar, because it only
+    bumps the write-event identity, not the data identity.  The sidecar is
+    parsed as JSON and those keys dropped before the canonical digest; a
+    non-JSON / unreadable sidecar degrades to hashing its RAW BYTES (a partial
+    rewrite still visible, and a JSON-level nicety like bookkeeping exclusion is
+    moot when the file is not JSON anyway).  Returns the hex digest — never
+    None: an unreadable sidecar maps to ``"<unreadable>"`` so the entry stays
+    present (fail-closed).
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -168,7 +177,7 @@ def manifest_body_digest(path: str) -> str:
         except OSError:
             return "<unreadable>"
     if isinstance(obj, dict):
-        obj = {k: v for k, v in obj.items() if k != "written_at"}
+        obj = {k: v for k, v in obj.items() if k not in _PER_WRITE_MANIFEST_KEYS}
     payload = json.dumps(obj, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()

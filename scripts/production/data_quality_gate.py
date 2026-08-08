@@ -66,7 +66,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -327,12 +326,14 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
 
     §v18-8: for the ``daily`` dataset the hash is a MERKLE ROOT over the
     per-stock manifest CONTENT hashes (``daily/{code}.manifest.json``, with
-    ``written_at`` excluded) — the manifest is the data's identity, bound at
-    write time.  A formal re-run reads only the small sidecars, never re-scans
-    the full-market Daily bytes (tens of GB).  A parquet whose manifest was
-    rewritten to reflect new content (the canonical write path) flips the
-    digest; a manifest-less parquet hashes a distinct marker so it never
-    silently equals a manifested one.
+    the per-write bookkeeping keys — ``written_at`` / ``updated`` / ``run_id``
+    — excluded) — the manifest is the data's identity, bound at write time.  A
+    formal re-run reads only the small sidecars, never re-scans the full-market
+    Daily bytes (tens of GB); a content-identical re-save (a no-op re-download
+    that only bumps ``updated`` / ``run_id``) does NOT flip the digest.  A
+    parquet whose manifest was rewritten to reflect new content (the canonical
+    write path) flips the digest; a manifest-less parquet hashes a distinct
+    marker so it never silently equals a manifested one.
 
     Non-daily datasets (features / features_panel / custom) keep the legacy
     byte-streaming hash — they have no per-stock manifest contract to bind.
@@ -351,9 +352,10 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
         return Path(root) / name
 
     def _hash_file(fp: Path, h) -> None:
-        # Stream the raw bytes in bounded chunks: a content-aware fingerprint
-        # cannot trust stat() metadata, which an in-place same-size rewrite
-        # preserves verbatim.  Unreadable files hash a marker so a corrupt /
+        # LEGACY non-daily branch (features / features_panel / custom): stream
+        # the raw bytes in bounded chunks — a content-aware fingerprint cannot
+        # trust stat() metadata, which an in-place same-size rewrite preserves
+        # verbatim.  Unreadable files hash a marker so a corrupt /
         # permission-blocked file still changes the digest from "absent".
         try:
             with open(fp, "rb") as fh:
@@ -384,7 +386,7 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
                 mp = d / f"{code}.manifest.json"
                 digest = (
                     manifest_body_digest(str(mp))
-                    if os.path.isfile(mp) else "<no-manifest>")
+                    if mp.is_file() else "<no-manifest>")
                 h.update(fp.name.encode("utf-8"))
                 h.update(b":")
                 h.update(digest.encode("utf-8"))

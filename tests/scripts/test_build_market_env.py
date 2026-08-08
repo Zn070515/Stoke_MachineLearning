@@ -83,20 +83,23 @@ def _write_industry(tmp_path):
     return daily
 
 
-def _write_daily_file(daily_dir, code, df):
+def _write_daily_file(daily_dir, code, df, *, run_id="run-1",
+                      updated="2026-08-08T00:00:00+00:00"):
     """Write a daily parquet + its manifest sidecar — the canonical write path
     (§v18-8).  The dataset fingerprint binds the per-stock MANIFEST content
-    hash, so every daily file carries a manifest, exactly like production."""
+    hash (per-write bookkeeping excluded), so every daily file carries a
+    manifest, exactly like production."""
     from stoke_ml.data.asset_contract import schema_hash
     df.to_parquet(daily_dir / f"{code}.parquet", index=False)
     (daily_dir / f"{code}.manifest.json").write_text(json.dumps({
-        "code": code,
+        "stock": code,
         "rows": int(len(df)),
         "schema_hash": schema_hash(df),
         "source": "test",
         "start": df["date"].min().strftime("%Y-%m-%d"),
         "end": df["date"].max().strftime("%Y-%m-%d"),
-        "written_at": "2026-08-08T00:00:00Z",
+        "run_id": run_id,
+        "updated": updated,
     }), encoding="utf-8")
 
 
