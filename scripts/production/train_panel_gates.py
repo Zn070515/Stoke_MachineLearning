@@ -109,6 +109,19 @@ def _resolve_required_set(args) -> tuple[set[str], dict, str]:
     ``required_set`` is just the explicit channels and ``coverage_contracts`` is
     empty.
 
+    Two §二十-1 safety properties hold when a named profile is ACTIVE:
+
+    * A named profile is ONE indivisible research recipe — the run's
+      ``--vintage-policy`` MUST equal the profile's declared ``vintage_policy``
+      (headline_v1 declares ``revision-safe``), or the required set resolved
+      under the profile would not match the channels the pipeline actually
+      opens.  A mismatch ABORTS loudly (SystemExit) instead of silently gating
+      a different recipe than the one the model consumes.
+    * ``--allow-fundamental-ablation`` forces the fundamental channel ON in the
+      pipeline, so under an active profile the flag ADDS ``"fundamental"`` to
+      the required set — a channel the model actually consumes must be gated,
+      not ride ungated.
+
     Returns ``(required_set, coverage_contracts, profile_name)``;
     ``coverage_contracts`` maps each profile channel to its CoverageContract
     (the metric measured + the minimum), and ``profile_name`` is ``"none"`` when
@@ -131,7 +144,7 @@ def _resolve_required_set(args) -> tuple[set[str], dict, str]:
         raise SystemExit(
             f"unknown feature profile {profile_name!r} — --feature-profile "
             f"must be one of {sorted(FEATURE_PROFILES)} or 'none'")
-    # §v18-1: a named profile is ONE indivisible research recipe — the run's
+    # §二十-1: a named profile is ONE indivisible research recipe — the run's
     # --vintage-policy MUST equal the profile's declared vintage_policy, or the
     # required-channel set (resolved under the profile) would not match the
     # channels the pipeline actually opens (headline-strict closes industry;
@@ -144,11 +157,11 @@ def _resolve_required_set(args) -> tuple[set[str], dict, str]:
             f"--feature-profile {profile_name!r} declares vintage_policy "
             f"{profile.vintage_policy!r} but --vintage-policy is "
             f"{args_vintage!r} — a named profile and its vintage policy are "
-            f"one indivisible research recipe (§v18-1).  Use --feature-profile "
+            f"one indivisible research recipe (§二十-1).  Use --feature-profile "
             f"none for a custom vintage policy, or align --vintage-policy to "
             f"the profile.")
     required_set = set(profile.required_channels) | extra
-    # §v18-1: --allow-fundamental-ablation forces the fundamental channel ON
+    # §二十-1: --allow-fundamental-ablation forces the fundamental channel ON
     # regardless of policy — the same class of hole as a mismatched vintage.  A
     # channel the model actually consumes must be REQUIRED (gated), so under an
     # active profile the ablation flag ADDS fundamental to the required set
