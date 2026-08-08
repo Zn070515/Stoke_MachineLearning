@@ -197,8 +197,10 @@ def _enforce_channel_coverage(
       era-coverage contract is composite: ``era_coverage`` >= 0.90 AND
       ``era_observable_stock_fraction`` >= 0.90 must BOTH hold, so 10/500
       era-observable stocks can never represent the requested universe.  A
-      missing / non-finite ``requires`` metric makes the channel unverifiable in
-      FORMAL mode and aborts.
+      missing / non-finite ``requires`` metric makes the channel unverifiable —
+      FORMAL aborts (coverage cannot be verified), EXPLORE warns, exactly like
+      the unprobeable declared-metric case; a ``requires`` metric BELOW its
+      threshold always aborts (consistent with the below-minimum abort).
 
     The DECLARED metric is read from the channel's ``CoverageContract`` (e.g.
     ``date_coverage`` for the market-wide broadcast channels etf_flow /
@@ -264,11 +266,22 @@ def _enforce_channel_coverage(
                 and not isinstance(frac, bool)
                 and np.isfinite(float(frac))
             ):
-                logger.error(
-                    "formal mode: required aux channel '%s' has no finite "
-                    "%s probe — composite coverage cannot be verified (§v18-3)",
+                # Missing/non-finite composite metric: the declared metric
+                # passed but the REQUIRES metric cannot be verified — the
+                # channel is unverifiable.  Mirror ``_unprobeable``: FORMAL
+                # aborts, EXPLORE warns (the threshold check below cannot run on
+                # a non-finite value, so warn-and-continue here).
+                if formal:
+                    logger.error(
+                        "formal mode: required aux channel '%s' has no finite "
+                        "%s probe — composite coverage cannot be verified (§v18-3)",
+                        ch, req_metric)
+                    sys.exit(1)
+                logger.warning(
+                    "Required aux channel '%s' has no finite %s probe — "
+                    "composite coverage cannot be verified (§v18-3)",
                     ch, req_metric)
-                sys.exit(1)
+                continue
             if float(frac) < req_threshold:
                 logger.error(
                     "Required aux channel '%s' %s %.4f < minimum %.4f "

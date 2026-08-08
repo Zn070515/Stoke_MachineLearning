@@ -231,6 +231,10 @@ _COVERAGE_METRICS: frozenset[str] = frozenset({
 class CoverageContract:
     """Per-channel coverage contract: which metric is measured and the minimum.
 
+    The gate measures the DECLARED metric — stock-level on the live path,
+    cell-level on the prebuilt probe, date-level for market-wide broadcasts —
+    so the same threshold means the same thing regardless of path (§T4, §十一).
+
     ``requires`` is an OPTIONAL COMPOSITE requirement (§v18-3): a second metric
     that must ALSO clear its own threshold.  Used by the era-coverage contract
     — the provider-era retrieval coverage AND the fraction of the requested

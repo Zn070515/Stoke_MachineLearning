@@ -2068,7 +2068,6 @@ def test_enforce_channel_coverage_era_fraction_blocks_10_of_500(tp, caplog):
     AND era_observable_stock_fraction >= 0.90.  10 era-observable stocks out of
     a 500-stock requested universe (fraction 0.02) must ABORT, not pass."""
     import logging
-    from stoke_ml.config.feature_profile import CoverageContract
     manifest = {
         "sentiment": {"era_coverage": 1.0, "era_observable_stocks": 10,
                       "era_not_observed_stocks": 490,
@@ -2081,11 +2080,11 @@ def test_enforce_channel_coverage_era_fraction_blocks_10_of_500(tp, caplog):
         with pytest.raises(SystemExit):
             tp._enforce_channel_coverage({"sentiment"}, manifest, contracts, formal=True)
     assert "era_observable_stock_fraction" in caplog.text
+    assert "0.0200 < minimum 0.9000" in caplog.text
 
 
 def test_enforce_channel_coverage_era_fraction_ok_when_450_of_500(tp):
     """450/500 era-observable (fraction 0.90) with era_coverage 0.95 passes."""
-    from stoke_ml.config.feature_profile import CoverageContract
     manifest = {
         "sentiment": {"era_coverage": 0.95, "era_observable_stocks": 450,
                       "era_not_observed_stocks": 50,
@@ -2094,3 +2093,33 @@ def test_enforce_channel_coverage_era_fraction_ok_when_450_of_500(tp):
     contracts = {"sentiment": CoverageContract(
         "era_coverage", 0.90, requires=("era_observable_stock_fraction", 0.90))}
     tp._enforce_channel_coverage({"sentiment"}, manifest, contracts, formal=True)
+
+
+def test_enforce_channel_coverage_era_fraction_missing_warns_in_explore(tp, caplog):
+    """§v18-3 review (Important 1): a channel whose declared metric passes but
+    whose REQUIRES metric is missing/non-finite is UNVERIFIABLE — EXPLORE mode
+    warns and does NOT abort, mirroring the unprobeable declared-metric case."""
+    import logging
+    manifest = {"sentiment": {"era_coverage": 1.0}}  # no fraction probe
+    contracts = {"sentiment": CoverageContract(
+        "era_coverage", 0.90,
+        requires=("era_observable_stock_fraction", 0.90))}
+    with caplog.at_level(logging.WARNING, logger="train_panel_mod"):
+        tp._enforce_channel_coverage({"sentiment"}, manifest, contracts, formal=False)
+    assert any("composite coverage cannot be verified" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_era_fraction_missing_aborts_in_formal(tp, caplog):
+    """§v18-3 review (Important 1): the SAME missing REQUIRES metric in FORMAL
+    mode ABORTS — coverage cannot be verified, so a formal run must not proceed."""
+    import logging
+    manifest = {"sentiment": {"era_coverage": 1.0}}  # no fraction probe
+    contracts = {"sentiment": CoverageContract(
+        "era_coverage", 0.90,
+        requires=("era_observable_stock_fraction", 0.90))}
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit) as ei:
+            tp._enforce_channel_coverage({"sentiment"}, manifest, contracts, formal=True)
+    assert ei.value.code == 1
+    assert any("formal mode" in m for m in caplog.messages)
+    assert any("composite coverage cannot be verified" in m for m in caplog.messages)

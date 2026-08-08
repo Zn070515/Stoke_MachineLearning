@@ -596,6 +596,53 @@ def test_merge_era_coverage_empty_manifest_stays_empty(tp, tmp_path):
     assert manifest == {}
 
 
+def test_merge_era_coverage_force_false_migrates_pre_t3_store(tp, monkeypatch):
+    """§v18-3 (Important 2): a pre-T3 store persisted ``era_coverage`` but NOT
+    ``era_observable_stock_fraction`` — on the force=False store-LOAD path that
+    entry is INCOMPLETE for the composite gate, so the merge must RE-PROBE it
+    and fill the fraction (denominator = the requested universe, not just the
+    era-observable stocks)."""
+    calls = []
+
+    def _spy(data_dir, ch, stock_list):
+        calls.append((data_dir, ch, list(stock_list)))
+        return 0.8, 2, 1  # (mean, n_obs, n_not)
+
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._probe_era_coverage", _spy)
+    manifest = {"sentiment": {"status": "OK", "era_coverage": 1.0}}
+    out = tp._merge_era_coverage(
+        manifest, "data", ["000001", "000002", "000003"], force=False)
+    assert len(calls) == 1                      # the probe RAN
+    assert calls[0][1] == "sentiment"
+    assert calls[0][2] == ["000001", "000002", "000003"]
+    assert out["sentiment"]["era_coverage"] == pytest.approx(0.8)
+    assert out["sentiment"]["era_observable_stocks"] == 2
+    assert out["sentiment"]["era_not_observed_stocks"] == 1
+    assert out["sentiment"]["era_observable_stock_fraction"] == pytest.approx(2 / 3)
+
+
+def test_merge_era_coverage_force_false_skips_complete_entry(tp, monkeypatch):
+    """§v18-3 (Important 2): a store that persisted BOTH ``era_coverage`` AND
+    ``era_observable_stock_fraction`` is complete for the composite gate — the
+    force=False store-LOAD path skips re-probing entirely (the probe must NOT
+    run) and leaves the persisted values intact."""
+    def _boom(*a, **k):
+        raise AssertionError(
+            "_probe_era_coverage must not run when the composite entry is "
+            "already present")
+
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._probe_era_coverage", _boom)
+    manifest = {"sentiment": {"status": "OK", "era_coverage": 0.95,
+                              "era_observable_stock_fraction": 0.90}}
+    out = tp._merge_era_coverage(manifest, "data", ["000001", "000002"],
+                                 force=False)
+    assert out["sentiment"]["era_coverage"] == 0.95
+    assert out["sentiment"]["era_observable_stock_fraction"] == 0.90
+    assert "era_observable_stocks" not in out["sentiment"]  # untouched
+
+
 def test_era_capable_channels_derives_from_profile_contracts(tp, monkeypatch):
     """§T8 review (Important 2): the era-probe channel set is DERIVED from the
     feature profiles' era_coverage contracts — adding an era contract to a

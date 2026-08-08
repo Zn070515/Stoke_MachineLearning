@@ -568,8 +568,11 @@ def _merge_era_coverage(
     for ch in _era_capable_channels():
         if ch not in channel_manifest:
             continue
-        if not force and "era_coverage" in channel_manifest[ch] \
-                and "era_observable_stock_fraction" in channel_manifest[ch]:
+        if (
+            not force
+            and "era_coverage" in channel_manifest[ch]
+            and "era_observable_stock_fraction" in channel_manifest[ch]
+        ):
             continue  # persisted build-time era coverage already present
         mean_cov, n_obs, n_not = _probe_era_coverage(data_dir, ch, stock_list)
         entry = channel_manifest[ch]
