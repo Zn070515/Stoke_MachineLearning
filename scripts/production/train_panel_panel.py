@@ -7,7 +7,6 @@ coverage manifest loading, and the has_* flag probe.  ``train_panel``
 re-exports these names for backward compatibility.
 """
 import glob
-import hashlib
 import json
 import logging
 import os
@@ -77,6 +76,21 @@ _MARKET_WIDE_CHANNELS = (
 )
 
 
+# §v18-2: the channels the LIVE pipeline can actually read data for —
+# load_aux_data provides these (per-stock loaders + MarketWideStorage + the
+# etf_flow aggregation), or the aux_aligner reads the broadcast files directly
+# (industry / market_env).  A use_*-OPEN channel NOT in this set has no live
+# data path — earnings / macro / pledge / index_membership are prebuilt-only
+# (never loaded live), and market_env_refine is a derived PROCESSING switch,
+# not a data channel — so there is no manifest to gate and it is NOT consumed
+# live.  Prebuilt runs consume these via the prebuilt feature manifest, never
+# the per-channel live gate.
+_LIVE_AUX_CHANNELS = frozenset({
+    "sentiment", "guba", "comment", "fundamental", "announcement",
+    "etf_flow", "industry", "market_env",
+}) | set(_MARKET_WIDE_CHANNELS)
+
+
 # §T2: base preference for each documented use_* dimension — what the feature
 # set would include with an unrestricted vintage policy.  Exactly matches the
 # switches the pipeline used before this change: FeaturePipeline defaults every
@@ -133,20 +147,27 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
 
 
 def _consumed_channels(args, seq_len: int) -> set[str]:
-    """The data channels the pipeline actually OPENS for this run (§v18-2).
+    """The data channels the LIVE pipeline actually reads for this run (§v18-2).
 
-    Mirrors ``_panel_pipeline_kwargs``: a channel is consumed exactly when its
-    ``use_*`` switch resolves True after the base preference AND the vintage
-    policy AND the explicit ablation opt-ins.  Consumed ≠ Required: Required ⊂
-    Consumed, with the required subset additionally carrying coverage
-    contracts.  Every CONSUMED channel must have a valid asset manifest under a
-    formal gate (``_enforce_formal_manifests``); the required subset is the
-    extra coverage-threshold layer (``_enforce_channel_coverage``).
+    A channel is consumed exactly when its ``use_*`` switch resolves True after
+    the base preference AND the vintage policy AND the explicit ablation
+    opt-ins (mirrors ``_panel_pipeline_kwargs``) AND it has a LIVE data path
+    (``_LIVE_AUX_CHANNELS``).  A switch-OPEN channel with no live loader —
+    earnings / macro / pledge / index_membership (prebuilt-only, never loaded
+    by ``load_aux_data``) and market_env_refine (a derived PROCESSING switch,
+    not a data channel) — is NOT consumed live, so there is no manifest to gate
+    and it must not be manifest-gated (prebuilt runs bind it via the prebuilt
+    feature manifest instead).  Consumed ≠ Required: Required ⊂ Consumed, with
+    the required subset additionally carrying coverage contracts.  Every
+    CONSUMED channel must have a valid asset manifest under a formal gate
+    (``_enforce_formal_manifests``); the required subset is the extra
+    coverage-threshold layer (``_enforce_channel_coverage``).
     """
     kwargs = _panel_pipeline_kwargs(args, seq_len)
     return {
         dim for dim in _BASE_DIM_PREFERENCE
         if kwargs.get(_SWITCH_KEY.get(dim, f"use_{dim}"), False)
+        and dim in _LIVE_AUX_CHANNELS
     }
 
 

@@ -1425,6 +1425,21 @@ def test_allow_revised_reproduces_todays_switch_set(tp):
     assert kw["minute_mode"] is False
 
 
+def test_consumed_channels_excludes_no_live_data_dims(tp):
+    """§v18-2: consumed = what the LIVE pipeline actually reads — a channel
+    with NO live data path (prebuilt-only earnings, or the market_env_refine
+    PROCESSING switch) is not consumed live, so it must not be manifest-gated
+    (no manifest exists to verify).  The live-loadable set (sentiment, and
+    fundamental under allow-revised / ablation) IS consumed."""
+    from scripts.production.train_panel_panel import _consumed_channels
+    args = _panel_args("allow-revised")
+    consumed = _consumed_channels(args, 60)
+    assert "market_env_refine" not in consumed
+    assert "earnings" not in consumed
+    assert "sentiment" in consumed
+    assert "fundamental" in consumed  # allow-revised opens it live (and T1 ablation adds it to required)
+
+
 def test_revision_safe_denies_revised_aligned_dims(tp):
     """revision-safe additionally turns OFF the base-True,
     latest_revised-sourced dims (fundamental/macro/earnings/valuation/
