@@ -1774,6 +1774,46 @@ def test_resolve_required_set_unknown_profile_aborts(tp):
     assert "unknown feature profile" in str(ei.value)
 
 
+def test_resolve_required_set_mismatched_vintage_aborts(tp):
+    """§v18-1: a named profile is ONE indivisible research recipe — the run's
+    --vintage-policy MUST equal the profile's declared vintage_policy, or the
+    required set (resolved under the profile) would not match the channels the
+    pipeline actually opens.  headline_v1 declares revision-safe."""
+    args = _panel_args("allow-revised", feature_profile="headline_v1")
+    with pytest.raises(SystemExit) as ei:
+        tp._resolve_required_set(args)
+    assert "vintage" in str(ei.value).lower()
+    assert "headline_v1" in str(ei.value)
+
+
+def test_resolve_required_set_matching_vintage_ok(tp):
+    """The default revision-safe + headline_v1 combination stays valid."""
+    args = _panel_args("revision-safe", feature_profile="headline_v1")
+    required_set, contracts, name = tp._resolve_required_set(args)
+    assert name == "headline_v1"
+
+
+def test_resolve_required_set_ablation_adds_fundamental(tp):
+    """§v18-1: --allow-fundamental-ablation forces fundamental ON — the same
+    class of hole as a mismatched vintage.  Under an active profile the flag
+    ADDS fundamental to required_set so the gate covers it."""
+    args = _panel_args("revision-safe", feature_profile="headline_v1",
+                       allow_fundamental_ablation=True)
+    required_set, _, name = tp._resolve_required_set(args)
+    assert name == "headline_v1"
+    assert "fundamental" in required_set
+
+
+def test_resolve_required_set_ablation_no_profile_unchanged(tp):
+    """No active profile → the ablation flag only affects the pipeline switch,
+    not the required set (existing behavior)."""
+    args = _panel_args("revision-safe", feature_profile="none",
+                       allow_fundamental_ablation=True, require_aux_channels="guba")
+    required_set, _, name = tp._resolve_required_set(args)
+    assert name == "none"
+    assert required_set == {"guba"}
+
+
 def test_enforce_channel_coverage_aborts_below_minimum(tp, caplog):
     """A probeable required channel below its profile contract minimum aborts the
     run, against the contract's declared metric (stock_coverage here)."""

@@ -131,7 +131,30 @@ def _resolve_required_set(args) -> tuple[set[str], dict, str]:
         raise SystemExit(
             f"unknown feature profile {profile_name!r} — --feature-profile "
             f"must be one of {sorted(FEATURE_PROFILES)} or 'none'")
+    # §v18-1: a named profile is ONE indivisible research recipe — the run's
+    # --vintage-policy MUST equal the profile's declared vintage_policy, or the
+    # required-channel set (resolved under the profile) would not match the
+    # channels the pipeline actually opens (headline-strict closes industry;
+    # allow-revised opens 8 more latest_revised channels).  Refuse loudly — a
+    # mismatched vintage silently gates a different recipe than the one the
+    # model consumes.
+    args_vintage = getattr(args, "vintage_policy", None)
+    if args_vintage != profile.vintage_policy:
+        raise SystemExit(
+            f"--feature-profile {profile_name!r} declares vintage_policy "
+            f"{profile.vintage_policy!r} but --vintage-policy is "
+            f"{args_vintage!r} — a named profile and its vintage policy are "
+            f"one indivisible research recipe (§v18-1).  Use --feature-profile "
+            f"none for a custom vintage policy, or align --vintage-policy to "
+            f"the profile.")
     required_set = set(profile.required_channels) | extra
+    # §v18-1: --allow-fundamental-ablation forces the fundamental channel ON
+    # regardless of policy — the same class of hole as a mismatched vintage.  A
+    # channel the model actually consumes must be REQUIRED (gated), so under an
+    # active profile the ablation flag ADDS fundamental to the required set
+    # rather than letting it ride ungated.
+    if getattr(args, "allow_fundamental_ablation", False):
+        required_set.add("fundamental")
     return required_set, dict(profile.coverage_contracts), profile_name
 
 def _enforce_channel_coverage(
