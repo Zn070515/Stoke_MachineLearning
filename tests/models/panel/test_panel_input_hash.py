@@ -11,10 +11,12 @@ hashes:
   ``.py`` file under ``stoke_ml/`` + ``scripts/production/`` (the source trees
   that compute the panel's feature values).  A code edit — committed or not —
   changes the hash, so a store built from old code is refused.
-* ``aux_asset_root_hash`` — content hash of the REQUIRED channels' live asset
+* ``aux_asset_root_hash`` — content hash of the CONSUMED channels' live asset
   manifests (``*.manifest.json`` sidecars, ``written_at`` excluded).  The §七
   guard: a live-mode store binds today's aux roots; changed aux tomorrow makes
-  the formal load refuse.
+  the formal load refuse.  (Required ⊂ Consumed — the required subset is the
+  extra coverage-threshold layer, but every channel the pipeline actually
+  reads must bind under a formal gate, §v18-2.)
 * ``panel_input_hash`` — SHA-256 aggregate (canonical JSON) of every input
   provenance component, so a change anywhere is a single key mismatch.
 
