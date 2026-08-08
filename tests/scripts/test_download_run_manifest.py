@@ -28,6 +28,8 @@ from omegaconf import OmegaConf
 from scripts.production import download_market_breadth as dmb
 from scripts.production import download_index_constituent as dic
 from scripts.production import download_earnings as de
+from scripts.production import download_industry as dind
+from scripts.production import download_industry_ranking as dindr
 from stoke_ml.data import download_manifest as dm
 
 # dataset subdir under data_dir where each script's manifest must land.
@@ -35,6 +37,8 @@ DATASET_DIR = {
     dmb: "a_shares/market_breadth",
     dic: "a_shares/index_constituents",
     de: "a_shares/earnings",
+    dind: "a_shares/industry",
+    dindr: "a_shares/industry_ranking",
 }
 
 
@@ -184,3 +188,63 @@ def test_earnings_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
               EarningsSource=_EarningsSource)
     assert rc == 1
     assert not _manifest_path(tmp_path, de).is_file()
+
+
+# ── download_industry ─────────────────────────────────────────────────
+
+class _FakeIndustry:
+    """A fetch-all that raises: main() must still reach the unconditional
+    run-manifest write (fetch failures only populate ``failed``, never abort)."""
+
+    def fetch_all_returns(self, start_date=None, end_date=None):
+        raise RuntimeError("synthetic industry fetch failure")
+
+    def fetch_stock_industry_map(self):
+        return pd.DataFrame()
+
+
+def test_industry_success_writes_manifest(tmp_path, monkeypatch):
+    rc = _run(monkeypatch, tmp_path, dind, ("--no-mapping",),
+              IndustrySource=_FakeIndustry)
+    assert rc is None
+    assert _manifest_path(tmp_path, dind).is_file()
+
+
+def test_industry_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
+    monkeypatch.setattr(dm, "write_run_manifest", _boom)
+    rc = _run(monkeypatch, tmp_path, dind, ("--no-mapping",),
+              IndustrySource=_FakeIndustry)
+    assert rc == 1
+    assert not _manifest_path(tmp_path, dind).is_file()
+
+
+# ── download_industry_ranking ─────────────────────────────────────────
+
+def _industry_ranking_fixtures(tmp_path):
+    """stock_sector_cache.csv + one daily parquet under the _fake_cfg data_dir."""
+    data_dir = tmp_path / "data"
+    daily = data_dir / "a_shares" / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "stock_code": ["600519"],
+        "sector": ["白酒"],
+    }).to_csv(data_dir / "a_shares" / "stock_sector_cache.csv", index=False)
+    pd.DataFrame({
+        "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+        "pct_change": [0.01, -0.005],
+    }).to_parquet(daily / "600519.parquet")
+
+
+def test_industry_ranking_success_writes_manifest(tmp_path, monkeypatch):
+    _industry_ranking_fixtures(tmp_path)
+    rc = _run(monkeypatch, tmp_path, dindr)
+    assert rc is None
+    assert _manifest_path(tmp_path, dindr).is_file()
+
+
+def test_industry_ranking_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
+    _industry_ranking_fixtures(tmp_path)
+    monkeypatch.setattr(dm, "write_run_manifest", _boom)
+    rc = _run(monkeypatch, tmp_path, dindr)
+    assert rc == 1
+    assert not _manifest_path(tmp_path, dindr).is_file()

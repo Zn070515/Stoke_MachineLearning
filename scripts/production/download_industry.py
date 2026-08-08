@@ -15,7 +15,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data.asset_contract import AtomicCommit, write_asset_manifest
 from stoke_ml.data.broadcast_assets import INDUSTRY_ASSET
 from stoke_ml.data.sources.a_shares.industry_source import IndustrySource
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -85,15 +85,14 @@ def main():
             logger.error("stock_industry_map: %s", str(e)[:120])
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/industry",
-            start_date=args.start, end_date=args.end,
-            requested=requested, failed=failed, complete=done,
-            success_count=len(done),
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    # A run that cannot record its own coverage fails loudly (§v18-10): a
+    # successful data write with a FAILED manifest is a non-successful task.
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/industry",
+        start_date=args.start, end_date=args.end,
+        requested=requested, failed=failed, complete=done,
+        success_count=len(done),
+    )
 
 
 if __name__ == "__main__":
