@@ -193,7 +193,8 @@ def _entry_fill_prob_mean(panel_data: dict) -> float | None:
 def _asset_manifest_entries(root: str) -> dict[str, str]:
     """Sorted relpath → digest map of every ``*.manifest.json`` under ``root``.
 
-    The value is the content digest of the sidecar with ``written_at`` excluded
+    The value is the content digest of the sidecar with the per-write
+    bookkeeping keys (``written_at`` / ``updated`` / ``run_id``) excluded
     (``_manifest_body_digest``).  The key is the file's name relative to the
     channel's LIVE asset root — so adding / removing / renaming a stock's
     sidecar changes the map even when every remaining sidecar's bytes are
@@ -222,7 +223,8 @@ def _aux_asset_root_hash(
     (every channel the run's pipeline actually opens — §v18-2, not just the
     required subset), hash the sorted relpath → digest map of the
     ``*.manifest.json`` sidecars under that channel's CHANNEL_SOURCE
-    ``live_dir`` (``written_at`` excluded).  ``live_aux`` is itself part of the
+    ``live_dir`` (per-write bookkeeping keys ``written_at`` / ``updated`` /
+    ``run_id`` excluded).  ``live_aux`` is itself part of the
     hash — a LIVE build (aux bound by these roots) is never interchangeable with
     a PREBUILT / ``--no-aux`` build, whose aux is bound differently (prebuilt
     feature manifest) or not at all.

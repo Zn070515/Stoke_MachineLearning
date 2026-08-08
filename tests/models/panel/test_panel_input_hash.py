@@ -12,7 +12,8 @@ hashes:
   that compute the panel's feature values).  A code edit — committed or not —
   changes the hash, so a store built from old code is refused.
 * ``aux_asset_root_hash`` — content hash of the CONSUMED channels' live asset
-  manifests (``*.manifest.json`` sidecars, ``written_at`` excluded).  The §七
+  manifests (``*.manifest.json`` sidecars, per-write bookkeeping keys
+  ``written_at`` / ``updated`` / ``run_id`` excluded).  The §七
   guard: a live-mode store binds today's aux roots; changed aux tomorrow makes
   the formal load refuse.  (Required ⊂ Consumed — the required subset is the
   extra coverage-threshold layer, but every channel the pipeline actually
