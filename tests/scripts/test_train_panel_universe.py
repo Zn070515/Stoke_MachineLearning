@@ -1925,6 +1925,7 @@ def _full_manifest(required_set, contracts):
                         "loaded_stocks": 100, "coverage": 1.0,
                         "stock_coverage": 1.0, "date_coverage": 1.0,
                         "era_coverage": 1.0,
+                        "era_observable_stock_fraction": 1.0,
                         "errors": 0, "status": "OK"}
     return manifest
 
@@ -2060,3 +2061,36 @@ def test_headline_v1_era_contracts_decidable_in_formal_mode(tp, caplog):
     assert ei.value.code == 1
     assert any("sentiment" in m for m in caplog.messages)
     assert any("0.5000 < minimum 0.9000" in m for m in caplog.messages)
+
+
+def test_enforce_channel_coverage_era_fraction_blocks_10_of_500(tp, caplog):
+    """§v18-3: the era-coverage contract is COMPOSITE — era_coverage >= 0.90
+    AND era_observable_stock_fraction >= 0.90.  10 era-observable stocks out of
+    a 500-stock requested universe (fraction 0.02) must ABORT, not pass."""
+    import logging
+    from stoke_ml.config.feature_profile import CoverageContract
+    manifest = {
+        "sentiment": {"era_coverage": 1.0, "era_observable_stocks": 10,
+                      "era_not_observed_stocks": 490,
+                      "era_observable_stock_fraction": 0.02},
+    }
+    contracts = {"sentiment": CoverageContract(
+        "era_coverage", 0.90,
+        requires=("era_observable_stock_fraction", 0.90))}
+    with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
+        with pytest.raises(SystemExit):
+            tp._enforce_channel_coverage({"sentiment"}, manifest, contracts, formal=True)
+    assert "era_observable_stock_fraction" in caplog.text
+
+
+def test_enforce_channel_coverage_era_fraction_ok_when_450_of_500(tp):
+    """450/500 era-observable (fraction 0.90) with era_coverage 0.95 passes."""
+    from stoke_ml.config.feature_profile import CoverageContract
+    manifest = {
+        "sentiment": {"era_coverage": 0.95, "era_observable_stocks": 450,
+                      "era_not_observed_stocks": 50,
+                      "era_observable_stock_fraction": 0.90},
+    }
+    contracts = {"sentiment": CoverageContract(
+        "era_coverage", 0.90, requires=("era_observable_stock_fraction", 0.90))}
+    tp._enforce_channel_coverage({"sentiment"}, manifest, contracts, formal=True)

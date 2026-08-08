@@ -215,11 +215,15 @@ del _channel, _cols, _col, _COLUMN_OWNER
 # per the gold asset manifest's provider-era fields.  It is the metric for the
 # SPARSE text event channels (sentiment / guba): it distinguishes a stock that
 # genuinely had no events (no_event, legitimate) from an era we never observed
-# (not_observed, a data gap).  ``date_availability`` is reserved for a future
-# date-presence metric (not currently produced).
+# (not_observed, a data gap).  §v18-3: ``era_observable_stock_fraction`` is the
+# fraction of the REQUESTED universe that is era-observable (n_obs / len(stock_list))
+# — the composite half of the era-coverage contract, so 10 era-observable stocks
+# can never represent a 500-stock requested universe.  ``date_availability`` is
+# reserved for a future date-presence metric (not currently produced).
 _COVERAGE_METRICS: frozenset[str] = frozenset({
     "stock_coverage", "cell_coverage", "date_coverage",
-    "valid_state_cell_coverage", "era_coverage", "date_availability",
+    "valid_state_cell_coverage", "era_coverage", "era_observable_stock_fraction",
+    "date_availability",
 })
 
 
@@ -227,13 +231,16 @@ _COVERAGE_METRICS: frozenset[str] = frozenset({
 class CoverageContract:
     """Per-channel coverage contract: which metric is measured and the minimum.
 
-    The gate measures the DECLARED metric — stock-level on the live path,
-    cell-level on the prebuilt probe, date-level for market-wide broadcasts —
-    so the same threshold means the same thing regardless of path (§T4, §十一).
+    ``requires`` is an OPTIONAL COMPOSITE requirement (§v18-3): a second metric
+    that must ALSO clear its own threshold.  Used by the era-coverage contract
+    — the provider-era retrieval coverage AND the fraction of the requested
+    universe that is era-observable must BOTH pass, so 10/500 observable stocks
+    can never represent the whole universe.
     """
 
     metric: str
     threshold: float
+    requires: tuple[str, float] | None = None
 
     def __post_init__(self):
         if self.metric not in _COVERAGE_METRICS:
@@ -244,6 +251,16 @@ class CoverageContract:
             raise ValueError(
                 f"CoverageContract threshold must be in (0,1], got "
                 f"{self.threshold}")
+        if self.requires is not None:
+            req_metric, req_threshold = self.requires
+            if req_metric not in _COVERAGE_METRICS:
+                raise ValueError(
+                    f"CoverageContract requires metric {req_metric!r} not in "
+                    f"{sorted(_COVERAGE_METRICS)}")
+            if not (0.0 < req_threshold <= 1.0):
+                raise ValueError(
+                    f"CoverageContract requires threshold must be in (0,1], "
+                    f"got {req_threshold}")
 
 
 @dataclass(frozen=True)
@@ -308,8 +325,12 @@ FEATURE_PROFILES: dict[str, FeatureProfile] = {
             "block_trade", "lockup", "dividend", "industry", "market_env",
         ),
         coverage_contracts={
-            "sentiment": CoverageContract("era_coverage", 0.90),
-            "guba": CoverageContract("era_coverage", 0.90),
+            "sentiment": CoverageContract(
+                "era_coverage", 0.90,
+                requires=("era_observable_stock_fraction", 0.90)),
+            "guba": CoverageContract(
+                "era_coverage", 0.90,
+                requires=("era_observable_stock_fraction", 0.90)),
             "comment": CoverageContract("stock_coverage", 0.90),
             "announcement": CoverageContract("stock_coverage", 0.70),
             "margin": CoverageContract("stock_coverage", 0.95),

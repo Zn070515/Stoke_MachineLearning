@@ -192,6 +192,13 @@ def _enforce_channel_coverage(
       exactly the legacy ``loaded 0 / coverage 0`` abort.
     * BELOW-MINIMUM — a channel with a ``CoverageContract`` whose declared-metric
       value is below the contract's threshold aborts.
+    * COMPOSITE (§v18-3) — a channel whose ``CoverageContract`` carries a
+      ``requires`` tuple must ALSO clear the second metric's own threshold.  The
+      era-coverage contract is composite: ``era_coverage`` >= 0.90 AND
+      ``era_observable_stock_fraction`` >= 0.90 must BOTH hold, so 10/500
+      era-observable stocks can never represent the requested universe.  A
+      missing / non-finite ``requires`` metric makes the channel unverifiable in
+      FORMAL mode and aborts.
 
     The DECLARED metric is read from the channel's ``CoverageContract`` (e.g.
     ``date_coverage`` for the market-wide broadcast channels etf_flow /
@@ -249,6 +256,25 @@ def _enforce_channel_coverage(
                 "(--feature-profile) — aborting",
                 ch, float(cov), contract.threshold)
             sys.exit(1)
+        if contract is not None and contract.requires is not None:
+            req_metric, req_threshold = contract.requires
+            frac = entry.get(req_metric)
+            if not (
+                isinstance(frac, (int, float))
+                and not isinstance(frac, bool)
+                and np.isfinite(float(frac))
+            ):
+                logger.error(
+                    "formal mode: required aux channel '%s' has no finite "
+                    "%s probe — composite coverage cannot be verified (§v18-3)",
+                    ch, req_metric)
+                sys.exit(1)
+            if float(frac) < req_threshold:
+                logger.error(
+                    "Required aux channel '%s' %s %.4f < minimum %.4f "
+                    "(--feature-profile) — aborting (§v18-3)",
+                    ch, req_metric, float(frac), req_threshold)
+                sys.exit(1)
 
 def _parse_quality_gate_report(report_path: str) -> dict:
     """Load and return the quality-gate report at ``report_path`` (§六-2).

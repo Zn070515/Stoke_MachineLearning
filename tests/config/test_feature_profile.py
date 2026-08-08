@@ -214,17 +214,23 @@ def test_headline_v1_coverage_contracts_exact_map():
     The SPARSE text event channels (sentiment / guba) use era_coverage (§T8) —
     the provider-era retrieval-coverage metric that distinguishes a stock with
     genuinely no events (no_event, legitimate) from an era we never observed
-    (not_observed, a data gap).  The remaining per-stock channels use
-    stock_coverage; the MARKET-WIDE broadcast channels (etf_flow / industry /
-    market_env) use date_coverage — their value is the same for every stock per
-    date, so stock coverage is vacuous (1.0 whenever the file exists) and date
-    coverage is the meaningful metric.  dragon_tiger is presence-only (required,
-    NO contract).  Thresholds are the historical minimum_coverage values — NOT
-    re-tuned.
+    (not_observed, a data gap).  §v18-3 makes those contracts COMPOSITE: each
+    also REQUIRES ``era_observable_stock_fraction`` >= 0.90, so 10/500
+    era-observable stocks can never represent the requested universe.  The
+    remaining per-stock channels use stock_coverage; the MARKET-WIDE broadcast
+    channels (etf_flow / industry / market_env) use date_coverage — their value
+    is the same for every stock per date, so stock coverage is vacuous (1.0
+    whenever the file exists) and date coverage is the meaningful metric.
+    dragon_tiger is presence-only (required, NO contract).  Thresholds are the
+    historical minimum_coverage values — NOT re-tuned.
     """
     assert _headline().coverage_contracts == {
-        "sentiment": CoverageContract("era_coverage", 0.90),
-        "guba": CoverageContract("era_coverage", 0.90),
+        "sentiment": CoverageContract(
+            "era_coverage", 0.90,
+            requires=("era_observable_stock_fraction", 0.90)),
+        "guba": CoverageContract(
+            "era_coverage", 0.90,
+            requires=("era_observable_stock_fraction", 0.90)),
         "comment": CoverageContract("stock_coverage", 0.90),
         "announcement": CoverageContract("stock_coverage", 0.70),
         "margin": CoverageContract("stock_coverage", 0.95),

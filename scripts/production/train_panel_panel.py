@@ -551,26 +551,32 @@ def _merge_era_coverage(
     Merges ONLY the era-capable channels that are ALREADY present — a
     ``--no-aux`` build's empty manifest stays empty (a channel not actually in
     the panel is not probed).  For each present channel, sets
-    ``era_observable_stocks`` / ``era_not_observed_stocks`` and, when at least
-    one stock is era-observable, ``era_coverage`` (the mean).  With ZERO
-    era-observable stocks ``era_coverage`` is left ABSENT so the coverage gate
-    treats the channel as unprobeable — a formal run must not proceed on a
-    channel nothing was observed for.
+    ``era_observable_stocks`` / ``era_not_observed_stocks``,
+    ``era_observable_stock_fraction`` (n_obs / len(stock_list), the §v18-3
+    composite half) and, when at least one stock is era-observable,
+    ``era_coverage`` (the mean).  With ZERO era-observable stocks
+    ``era_coverage`` is left ABSENT so the coverage gate treats the channel as
+    unprobeable — a formal run must not proceed on a channel nothing was
+    observed for.
 
     ``force=False`` (the store-LOAD path) skips a channel that already carries a
-    persisted build-time ``era_coverage`` — a freshly-built store replays its
-    frozen era coverage without re-probing the gold manifests on the fast path;
-    only a LEGACY store (built before §T8) is probed.
+    persisted build-time ``era_coverage`` AND ``era_observable_stock_fraction``
+    — a freshly-built store replays its frozen era coverage without re-probing
+    the gold manifests on the fast path; only a LEGACY store (built before §T8
+    or before §v18-3, missing the fraction) is probed.
     """
     for ch in _era_capable_channels():
         if ch not in channel_manifest:
             continue
-        if not force and "era_coverage" in channel_manifest[ch]:
+        if not force and "era_coverage" in channel_manifest[ch] \
+                and "era_observable_stock_fraction" in channel_manifest[ch]:
             continue  # persisted build-time era coverage already present
         mean_cov, n_obs, n_not = _probe_era_coverage(data_dir, ch, stock_list)
         entry = channel_manifest[ch]
         entry["era_observable_stocks"] = n_obs
         entry["era_not_observed_stocks"] = n_not
+        entry["era_observable_stock_fraction"] = (
+            (n_obs / len(stock_list)) if stock_list else 0.0)
         if mean_cov is not None:
             entry["era_coverage"] = mean_cov
     return channel_manifest
