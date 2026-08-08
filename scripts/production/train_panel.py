@@ -60,6 +60,7 @@ from scripts.production.train_panel_registry import (
     _ablation_desc,  # noqa: F401  re-exported for import-compat
     _objective_desc,  # noqa: F401  re-exported for import-compat
     _experiment_signature,
+    _asset_identity_digest,
     _distinct_trial_count,
     _registry_lock,  # noqa: F401  re-exported for import-compat
     _load_experiment_registry,
@@ -484,10 +485,23 @@ def main():
     # prior row with this run's experiment_signature is the SAME experiment
     # re-run, so it is replaced and N does not grow.
     experiment_registry = _load_experiment_registry(_EXPERIMENT_REGISTRY_PATH)
+    # §P2-15: bind the profile's coverage-contract CONTENT (the profile NAME is
+    # bound via feature_profile above; the per-channel (metric, minimum) is
+    # serialized here so a retuned threshold is a distinct trial) and the asset
+    # identity (canonical digest of the DataAssetContract definitions the
+    # consumed channels adopted).  An inactive profile carries {} → None → 'none'
+    # so profile-inactive runs' signatures stay stable.
+    _coverage_contracts = {
+        ch: {"metric": c.metric, "threshold": c.threshold}
+        for ch, c in coverage_contracts.items()
+    }
     experiment_signature = _experiment_signature(
         version_info, config, augmentation=bool(args.augment),
         vintage_policy=args.vintage_policy, feature_profile=profile_name,
-        universe_membership=universe_membership)
+        universe_membership=universe_membership,
+        coverage_contracts=_coverage_contracts or None,
+        asset_identity=_asset_identity_digest(
+            ch for ch in channel_manifest if not ch.startswith("_")))
     n_trials = _distinct_trial_count(experiment_registry, experiment_signature)
     fold_result = _run_fold_loop(
         panel_data, panel_stocks, config, device, args,

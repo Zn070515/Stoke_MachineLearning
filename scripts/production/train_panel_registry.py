@@ -7,6 +7,7 @@ single-use lockbox gate.  ``train_panel`` re-exports these names for backward
 compatibility.
 """
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -309,6 +310,73 @@ def _objective_desc(config: PanelConfig) -> str:
             f";ablation={_ablation_desc(config)}")
 
 
+# The market-wide channels whose file-level asset contract lives in
+# ``MARKET_WIDE_ASSETS`` (``market_wide_storage.py``) — the remaining adopted
+# channels resolve to their module-level asset singleton (§十七 / §T9).
+_MARKET_WIDE_CHANNELS = frozenset({
+    "margin", "northbound", "dragon_tiger", "capital_flow",
+    "block_trade", "lockup", "dividend",
+})
+
+
+def _channel_asset(channel: str):
+    """The file-level ``DataAssetContract`` governing ``channel``, or None.
+
+    Resolves the module-level asset singleton for each adopted channel (§十七 /
+    §T9): the market-wide channels from ``MARKET_WIDE_ASSETS``, the rest from
+    their storage module's frozen asset.  Lazy imports keep the
+    (baseline-heavy) ``train_panel_registry`` import graph light — the helpers
+    only run at the deep-run call site / in tests.  A channel with NO
+    DataAssetContract (e.g. valuation / sector / concept — unadopted) returns
+    None.
+    """
+    if channel in _MARKET_WIDE_CHANNELS:
+        from stoke_ml.data.market_wide_storage import MARKET_WIDE_ASSETS
+        return MARKET_WIDE_ASSETS.get(channel)
+    from stoke_ml.data import (
+        announcement_storage, broadcast_assets, comment_storage,
+        earnings_storage, etf_storage, fundamental_storage, guba_storage,
+        news_storage,
+    )
+    return {
+        "sentiment": news_storage.SENTIMENT_ASSET,
+        "guba": guba_storage.GUBA_SENTIMENT_ASSET,
+        "comment": comment_storage.COMMENT_SENTIMENT_ASSET,
+        "announcement": announcement_storage.ANNOUNCEMENT_SENTIMENT_ASSET,
+        "fundamental": fundamental_storage.FUNDAMENTAL_ASSET,
+        "earnings": earnings_storage.EARNINGS_ASSET,
+        "etf_flow": etf_storage.ETF_FLOW_ASSET,
+        "industry": broadcast_assets.INDUSTRY_ASSET,
+        "market_env": broadcast_assets.MARKET_ENV_ASSET,
+    }.get(channel)
+
+
+def _asset_identity_digest(channels) -> str | None:
+    """§P2-15: canonical sha1 of the DataAssetContract definitions a run adopted.
+
+    One entry per consumed channel that has a file-level DataAssetContract
+    (``{channel: contract_identity}``), sorted by channel name so the digest is
+    ORDER-INDEPENDENT across runs.  The contract identity is the full frozen
+    definition (``dataclasses.asdict``): data_type / partition / extent_column /
+    column_contract (schema version) / effective_date_policy / the channel's
+    3-dim vintage resolution (vintage_source / vintage_transform /
+    vintage_pit) — the DESIGN-level facts that distinguish "which contract
+    definition this run adopted".  Measured data coverage is deliberately NOT
+    included (that is data, not design).  A channel with NO contract is
+    excluded; when no consumed channel has a contract (explore-mode / no-formal
+    runs) the digest is ``None`` so the experiment signature hashes 'none'.
+    """
+    contracts = {}
+    for ch in sorted({str(c) for c in channels}):
+        asset = _channel_asset(ch)
+        if asset is not None:
+            contracts[ch] = dataclasses.asdict(asset)
+    if not contracts:
+        return None
+    return hashlib.sha1(
+        json.dumps(contracts, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _experiment_signature(version: dict, config: PanelConfig,
                           model_key: str | None = None,
                           *,
@@ -317,6 +385,8 @@ def _experiment_signature(version: dict, config: PanelConfig,
                           vintage_policy: str | None = None,
                           feature_profile: str | None = None,
                           universe_membership: dict | None = None,
+                          coverage_contracts: dict | None = None,
+                          asset_identity: str | None = None,
                           baseline_hyperparameter_hash: str | None = None,
                           baseline_input_recipe_hash: str | None = None,
                           training_sample_policy_hash: str | None = None,
@@ -355,6 +425,17 @@ def _experiment_signature(version: dict, config: PanelConfig,
     provenance differs (monthly-reconstructed vs a future official
     effective-date artifact) are distinct trials.  Defaults to 'none' so
     non-CSI / non-deep callers are unaffected.
+
+    §P2-15: the deep-run signature ALSO binds the feature profile's
+    COVERAGE-CONTRACT CONTENT and the run's ASSET IDENTITY.  The profile NAME
+    is already bound above; binding the per-channel coverage-contract CONTENT
+    (the canonical JSON of each channel's ``(metric, minimum)``) as well means
+    two runs whose profile's per-channel minimums differ — same profile name,
+    retuned threshold — are DISTINCT trials.  The asset identity is a
+    caller-computed canonical digest of the DataAssetContract definitions the
+    run adopted (channel + schema/vintage declaration) — two runs guarded by
+    different asset contracts are distinct trials.  Both default to 'none' so
+    non-deep callers (baselines) are unaffected.
     """
     h = hashlib.sha1()
     for key in ("data_manifest_hash", "feature_schema_hash", "universe_hash"):
@@ -411,6 +492,20 @@ def _experiment_signature(version: dict, config: PanelConfig,
              f"{json.dumps(universe_membership, sort_keys=True) if universe_membership else 'none'};"
              .encode("utf-8"))
     h.update(f"feature_profile={feature_profile or 'none'};".encode("utf-8"))
+    # §P2-15: the deep run's signature ALSO binds the profile's coverage-contract
+    # CONTENT and the run's asset identity.  The profile NAME already enters
+    # above; binding the per-channel coverage-contract CONTENT (canonical JSON of
+    # each channel's (metric, minimum)) as well means two runs whose profile's
+    # per-channel minimums differ — same name, retuned threshold — are DISTINCT
+    # trials.  The asset identity is a caller-computed canonical digest of the
+    # DataAssetContract definitions the run adopted — two runs guarded by
+    # different asset contracts (different schema/vintage declaration) are
+    # distinct trials.  Each defaults to 'none' so non-deep callers (baselines)
+    # hash a stable signature.
+    h.update(f"coverage_contracts="
+             f"{json.dumps(coverage_contracts, sort_keys=True) if coverage_contracts else 'none'};"
+             .encode("utf-8"))
+    h.update(f"asset_identity={asset_identity or 'none'};".encode("utf-8"))
     # §十七: baseline identity levers — input recipe (with_seq + seq_len +
     # construction version), model hyperparameters, the training-sample policy
     # (max_train_rows / sampling strategy), and the feature-scaling recipe are

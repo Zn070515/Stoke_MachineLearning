@@ -629,6 +629,84 @@ def test_signature_vintage_profile_default_to_none(tp):
             == tp._experiment_signature(base, cfg, universe_membership=None))
 
 
+def test_signature_binds_coverage_contracts(tp):
+    """§P2-15: the profile NAME is already bound (feature_profile); binding the
+    coverage-contract CONTENT too means two runs whose profile's per-channel
+    minimums differ — same profile name, retuned threshold — are DISTINCT
+    trials."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    cc = {"sentiment": {"metric": "date_availability", "min": 0.90}}
+    s_cc = tp._experiment_signature(base, cfg, coverage_contracts=cc)
+    # Different contract CONTENT (same keys, retuned minimum) → NEW trial.
+    assert (tp._experiment_signature(
+        base, cfg,
+        coverage_contracts={"sentiment": {"metric": "date_availability", "min": 0.80}})
+        != s_cc)
+    # Same content + same everything else → same signature (a re-run).
+    assert tp._experiment_signature(base, cfg, coverage_contracts=cc) == s_cc
+    # {} / None / omitted all hash identically ('none' stability) — a
+    # profile-inactive run carries {} and must stay a stable signature.
+    assert (tp._experiment_signature(base, cfg)
+            == tp._experiment_signature(base, cfg, coverage_contracts=None)
+            == tp._experiment_signature(base, cfg, coverage_contracts={}))
+
+
+def test_signature_binds_asset_identity(tp):
+    """§P2-15: the asset identity — the set of DataAssetContract definitions a
+    run adopted — binds into the trial signature: two runs guarded by different
+    asset contracts (different schema/vintage declaration) are distinct trials."""
+    from stoke_ml.models.panel import PanelConfig
+
+    base = {
+        "data_manifest_hash": "d1", "feature_schema_hash": "f1",
+        "universe_hash": "u1", "model_hash": "m1",
+        "evaluator_version": "ev1", "calendar_version": "cv1",
+        "calendar_artifact_hash": "ch1",
+    }
+    cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
+                      past_observed_dim=20, horizon=1, seed=42)
+    ai = tp._asset_identity_digest(["sentiment", "margin"])
+    assert ai is not None
+    s_ai = tp._experiment_signature(base, cfg, asset_identity=ai)
+    # A different adopted asset-contract set → a different digest → NEW trial.
+    other = tp._asset_identity_digest(["sentiment", "margin", "etf_flow"])
+    assert other != ai
+    assert tp._experiment_signature(base, cfg, asset_identity=other) != s_ai
+    # Same digest + same everything else → same signature (a re-run).
+    assert tp._experiment_signature(base, cfg, asset_identity=ai) == s_ai
+    # None / omitted / '' all hash 'none' (the feature_profile or-'none' pattern).
+    assert (tp._experiment_signature(base, cfg)
+            == tp._experiment_signature(base, cfg, asset_identity=None)
+            == tp._experiment_signature(base, cfg, asset_identity=""))
+
+
+def test_asset_identity_digest_deterministic_and_order_independent(tp):
+    """§P2-15: the asset-identity digest is deterministic and ORDER-INDEPENDENT
+    (sorted by channel name), and None when no consumed channel has a contract
+    (explore-mode / no-formal runs hash 'none')."""
+    # Determinism: same consumed channels → same digest.
+    d1 = tp._asset_identity_digest(["sentiment", "margin", "industry"])
+    assert tp._asset_identity_digest(["sentiment", "margin", "industry"]) == d1
+    # Order-independence: any input ordering → identical digest.
+    assert tp._asset_identity_digest(["industry", "sentiment", "margin"]) == d1
+    assert tp._asset_identity_digest(["margin", "sentiment", "industry"]) == d1
+    # None when no consumed channel has a DataAssetContract (unadopted channels).
+    assert tp._asset_identity_digest(["valuation", "sector", "concept"]) is None
+    assert tp._asset_identity_digest([]) is None
+    # Two different adopted contract sets → different digests.
+    assert (tp._asset_identity_digest(["sentiment"])
+            != tp._asset_identity_digest(["sentiment", "margin"]))
+
+
 # ── _require_quality_gate (§九.1 custom-prebuilt binding / §八-2 universe) ──
 
 _VALID_RECON = {
