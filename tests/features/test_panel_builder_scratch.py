@@ -29,6 +29,7 @@ from stoke_ml.features.panel_builder import (
 from scripts.production.train_panel_panel import (
     _enforce_streaming_disk_space,
     _resolve_scratch_dir,
+    _same_filesystem,
     _streaming_disk_required_gb,
 )
 
@@ -200,13 +201,13 @@ def test_resolve_scratch_dir_temp_fallback():
 
 # ── disk pre-check (estimate-based, pre-build) ─────────────────────────────
 
-def test_streaming_disk_required_gb_includes_margin():
-    """required == final-panel + scratch + safety margin (never under-budget)."""
-    required = _streaming_disk_required_gb(100, 243, 1700)
-    final_panel = 100 * 243 * 1700 * 4 / (1024 ** 3)
-    scratch = 100 * 243 * 1700 * 8 * 1.3 / (1024 ** 3)
-    assert required > final_panel + scratch
-    assert required > 0.0
+def test_streaming_disk_required_gb_splits_final_vs_scratch():
+    """Returns (final_panel_gb, scratch_gb) — no margin, split by destination."""
+    final_gb, scratch_gb = _streaming_disk_required_gb(100, 243, 1700)
+    assert final_gb == pytest.approx(100 * 243 * 1700 * 4 / (1024 ** 3))
+    assert scratch_gb == pytest.approx(
+        100 * 243 * 1700 * 8 * 1.3 / (1024 ** 3))
+    assert final_gb > 0.0 and scratch_gb > 0.0
 
 
 def test_enforce_streaming_disk_space_refuses(monkeypatch, tmp_path):
@@ -252,6 +253,87 @@ def test_enforce_streaming_disk_space_ok(monkeypatch, tmp_path):
     got = _enforce_streaming_disk_space(args, ["000001"], str(tmp_path), scratch)
     assert got is not None
     assert got[0] > 0.0
+
+
+def test_enforce_streaming_disk_space_sizes_volumes_independently(
+        monkeypatch, tmp_path):
+    """§v18-6: scratch and panel_store on DIFFERENT volumes are sized
+    independently — the panel-only volume must not be asked to also fit the
+    scratch pickles (the old combined check would falsely refuse here)."""
+    import scripts.production.train_panel_panel as tpp
+    scratch = tmp_path / "scratch"
+    panel = tmp_path / "panel"
+    os.makedirs(scratch)
+    os.makedirs(panel)
+    monkeypatch.setattr(tpp, "_same_filesystem", lambda a, b: False)
+    monkeypatch.setattr(tpp, "_scratch_safety_margin_gb", lambda: 0.0)
+    usage = {os.path.realpath(str(scratch)): 10 ** 15,      # huge scratch
+             os.path.realpath(str(panel)): 1.0 * (1024 ** 3)}  # panel fits final only
+    monkeypatch.setattr(
+        tpp.shutil, "disk_usage",
+        lambda p: SimpleNamespace(free=usage[os.path.realpath(str(p))]))
+    args = _scratch_args(panel_store=str(panel))
+    args.prebuilt = None
+    args.minute = False
+    args.seq_len = None
+    args.vintage_policy = "revision-safe"
+    args.allow_fundamental_ablation = False
+    args.start = "2024-01-01"
+    args.end = "2024-12-31"
+    # 500 stocks x ~243 timesteps x 1700 feats → final ≈ 0.8 GB, scratch ≈ 8 GB.
+    # panel free 1 GB fits final+margin but NOT final+scratch+margin — so the
+    # per-fs check passes (no SystemExit) where the old combined sizing against
+    # the panel volume would have refused.
+    got = _enforce_streaming_disk_space(
+        args, ["000001"] * 500, str(tmp_path), str(scratch))
+    assert got is not None
+    assert got[0] > 0.0
+
+
+def test_enforce_streaming_disk_space_refuses_when_panel_volume_small(
+        monkeypatch, tmp_path):
+    """§v18-6: a panel_store volume too small for the FINAL grids alone is
+    refused — the per-fs check must catch an over-full panel volume (the old
+    scratch-only check would have falsely passed)."""
+    import scripts.production.train_panel_panel as tpp
+    scratch = tmp_path / "scratch"
+    panel = tmp_path / "panel"
+    os.makedirs(scratch)
+    os.makedirs(panel)
+    monkeypatch.setattr(tpp, "_same_filesystem", lambda a, b: False)
+    monkeypatch.setattr(tpp, "_scratch_safety_margin_gb", lambda: 0.0)
+    usage = {os.path.realpath(str(scratch)): 10 ** 15,
+             os.path.realpath(str(panel)): 1}   # panel free = 1 byte
+    monkeypatch.setattr(
+        tpp.shutil, "disk_usage",
+        lambda p: SimpleNamespace(free=usage[os.path.realpath(str(p))]))
+    args = _scratch_args(panel_store=str(panel))
+    args.prebuilt = None
+    args.minute = False
+    args.seq_len = None
+    args.vintage_policy = "revision-safe"
+    args.allow_fundamental_ablation = False
+    args.start = "2024-01-01"
+    args.end = "2024-12-31"
+    with pytest.raises(SystemExit) as ei:
+        _enforce_streaming_disk_space(
+            args, ["000001"] * 500, str(tmp_path), str(scratch))
+    assert "final panel" in str(ei.value)
+
+
+def test_same_filesystem_same_volume(tmp_path):
+    """Two paths under the same tmp volume resolve to the same st_dev."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    os.makedirs(a)
+    os.makedirs(b)
+    assert _same_filesystem(str(a), str(b))
+
+
+def test_same_filesystem_missing_paths_conservative(tmp_path):
+    """Nonexistent paths → OSError → True (combined conservative check)."""
+    assert _same_filesystem(
+        str(tmp_path / "nope1"), str(tmp_path / "nope2"))
 
 
 def test_enforce_streaming_disk_space_skipped_non_streaming(tmp_path):
@@ -458,6 +540,49 @@ def test_exact_disk_backstop_refuses(monkeypatch, tmp_path):
         _tiny_pipeline().build_panel_features(
             _tiny_panel(), horizon=1, memmap_dir=str(tmp_path / "sink"),
             scratch_dir=str(tmp_path / "scratch"), run_id="r1")
+
+
+def test_exact_disk_backstop_sizes_volumes_independently(monkeypatch, tmp_path):
+    """§v18-6: the exact backstop sizes the panel volume separately from the
+    scratch volume — a panel volume that fits the grids (but not grids+scratch)
+    passes the per-fs net where the old combined net would have refused."""
+    import stoke_ml.features.panel_builder as pb
+    scratch = str(tmp_path / "scratch")
+    sink = str(tmp_path / "sink")
+    os.makedirs(scratch)
+    os.makedirs(sink)
+    real_stat = os.stat
+
+    def _stat_with_dev(p, dev):
+        # Override only st_dev; keep every other field so pathlib / pandas
+        # (st_mode / st_size) still work on these real directories.
+        r = real_stat(p)
+        return os.stat_result((
+            r.st_mode, r.st_ino, dev, r.st_nlink,
+            r.st_uid, r.st_gid, r.st_size,
+            r.st_atime, r.st_mtime, r.st_ctime,
+        ))
+
+    def fake_stat(p, *a, **k):
+        p = os.path.realpath(str(p))
+        if p == os.path.realpath(scratch):
+            return _stat_with_dev(p, 1)
+        if p == os.path.realpath(sink):
+            return _stat_with_dev(p, 2)
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(pb.os, "stat", fake_stat)
+    # scratch huge; sink fits grids+margin but not grids+scratch+margin
+    monkeypatch.setattr(
+        pb.shutil, "disk_usage",
+        lambda p: SimpleNamespace(free=10 ** 15))
+    # NOTE: use a TINY panel so grid_bytes is small and the exact numbers are
+    # not the point — the point is the code path (cross-fs branch) runs and
+    # does not raise. The build succeeds.
+    out = _tiny_pipeline().build_panel_features(
+        _tiny_panel(), horizon=1, memmap_dir=sink,
+        scratch_dir=scratch, run_id="r1")
+    assert len(out["stock_codes"]) == 3
 
 
 # ── _resolve_panel threads the scratch spec into the builder ───────────────

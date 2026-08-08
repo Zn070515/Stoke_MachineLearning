@@ -1097,9 +1097,14 @@ def _resolve_scratch_dir(args) -> tuple[str, str, str | None, str | None]:
 
 def _streaming_disk_required_gb(
     n_stocks: int, n_timesteps: int, n_features: int,
-) -> float:
-    """§T7 disk required for a streaming build (GB): final panel grids + the
-    scratch pickles + the safety margin — never under-budgets."""
+) -> tuple[float, float]:
+    """§v18-6 disk required for a streaming build (GB), split by destination.
+
+    Returns ``(final_panel_gb, scratch_gb)`` — the final grids land on the
+    panel_store volume, the scratch pickles on the scratch volume.  A
+    cross-filesystem build sizes each disk independently; a same-filesystem
+    build sums them (the caller decides).  Never under-budgets.
+    """
     final_panel = (
         int(n_stocks) * int(n_timesteps) * int(n_features) * 4 / (1024 ** 3)
     )
@@ -1107,7 +1112,7 @@ def _streaming_disk_required_gb(
         int(n_stocks) * int(n_timesteps) * int(n_features) * 8
         * _SCRATCH_PICKLE_OVERHEAD / (1024 ** 3)
     )
-    return final_panel + scratch + _scratch_safety_margin_gb()
+    return final_panel, scratch
 
 
 def _streaming_disk_estimate(
@@ -1154,16 +1159,34 @@ def _streaming_disk_estimate(
     return n_stocks, n_timesteps, n_features
 
 
+def _same_filesystem(a: str, b: str) -> bool:
+    """True when two paths resolve to the same volume (``os.stat`` device id).
+
+    Windows and POSIX both expose the volume/device via ``st_dev``.  An
+    un-stat-able path (not yet created) degrades to True (same) so the
+    conservative COMBINED check applies.
+    """
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return True
+
+
 def _enforce_streaming_disk_space(
     args, stock_list: list[str], data_dir, scratch_dir: str,
 ) -> tuple[float, float] | None:
-    """§T7 refuse to start a streaming build whose disk footprint cannot fit.
+    """§v18-6 refuse to start a streaming build whose disk footprint cannot fit.
 
     Estimate-based pre-build check: when ``--panel-store`` is set (the STREAMING
-    path), compute the required disk (final grids + scratch pickles + margin)
-    vs the scratch drive's free space; insufficient → SystemExit BEFORE any
-    engineering work.  No ``--panel-store`` (dense build) → no-op (None).  The
-    builder's exact post-Pass-1 backstop is the second, un-underestimating net.
+    path), size the required disk PER FILESYSTEM — the final grids land on the
+    panel_store volume, the scratch pickles on the scratch volume.  On a
+    same-filesystem build the two are summed and compared against the shared
+    drive; on a cross-filesystem build each volume is checked independently
+    (a panel volume that fits only the grids, or a scratch volume that fits only
+    the pickles, is not falsely refused nor falsely passed).  Insufficient →
+    SystemExit BEFORE any engineering work.  No ``--panel-store`` (dense build)
+    → no-op (None).  The builder's exact post-Pass-1 backstop is the second,
+    un-underestimating net.
 
     Returns ``(required_gb, free_gb)`` when checked, else None.
     """
@@ -1172,25 +1195,50 @@ def _enforce_streaming_disk_space(
     est = _streaming_disk_estimate(args, stock_list, data_dir)
     if est is None:
         return None
-    # Create the scratch dir first: shutil.disk_usage needs an existing path on
-    # POSIX (os.statvfs raises on a missing one; Windows tolerates it).  The
-    # builder also makedirs it idempotently, so this is only an early-existence
-    # guarantee for the pre-check, never a semantic difference.
+    # Create the scratch dir + panel_store first: shutil.disk_usage needs an
+    # existing path on POSIX (os.statvfs raises on a missing one; Windows
+    # tolerates it).  The builder also makedirs them idempotently, so this is
+    # only an early-existence guarantee for the pre-check, never a semantic
+    # difference.
     os.makedirs(scratch_dir, exist_ok=True)
-    required_gb = _streaming_disk_required_gb(*est)
-    free_gb = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
-    if required_gb > free_gb:
-        n_stocks, n_timesteps, n_features = est
+    os.makedirs(args.panel_store, exist_ok=True)
+    final_gb, scratch_gb = _streaming_disk_required_gb(*est)
+    margin_gb = _scratch_safety_margin_gb()
+    n_stocks, n_timesteps, n_features = est
+    if _same_filesystem(scratch_dir, args.panel_store):
+        need = final_gb + scratch_gb + margin_gb
+        free = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
+        if need > free:
+            raise SystemExit(
+                f"streaming panel build into --panel-store requires "
+                f"{need:.1f} GB which exceeds free space {free:.1f} GB on the "
+                f"shared drive ({scratch_dir}) (n_stocks={n_stocks} x "
+                f"n_timesteps={n_timesteps} x n_features={n_features} + "
+                f"scratch pickles + margin) — the build cannot fit (§v18-6).  "
+                f"Point --scratch-dir at a drive with more room, or shrink the "
+                f"universe/stocks.")
+        return need, free
+    scratch_free = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
+    panel_free = shutil.disk_usage(args.panel_store).free / (1024 ** 3)
+    problems = []
+    if scratch_gb + margin_gb > scratch_free:
+        problems.append(
+            f"scratch pickles {scratch_gb:.1f} GB + margin {margin_gb:.1f} GB "
+            f"exceeds free space {scratch_free:.1f} GB on the scratch drive "
+            f"({scratch_dir})")
+    if final_gb + margin_gb > panel_free:
+        problems.append(
+            f"final panel {final_gb:.1f} GB + margin {margin_gb:.1f} GB "
+            f"exceeds free space {panel_free:.1f} GB on the panel_store drive "
+            f"({args.panel_store})")
+    if problems:
         raise SystemExit(
-            f"streaming panel build into --panel-store requires "
-            f"{required_gb:.1f} GB which exceeds free space {free_gb:.1f} GB "
-            f"on the scratch drive ({scratch_dir}) (n_stocks={n_stocks} x "
-            f"n_timesteps={n_timesteps} x n_features={n_features} + scratch "
-            f"pickles + margin) — the build cannot fit (§T7).  Point "
-            f"--scratch-dir at a drive with more room, or shrink the "
-            f"universe/stocks."
-        )
-    return required_gb, free_gb
+            "streaming panel build disk pre-check FAILED (§v18-6): "
+            + "; ".join(problems)
+            + f" (n_stocks={n_stocks} x n_timesteps={n_timesteps} x "
+            f"n_features={n_features}) — free disk space or re-point "
+            f"--scratch-dir / --panel-store to a larger drive.")
+    return final_gb + scratch_gb + margin_gb, min(scratch_free, panel_free)
 
 
 def _early_panel_memory_guard(

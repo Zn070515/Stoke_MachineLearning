@@ -597,20 +597,49 @@ def _build_panel_streaming(
             )
             grid_bytes = N_stocks * max_T * len(all_cols) * 4
             margin = _DEFAULT_SCRATCH_SAFETY_MARGIN_GB * (1024 ** 3)
-            need = grid_bytes + scratch_bytes + margin
-            free = shutil.disk_usage(scratch).free
-            if need > free:
-                raise RuntimeError(
-                    "streaming panel build: exact disk footprint "
-                    f"{(grid_bytes + scratch_bytes) / (1024 ** 3):.1f} GB "
-                    f"(final grids {N_stocks} x {max_T} x {len(all_cols)} x "
-                    f"4B = {grid_bytes / (1024 ** 3):.1f} GB + scratch "
-                    f"pickles {scratch_bytes / (1024 ** 3):.1f} GB) + safety "
-                    f"margin {_DEFAULT_SCRATCH_SAFETY_MARGIN_GB:.0f} GB "
-                    f"exceeds the scratch drive's free space "
-                    f"{free / (1024 ** 3):.1f} GB at {scratch} (§T7).  Free "
-                    f"disk space or point --scratch-dir at a larger drive."
-                )
+            # §v18-6: per-filesystem — final grids on the memmap/panel_store
+            # volume, scratch pickles on the scratch volume; combined when same.
+            try:
+                same_fs = os.stat(scratch).st_dev == os.stat(memmap_dir).st_dev
+            except OSError:
+                same_fs = True
+            if same_fs:
+                need = grid_bytes + scratch_bytes + margin
+                free = shutil.disk_usage(scratch).free
+                if need > free:
+                    raise RuntimeError(
+                        "streaming panel build: exact disk footprint "
+                        f"{(grid_bytes + scratch_bytes) / (1024 ** 3):.1f} GB "
+                        f"(final grids {N_stocks} x {max_T} x {len(all_cols)} x "
+                        f"4B = {grid_bytes / (1024 ** 3):.1f} GB + scratch "
+                        f"pickles {scratch_bytes / (1024 ** 3):.1f} GB) + safety "
+                        f"margin {_DEFAULT_SCRATCH_SAFETY_MARGIN_GB:.0f} GB "
+                        f"exceeds the scratch drive's free space "
+                        f"{free / (1024 ** 3):.1f} GB at {scratch} (§v18-6).  Free "
+                        f"disk space or point --scratch-dir at a larger drive."
+                    )
+            else:
+                scratch_free = shutil.disk_usage(scratch).free
+                panel_free = shutil.disk_usage(memmap_dir).free
+                problems = []
+                if scratch_bytes + margin > scratch_free:
+                    problems.append(
+                        f"scratch pickles {scratch_bytes/(1024**3):.1f} GB + "
+                        f"margin {margin/(1024**3):.1f} GB exceeds free "
+                        f"{scratch_free/(1024**3):.1f} GB on the scratch volume "
+                        f"({scratch})")
+                if grid_bytes + margin > panel_free:
+                    problems.append(
+                        f"final grids {grid_bytes/(1024**3):.1f} GB + margin "
+                        f"{margin/(1024**3):.1f} GB exceeds free "
+                        f"{panel_free/(1024**3):.1f} GB on the panel volume "
+                        f"({memmap_dir})")
+                if problems:
+                    raise RuntimeError(
+                        "streaming panel build: exact disk footprint does not "
+                        "fit (§v18-6): " + "; ".join(problems)
+                        + f" (N_stocks={N_stocks} x max_T={max_T} x "
+                        f"len(cols)={len(all_cols)})")
 
         # Discover PK / PO / static columns.
         static_cols_available = list(_PIT_STATIC_COLS)
