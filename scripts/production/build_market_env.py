@@ -303,9 +303,11 @@ def _file_sha256(path: str) -> str:
 def _upstream_roots(data_dir: str) -> dict:
     """The exact input assets this market_env build derives from (§v18-7).
 
-    ``daily`` is a content-aware dataset fingerprint (streamed parquet bytes of
-    ``a_shares/daily``); the three single-file upstreams are streamed SHA-256
-    digests of the exact file the builder reads.  A present-but-unreadable input
+    ``daily`` is the dataset fingerprint's MANIFEST-ROOT Merkle digest over the
+    per-stock ``daily/*.manifest.json`` sidecars (§v18-8) — the manifest, bound
+    at write time, is the daily data's identity; the three single-file upstreams
+    are streamed SHA-256 digests of the exact file the builder reads.  A
+    present-but-unreadable input
     records ``"<unreadable>"`` and a healthy-but-absent optional input records
     ``"<missing>"``, so a downstream freshness check sees the root change
     rather than silently treating a broken OR absent input as fresh — without
