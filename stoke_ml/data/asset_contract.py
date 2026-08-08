@@ -142,6 +142,38 @@ def atomic_write_json(path: str, payload: dict) -> None:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def manifest_body_digest(path: str) -> str:
+    """Content digest of ONE ``*.manifest.json`` sidecar, ``written_at`` excluded.
+
+    ``written_at`` is a per-write TIMESTAMP, so a content-identical rewrite of
+    the same data (a re-download that changed nothing) must NOT change any
+    hash built from this sidecar — the binding is WHAT the data is, not when it
+    was written.  The sidecar is parsed as JSON and the timestamp key dropped
+    before the canonical digest; a non-JSON / unreadable sidecar degrades to
+    hashing its RAW BYTES (a partial rewrite still visible, and a JSON-level
+    nicety like written_at exclusion is moot when the file is not JSON anyway).
+    Returns the hex digest — never None: an unreadable sidecar maps to
+    ``"<unreadable>"`` so the entry stays present (fail-closed).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError):
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except OSError:
+            return "<unreadable>"
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if k != "written_at"}
+    payload = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 # ── Single-writer lock ─────────────────────────────────────────────────────
 # A read-modify-write on the same target from two processes (parallel macro
 # downloads, parallel market-wide backfills) must be exclusive.  Atomic rename

@@ -167,6 +167,41 @@ def test_formal_unadopted_market_wide_channel_fails(tp, tmp_path):
     assert "no asset-manifest support" in msg or "no asset-manifest contract" in msg
 
 
+def test_formal_manifest_gate_covers_consumed_fundamental_ablation(
+        tp, tmp_path):
+    """§v18-2: a consumed-but-unrequired channel (fundamental via ablation) is
+    manifest-gated, not silently skipped — corrupting its manifest aborts.
+
+    ``fundamental`` is denied under revision-safe unless the ablation flag
+    forces it ON, so under a real run it enters the CONSUMED set only via the
+    explicit ablation.  With it in the consumed set, a present-but-manifest-less
+    fundamental parquet must FAIL the formal gate (SystemExit) — the same way a
+    required channel's broken manifest does.
+    """
+    data_dir = str(tmp_path / "data")
+    fundamental_dir = os.path.join(data_dir, "a_shares", "fundamentals")
+    os.makedirs(fundamental_dir, exist_ok=True)
+    # A present fundamental parquet with NO sidecar asset manifest — the
+    # FormalStorage formal read refuses it (require_valid_manifest=True).
+    pd.DataFrame({
+        "report_date": pd.to_datetime(["2024-03-31"]),
+        "stock_code": ["000001"],
+        "pe": [10.0],
+    }).to_parquet(os.path.join(fundamental_dir, "000001.parquet"),
+                  index=False, compression="lz4")
+    # Route through load_aux_data: formal + consumed_channels (the full channel
+    # set the run opens) drives the gate, with fundamental consumed-but-unrequired.
+    with pytest.raises(SystemExit) as ei:
+        tp.load_aux_data(
+            ["000001"], data_dir, "2020-01-01", "2024-12-31",
+            required_channels=set(),
+            consumed_channels={"sentiment", "fundamental"}, formal=True)
+    msg = str(ei.value)
+    assert "formal mode" in msg
+    assert "fundamental" in msg
+    assert "manifest missing" in msg
+
+
 def test_formal_multi_channel_aggregates_all_failures(tp, tmp_path):
     """TWO required channels failing at once → BOTH channel names appear in the
     single SystemExit message, locking the aggregate diagnostics join format."""
@@ -295,9 +330,10 @@ def _resolve_panel_with_spy(tp, monkeypatch, **args_overrides):
     captured = {}
 
     def _spy_aux(stock_list, data_dir, start_date, end_date,
-                 required_channels=None, formal=False):
+                 required_channels=None, consumed_channels=None, formal=False):
         captured["formal"] = formal
         captured["required"] = set(required_channels or ())
+        captured["consumed"] = set(consumed_channels or ())
         return {}, {}
 
     monkeypatch.setattr(
@@ -315,6 +351,10 @@ def test_resolve_panel_live_branch_forwards_formal_true(tp, monkeypatch):
     captured = _resolve_panel_with_spy(tp, monkeypatch)
     assert captured["formal"] is True
     assert captured["required"] == {"sentiment"}
+    # §v18-2: the live branch ALSO threads the full CONSUMED set — the gate
+    # covers every channel the pipeline opens, with required ⊆ consumed.
+    assert "sentiment" in captured["consumed"]
+    assert captured["required"] <= captured["consumed"]
 
 
 def test_resolve_panel_live_branch_forwards_formal_false(tp, monkeypatch):

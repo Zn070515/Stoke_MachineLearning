@@ -22,7 +22,10 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.config import feature_profile as _fp
-from stoke_ml.data.asset_contract import parse_era_coverage
+from stoke_ml.data.asset_contract import (
+    manifest_body_digest as _manifest_body_digest,
+    parse_era_coverage,
+)
 from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.channel_sources import CHANNEL_SOURCE, live_data_type, source_dir
 from stoke_ml.data.universe import (
@@ -128,6 +131,25 @@ def _panel_pipeline_kwargs(args, seq_len: int) -> dict:
     kwargs["minute_mode"] = args.minute
     return kwargs
 
+
+def _consumed_channels(args, seq_len: int) -> set[str]:
+    """The data channels the pipeline actually OPENS for this run (§v18-2).
+
+    Mirrors ``_panel_pipeline_kwargs``: a channel is consumed exactly when its
+    ``use_*`` switch resolves True after the base preference AND the vintage
+    policy AND the explicit ablation opt-ins.  Consumed ≠ Required: Required ⊂
+    Consumed, with the required subset additionally carrying coverage
+    contracts.  Every CONSUMED channel must have a valid asset manifest under a
+    formal gate (``_enforce_formal_manifests``); the required subset is the
+    extra coverage-threshold layer (``_enforce_channel_coverage``).
+    """
+    kwargs = _panel_pipeline_kwargs(args, seq_len)
+    return {
+        dim for dim in _BASE_DIM_PREFERENCE
+        if kwargs.get(_SWITCH_KEY.get(dim, f"use_{dim}"), False)
+    }
+
+
 def _entry_fill_prob_mean(panel_data: dict) -> float | None:
     """Period mean of the per-date ENTRY-side fill probability (§十八 T10a).
 
@@ -145,36 +167,6 @@ def _entry_fill_prob_mean(panel_data: dict) -> float | None:
     if not np.isfinite(efp).any():
         return None
     return float(np.nanmean(efp))
-
-
-def _manifest_body_digest(path: str) -> str:
-    """Content digest of ONE ``*.manifest.json`` sidecar, ``written_at`` excluded.
-
-    ``written_at`` is a per-write TIMESTAMP, so a content-identical rewrite of
-    the same data (a re-download that changed nothing) must NOT change the aux
-    asset-root binding — the §T6 guard binds WHAT the data is, not when it was
-    written.  The sidecar is parsed as JSON and the timestamp key dropped before
-    the canonical digest; a non-JSON / unreadable sidecar degrades to hashing
-    its RAW BYTES (a partial rewrite still visible, and a JSON-level nicety like
-    written_at exclusion is moot when the file is not JSON anyway).  Returns the
-    hex digest — never None: an unreadable sidecar maps to ``"<unreadable>"`` so
-    the entry stays present (fail-closed, the tree differs from an absent one).
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            obj = json.load(fh)
-    except (OSError, ValueError):
-        try:
-            h = hashlib.sha256()
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(65536), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except OSError:
-            return "<unreadable>"
-    if isinstance(obj, dict):
-        obj = {k: v for k, v in obj.items() if k != "written_at"}
-    return hash_json(obj)
 
 
 def _asset_manifest_entries(root: str) -> dict[str, str]:
@@ -201,24 +193,26 @@ def _asset_manifest_entries(root: str) -> dict[str, str]:
 
 
 def _aux_asset_root_hash(
-    data_dir: str, required_set: set[str], *, live_aux: bool,
+    data_dir: str, consumed_set: set[str], *, live_aux: bool,
 ) -> str:
-    """Content hash of the REQUIRED channels' live asset-manifest roots (§T6).
+    """Content hash of the CONSUMED channels' live asset-manifest roots (§T6).
 
-    The §七 guard's "changed aux tomorrow" binding: for every required channel,
-    hash the sorted relpath → digest map of the ``*.manifest.json`` sidecars
-    under that channel's CHANNEL_SOURCE ``live_dir`` (``written_at`` excluded).
-    ``live_aux`` is itself part of the hash — a LIVE build (aux bound by these
-    roots) is never interchangeable with a PREBUILT / ``--no-aux`` build, whose
-    aux is bound differently (prebuilt feature manifest) or not at all.
+    The §七 guard's "changed aux tomorrow" binding: for every CONSUMED channel
+    (every channel the run's pipeline actually opens — §v18-2, not just the
+    required subset), hash the sorted relpath → digest map of the
+    ``*.manifest.json`` sidecars under that channel's CHANNEL_SOURCE
+    ``live_dir`` (``written_at`` excluded).  ``live_aux`` is itself part of the
+    hash — a LIVE build (aux bound by these roots) is never interchangeable with
+    a PREBUILT / ``--no-aux`` build, whose aux is bound differently (prebuilt
+    feature manifest) or not at all.
 
-    Fail-closed: a required channel with no CHANNEL_SOURCE entry is recorded as
+    Fail-closed: a consumed channel with no CHANNEL_SOURCE entry is recorded as
     an explicit marker (``{"__missing_registry_entry__": True}``) — never
     silently dropped, so an unknown channel still differentiates the binding.
-    An empty required set yields a stable hash over just the ``live_aux`` flag.
+    An empty consumed set yields a stable hash over just the ``live_aux`` flag.
     """
     channels: dict[str, dict] = {}
-    for ch in sorted(required_set or ()):
+    for ch in sorted(consumed_set or ()):
         spec = CHANNEL_SOURCE.get(ch)
         if spec is None:
             channels[ch] = {"__missing_registry_entry__": True}
@@ -237,13 +231,16 @@ def _panel_store_meta(
     """Build-time fingerprint persisted in a panel store's meta.json.
 
     ``required_set`` is a REQUIRED keyword-only parameter — the resolved set of
-    required aux channels (from ``train_panel_gates._resolve_required_set``).  It
-    must be explicit: a forgotten/omitted set would silently bind the store to an
-    EMPTY aux asset root (§T6 ``aux_asset_root_hash`` → ``channels={}``), making
-    the §七 "changed aux tomorrow" guard vacuous — exactly the fake-provenance
-    hole T6 closes.  Making it required forces every caller to state the channel
-    contract the store is bound under (``set()`` is the honest value for a
-    no-profile / no-required-channel build).
+    required aux channels (from ``train_panel_gates._resolve_required_set``).
+    §v18-2: the ``aux_asset_root_hash`` binding is computed over the CONSUMED
+    channel set (``_consumed_channels(args, seq_len)``), and ``required_set``
+    feeds the required ⊆ consumed invariant — a required channel the pipeline
+    does not open is a contradiction (SystemExit), so the caller must state the
+    channel contract the store is bound under explicitly (``set()`` is the
+    honest value for a no-profile / no-required-channel build).  Making it
+    required forces every caller to declare the contract rather than leave the
+    invariant unchecked (a forgotten/omitted set would silently skip the
+    §v18-2 contradiction check).
 
     Re-checked by load_panel_memmap on a store-backed re-run so a stale store
     (different horizon / universe / feature switches / date window) is refused
@@ -271,11 +268,12 @@ def _panel_store_meta(
       ``git_commit``).  An uncommitted code edit changes the hash, so a store
       built from edited feature code is refused instead of silently reused
       (code_tree_hash).  Recorded on EVERY build.
-    * ``aux_asset_root_hash`` — content hash of the REQUIRED channels' live
+    * ``aux_asset_root_hash`` — content hash of the CONSUMED channels' live
       asset-manifest roots (``*.manifest.json`` sidecars, ``written_at``
-      excluded).  Recorded ONLY for a LIVE-aux build (``data_dir`` set and no
-      ``--prebuilt`` / ``--no-aux``): the store binds TODAY's aux roots, so
-      changed aux TOMORROW makes a formal load refuse.  A prebuilt / no-aux
+      excluded; §v18-2: every channel the run's pipeline opens, not just the
+      required subset).  Recorded ONLY for a LIVE-aux build (``data_dir`` set
+      and no ``--prebuilt`` / ``--no-aux``): the store binds TODAY's aux roots,
+      so changed aux TOMORROW makes a formal load refuse.  A prebuilt / no-aux
       store records no aux binding (its aux is bound via
       ``prebuilt_feature_manifest_hash`` or not at all).
     * ``panel_input_hash`` — SHA-256 aggregate (canonical JSON) of EVERY input
@@ -356,8 +354,20 @@ def _panel_store_meta(
     tree_hash = feature_code_tree_hash()
     meta["feature_code_tree_hash"] = tree_hash
     if data_dir is not None and live_aux:
+        consumed = _consumed_channels(args, seq_len)
+        # §v18-2 invariant: required ⊆ consumed — a required channel the
+        # pipeline does not open is a contradiction (you demand coverage for a
+        # channel the model never reads).  The §二十-1 vintage binding makes
+        # this hold for every named-profile run.
+        not_consumed = set(required_set) - consumed
+        if not_consumed:
+            raise SystemExit(
+                "required channels not consumed by this run's pipeline "
+                f"({sorted(not_consumed)}) — required ⊂ consumed must hold; "
+                "align --require-aux-channels / --feature-profile with the "
+                "--vintage-policy (§v18-2)")
         meta["aux_asset_root_hash"] = _aux_asset_root_hash(
-            data_dir, required_set, live_aux=True)
+            data_dir, consumed, live_aux=True)
     meta["panel_input_hash"] = hash_json({
         "schema_version": 1,
         "feature_code_tree_hash": tree_hash,
@@ -644,6 +654,7 @@ def _resolve_panel(
         aux_data, channel_manifest = load_aux_data(
             stock_list, data_dir, args.start, args.end,
             required_channels=required_set,
+            consumed_channels=_consumed_channels(args, seq_len),
             formal=_formal_mode(args),
         )
         logger.info("Aux data loaded in %.1fs", time.time() - t_aux)
@@ -1375,19 +1386,20 @@ def _enforce_formal_manifests(
     data_dir: str,
     start_date: str,
     end_date: str,
-    required_set: set[str],
+    consumed_set: set[str],
 ) -> None:
-    """§T4/§十九-9: formal-mode asset-manifest gate for the required aux channels.
+    """§T4/§十九-9: formal-mode asset-manifest gate for the consumed aux channels.
 
     Runs once, BEFORE the lenient per-channel load, when ``formal=True``.  For
-    every required channel with data on disk, the channel's asset manifest(s)
-    must be present AND match the parquet they guard (content ``schema_hash`` /
-    ``rows`` / ``start``-``end`` extent / ``data_type`` / ``partition`` / vintage
-    declaration).  A channel whose data file exists but whose manifest is
-    missing or mismatched — or a required channel with NO manifest support at
-    all (the cninfo announcement-sentiment path, and the unadopted
-    MarketWideStorage types shareholder/valuation) — FAILS HARD (SystemExit)
-    instead of the explore-mode warn-and-proceed.
+    every CONSUMED channel with data on disk (every channel the run's pipeline
+    actually opens — §v18-2, not just the required subset), the channel's asset
+    manifest(s) must be present AND match the parquet they guard (content
+    ``schema_hash`` / ``rows`` / ``start``-``end`` extent / ``data_type`` /
+    ``partition`` / vintage declaration).  A channel whose data file exists but
+    whose manifest is missing or mismatched — or a consumed channel with NO
+    manifest support at all (the cninfo announcement-sentiment path, and the
+    unadopted MarketWideStorage types shareholder/valuation) — FAILS HARD
+    (SystemExit) instead of the explore-mode warn-and-proceed.
 
     Channels with NO data on disk are NOT checked here: the coverage gate
     (``train_panel_gates._enforce_channel_coverage``) already aborts a required
@@ -1443,7 +1455,7 @@ def _enforce_formal_manifests(
                 problems.append(f"{ch}[{code}]: {exc}")
                 return
 
-    for ch in sorted(required_set):
+    for ch in sorted(consumed_set):
         if ch == "sentiment":
             _per_stock(ch, NewsStorage(data_dir), "load_daily_sentiment")
         elif ch == "guba":
@@ -1508,14 +1520,14 @@ def _enforce_formal_manifests(
                     problems.append(_fmt_manifest_problem(path, report))
         else:
             problems.append(
-                f"{ch}: required channel is not loaded by load_aux_data and "
+                f"{ch}: consumed channel is not loaded by load_aux_data and "
                 "has no manifest checker — cannot verify in formal mode; use "
                 "--prebuilt")
     if problems:
         for p in problems:
             logger.error("formal manifest gate: %s", p)
         raise SystemExit(
-            "formal mode: required aux-channel asset-manifest gate FAILED — "
+            "formal mode: consumed aux-channel asset-manifest gate FAILED — "
             "refusing to train on unverified data (§T4/§十九-9): "
             + "; ".join(problems))
 
@@ -1526,17 +1538,23 @@ def load_aux_data(
     start_date: str,
     end_date: str,
     required_channels: set[str] | None = None,
+    consumed_channels: set[str] | None = None,
     formal: bool = False,
 ) -> tuple[dict[str, dict[str, pd.DataFrame]], dict]:
     """Load auxiliary data (sentiment, guba, margin, etc.) per stock.
 
     ``formal`` (§T4): a FORMAL run (``formal=True``, threaded from
     ``_formal_mode(args)`` in the live branch of ``_resolve_panel``) runs
-    :func:`_enforce_formal_manifests` first — every required channel's asset
-    manifest must be present + matching, else the run aborts (SystemExit).  The
-    default ``formal=False`` (explore / legacy) keeps the warn-and-proceed
-    behavior byte-for-byte: lenient reads, a present-but-mismatched manifest
-    logs a warning, a manifest-less file reads as legacy data.
+    :func:`_enforce_formal_manifests` first — every CONSUMED channel's asset
+    manifest must be present + matching, else the run aborts (SystemExit).
+    ``consumed_channels`` (§v18-2) is the full channel set the run's pipeline
+    opens (derived from ``args`` + ``seq_len`` via ``_consumed_channels``);
+    ``required_channels`` stays the coverage-contract subset.  The gate covers
+    ``consumed_channels`` when given, else falls back to ``required_channels``
+    (backward compat).  The default ``formal=False`` (explore / legacy) keeps
+    the warn-and-proceed behavior byte-for-byte: lenient reads, a
+    present-but-mismatched manifest logs a warning, a manifest-less file reads
+    as legacy data.
 
     Returns (result, manifest):
       result   — {stock_code: {"sentiment": df, "guba": df, ...}}
@@ -1554,12 +1572,15 @@ def load_aux_data(
     manifest: dict[str, dict] = {}
     required_set = set(required_channels or ())
 
-    # §T4/§十九-9: formal mode — every required channel's asset manifest must
+    # §T4/§十九-9: formal mode — every consumed channel's asset manifest must
     # be present + matching BEFORE any lenient load proceeds.  Explore mode
     # (formal=False) skips this entirely and keeps the legacy warn-and-proceed.
-    if formal and required_set:
+    # §v18-2: the gate binds the full CONSUMED set when threaded, not just the
+    # required subset (which is the extra coverage-contract layer).
+    if formal and (consumed_channels or required_set):
         _enforce_formal_manifests(
-            stock_list, data_dir, start_date, end_date, required_set)
+            stock_list, data_dir, start_date, end_date,
+            consumed_channels or required_set)
 
     # Sentiment (news)
     _load_channel_aux(

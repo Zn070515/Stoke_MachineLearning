@@ -317,6 +317,33 @@ class TestAuxAssetRootHash:
         h_empty = _aux_asset_root_hash(self._data(tmp_path), set(), live_aux=True)
         assert h != h_empty
 
+    def test_aux_asset_root_hash_binds_consumed_not_just_required(self, tmp_path):
+        """§v18-2: the aux root binding must cover the channels the run CONSUMES,
+        not only the required subset — a consumed-but-unrequired channel (e.g. the
+        fundamental ablation) whose data changes must make the binding differ."""
+        data = self._data(tmp_path)
+        h_required_only = _aux_asset_root_hash(
+            data, {"sentiment"}, live_aux=True)
+        h_with_consumed = _aux_asset_root_hash(
+            data, {"sentiment", "fundamental"}, live_aux=True)
+        assert h_required_only != h_with_consumed
+
+    def test_panel_store_meta_binds_consumed_channels(self, tmp_path):
+        """§v18-2: _panel_store_meta's aux_asset_root_hash is computed over the
+        CONSUMED channel set (derived from args + seq_len), so an ablation store
+        differs from a non-ablation store even when required_set is empty."""
+        base = _panel_store_meta(
+            _panel_args(vintage_policy="revision-safe"),
+            seq_len=60, stock_list=["000001"], data_dir=str(tmp_path),
+            required_set=set())
+        ablated = _panel_store_meta(
+            _panel_args(vintage_policy="revision-safe",
+                        allow_fundamental_ablation=True),
+            seq_len=60, stock_list=["000001"], data_dir=str(tmp_path),
+            required_set=set())
+        assert base.get("aux_asset_root_hash") != ablated.get(
+            "aux_asset_root_hash")
+
 
 # ── strict validation of the provenance keys ────────────────────────────
 
