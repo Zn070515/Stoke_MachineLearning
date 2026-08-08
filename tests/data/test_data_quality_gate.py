@@ -764,14 +764,40 @@ class TestFingerprints:
         root = tmp_path
         daily = root / "a_shares" / "daily"
         daily.mkdir(parents=True)
-        _daily(TRADE_DATES, [10.0] * 5).to_parquet(daily / "000001.parquet", index=False)
+        self._write_daily_with_manifest(daily, "000001", TRADE_DATES, [10.0] * 5)
         h1 = dataset_fingerprint(root, ["daily"])
         assert dataset_fingerprint(root, ["daily"]) == h1
-        # Rebuild the same file with more rows: size + mtime change -> digest flips.
-        _daily(TRADE_DATES + ["2024-01-09"], [10.0] * 6).to_parquet(
-            daily / "000001.parquet", index=False
-        )
+        # §v18-8: the fingerprint binds the per-stock MANIFEST (content hash),
+        # not a byte re-scan.  Rebuilding the data MUST rewrite the manifest —
+        # the canonical write path — and the digest flips.
+        self._write_daily_with_manifest(
+            daily, "000001", TRADE_DATES + ["2024-01-09"], [10.0] * 6)
         assert dataset_fingerprint(root, ["daily"]) != h1
+
+    def test_dataset_fingerprint_missing_manifest_is_a_marker(self, tmp_path):
+        """§v18-8: a parquet WITHOUT a manifest hashes a distinct marker — the
+        fingerprint differs from the same parquet WITH a manifest (fail-closed:
+        a manifest-less file is never silently treated as identical)."""
+        root = tmp_path
+        daily = root / "a_shares" / "daily"
+        daily.mkdir(parents=True)
+        _daily(TRADE_DATES, [10.0] * 5).to_parquet(daily / "000001.parquet", index=False)
+        h_no_manifest = dataset_fingerprint(root, ["daily"])
+        self._write_daily_with_manifest(daily, "000001", TRADE_DATES, [10.0] * 5)
+        h_with_manifest = dataset_fingerprint(root, ["daily"])
+        assert h_no_manifest != h_with_manifest
+
+    @staticmethod
+    def _write_daily_with_manifest(daily_dir, code, dates, closes):
+        from stoke_ml.data.asset_contract import schema_hash
+        df = _daily(dates, closes)
+        df.to_parquet(daily_dir / f"{code}.parquet", index=False)
+        with open(daily_dir / f"{code}.manifest.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "code": code, "rows": len(df), "schema_hash": schema_hash(df),
+                "source": "test", "start": dates[0], "end": dates[-1],
+                "written_at": "2026-08-08T00:00:00Z",
+            }, f)
 
     def test_dataset_fingerprint_missing_dir_is_stable(self, tmp_path):
         h1 = dataset_fingerprint(tmp_path, ["daily", "features_panel"])

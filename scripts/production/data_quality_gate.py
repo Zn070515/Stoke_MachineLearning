@@ -66,6 +66,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +74,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from stoke_ml.data.asset_contract import manifest_body_digest
 from stoke_ml.data.calendar import (
     TradingCalendar,
     calendar_artifact_hash,
@@ -182,11 +184,15 @@ SPARSE_NONZERO_RATIO = 0.005
 
 # Gate's own version, recorded in every report so a consuming run (train_panel's
 # required quality-gate check, §六-2) can verify it reviewed THIS gate.
+# 3.0 (§二十-8): the daily dataset fingerprint is now a Merkle root over the
+# per-stock manifest content hashes — old gate reports' data_manifest_hash are
+# NO LONGER comparable, so a consuming run must re-run the gate before it can
+# trust the report-to-training binding.
 # 2.0 (§七.2/§七.3/§七.4): content-aware dataset fingerprint + explicit run
 # scope/sample fields + always-full manifest/contract scan.  Any semantic change
 # to what PASS means MUST bump this — a consuming run refuses a gate whose
 # semantics it can't name.
-QUALITY_GATE_VERSION = "2.0"
+QUALITY_GATE_VERSION = "3.0"
 
 # Frozen formal-research profile (§六-4).  The bootstrap defaults are fine for
 # dev, but a 5530-stock research run must clear these floors: readable stocks
@@ -319,15 +325,19 @@ def contract_version() -> str:
 def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
     """Deterministic content-aware hash over the required dataset directories.
 
-    §七.3: hashes the parquet file BYTES (streamed, never trusting size/mtime),
-    so a same-size replacement that preserves mtime_ns still flips the digest —
-    name+size+mtime hashing let an in-place overwrite of identical size/mtime
-    slip past.  Any dataset a training run consumes that changed after the gate
-    PASS — a rebuild, a partial overwrite, an incremental download, a
-    re-adjustment — flips the digest and train_panel's report-match check fails
-    (§六-2).  ``datasets`` resolve against ``root`` explicitly (NOT the
-    module-level dir globals), so a consuming script that imports this function
-    hashes the root it actually reads, not the gate's last --data-dir.
+    §v18-8: for the ``daily`` dataset the hash is a MERKLE ROOT over the
+    per-stock manifest CONTENT hashes (``daily/{code}.manifest.json``, with
+    ``written_at`` excluded) — the manifest is the data's identity, bound at
+    write time.  A formal re-run reads only the small sidecars, never re-scans
+    the full-market Daily bytes (tens of GB).  A parquet whose manifest was
+    rewritten to reflect new content (the canonical write path) flips the
+    digest; a manifest-less parquet hashes a distinct marker so it never
+    silently equals a manifested one.
+
+    Non-daily datasets (features / features_panel / custom) keep the legacy
+    byte-streaming hash — they have no per-stock manifest contract to bind.
+    Any dataset a training run consumes that changed after the gate PASS flips
+    the digest and train_panel's report-match check fails (§六-2).
     """
     def _resolve(name: str) -> Path:
         # §九.1: mirror _dataset_dir — a custom (non-canonical) dataset resolves
@@ -366,6 +376,19 @@ def dataset_fingerprint(root: Path, datasets: list[str]) -> str:
         if not d.is_dir():
             h.update(b"missing")
             h.update(b";")
+            continue
+        if ds == "daily":
+            # §v18-8: Merkle root over per-stock manifest content digests.
+            for fp in sorted(d.glob("*.parquet")):
+                code = fp.stem
+                mp = d / f"{code}.manifest.json"
+                digest = (
+                    manifest_body_digest(str(mp))
+                    if os.path.isfile(mp) else "<no-manifest>")
+                h.update(fp.name.encode("utf-8"))
+                h.update(b":")
+                h.update(digest.encode("utf-8"))
+                h.update(b";")
             continue
         for fp in sorted(d.glob("*.parquet")):
             h.update(fp.name.encode("utf-8"))
