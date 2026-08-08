@@ -22,6 +22,7 @@ part while it is proxy (ablation-only, mirroring ``use_topic``).
 Synthetic data on ``tmp_path``, no network, no real market data.
 """
 import importlib.util
+import json
 import os
 
 import pandas as pd
@@ -195,6 +196,24 @@ def test_manifest_written_and_formal_read_passes(bme, tmp_path):
     # formal read of the re-read file passes (schema_hash survives round-trip)
     reread = pd.read_parquet(path)
     check_asset_read(path, MARKET_ENV_ASSET, reread, require_valid_manifest=True)
+
+
+def test_write_market_env_manifest_carries_lineage(bme, tmp_path):
+    """§v18-7: the derived market_env manifest records upstream_roots +
+    transform_code_hash + transform_config_hash — freshness/derivation lineage,
+    not just self-integrity."""
+    _write_account_stats(tmp_path)
+    _write_highs_lows(tmp_path)
+    _write_industry(tmp_path)
+    _write_daily(tmp_path)
+    df, parts = bme.build_market_env(str(tmp_path))
+    out = bme.write_market_env(str(tmp_path), df, parts)
+    with open(out + ".manifest.json", encoding="utf-8") as f:
+        m = json.load(f)
+    assert "upstream_roots" in m and isinstance(m["upstream_roots"], dict)
+    assert "daily" in m["upstream_roots"]
+    assert m.get("transform_code_hash") and len(m["transform_code_hash"]) == 64
+    assert "transform_config_hash" in m and m["transform_config_hash"]
 
 
 # ── backward-compat consumer schema ───────────────────────────────────────

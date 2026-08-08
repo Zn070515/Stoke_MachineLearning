@@ -45,12 +45,14 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import logging
 import os
 
 import numpy as np
 import pandas as pd
 
+from scripts.production.data_quality_gate import dataset_fingerprint
 from stoke_ml.config import load_config
 from stoke_ml.config.feature_profile import (
     MARKET_ENV_ACCOUNT_COLS,
@@ -63,6 +65,7 @@ from stoke_ml.data.asset_contract import (
 )
 from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
 from stoke_ml.features.aux_cols import MARKET_ENV_COLS
+from stoke_ml.models.panel.code_tree_hash import hash_json
 
 logger = logging.getLogger(__name__)
 
@@ -280,12 +283,58 @@ def _build_high_low_ratio(base: str) -> pd.Series:
         "high_low_ratio")
 
 
+def _file_sha256(path: str) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return "<unreadable>"
+
+
+def _upstream_roots(data_dir: str) -> dict:
+    """The exact input assets this market_env build derives from (§v18-7).
+
+    ``daily`` is a content-aware dataset fingerprint (streamed parquet bytes of
+    ``a_shares/daily``); the three single-file upstreams are streamed SHA-256
+    digests of the exact file the builder reads.  An unreadable/absent input
+    records ``"<unreadable>"`` so a downstream freshness check still sees the
+    root change rather than silently treating a broken input as fresh.
+    """
+    base = os.path.join(data_dir, "a_shares")
+    return {
+        "daily": dataset_fingerprint(data_dir, ["daily"]),
+        "highs_lows": _file_sha256(
+            os.path.join(base, "market_breadth", "highs_lows.parquet")),
+        "industry_ranking": _file_sha256(
+            os.path.join(base, "industry_ranking.parquet")),
+        "account_stats": _file_sha256(
+            os.path.join(base, "market_breadth", "account_stats.parquet")),
+    }
+
+
+def _transform_code_hash() -> str:
+    """Content hash of THIS builder's source — the transform identity (§v18-7).
+
+    Any edit to this file flips the digest, so a downstream formal gate can tell
+    whether an on-disk market_env was built by the code that is on disk RIGHT
+    NOW.  Hashing this module's own bytes (not the whole tree) keeps the lineage
+    scoped to the exact transform that produced the asset.
+    """
+    return _file_sha256(os.path.abspath(__file__))
+
+
 def write_market_env(data_dir: str, df: pd.DataFrame, parts: dict) -> str:
     """Atomically write the parquet + MARKET_ENV_ASSET manifest, then self-check.
 
     The manifest carries the channel-level vintage (``vintage_pit="proxy"`` —
     the STRICTER of the two parts, drawn from channel_vintage's ``market_env``
-    entry) plus the ``parts`` per-part declaration.  A formal read
+    entry), the per-part ``parts`` declaration, AND the §v18-7 DERIVATION
+    LINEAGE: ``upstream_roots`` (content hash of every input asset the build
+    read), ``transform_code_hash`` (this builder's own source), and
+    ``transform_config_hash`` (the build's config inputs).  A formal read
     (``require_valid_manifest=True``) of the re-read file must pass, proving the
     schema_hash survives the parquet round-trip.
     """
@@ -294,7 +343,15 @@ def write_market_env(data_dir: str, df: pd.DataFrame, parts: dict) -> str:
     out_path = os.path.join(br, "market_env_daily.parquet")
     with AtomicCommit(out_path) as ac:
         df.to_parquet(ac.tmp_path, compression="lz4")
-    write_asset_manifest(out_path, MARKET_ENV_ASSET, df, parts=parts)
+    write_asset_manifest(
+        out_path, MARKET_ENV_ASSET, df, parts=parts,
+        upstream_roots=_upstream_roots(data_dir),
+        transform_code_hash=_transform_code_hash(),
+        transform_config_hash=hash_json({
+            "output_columns": sorted(OUTPUT_COLUMNS),
+            "parts": parts,
+        }),
+    )
     reread = pd.read_parquet(out_path)
     check_asset_read(out_path, MARKET_ENV_ASSET, reread, require_valid_manifest=True)
     return out_path
