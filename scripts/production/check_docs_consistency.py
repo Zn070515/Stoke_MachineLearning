@@ -153,13 +153,17 @@ def main():
                   str(n_stocks) in docs[doc_key],
                   f"expect {n_stocks} in {doc_key}")
 
-    # ── Fold schedule → train_panel.py + docs ──
-    # Non-overlapping OOS folds (step = val_len), inner_val
-    # carve selects best epoch, outer_test evaluated once, lockbox reserved.
+    # ── Fold schedule → train_panel.py / train_panel_folds.py + docs ──
+    # Non-overlapping OOS folds (step = val_len) are configured in main();
+    # the inner_val carve that selects the best epoch lives in the extracted
+    # fold loop (train_panel_folds._run_fold_loop).  Both invariants stay
+    # verified at their current homes.
     tp = read_src(os.path.join("scripts", "production", "train_panel.py"))
-    val_ok = "inner_val" in tp and "step = val_len" in tp
+    tpf = read_src(os.path.join("scripts", "production", "train_panel_folds.py"))
+    val_ok = "step = val_len" in tp and "inner_val" in tpf
     check("train_panel fold", val_ok,
-          "expect inner_val carve + step=val_len (non-overlapping folds) in train_panel.py")
+          "expect step=val_len (train_panel.py) + inner_val carve "
+          "(train_panel_folds.py) for non-overlapping folds")
     for doc_key in ("CONTEXT.md", "README.md"):
         ok = (re.search(r"inner[ _]val", docs[doc_key], re.IGNORECASE) is not None
               and re.search(r"63\s*天", docs[doc_key]) is None)
