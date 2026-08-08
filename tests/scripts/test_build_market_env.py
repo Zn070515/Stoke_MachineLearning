@@ -83,14 +83,31 @@ def _write_industry(tmp_path):
     return daily
 
 
+def _write_daily_file(daily_dir, code, df):
+    """Write a daily parquet + its manifest sidecar — the canonical write path
+    (§v18-8).  The dataset fingerprint binds the per-stock MANIFEST content
+    hash, so every daily file carries a manifest, exactly like production."""
+    from stoke_ml.data.asset_contract import schema_hash
+    df.to_parquet(daily_dir / f"{code}.parquet", index=False)
+    (daily_dir / f"{code}.manifest.json").write_text(json.dumps({
+        "code": code,
+        "rows": int(len(df)),
+        "schema_hash": schema_hash(df),
+        "source": "test",
+        "start": df["date"].min().strftime("%Y-%m-%d"),
+        "end": df["date"].max().strftime("%Y-%m-%d"),
+        "written_at": "2026-08-08T00:00:00Z",
+    }), encoding="utf-8")
+
+
 def _write_daily(tmp_path):
     daily = tmp_path / "a_shares" / "daily"
     daily.mkdir(parents=True, exist_ok=True)
     for code in ("000001", "000002"):
-        pd.DataFrame({
+        _write_daily_file(daily, code, pd.DataFrame({
             "date": pd.to_datetime(["2024-07-03", "2024-07-04", "2024-07-05"]),
             "amount": [1e9, 1.1e9, 1.2e9],
-        }).to_parquet(daily / f"{code}.parquet", index=False)
+        }))
 
 
 def _build_full(tmp_path, bme, *, publish_col=None):
@@ -217,9 +234,14 @@ def test_write_market_env_manifest_carries_lineage(bme, tmp_path):
 
 
 def test_write_market_env_lineage_veracity_and_freshness(bme, tmp_path):
-    """§v18-7: the lineage is REAL — the recorded daily root equals a fresh
-    recomputation, an unchanged rebuild is stable, and mutating a daily source
-    flips the daily root (freshness detection, not a hardcoded value)."""
+    """§v18-7 + §v18-8: the lineage is REAL — the recorded daily root equals a
+    fresh recomputation, an unchanged rebuild is stable, and mutating a daily
+    source flips the daily root (freshness detection, not a hardcoded value).
+
+    §v18-8: the daily fingerprint binds the per-stock MANIFEST content hash, so
+    a source change is visible ONLY through the canonical write path — parquet
+    + manifest rewritten together (a bare byte edit with no manifest rewrite is
+    intentionally invisible to the fingerprint)."""
     _write_account_stats(tmp_path)
     _write_highs_lows(tmp_path)
     _write_industry(tmp_path)
@@ -238,10 +260,12 @@ def test_write_market_env_lineage_veracity_and_freshness(bme, tmp_path):
     with open(out2 + ".manifest.json", encoding="utf-8") as f:
         m2 = json.load(f)
     assert m2["upstream_roots"] == root1
-    # mutate a daily source → the daily root flips
-    d = pd.read_parquet(tmp_path / "a_shares" / "daily" / "000001.parquet")
-    d.assign(amount=d["amount"] * 2.0).to_parquet(
-        tmp_path / "a_shares" / "daily" / "000001.parquet", index=False)
+    # mutate a daily source → the daily root flips via the canonical write path
+    # (§v18-8): the parquet AND its manifest are rewritten together, so the
+    # manifest content digest (schema_hash of the new values) changes.
+    daily_dir = tmp_path / "a_shares" / "daily"
+    d = pd.read_parquet(daily_dir / "000001.parquet")
+    _write_daily_file(daily_dir, "000001", d.assign(amount=d["amount"] * 2.0))
     df3, parts3 = bme.build_market_env(str(tmp_path))
     out3 = bme.write_market_env(str(tmp_path), df3, parts3)
     with open(out3 + ".manifest.json", encoding="utf-8") as f:
