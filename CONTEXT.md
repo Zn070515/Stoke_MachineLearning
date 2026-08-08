@@ -87,6 +87,16 @@
 - `stock_industry_map.parquet`：无 manifest（无 consumer / formal gate 要求，T9 不改）。
 - **cninfo announcement-sentiment 路径**（`a_shares/cninfo_announcements/sentiment/`）：无 storage/manifest 支持 —— formal 模式下显式拒绝（`use --prebuilt or add a DataAssetContract writer`），T9 维持显式排除，不补 writer。
 
+### 正式研究 Prebuilt 主线（§P2-16，T14 收口）
+
+正式研究的 canonical 流程（各阶段产物在括号中）：
+
+**Raw Assets → Formal Asset Gate → Prebuilt Feature Artifact → Formal Feature Manifest → Streaming PanelStore → Training**
+
+即：原始数据下载（`download_*.py`）→ 质量门报告（`reports/data_quality_gate.json`，formal 必检）→ `build_features.py --panel-mode` 一次性构建面板特征（`data/features_panel/`）→ 每份特征 parquet 携带 sidecar manifest（`--require-feature-manifest` 默认开）→ 可选 `--panel-store` 流式固化 → 训练直接读 `--prebuilt data/features_panel`（`train_panel.py`）。面板特征只构建一次，训练循环不再在线做特征工程。
+
+门禁规则（`_require_prebuilt_mainline`，T14）：**formal 研究**（quality gate 强制 且 非 `--no-formal`）且**解析后股票数 > 1000** 且 无 `--prebuilt` / 无完整 `--panel-store` → 启动即拒绝，提示先构建 prebuilt 特征。`--universe all` 无论模式一律拒绝（5530 只无法在 RAM 内做特征工程，§七-P0）。在线特征工程保留给 debug / smoke / 小宇宙 / 特征开发；逃生口是 `--no-formal`（探索性）/ `--no-require-quality-gate`（dev smoke）。minute 模式无 prebuilt 产物，豁免计数门禁。
+
 ### 格式
 
 全链路 Parquet（列存，压缩，pandas 原生读写）。

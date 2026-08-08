@@ -178,17 +178,31 @@ def _resolve_universe(
         return chosen, f"{universe} {len(chosen)}{note}"
     raise ValueError(f"unknown --universe: {universe}")
 
-def _require_all_universe_prebuilt(
-    universe: str, prebuilt: str | None, store_complete: bool = False,
-) -> None:
-    """§七-P0: ``--universe all`` without ``--prebuilt`` is refused outright.
+_PREBUILT_MAINLINE_THRESHOLD = 1000
 
-    The full market cannot be feature-engineered in RAM (~225GB of feature
-    arrays on a ~96GB host); it must read prebuilt panel features
-    (build_features.py --panel-mode).  A complete ``--panel-store`` is an
-    equivalent source (the full panel already persisted as mmap'd arrays), so
-    it lifts the requirement.  Extracted from main() so the refusal is
-    unit-testable.
+
+def _require_prebuilt_mainline(
+    universe: str,
+    prebuilt: str | None,
+    store_complete: bool = False,
+    n_resolved: int = 0,
+    formal_research: bool = False,
+    threshold: int = _PREBUILT_MAINLINE_THRESHOLD,
+) -> None:
+    """§七-P0 / §P2-16: refuse a large-universe run without prebuilt features.
+
+    Two independent refusal branches:
+      * ``universe == "all"`` without ``--prebuilt`` / a complete
+        ``--panel-store`` is refused outright — the full market cannot be
+        feature-engineered in RAM (~225GB of feature arrays on a ~96GB host),
+        regardless of mode (§七-P0).
+      * a FORMAL-RESEARCH run whose resolved universe exceeds ``threshold``
+        stocks, without ``--prebuilt`` / a complete store, is refused — live
+        feature engineering is reserved for debug/smoke/small-universe/feature-
+        development runs; formal research on large universes uses the prebuilt
+        mainline (§P2-16).
+    A complete ``--panel-store`` is an equivalent source in both cases (the
+    panel was already built and persisted as mmap'd arrays).
     """
     if universe == "all" and not prebuilt and not store_complete:
         raise SystemExit(
@@ -198,4 +212,16 @@ def _require_all_universe_prebuilt(
             "Run scripts/production/build_features.py --panel-mode first, then "
             "re-run with --prebuilt data/features_panel, or point --panel-store "
             "at a previously-built store."
+        )
+    if formal_research and n_resolved > threshold and not prebuilt and not store_complete:
+        raise SystemExit(
+            f"formal research on a large universe ({n_resolved} resolved stocks "
+            f"> {threshold}) requires the prebuilt feature mainline: live "
+            f"feature engineering is reserved for debug / smoke / small-universe "
+            f"/ feature-development runs (§P2-16).  Run "
+            f"scripts/production/build_features.py --panel-mode to build "
+            f"data/features_panel once, then re-run with --prebuilt "
+            f"data/features_panel (or point --panel-store at a previously-built "
+            f"complete store).  To run live anyway, pass --no-formal "
+            f"(exploratory) or --no-require-quality-gate (dev smoke) explicitly."
         )

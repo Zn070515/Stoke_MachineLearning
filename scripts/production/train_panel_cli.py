@@ -113,7 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(built via build_features.py --panel-mode). "
                              "Skips aux data loading and live feature "
                              "engineering — the panel is built from the "
-                             "prebuilt parquets")
+                             "prebuilt parquets.  Formal research on a large "
+                             "universe (>1000 resolved stocks) requires it "
+                             "(or a complete --panel-store) (§P2-16)")
     parser.add_argument("--require-feature-manifest",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Require every prebuilt feature parquet to carry a "

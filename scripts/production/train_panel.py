@@ -74,7 +74,7 @@ from scripts.production.train_panel_universe import (
     _strict_index_training_effective,
     _load_index_universe,  # noqa: F401  re-exported for import-compat
     _resolve_universe,
-    _require_all_universe_prebuilt,
+    _require_prebuilt_mainline,
 )
 from scripts.production.train_panel_gates import (
     _assess_universe_reconciliation,  # noqa: F401  re-exported for import-compat
@@ -198,14 +198,6 @@ def main():
             gate_report.get("manifest_contract_full_scan"),
         )
 
-    # §七-P0: the full market cannot be feature-engineered in RAM.  `--universe
-    # all` must read prebuilt panel features (build_features.py --panel-mode)
-    # rather than live-engineering 5530 stocks (~225GB of feature arrays on a
-    # ~96GB host).  Without --prebuilt this is refused outright; with it the
-    # post-build memory estimate below still warns when the panel is too big.
-    _require_all_universe_prebuilt(
-        args.universe, args.prebuilt, store_complete=_store_load)
-
     if args.stock_list:
         stock_list = [c.strip() for c in args.stock_list.split(",")]
         universe_desc = f"stock-list (explicit, n={len(stock_list)})"
@@ -227,6 +219,17 @@ def main():
         sys.exit(1)
 
     universe_resolved = list(stock_list)
+
+    # §P2-16: formal research on a large universe must use the prebuilt
+    # feature mainline (or a complete --panel-store); live feature engineering
+    # is for debug/smoke/small-universe/feature-dev runs.  Minute mode has no
+    # prebuilt artifact, so it is exempt from the count gate.  The --universe
+    # all refusal fires here too (5530 > any threshold, and by name).
+    _require_prebuilt_mainline(
+        args.universe, args.prebuilt, store_complete=_store_load,
+        n_resolved=len(universe_resolved),
+        formal_research=_gate_enforced(args) and _formal_mode(args) and not args.minute,
+    )
 
     # §七-P0: refuse an oversized universe BEFORE the panel build allocates the
     # dense (N, T, D) grids — the post-build check below is too late (the build

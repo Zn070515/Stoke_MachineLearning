@@ -1019,18 +1019,52 @@ def test_lockbox_open_refuses_second_formal_use(tp, tmp_path):
 
 # ── §七-P0 universe memory guard ─────────────────────────────────────
 
-def test_require_all_universe_prebuilt_refuses_without_prebuilt(tp):
+def test_require_prebuilt_mainline_all_universe_refuses_without_prebuilt(tp):
     """--universe all without --prebuilt is refused outright — the full market
     cannot be feature-engineered in RAM (§七-P0)."""
     with pytest.raises(SystemExit):
-        tp._require_all_universe_prebuilt("all", None)
+        tp._require_prebuilt_mainline("all", None)
 
 
-def test_require_all_universe_prebuilt_allows_prebuilt(tp):
-    """--universe all WITH --prebuilt proceeds; a non-all universe needs no
-    prebuilt at all."""
-    tp._require_all_universe_prebuilt("all", "data/features_panel")
-    tp._require_all_universe_prebuilt("random", None)
+def test_require_prebuilt_mainline_all_universe_allows_prebuilt_or_store(tp):
+    """--universe all WITH --prebuilt / a complete store proceeds."""
+    tp._require_prebuilt_mainline("all", "data/features_panel")
+    tp._require_prebuilt_mainline("all", None, store_complete=True)
+
+
+def test_require_prebuilt_mainline_large_formal_refuses_live(tp):
+    """formal research + large resolved universe + live (no prebuilt) refused."""
+    with pytest.raises(SystemExit) as ei:
+        tp._require_prebuilt_mainline(
+            "csi800", None, n_resolved=1500, formal_research=True)
+    msg = str(ei.value).lower()
+    assert "prebuilt" in msg and ("csi800" in msg or "1500" in msg)
+
+
+def test_require_prebuilt_mainline_large_formal_allows_prebuilt_and_store(tp):
+    """formal research + large universe passes with --prebuilt or complete store."""
+    tp._require_prebuilt_mainline(
+        "csi800", "data/features_panel", n_resolved=1500, formal_research=True)
+    tp._require_prebuilt_mainline(
+        "csi800", None, store_complete=True, n_resolved=1500, formal_research=True)
+
+
+def test_require_prebuilt_mainline_large_nonformal_allowed(tp):
+    """exploratory/dev-smoke (formal_research=False) large live universe allowed."""
+    tp._require_prebuilt_mainline("csi800", None, n_resolved=1500, formal_research=False)
+
+
+def test_require_prebuilt_mainline_small_formal_allowed(tp):
+    """formal research on a small universe is fine live."""
+    tp._require_prebuilt_mainline("random", None, n_resolved=500, formal_research=True)
+
+
+def test_require_prebuilt_mainline_threshold_boundary(tp):
+    """n_resolved == threshold is OK; strictly above it is refused (formal+live)."""
+    tp._require_prebuilt_mainline("random", None, n_resolved=1000, formal_research=True)
+    with pytest.raises(SystemExit):
+        tp._require_prebuilt_mainline(
+            "random", None, n_resolved=1001, formal_research=True)
 
 
 def test_panel_memory_gb_formula(tp):
