@@ -644,12 +644,12 @@ def test_signature_binds_coverage_contracts(tp):
     }
     cfg = PanelConfig(seq_len=60, static_dim=5, past_known_dim=10,
                       past_observed_dim=20, horizon=1, seed=42)
-    cc = {"sentiment": {"metric": "date_availability", "min": 0.90}}
+    cc = {"sentiment": {"metric": "date_availability", "threshold": 0.90}}
     s_cc = tp._experiment_signature(base, cfg, coverage_contracts=cc)
-    # Different contract CONTENT (same keys, retuned minimum) → NEW trial.
+    # Different contract CONTENT (same keys, retuned threshold) → NEW trial.
     assert (tp._experiment_signature(
         base, cfg,
-        coverage_contracts={"sentiment": {"metric": "date_availability", "min": 0.80}})
+        coverage_contracts={"sentiment": {"metric": "date_availability", "threshold": 0.80}})
         != s_cc)
     # Same content + same everything else → same signature (a re-run).
     assert tp._experiment_signature(base, cfg, coverage_contracts=cc) == s_cc

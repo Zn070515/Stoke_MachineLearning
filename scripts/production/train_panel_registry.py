@@ -310,34 +310,28 @@ def _objective_desc(config: PanelConfig) -> str:
             f";ablation={_ablation_desc(config)}")
 
 
-# The market-wide channels whose file-level asset contract lives in
-# ``MARKET_WIDE_ASSETS`` (``market_wide_storage.py``) — the remaining adopted
-# channels resolve to their module-level asset singleton (§十七 / §T9).
-_MARKET_WIDE_CHANNELS = frozenset({
-    "margin", "northbound", "dragon_tiger", "capital_flow",
-    "block_trade", "lockup", "dividend",
-})
-
-
 def _channel_asset(channel: str):
     """The file-level ``DataAssetContract`` governing ``channel``, or None.
 
     Resolves the module-level asset singleton for each adopted channel (§十七 /
-    §T9): the market-wide channels from ``MARKET_WIDE_ASSETS``, the rest from
-    their storage module's frozen asset.  Lazy imports keep the
+    §T9): the market-wide channels from ``MARKET_WIDE_ASSETS`` (membership
+    derived directly from its keys so a future asset is auto-adopted), the rest
+    from their storage module's frozen asset.  Lazy imports keep the
     (baseline-heavy) ``train_panel_registry`` import graph light — the helpers
     only run at the deep-run call site / in tests.  A channel with NO
     DataAssetContract (e.g. valuation / sector / concept — unadopted) returns
     None.
     """
-    if channel in _MARKET_WIDE_CHANNELS:
-        from stoke_ml.data.market_wide_storage import MARKET_WIDE_ASSETS
+    from stoke_ml.data.market_wide_storage import MARKET_WIDE_ASSETS
+    if channel in MARKET_WIDE_ASSETS:
         return MARKET_WIDE_ASSETS.get(channel)
     from stoke_ml.data import (
         announcement_storage, broadcast_assets, comment_storage,
         earnings_storage, etf_storage, fundamental_storage, guba_storage,
         news_storage,
     )
+    # add new contract-owning channels here so their asset identity enters the
+    # signature
     return {
         "sentiment": news_storage.SENTIMENT_ASSET,
         "guba": guba_storage.GUBA_SENTIMENT_ASSET,
