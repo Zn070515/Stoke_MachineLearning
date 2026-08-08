@@ -320,6 +320,15 @@ class FeatureProfile:
 # rides along in the same file as an ablation-only sub-part (consumed only when
 # ``use_market_env_account`` is ON, or once the account part is verified),
 # never required.
+#
+# §v18-9 (Lockbox declaration): ``headline_v1`` is the REVISION-SAFE formal
+# baseline — it is NOT headline-strict.  ``industry`` remains required yet its
+# historical sector classification is source_vintage=immutable_snapshot,
+# transform=formula_versioned, pit_alignment=proxy (a reconstruction / proxy of
+# today's sector map over history).  A formal headline_v1 conclusion therefore
+# carries an industry PROXY in its feature set; the Lockbox final result may
+# either adopt a future headline_strict_v1 (dropping industry) or keep
+# headline_v1 and declare the proxy explicitly in the research writeup.
 FEATURE_PROFILES: dict[str, FeatureProfile] = {
     "headline_v1": FeatureProfile(
         name="headline_v1",

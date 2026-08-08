@@ -112,6 +112,16 @@ Feature 开发 / Debug / Smoke / 小规模快速实验路径。
   Lockbox 主结论一律 prebuilt。
 - 不删除 live 路径——只做门禁 + 文档。
 
+### Lockbox 声明：revision-safe headline_v1 含 industry proxy（v18 §二十-9）
+
+`headline_v1`（默认 formal profile）是 **revision-safe** 档，不是
+headline-strict：其 required channel 里的 `industry` 历史行业分类带
+`pit_alignment=proxy`（源：immutable_snapshot 行业快照 × formula_versioned
+分类算法）。正式 headline_v1 结论的 feature set 内含该 industry proxy。
+Lockbox 最终主结论二选一：(a) 新建 headline_strict_v1 剔除 industry；(b)
+沿用 headline_v1 并在研究报告中显式声明该 proxy。当前按 (b) 声明，不建新
+profile。
+
 ### 格式
 
 全链路 Parquet（列存，压缩，pandas 原生读写）。
