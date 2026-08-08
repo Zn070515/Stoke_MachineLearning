@@ -216,6 +216,54 @@ def test_write_market_env_manifest_carries_lineage(bme, tmp_path):
     assert "transform_config_hash" in m and m["transform_config_hash"]
 
 
+def test_write_market_env_lineage_veracity_and_freshness(bme, tmp_path):
+    """§v18-7: the lineage is REAL — the recorded daily root equals a fresh
+    recomputation, an unchanged rebuild is stable, and mutating a daily source
+    flips the daily root (freshness detection, not a hardcoded value)."""
+    _write_account_stats(tmp_path)
+    _write_highs_lows(tmp_path)
+    _write_industry(tmp_path)
+    _write_daily(tmp_path)
+    from scripts.production.data_quality_gate import dataset_fingerprint
+    df, parts = bme.build_market_env(str(tmp_path))
+    out1 = bme.write_market_env(str(tmp_path), df, parts)
+    with open(out1 + ".manifest.json", encoding="utf-8") as f:
+        m1 = json.load(f)
+    root1 = m1["upstream_roots"]
+    # not hardcoded: equals a fresh recomputation over the actual data dir
+    assert root1["daily"] == dataset_fingerprint(str(tmp_path), ["daily"])
+    # unchanged rebuild → roots identical (deterministic)
+    df2, parts2 = bme.build_market_env(str(tmp_path))
+    out2 = bme.write_market_env(str(tmp_path), df2, parts2)
+    with open(out2 + ".manifest.json", encoding="utf-8") as f:
+        m2 = json.load(f)
+    assert m2["upstream_roots"] == root1
+    # mutate a daily source → the daily root flips
+    d = pd.read_parquet(tmp_path / "a_shares" / "daily" / "000001.parquet")
+    d.assign(amount=d["amount"] * 2.0).to_parquet(
+        tmp_path / "a_shares" / "daily" / "000001.parquet", index=False)
+    df3, parts3 = bme.build_market_env(str(tmp_path))
+    out3 = bme.write_market_env(str(tmp_path), df3, parts3)
+    with open(out3 + ".manifest.json", encoding="utf-8") as f:
+        m3 = json.load(f)
+    assert m3["upstream_roots"]["daily"] != root1["daily"]
+    assert m3["upstream_roots"]["highs_lows"] == root1["highs_lows"]
+
+
+def test_write_market_env_missing_optional_upstream_marked(bme, tmp_path):
+    """§v18-7: an ABSENT optional upstream (account_stats) records a distinct
+    <missing> marker, never <unreadable> — a healthy-but-absent optional input
+    must not masquerade as a broken file."""
+    _write_highs_lows(tmp_path)
+    _write_industry(tmp_path)
+    _write_daily(tmp_path)
+    df, parts = bme.build_market_env(str(tmp_path))
+    out = bme.write_market_env(str(tmp_path), df, parts)
+    with open(out + ".manifest.json", encoding="utf-8") as f:
+        m = json.load(f)
+    assert m["upstream_roots"]["account_stats"] == "<missing>"
+
+
 # ── backward-compat consumer schema ───────────────────────────────────────
 
 def test_output_schema_backward_compatible(bme, tmp_path):

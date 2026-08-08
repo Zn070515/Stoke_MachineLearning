@@ -284,6 +284,12 @@ def _build_high_low_ratio(base: str) -> pd.Series:
 
 
 def _file_sha256(path: str) -> str:
+    # Deliberately differs from code_tree_hash._file_digest (None-vs-marker
+    # convention): this builder records an explicit marker string so the manifest
+    # distinguishes a healthy-but-absent optional input (<missing>) from a
+    # present-but-unreadable file (<unreadable>) — see _upstream_roots.
+    if not os.path.isfile(path):
+        return "<missing>"
     try:
         h = hashlib.sha256()
         with open(path, "rb") as fh:
@@ -299,9 +305,11 @@ def _upstream_roots(data_dir: str) -> dict:
 
     ``daily`` is a content-aware dataset fingerprint (streamed parquet bytes of
     ``a_shares/daily``); the three single-file upstreams are streamed SHA-256
-    digests of the exact file the builder reads.  An unreadable/absent input
-    records ``"<unreadable>"`` so a downstream freshness check still sees the
-    root change rather than silently treating a broken input as fresh.
+    digests of the exact file the builder reads.  A present-but-unreadable input
+    records ``"<unreadable>"`` and a healthy-but-absent optional input records
+    ``"<missing>"``, so a downstream freshness check sees the root change
+    rather than silently treating a broken OR absent input as fresh — without
+    conflating the two.
     """
     base = os.path.join(data_dir, "a_shares")
     return {
