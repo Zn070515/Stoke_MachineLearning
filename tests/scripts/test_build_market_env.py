@@ -92,12 +92,12 @@ def _write_daily(tmp_path):
         }).to_parquet(daily / f"{code}.parquet", index=False)
 
 
-def _build_full(tmp_path, bme, *, skip_turnover=False, publish_col=None):
+def _build_full(tmp_path, bme, *, publish_col=None):
     _write_account_stats(tmp_path, publish_col=publish_col)
     _write_highs_lows(tmp_path)
     _write_industry(tmp_path)
     _write_daily(tmp_path)
-    return bme.build_market_env(str(tmp_path), skip_turnover=skip_turnover)
+    return bme.build_market_env(str(tmp_path))
 
 
 # ── (a) price part: verified PIT declaration ──────────────────────────────
@@ -252,7 +252,7 @@ def test_empty_input_dir_fails_loudly(bme, tmp_path, monkeypatch):
     empty = tmp_path / "empty_data"
     empty.mkdir()
     monkeypatch.setattr(sys, "argv", [
-        "build_market_env.py", "--data-dir", str(empty), "--skip-turnover"])
+        "build_market_env.py", "--data-dir", str(empty)])
     with pytest.raises(ValueError) as ei:
         bme.main()
     assert "PRICE columns missing" in str(ei.value)

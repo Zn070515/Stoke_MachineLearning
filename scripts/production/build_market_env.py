@@ -40,7 +40,6 @@ industry asset uses, so the §T4 formal gate
 
 Run:
     PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_market_env.py
-    PYTHONPATH=. ./.venv/Scripts/python scripts/production/build_market_env.py --skip-turnover
 """
 from __future__ import annotations
 
@@ -189,14 +188,11 @@ def build_account_part(data_dir: str) -> tuple[pd.DataFrame, str]:
     }), pit
 
 
-def build_market_env(
-    data_dir: str, *, skip_turnover: bool = False,
-) -> tuple[pd.DataFrame, dict]:
+def build_market_env(data_dir: str) -> tuple[pd.DataFrame, dict]:
     """Assemble the market_env daily panel WITHOUT writing.
 
     Args:
         data_dir: the project data root (contains ``a_shares/``).
-        skip_turnover: skip the slow daily-file turnover scan (legacy flag).
 
     Returns:
         (df, parts) — ``df`` the 7-column DatetimeIndexed panel; ``parts`` the
@@ -212,10 +208,9 @@ def build_market_env(
     adv = build_industry_advance(base)
     if not adv.empty:
         series["market_adv_ratio"] = adv
-    if not skip_turnover:
-        turn = build_turnover_daily(base)
-        if not turn.empty:
-            series["market_turnover_z"] = turn
+    turn = build_turnover_daily(base)
+    if not turn.empty:
+        series["market_turnover_z"] = turn
 
     # account part — PROXY unless a real publish date is recorded
     acc_part, account_pit = build_account_part(data_dir)
@@ -307,8 +302,6 @@ def write_market_env(data_dir: str, df: pd.DataFrame, parts: dict) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--skip-turnover", action="store_true",
-                    help="skip the slow daily-file turnover scan")
     ap.add_argument("--data-dir", default=None,
                     help="project data root (default: resolved from config.yaml)")
     args = ap.parse_args()
@@ -319,7 +312,7 @@ def main() -> None:
     else:
         data_dir = os.path.abspath(args.data_dir)
 
-    df, parts = build_market_env(data_dir, skip_turnover=args.skip_turnover)
+    df, parts = build_market_env(data_dir)
     if df.empty or not OUTPUT_COLUMNS:
         # A formal builder must fail loudly rather than write an empty
         # market_env_daily.parquet + manifest (a silent rows:0 asset would pass
