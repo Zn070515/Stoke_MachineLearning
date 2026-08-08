@@ -214,43 +214,15 @@ def _enforce_channel_coverage(
                 ch, float(cov), contract.threshold)
             sys.exit(1)
 
-def _require_quality_gate(
-    data_dir: str,
-    prebuilt_dir: str | None,
-    report_path: str,
-    allow_missing: bool = False,
-    **deprecated,
-) -> dict:
-    """Verify a matching quality-gate report covers the data this run consumes.
+def _parse_quality_gate_report(report_path: str) -> dict:
+    """Load and return the quality-gate report at ``report_path`` (§六-2).
 
-    §六-2: training must not read data the gate has not validated, or that
-    changed since the gate PASS.  A missing / stale / mismatched report exits
-    the run; --no-require-quality-gate disables the whole gate (dev smoke).
-
-    ``universe_name`` / ``requested`` were historically accepted but never read
-    by the body (the reconciliation is validated from the report's own
-    ``universe_reconciliation`` section, not re-scoped by the caller), so they
-    are dropped.  A legacy caller still passing them is absorbed via
-    ``**deprecated`` so the shared baselines entry point keeps working.
-
-    §八-2: EVERY enforced run consumes a DEFINED universe, so the gate report
-    must carry a ``universe_reconciliation`` of the download Run Manifest's
-    requested universe — training is never "whatever is on disk".  Requested
-    stocks missing from disk are refused outright unless ``allow_missing`` (the
-    explicit --allow-missing-universe escape) is passed; the escape still
-    surfaces the missing list so the caller records it.  Present-but-degraded
-    stocks are never escapable.  A ``scope=="full"`` report additionally must
-    have actually audited the ``manifest`` AND ``contract_schema`` checks (both
-    present and passed) — the full-scan floor §八-2 wants, verified from the
-    checks array rather than the boolean flag alone.
+    The file-existence check + ``json.load`` — the read half of
+    :func:`_require_quality_gate`.  A missing report exits the run (the gate
+    cannot verify data it never saw); a corrupt JSON payload propagates as a
+    ``json.JSONDecodeError`` so the caller sees exactly what is wrong with the
+    file.  Returns the parsed report dict.
     """
-    if deprecated:
-        bad = sorted(k for k in deprecated if k not in ("universe_name", "requested"))
-        if bad:
-            raise TypeError(
-                f"_require_quality_gate got unexpected keyword arguments: {bad}"
-            )
-
     if not os.path.isfile(report_path):
         raise SystemExit(
             f"quality gate report not found at {report_path} — run "
@@ -258,7 +230,26 @@ def _require_quality_gate(
             f"before training, or pass --no-require-quality-gate to bypass."
         )
     with open(report_path, encoding="utf-8") as fh:
-        report = json.load(fh)
+        return json.load(fh)
+
+def _validate_quality_gate_report(
+    report: dict,
+    data_dir: str,
+    prebuilt_dir: str | None,
+    allow_missing: bool = False,
+) -> list[str]:
+    """Verify a loaded quality-gate report against the data this run consumes.
+
+    The validation half of :func:`_require_quality_gate` — accumulates every
+    mismatch into a ``problems`` list and returns it (empty list = the report
+    passes).  Version / data-root / calendar / contract / scope / dataset-
+    coverage / fingerprint / universe-reconciliation / full-scan / passed-flag
+    checks are all here; the caller decides whether to raise on the result.
+    ``prebuilt_dir`` ``None`` → the gate only needs to cover the ``daily``
+    dataset; otherwise the report must have validated the SAME absolute
+    prebuilt directory this run reads (§九.1).  ``allow_missing`` tolerates a
+    report that failed purely on the universe reconciliation (§八-2 escape).
+    """
     problems: list[str] = []
     if report.get("quality_gate_version") != QUALITY_GATE_VERSION:
         problems.append(
@@ -372,6 +363,51 @@ def _require_quality_gate(
     )
     if not report.get("passed") and not universe_escape:
         problems.append("gate did not PASS")
+    return problems
+
+def _require_quality_gate(
+    data_dir: str,
+    prebuilt_dir: str | None,
+    report_path: str,
+    allow_missing: bool = False,
+    **deprecated,
+) -> dict:
+    """Verify a matching quality-gate report covers the data this run consumes.
+
+    §六-2: training must not read data the gate has not validated, or that
+    changed since the gate PASS.  A missing / stale / mismatched report exits
+    the run; --no-require-quality-gate disables the whole gate (dev smoke).
+
+    ``universe_name`` / ``requested`` were historically accepted but never read
+    by the body (the reconciliation is validated from the report's own
+    ``universe_reconciliation`` section, not re-scoped by the caller), so they
+    are dropped.  A legacy caller still passing them is absorbed via
+    ``**deprecated`` so the shared baselines entry point keeps working.
+
+    §八-2: EVERY enforced run consumes a DEFINED universe, so the gate report
+    must carry a ``universe_reconciliation`` of the download Run Manifest's
+    requested universe — training is never "whatever is on disk".  Requested
+    stocks missing from disk are refused outright unless ``allow_missing`` (the
+    explicit --allow-missing-universe escape) is passed; the escape still
+    surfaces the missing list so the caller records it.  Present-but-degraded
+    stocks are never escapable.  A ``scope=="full"`` report additionally must
+    have actually audited the ``manifest`` AND ``contract_schema`` checks (both
+    present and passed) — the full-scan floor §八-2 wants, verified from the
+    checks array rather than the boolean flag alone.
+
+    Composition of :func:`_parse_quality_gate_report` (read the report,
+    exiting when the file is missing) and :func:`_validate_quality_gate_report`
+    (accumulate the mismatch list), raising ``SystemExit`` on any problem.
+    """
+    if deprecated:
+        bad = sorted(k for k in deprecated if k not in ("universe_name", "requested"))
+        if bad:
+            raise TypeError(
+                f"_require_quality_gate got unexpected keyword arguments: {bad}"
+            )
+    report = _parse_quality_gate_report(report_path)
+    problems = _validate_quality_gate_report(
+        report, data_dir, prebuilt_dir, allow_missing)
     if problems:
         raise SystemExit(
             "quality-gate report mismatch — refusing to train on unvalidated "
