@@ -142,6 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Max fraction of previously-present dates a "
                              "replace_range write may drop before it is rejected "
                              "(default 0.2)")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass the replace_range degradation guard: allow "
+                             "an intentional destructive rewrite (schema "
+                             "unification / full-range regeneration) even when "
+                             "the new output drops columns or covers fewer "
+                             "dates.  The coverage report is still written to "
+                             "the sidecar manifest so the outcome stays "
+                             "auditable (§v19 migration rebuilds).")
     parser.add_argument(
         "--sector-snapshot-asof", type=str, default=None,
         help="Date the current stock_sector_cache.csv snapshot is valid from "
@@ -304,6 +312,7 @@ def _process_standard(dtype, storage_key, pp, chain_name, stock_list, data_dir,
                 rejected += dest.save(
                     processed, replace_range=True,
                     provenance=prov, degrade_threshold=args.degrade_threshold,
+                    force=args.force,
                     replace_window=(args.start, args.end),
                 )
                 total += len(processed)
@@ -421,6 +430,7 @@ def _process_board(pp, chain_name, stock_list, data_dir, args, provenance,
                 rejected += dest.save(
                     processed, replace_range=True,
                     provenance=prov, degrade_threshold=args.degrade_threshold,
+                    force=args.force,
                     replace_window=(args.start, args.end),
                 )
                 total += len(processed)
@@ -616,6 +626,7 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
                 rejected += dest.save(
                     processed, replace_range=True,
                     provenance=prov, degrade_threshold=args.degrade_threshold,
+                    force=args.force,
                     replace_window=(args.start, args.end),
                 )
                 total += len(processed)
