@@ -16,6 +16,7 @@ from stoke_ml.data.asset_contract import (
     write_asset_manifest,
 )
 from stoke_ml.data.calendar import get_research_calendar
+from stoke_ml.data.date_normalize import as_date_us
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +158,8 @@ class AnnouncementStorage:
         df = pd.read_parquet(path)
         check_asset_read(path, ANNOUNCEMENT_SENTIMENT_ASSET, df,
                          require_valid_manifest=require_valid_manifest)
-        df["date"] = pd.to_datetime(df["date"])
+        # §v19: canonical datetime64[us] coercion (ms/us mixed on disk).
+        df = as_date_us(df)
         if start_date:
             df = df[df["date"] >= pd.Timestamp(start_date)]
         if end_date:

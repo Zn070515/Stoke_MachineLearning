@@ -300,3 +300,31 @@ class TestLoadDateErrorReporting:
         # §T18: the corrupt partition is aggregated + reported, not silently dropped.
         assert any("Error summary" in r.getMessage() for r in caplog.records)
         assert any("load_date:margin" in r.getMessage() for r in caplog.records)
+
+
+class TestLoadDateUnitNormalization:
+    """§v19: pandas 3.0 hard-errors (MergeError) on mismatched datetime64 units.
+    ``MarketWideStorage.load`` must coerce ``date`` to canonical
+    ``datetime64[us]`` regardless of the on-disk unit (ms stragglers).  Uses the
+    unadopted ``shareholder`` data type so a bare parquet (no asset contract,
+    no manifest) loads through the raw path."""
+
+    def _write_flat(self, tmp_path, dates, unit="datetime64[ms]"):
+        base = os.path.join(str(tmp_path), "a_shares", "shareholder")
+        os.makedirs(base, exist_ok=True)
+        df = _frame(dates)
+        df["date"] = df["date"].astype(unit)
+        df.to_parquet(os.path.join(base, "000001.parquet"), index=False)
+
+    def test_load_ms_parquet_returns_us(self, tmp_path):
+        self._write_flat(tmp_path, ["2024-01-02", "2024-01-03"])
+        out = _storage(tmp_path, "shareholder").load("000001", "2024-01-01",
+                                                     "2024-01-31")
+        assert out["date"].dtype == "datetime64[us]"
+
+    def test_load_us_parquet_stays_us(self, tmp_path):
+        self._write_flat(tmp_path, ["2024-01-02", "2024-01-03"],
+                         unit="datetime64[us]")
+        out = _storage(tmp_path, "shareholder").load("000001", "2024-01-01",
+                                                     "2024-01-31")
+        assert out["date"].dtype == "datetime64[us]"

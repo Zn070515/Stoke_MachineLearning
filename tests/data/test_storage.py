@@ -724,3 +724,56 @@ class TestLockV9:
         self._write_json_lock(lock, 999999, __import__("socket").gethostname())
         os.utime(lock, (1.0, 1.0))
         assert _lock_is_stale(lock) is True
+
+
+class TestLoadDailyDateUnitNormalization:
+    """§v19: pandas 3.0 hard-errors (MergeError) when merge keys are mismatched
+    datetime64 units.  On-disk daily parquets are a mixture of ``datetime64[ms]``
+    and ``datetime64[us]`` date columns (1453/5530 ms).  The read layer must
+    coerce every ``load_daily`` result to canonical ``datetime64[us]`` so
+    downstream ``.merge(on="date")`` / ``merge_asof`` never sees mismatched
+    keys.  Files on disk are left untouched (in-memory coercion only)."""
+
+    def _write_flat(self, tmp_path, code, dates, unit="datetime64[ms]"):
+        base = os.path.join(str(tmp_path), "a_shares", "daily")
+        os.makedirs(base, exist_ok=True)
+        df = _frame(dates, code=code)
+        df["date"] = df["date"].astype(unit)
+        df.attrs.clear()
+        df.to_parquet(os.path.join(base, f"{code}.parquet"), index=False)
+
+    def test_load_daily_ms_parquet_returns_us(self, tmp_path):
+        self._write_flat(tmp_path, "000001", ["2024-01-02", "2024-01-03"])
+        out = DataStorage(str(tmp_path)).load_daily(
+            "000001", "2024-01-01", "2024-01-31"
+        )
+        assert out["date"].dtype == "datetime64[us]"
+
+    def test_load_daily_us_parquet_stays_us(self, tmp_path):
+        self._write_flat(tmp_path, "000001", ["2024-01-02", "2024-01-03"],
+                         unit="datetime64[us]")
+        out = DataStorage(str(tmp_path)).load_daily(
+            "000001", "2024-01-01", "2024-01-31"
+        )
+        assert out["date"].dtype == "datetime64[us]"
+
+    def test_load_daily_merge_asof_with_us_aux(self, tmp_path):
+        """Reproduces preprocess_new_data.py's merge_asof failure: the K-line
+        base (ms on disk) merging a us-dated sector_membership channel.  With
+        canonical-us coercion the as-of merge must not raise."""
+        self._write_flat(tmp_path, "000001", ["2024-01-02", "2024-01-03"])
+        base = DataStorage(str(tmp_path)).load_daily(
+            "000001", "2024-01-01", "2024-01-31"
+        )
+        sub = pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "sector_code": ["bank", "bank"],
+        }).astype({"date": "datetime64[us]"})
+        merged = pd.merge_asof(
+            base.sort_values("date").reset_index(drop=True),
+            sub[["date", "sector_code"]],
+            on="date",
+            direction="backward",
+        )
+        assert len(merged) == 2
+        assert set(merged["sector_code"]) == {"bank"}

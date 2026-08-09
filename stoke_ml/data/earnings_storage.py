@@ -25,6 +25,7 @@ import pandas as pd
 
 from stoke_ml.data.asset_contract import contract_for_channel
 from stoke_ml.data.codes import normalize_stock_code_series
+from stoke_ml.data.date_normalize import as_date_us
 from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,9 @@ class EarningsStorage:
                     "net_profit_low", "net_profit_high"]].reindex(idx).ffill()
         active = sub[["announce_date"]].reindex(idx).ffill()["announce_date"].notna()
 
-        daily = pd.DataFrame({"date": idx})
+        # §v19: canonical datetime64[us] — the calendar index is datetime64[s],
+        # which pandas 3.0 refuses to merge against us aux channels.
+        daily = as_date_us(pd.DataFrame({"date": idx}))
         # Positional assignment (daily is RangeIndex, active is DatetimeIndex —
         # index-aligned assignment would silently produce all-NaN).
         daily["has_forecast"] = active.to_numpy(dtype=np.float32)

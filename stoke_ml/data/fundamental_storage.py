@@ -16,6 +16,7 @@ from stoke_ml.data.asset_contract import (
 )
 from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
 from stoke_ml.data.codes import normalize_stock_code
+from stoke_ml.data.date_normalize import as_date_us
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +143,9 @@ class FundamentalStorage:
             return pd.DataFrame()
 
         trading_days = self._calendar.get_trading_days(start_date, end_date)
-        daily_df = pd.DataFrame({"date": trading_days})
-        daily_df["date"] = pd.to_datetime(daily_df["date"])
+        # §v19: canonical datetime64[us] so the merged daily frame never
+        # carries the calendar's datetime64[s] alongside us aux channels.
+        daily_df = as_date_us(pd.DataFrame({"date": trading_days}))
 
         fill_col = "disclose_date" if "disclose_date" in raw.columns else "report_date"
         raw["_fill_from"] = pd.to_datetime(raw[fill_col])

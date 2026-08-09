@@ -18,6 +18,7 @@ from stoke_ml.data.asset_contract import (
     write_asset_manifest,
 )
 from stoke_ml.data.calendar import TradingCalendar, get_research_calendar
+from stoke_ml.data.date_normalize import as_date_us
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,8 @@ class GubaStorage:
             df = pd.read_parquet(flat_path)
             check_asset_read(flat_path, GUBA_SENTIMENT_ASSET, df,
                              require_valid_manifest=require_valid_manifest)
-            df["date"] = pd.to_datetime(df["date"])
+            # §v19: canonical datetime64[us] coercion (ms/us mixed on disk).
+            df = as_date_us(df)
             mask = (df["date"] >= start) & (df["date"] <= end)
             return df[mask].sort_values("date").reset_index(drop=True)
 
@@ -267,7 +269,8 @@ class GubaStorage:
                     df = pd.read_parquet(path)
                     check_asset_read(path, GUBA_SENTIMENT_ASSET, df,
                                      require_valid_manifest=require_valid_manifest)
-                    df["date"] = pd.to_datetime(df["date"])
+                    # §v19: canonical datetime64[us] coercion.
+                    df = as_date_us(df)
                     mask = (df["date"] >= start) & (df["date"] <= end)
                     frames.append(df[mask])
 

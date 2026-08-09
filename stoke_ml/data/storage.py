@@ -56,6 +56,7 @@ import pandas as pd
 from stoke_ml.data.calendar import VERIFIED_UNTIL, TradingCalendar
 from stoke_ml.data.codes import is_a_share_equity_code, normalize_stock_code_series
 from stoke_ml.data.contract import RESEARCH_QFQ_DAILY, validate_contract
+from stoke_ml.data.date_normalize import as_date_us
 
 _LOCK_TIMEOUT = 30.0  # seconds to wait for a concurrent writer
 _LOCK_STALE = 600.0   # a dead lock older than this is a crashed writer's leftover
@@ -614,8 +615,10 @@ class DataStorage:
                     f"refusing to read {stock_code} with require_valid_manifest=True: "
                     f"{report.get('reason') or report.get('mismatches')}"
                 )
-        result = pd.read_parquet(flat_path)
-        result["date"] = pd.to_datetime(result["date"])
+        # §v19: on-disk daily parquets mix datetime64[ms] and datetime64[us]
+        # date columns; pandas 3.0 raises MergeError on mismatched merge keys.
+        # Canonical-us coercion at the read layer (in-memory only, files kept).
+        result = as_date_us(pd.read_parquet(flat_path))
         if require_valid_manifest:
             # §十三-1 (v14): pass the ALREADY-VALIDATED manifest and the
             # official trading-day set into the contract, instead of depending

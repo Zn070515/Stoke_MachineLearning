@@ -35,6 +35,7 @@ from stoke_ml.data.stock_sector_mapper import StockSectorMapper
 from stoke_ml.data.guba_storage import GubaStorage
 from stoke_ml.data.comment_storage import CommentStorage
 from stoke_ml.data.announcement_storage import AnnouncementStorage
+from stoke_ml.data.date_normalize import as_date_us
 from stoke_ml.features import cache_manifest
 from stoke_ml.features.pipeline import FeaturePipeline
 from stoke_ml.utils.error_summary import ErrorSummary, classify_error, log_summary
@@ -71,7 +72,9 @@ def _load_stock_parquet(directory: str, code: str) -> pd.DataFrame:
     if not os.path.isfile(path):
         return pd.DataFrame()
     try:
-        return pd.read_parquet(path)
+        # §v19: canonical datetime64[us] coercion — processed-channel parquets
+        # (board/lockup/…) carry ms date stragglers that break pandas 3.0 merges.
+        return as_date_us(pd.read_parquet(path))
     except (OSError, ValueError) as exc:
         logger.warning(
             "Corrupted parquet, skipping (category=%s): %s",

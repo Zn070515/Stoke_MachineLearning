@@ -19,6 +19,7 @@ from stoke_ml.data.asset_contract import (
     write_asset_manifest,
 )
 from stoke_ml.data.channel_sources import CHANNEL_SOURCE, processed_data_type
+from stoke_ml.data.date_normalize import as_date_us
 from stoke_ml.utils.error_summary import ErrorSummary, log_summary
 
 logger = logging.getLogger(__name__)
@@ -365,7 +366,8 @@ class MarketWideStorage:
             if asset is not None:
                 check_asset_read(flat_path, asset, df,
                                  require_valid_manifest=require_valid_manifest)
-            df["date"] = pd.to_datetime(df["date"])
+            # §v19: canonical datetime64[us] coercion (ms/us mixed on disk).
+            df = as_date_us(df)
             mask = (df["date"] >= start) & (df["date"] <= end)
             return df[mask].sort_values("date").reset_index(drop=True)
 
@@ -389,7 +391,8 @@ class MarketWideStorage:
                 if asset is not None:
                     check_asset_read(file_path, asset, df,
                                      require_valid_manifest=require_valid_manifest)
-                df["date"] = pd.to_datetime(df["date"])
+                # §v19: canonical datetime64[us] coercion (ms/us mixed on disk).
+                df = as_date_us(df)
                 mask = (df["date"] >= start) & (df["date"] <= end)
                 frames.append(df[mask])
 
@@ -414,7 +417,7 @@ class MarketWideStorage:
             if not f.endswith(".parquet"):
                 continue
             try:
-                df = pd.read_parquet(os.path.join(part_dir, f))
+                df = as_date_us(pd.read_parquet(os.path.join(part_dir, f)))
                 mask = pd.to_datetime(df["date"]).dt.date == dt.date()
                 matched = df[mask]
                 if not matched.empty:

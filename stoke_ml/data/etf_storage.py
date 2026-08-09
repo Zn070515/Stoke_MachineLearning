@@ -13,6 +13,7 @@ from stoke_ml.data.asset_contract import (
     check_asset_read,
     write_asset_manifest,
 )
+from stoke_ml.data.date_normalize import as_date_us
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,8 @@ class ETFStorage:
             check_asset_read(flat_path, ETF_FLOW_ASSET, df,
                              require_valid_manifest=require_valid_manifest)
             if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
+                # §v19: canonical datetime64[us] coercion (ms/us mixed on disk).
+                df = as_date_us(df)
                 mask = (df["date"] >= start) & (df["date"] <= end)
                 return df[mask].sort_values("date").reset_index(drop=True)
             return df
@@ -104,7 +106,8 @@ class ETFStorage:
                 check_asset_read(file_path, ETF_FLOW_ASSET, df,
                                  require_valid_manifest=require_valid_manifest)
                 if "date" in df.columns:
-                    df["date"] = pd.to_datetime(df["date"])
+                    # §v19: canonical datetime64[us] coercion.
+                    df = as_date_us(df)
                     mask = (df["date"] >= start) & (df["date"] <= end)
                     frames.append(df[mask])
 
