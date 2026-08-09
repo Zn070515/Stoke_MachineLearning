@@ -19,12 +19,17 @@ Output: ``a_shares/sector_membership.parquet``
 
 Resumability: per-stock parsed intervals are cached under
 ``a_shares/sector_membership_pit/_stocks/{code}.json``; a re-run skips already-
-fetched stocks.
+fetched stocks.  The cache payload is versioned (``cache_version`` + a
+``parser_hash`` digest of the parse logic), so a parser or gate-map change is
+detected and forces a fail-closed refetch instead of trusting stale intervals
+(§v19 §十九).
 
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_sector_membership.py
 """
 import datetime as dt
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -41,6 +46,11 @@ from stoke_ml.data.asset_contract import (
     DataAssetContract,
     contract_for_channel,
     write_asset_manifest,
+)
+from stoke_ml.data.csrc_gate import (
+    CSRC_GATE_CODES,
+    CSRC_STANDARD_LABELS,
+    csrc_gate_code,
 )
 from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 from stoke_ml.data.storage import DataStorage
@@ -94,7 +104,6 @@ def parse_cninfo_events(stock_code: str, events: pd.DataFrame) -> pd.DataFrame:
     mapping only decorates each interval; an unrecognized gate yields
     ``sector_code=None`` and that interval is EXCLUDED from the returned rows.
     """
-    from stoke_ml.data.csrc_gate import CSRC_STANDARD_LABELS, csrc_gate_code
     empty = pd.DataFrame(columns=["date", "stock_code", "sector_code", "sector_name"])
     if events is None or events.empty:
         return empty
@@ -137,9 +146,61 @@ def _expand(intervals: pd.DataFrame, days: pd.DatetimeIndex) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def _expand_stock(intervals: pd.DataFrame, storage: DataStorage,
+                  code: str) -> pd.DataFrame:
+    """Expand one stock's CSRC intervals over its OWN trading days.
+
+    Returns an empty frame for a legit no-gate stock (no intervals to expand —
+    the daily store is not touched).  Raises when the canonical daily formal
+    read fails (corrupt/missing manifest) or returns no rows — a stock with
+    CSRC intervals is expected to have daily history, so an empty or unreadable
+    daily is a defect that must land in ``failed``, never a silent skip (§v19
+    §十五).
+    """
+    if intervals is None or intervals.empty:
+        return pd.DataFrame(columns=["date", "stock_code", "sector_code",
+                                     "sector_name"])
+    d = storage.load_daily(
+        code, "1970-01-01", "2099-12-31", require_valid_manifest=True)
+    if d is None or d.empty:
+        raise ValueError(
+            f"sector_membership[{code}]: no daily history — expected rows, "
+            f"got empty (defect)")
+    days = pd.DatetimeIndex(pd.to_datetime(d["date"]).drop_duplicates()
+                            .sort_values())
+    return _expand(intervals, days)
+
+
 # ── per-stock interval cache (resumable crawl) ──────────────────────────────
 
-def _write_intervals_cache(path: str, intervals: pd.DataFrame) -> None:
+#: Cache payload schema version (§v19 §十九).  Bump when the cache format or
+#: the parser semantics change; a mismatched version forces a fail-closed
+#: refetch instead of trusting stale intervals.
+_CACHE_VERSION = "v2"
+
+
+def _parser_hash() -> str:
+    """Deterministic digest of the parse logic (gate map + labels + source).
+
+    The cache must be invalidated whenever the same raw CNINFO events would
+    parse into DIFFERENT intervals, so the digest covers both the CSRC gate
+    mapping and ``parse_cninfo_events`` itself (§v19 §十九).
+    """
+    return hashlib.sha256(
+        (repr(sorted(CSRC_GATE_CODES.items())) + "|"
+         + repr(sorted(CSRC_STANDARD_LABELS)) + "|"
+         + inspect.getsource(parse_cninfo_events)).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def _write_intervals_cache(path: str, intervals: pd.DataFrame,
+                           start_date: str, end_date: str) -> None:
+    """Atomically write the per-stock interval cache under the current schema.
+
+    The payload carries the cache/parser identity and the fetch range so a
+    stale or differently-shaped cache is detected on load and refetched (§v19
+    §十九).
+    """
     payload = [{
         "date": pd.Timestamp(iv["date"]).strftime("%Y-%m-%d"),
         "end": pd.Timestamp(iv["_end"]).strftime("%Y-%m-%d"),
@@ -153,21 +214,32 @@ def _write_intervals_cache(path: str, intervals: pd.DataFrame) -> None:
     # permanently failed (§v19 P0#1 review #3).
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"intervals": payload}, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "cache_version": _CACHE_VERSION,
+            "parser_hash": _parser_hash(),
+            "source": "cninfo",
+            "start_date": start_date,
+            "end_date": end_date,
+            "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "intervals": payload,
+        }, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
 
-def _load_intervals_cache(path: str) -> pd.DataFrame:
+def _load_intervals_cache(path: str) -> tuple[pd.DataFrame, dict]:
+    """Load a cached interval frame plus its meta (top-level JSON minus
+    ``intervals``) so the caller can verify cache/parser/range identity."""
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
+    meta = {k: v for k, v in raw.items() if k != "intervals"}
     rows = raw.get("intervals", [])
     if not rows:
-        return pd.DataFrame(columns=["date", "stock_code", "sector_code",
-                                     "sector_name", "_end"])
+        return (pd.DataFrame(columns=["date", "stock_code", "sector_code",
+                                      "sector_name", "_end"]), meta)
     iv = pd.DataFrame(rows)
     iv["date"] = pd.to_datetime(iv["date"])
     iv["_end"] = pd.to_datetime(iv["end"])
-    return iv.drop(columns=["end"])
+    return (iv.drop(columns=["end"]), meta)
 
 
 # ── CNINFO fetch (rate-limited, retried) ─────────────────────────────────────
@@ -197,7 +269,14 @@ def _rate_limited_fetch(stock_code: str, start_date: str, end_date: str) -> pd.D
     try:
         return ak.stock_industry_change_cninfo(
             symbol=stock_code, start_date=start_date, end_date=end_date)
-    except KeyError:
+    except KeyError as exc:
+        # §v19 §十八: akshare's known empty-result signature is a 0×0 frame then
+        # temp_df["变更日期"] → KeyError('变更日期').  ONLY this exact key means
+        # "stock has no CSRC records".  A schema drift that fails a DIFFERENT
+        # column index must NOT be swallowed as a legit no-gate stock — re-raise
+        # so _ensure_parseable() / the retry loop handle it.
+        if not (exc.args and exc.args[0] == "变更日期"):
+            raise
         logger.info("sector_membership[%s]: CNINFO returned no records — "
                     "legit-empty (no CSRC gate), not a failure", stock_code)
         return _empty_cninfo_frame()
@@ -231,36 +310,86 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
                  end_date: str) -> pd.DataFrame:
     """Fetch + parse one stock's CSRC intervals, caching them; raises on failure.
 
-    A cache hit (from a prior run) skips the network call entirely.  An empty
-    return is a LEGITIMATE result (the stock has no CSRC gate) — it is still
-    cached so a re-run skips it.
+    A cache hit (from a prior run) skips the network call entirely — but only
+    when the cached payload's version/parser-hash/source/range all match the
+    current run.  A mismatched or legacy cache is NOT trusted: it is removed
+    and refetched once (fail closed — one-time full crawl is the honest
+    behavior) (§v19 §十九).  An empty return is a LEGITIMATE result (the stock
+    has no CSRC gate) — it is still cached so a re-run skips it.
     """
     cache_path = os.path.join(cache_dir, f"{stock_code}.json")
     if os.path.isfile(cache_path):
-        return _load_intervals_cache(cache_path)
+        intervals, meta = _load_intervals_cache(cache_path)
+        if (meta.get("cache_version") == _CACHE_VERSION
+                and meta.get("parser_hash") == _parser_hash()
+                and meta.get("source") == "cninfo"
+                and meta.get("start_date") == start_date
+                and meta.get("end_date") == end_date):
+            return intervals
+        logger.info("sector_membership[%s]: cache mismatch — refetching "
+                    "(version=%r, parser_ok=%s, source=%r, range=%s..%s)",
+                    stock_code, meta.get("cache_version"),
+                    meta.get("parser_hash") == _parser_hash(),
+                    meta.get("source"), meta.get("start_date"),
+                    meta.get("end_date"))
+        os.remove(cache_path)
     events = _fetch_cninfo_events(stock_code, start_date, end_date)
     _ensure_parseable(events)
     intervals = parse_cninfo_events(stock_code, events)
-    _write_intervals_cache(cache_path, intervals)
+    _write_intervals_cache(cache_path, intervals, start_date, end_date)
     return intervals
 
 
 # ── per-year coverage audit ──────────────────────────────────────────────────
 
-def _coverage_by_year(membership: pd.DataFrame, universe: list[str]) -> dict:
-    """``{year: fraction of the universe with an asserted gate that year}``.
+def _active_stocks_by_year(daily_dir: str, codes: list[str]) -> dict[int, int]:
+    """``{calendar year: count of stocks whose daily span covers that year}``.
+
+    A stock is active for every year in ``[start_year, end_year]`` taken from
+    its ``daily/{code}.manifest.json`` ``start``/``end`` (ISO).  A missing or
+    unreadable manifest is ignored — that stock is active NOWHERE
+    (conservative), so the coverage denominator never over-counts (§v19 §十六).
+    """
+    counts: dict[int, int] = {}
+    for code in codes:
+        try:
+            with open(os.path.join(daily_dir, f"{code}.manifest.json"),
+                      "r", encoding="utf-8") as f:
+                m = json.load(f)
+            start_s = m.get("start")
+            end_s = m.get("end")
+            if not start_s or not end_s:
+                continue
+            start = pd.Timestamp(start_s).year
+            end = pd.Timestamp(end_s).year
+        except (OSError, ValueError, TypeError, AttributeError,
+                json.JSONDecodeError):
+            continue
+        for y in range(start, end + 1):
+            counts[y] = counts.get(y, 0) + 1
+    return counts
+
+
+def _coverage_by_year(membership: pd.DataFrame,
+                      active_by_year: dict[int, int]) -> dict:
+    """``{year: fraction of stocks ACTIVE that year with an asserted gate}``.
 
     The honest-PIT audit the review demanded: pre-gate years (and no-gate
-    stocks) simply have no membership rows, so the per-year fraction reveals
-    exactly how far back CNINFO can assert a classification.
+    stocks) simply have no membership rows, so the per-year fraction against
+    the stocks actually trading that year reveals exactly how far back CNINFO
+    can assert a classification (§v19 §十六).  A year with no membership rows
+    reports ``0.0``; an empty membership reports ``0.0`` for every active year.
     """
-    total = max(len(universe), 1)
     if membership is None or membership.empty:
-        return {}
+        return {str(int(y)): 0.0 for y in active_by_year}
     g = membership.copy()
     g["year"] = pd.to_datetime(g["date"]).dt.year
-    cov = g.groupby("year")["stock_code"].nunique() / total
-    return {str(int(y)): float(round(v, 4)) for y, v in cov.items()}
+    cov = g.groupby("year")["stock_code"].nunique()
+    out = {}
+    for y, active in active_by_year.items():
+        v = cov.get(y, 0) / max(int(active), 1)
+        out[str(int(y))] = float(round(v, 4))
+    return out
 
 
 def main() -> None:
@@ -279,12 +408,14 @@ def main() -> None:
     start_date = "19900101"
     end_date = dt.date.today().strftime("%Y%m%d")
 
-    # 1. Fetch + parse CNINFO change events (8-worker pool, resumable cache)
+    # 1. Fetch + parse CNINFO change events (8-worker pool, resumable cache).
+    #    ``complete`` is NOT granted here — it requires the full pipeline below
+    #    (§v19 §十五).  Fetch failures collect into ``fetch_failed``.
     logger.info("Fetching CNINFO industry-classification change events for "
                 "%d stocks (%s → %s)...", len(codes), start_date, end_date)
     intervals_by_code: dict[str, pd.DataFrame] = {}
     complete: set[str] = set()
-    failed: list[str] = []
+    fetch_failed: list[str] = []
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as ex:
         futures = {
@@ -295,40 +426,41 @@ def main() -> None:
             code = futures[fut]
             try:
                 intervals_by_code[code] = fut.result()
-                complete.add(code)
             except Exception as exc:
-                failed.append(code)
+                fetch_failed.append(code)
                 logger.warning("sector_membership[%s]: FAILED %s",
                                code, str(exc)[:120])
     logger.info("Fetched %d/%d stocks in %.1fs (%d failed)",
-                len(complete), len(codes), time.time() - t0, len(failed))
+                len(intervals_by_code), len(codes), time.time() - t0,
+                len(fetch_failed))
 
-    # 2. Expand intervals to per-trading-day rows over each stock's OWN daily dates
+    # 2. Expand intervals to per-trading-day rows over each stock's OWN daily
+    #    dates.  ``complete`` is granted ONLY here — after fetch + parse + the
+    #    canonical daily formal read + expansion (or a legitimate no-gate).
+    #    A daily failure (corrupt/missing manifest, empty history) is a FAILURE
+    #    that lands in ``failed``, never a silent skip (§v19 §十五).
     logger.info("Expanding intervals to per-day membership over each stock's "
                 "own trading days...")
     frames: list[pd.DataFrame] = []
+    expansion_failed: list[str] = []
     for code in codes:
         intervals = intervals_by_code.get(code)
         if intervals is None or intervals.empty:
+            # legit no-gate: no CSRC records → no intervals to expand
+            complete.add(code)
             continue
         try:
-            d = storage.load_daily(code, "1970-01-01", "2099-12-31")
-        except Exception as exc:
-            # A crawl is best-effort: a corrupt daily must not abort the whole
-            # run.  Skip this stock's expansion; the coverage audit stays honest
-            # because no membership rows are claimed for it (§v19 P0#1 review #7).
-            logger.warning("sector_membership[%s]: daily read failed — skipping "
-                           "this stock's expansion (coverage audit stays honest): "
-                           "%s", code, str(exc)[:120])
+            exp = _expand_stock(intervals, storage, code)
+        except (ValueError, OSError) as exc:
+            expansion_failed.append(code)
+            logger.warning("sector_membership[%s]: FAILED daily read — this "
+                           "stock's expansion FAILED (not skipped): %s",
+                           code, str(exc)[:120])
             continue
-        if d is None or d.empty:
-            continue
-        days = pd.DatetimeIndex(pd.to_datetime(d["date"]).drop_duplicates()
-                                .sort_values())
-        exp = _expand(intervals, days)
         if exp.empty:
             continue
         frames.append(exp)
+        complete.add(code)
     if not frames:
         logger.error("No sector membership could be built — no stock had CSRC "
                      "gate data (or no daily history). Refusing to write an "
@@ -339,9 +471,13 @@ def main() -> None:
     membership = membership.sort_values(["date", "stock_code"]).reset_index(drop=True)
     membership = membership[["date", "stock_code", "sector_code", "sector_name"]]
 
-    # 3. Write parquet + asset manifest + per-year coverage audit
+    # 3. Write parquet + asset manifest + per-year coverage audit.  The
+    #    coverage denominator is the stocks ACTIVE each year (from each daily
+    #    manifest's start/end span), not the whole universe (§v19 §十六).
     out_path = os.path.join(base, "sector_membership.parquet")
-    coverage = _coverage_by_year(membership, codes)
+    daily_dir = os.path.join(base, "daily")
+    active_by_year = _active_stocks_by_year(daily_dir, codes)
+    coverage = _coverage_by_year(membership, active_by_year)
     membership.attrs["source"] = (
         "CNINFO industry-classification change history "
         "(AKShare stock_industry_change_cninfo)")
@@ -352,7 +488,10 @@ def main() -> None:
     logger.info("Saved %d membership rows (%d stocks) to %s",
                 len(membership), membership["stock_code"].nunique(), out_path)
 
-    # 4. Fail-closed run manifest (§五-5): a partial run can never pass complete
+    # 4. Fail-closed run manifest (§五-5 / §v19 §十五): ``complete`` requires the
+    #    full pipeline; ``failed`` = fetch failures + expansion failures
+    #    (dedup, keep order).  A partial run can never pass complete.
+    failed = list(dict.fromkeys(fetch_failed + expansion_failed))
     write_run_manifest_or_exit(
         data_dir, "a_shares/sector_membership",
         requested=codes, failed=failed, complete=complete,
@@ -360,8 +499,8 @@ def main() -> None:
     )
     logger.info("Run manifest: %d requested, %d complete, %d failed",
                 len(codes), len(complete), len(failed))
-    logger.info("Per-year gate coverage (fraction of the universe with an "
-                "asserted 门类 gate):")
+    logger.info("Per-year gate coverage (fraction of stocks ACTIVE that year "
+                "with an asserted 门类 gate):")
     if coverage:
         for y in sorted(coverage):
             logger.info("  %s: %.1f%%", y, coverage[y] * 100.0)
