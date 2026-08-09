@@ -6,7 +6,7 @@ runs the appropriate PreprocessingChain, saves preprocessed results.
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type all
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type flow
-  PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type event --event-type block_trade
+  PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type block_trade
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/preprocess_new_data.py --type concept --stocks 600519,000001
 """
 
@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from stoke_ml.config import load_config
+from stoke_ml.data.date_normalize import as_date_us
 from stoke_ml.data.market_wide_storage import MarketWideStorage
 from stoke_ml.preprocessing.pipeline import (
     PreprocessingPipeline,
@@ -464,11 +465,7 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
             "No industry_ranking.parquet found — run download_industry_ranking.py first"
         )
         return
-    industry_ranking = pd.read_parquet(ir_path)
-    if "date" in industry_ranking.columns:
-        industry_ranking["date"] = pd.to_datetime(
-            industry_ranking["date"], errors="coerce"
-        )
+    industry_ranking = as_date_us(pd.read_parquet(ir_path))
     # Date filter
     start_ts = pd.Timestamp(args.start)
     end_ts = pd.Timestamp(args.end)
@@ -527,7 +524,7 @@ def _process_sector(pp, chain_name, stock_list, data_dir, args, provenance,
             )
             membership = None
         else:
-            membership["date"] = pd.to_datetime(membership["date"], errors="coerce")
+            membership = as_date_us(membership)
             membership["stock_code"] = membership["stock_code"].astype(str)
             logger.info(
                 "  sector: using PIT sector_membership.parquet (%d records, "
