@@ -345,7 +345,7 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
     if os.path.isfile(cache_path):
         try:
             intervals, meta = _load_intervals_cache(cache_path)
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
             # A corrupt/unreadable cache must NOT permanently fail a stock —
             # treat it as a mismatch, remove it, and refetch once (§v19 §十九).
             logger.warning("sector_membership[%s]: unreadable cache (%s) — "
