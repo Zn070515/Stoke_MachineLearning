@@ -1,0 +1,93 @@
+{
+  "000338": {
+    "file_exists": true,
+    "rows": 4624,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 4624
+  },
+  "000596": {
+    "file_exists": true,
+    "rows": 6237,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 6237
+  },
+  "302132": {
+    "file_exists": true,
+    "rows": 3782,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 3782
+  },
+  "000520": {
+    "file_exists": true,
+    "rows": 5704,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 5704
+  },
+  "001872": {
+    "file_exists": true,
+    "rows": 6158,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 6158
+  },
+  "001914": {
+    "file_exists": true,
+    "rows": 6233,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 6233
+  },
+  "002506": {
+    "file_exists": true,
+    "rows": 3409,
+    "flips": 0,
+    "junks": 0,
+    "sig_problems": [],
+    "sig_flags": [],
+    "nan_vol": 0,
+    "nan_amt": 0,
+    "validate_ok": true,
+    "formal_ok": true,
+    "formal_rows": 3409
+  }
+}

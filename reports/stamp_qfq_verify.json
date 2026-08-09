@@ -1,0 +1,613 @@
+{
+  "mode": "write",
+  "n_files": 5530,
+  "n_already_qfq": 24,
+  "n_pass": 5503,
+  "n_skip": 3,
+  "n_failed": 0,
+  "n_qfq_now": 5527,
+  "sample_size": 115,
+  "sample_formal_ok": 111,
+  "sample_formal_blocked": 4,
+  "formal_blocked": [
+    {
+      "code": "000520",
+      "kind": "formal_read",
+      "reason": "refusing to read 000520 with require_valid_manifest=True: 000520:volume_finite_ratio:0.9762<0.99; 000520:amount_finite_r"
+    },
+    {
+      "code": "001872",
+      "kind": "formal_read",
+      "reason": "refusing to read 001872 with require_valid_manifest=True: 001872:volume_finite_ratio:0.9867<0.99; 001872:amount_finite_r"
+    },
+    {
+      "code": "001914",
+      "kind": "formal_read",
+      "reason": "refusing to read 001914 with require_valid_manifest=True: 001914:volume_finite_ratio:0.9792<0.99; 001914:amount_finite_r"
+    },
+    {
+      "code": "002506",
+      "kind": "formal_read",
+      "reason": "refusing to read 002506 with require_valid_manifest=True: 002506:volume_finite_ratio:0.9607<0.99; 002506:amount_finite_r"
+    }
+  ],
+  "content_invariant_ok": true,
+  "skipped_still_unknown": true,
+  "per_file": {
+    "000001": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6439
+    },
+    "000096": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6311
+    },
+    "000519": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6300
+    },
+    "000520": {
+      "validate": "OK",
+      "formal": "FAIL",
+      "reason": "refusing to read 000520 with require_valid_manifest=True: 000520:volume_finite_ratio:0.9762<0.99; 000520:amount_finite_r"
+    },
+    "000589": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6436
+    },
+    "000677": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6332
+    },
+    "000751": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6418
+    },
+    "000825": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6331
+    },
+    "000911": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6410
+    },
+    "000985": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6309
+    },
+    "001260": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 839
+    },
+    "001359": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 568
+    },
+    "001872": {
+      "validate": "OK",
+      "formal": "FAIL",
+      "reason": "refusing to read 001872 with require_valid_manifest=True: 001872:volume_finite_ratio:0.9867<0.99; 001872:amount_finite_r"
+    },
+    "001914": {
+      "validate": "OK",
+      "formal": "FAIL",
+      "reason": "refusing to read 001914 with require_valid_manifest=True: 001914:volume_finite_ratio:0.9792<0.99; 001914:amount_finite_r"
+    },
+    "002024": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 5326
+    },
+    "002076": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4551
+    },
+    "002130": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4635
+    },
+    "002182": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4543
+    },
+    "002234": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4421
+    },
+    "002287": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4104
+    },
+    "002342": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3987
+    },
+    "002393": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3952
+    },
+    "002448": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3892
+    },
+    "002506": {
+      "validate": "OK",
+      "formal": "FAIL",
+      "reason": "refusing to read 002506 with require_valid_manifest=True: 002506:volume_finite_ratio:0.9607<0.99; 002506:amount_finite_r"
+    },
+    "002507": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3678
+    },
+    "002559": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3735
+    },
+    "002611": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3483
+    },
+    "002664": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3311
+    },
+    "002722": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3022
+    },
+    "002780": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2576
+    },
+    "002837": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2250
+    },
+    "002890": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2174
+    },
+    "002947": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1816
+    },
+    "003001": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1409
+    },
+    "300010": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3898
+    },
+    "300066": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3968
+    },
+    "300123": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3610
+    },
+    "300174": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3704
+    },
+    "300229": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3587
+    },
+    "300283": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3492
+    },
+    "300339": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3312
+    },
+    "300398": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2772
+    },
+    "300449": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2637
+    },
+    "300500": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2475
+    },
+    "300553": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2370
+    },
+    "300604": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2236
+    },
+    "300656": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2161
+    },
+    "300707": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2134
+    },
+    "300763": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1778
+    },
+    "300816": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1567
+    },
+    "300866": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1428
+    },
+    "300918": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1353
+    },
+    "300972": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1271
+    },
+    "301024": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1208
+    },
+    "301079": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1146
+    },
+    "301135": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1039
+    },
+    "301197": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 959
+    },
+    "301261": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 737
+    },
+    "301317": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 848
+    },
+    "301383": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 756
+    },
+    "301515": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 726
+    },
+    "301598": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 384
+    },
+    "600017": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4765
+    },
+    "600085": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6429
+    },
+    "600153": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6195
+    },
+    "600217": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6247
+    },
+    "600284": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 5320
+    },
+    "600353": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 5592
+    },
+    "600422": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6108
+    },
+    "600502": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 5462
+    },
+    "600563": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 5729
+    },
+    "600621": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6311
+    },
+    "600688": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6429
+    },
+    "600745": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6081
+    },
+    "600807": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6164
+    },
+    "600868": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 6425
+    },
+    "600958": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2730
+    },
+    "601018": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3699
+    },
+    "601169": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 4533
+    },
+    "601519": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3732
+    },
+    "601798": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 3603
+    },
+    "601975": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1827
+    },
+    "603042": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2214
+    },
+    "603101": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2481
+    },
+    "603169": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2773
+    },
+    "603222": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2722
+    },
+    "603296": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 711
+    },
+    "603356": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2049
+    },
+    "603466": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2125
+    },
+    "603596": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1994
+    },
+    "603681": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1778
+    },
+    "603778": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2527
+    },
+    "603878": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2329
+    },
+    "603966": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 2300
+    },
+    "605089": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1270
+    },
+    "605298": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1310
+    },
+    "688015": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1699
+    },
+    "688073": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 909
+    },
+    "688128": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1629
+    },
+    "688187": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1174
+    },
+    "688246": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1116
+    },
+    "688305": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1221
+    },
+    "688362": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 893
+    },
+    "688435": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 848
+    },
+    "688528": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1471
+    },
+    "688593": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 752
+    },
+    "688660": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1257
+    },
+    "688729": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 254
+    },
+    "920002": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 522
+    },
+    "920080": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 192
+    },
+    "920171": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1134
+    },
+    "920271": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1005
+    },
+    "920489": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1453
+    },
+    "920693": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 664
+    },
+    "920892": {
+      "validate": "OK",
+      "formal": "OK",
+      "rows": 1149
+    }
+  }
+}

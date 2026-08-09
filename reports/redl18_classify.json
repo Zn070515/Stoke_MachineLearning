@@ -1,0 +1,144 @@
+{
+  "mode": "dry-run",
+  "backup_dir": null,
+  "n_files": 18,
+  "n_rows": 96232,
+  "n_flip_rows": 0,
+  "n_junk_rows": 0,
+  "n_files_with_flips": 0,
+  "n_files_with_junk": 0,
+  "n_files_skipped_no_flip": 18,
+  "n_files_written": 0,
+  "n_files_failed": 0,
+  "manifest_failures": [],
+  "failed": [],
+  "still_out_of_band_after_write": [],
+  "per_file": {
+    "000333": {
+      "rows": 3069,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000408": {
+      "rows": 5949,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000429": {
+      "rows": 6171,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000568": {
+      "rows": 6332,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000651": {
+      "rows": 6231,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000708": {
+      "rows": 6257,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000830": {
+      "rows": 6371,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000858": {
+      "rows": 6309,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000895": {
+      "rows": 5881,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000933": {
+      "rows": 6352,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "000937": {
+      "rows": 6357,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002001": {
+      "rows": 5318,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002003": {
+      "rows": 5213,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002043": {
+      "rows": 4998,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002088": {
+      "rows": 4697,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002110": {
+      "rows": 4448,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002372": {
+      "rows": 3970,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "002847": {
+      "rows": 2309,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    }
+  }
+}

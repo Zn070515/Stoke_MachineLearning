@@ -1,0 +1,58 @@
+{
+  "mode": "write",
+  "backup_dir": "D:\\Projects\\Stoke_MachineLearning\\data\\a_shares\\daily_backup_20260809_163820",
+  "n_files": 4,
+  "n_rows": 22744,
+  "n_flip_rows": 10440,
+  "n_junk_rows": 0,
+  "n_files_with_flips": 4,
+  "n_files_with_junk": 0,
+  "n_files_skipped_no_flip": 0,
+  "n_files_written": 4,
+  "n_files_failed": 0,
+  "manifest_failures": [],
+  "failed": [],
+  "still_out_of_band_after_write": [],
+  "per_file": {
+    "000520": {
+      "rows": 6431,
+      "flips": 2560,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:2560"
+      ],
+      "write_route": "direct"
+    },
+    "001872": {
+      "rows": 6158,
+      "flips": 2522,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:2522"
+      ],
+      "write_route": "direct"
+    },
+    "001914": {
+      "rows": 6359,
+      "flips": 2723,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:2723"
+      ],
+      "write_route": "direct"
+    },
+    "002506": {
+      "rows": 3796,
+      "flips": 2635,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:2635"
+      ],
+      "write_route": "direct"
+    }
+  }
+}

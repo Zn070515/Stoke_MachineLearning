@@ -1,0 +1,102 @@
+{
+  "mode": "dry-run",
+  "backup_dir": null,
+  "n_files": 9,
+  "n_rows": 50762,
+  "n_flip_rows": 10951,
+  "n_junk_rows": 1001,
+  "n_files_with_flips": 7,
+  "n_files_with_junk": 3,
+  "n_files_skipped_no_flip": 2,
+  "n_files_written": 0,
+  "n_files_failed": 0,
+  "manifest_failures": [],
+  "failed": [],
+  "still_out_of_band_after_write": [],
+  "per_file": {
+    "000001": {
+      "rows": 6439,
+      "flips": 738,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:738"
+      ]
+    },
+    "000155": {
+      "rows": 5824,
+      "flips": 643,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:643"
+      ]
+    },
+    "000408": {
+      "rows": 6377,
+      "flips": 1332,
+      "junk": 242,
+      "out_of_band_after": 1406,
+      "flags": [
+        "corrupt_year:2020:44901.7",
+        "flips:1332",
+        "junk:242"
+      ]
+    },
+    "000725": {
+      "rows": 6188,
+      "flips": 2778,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:2778"
+      ]
+    },
+    "000858": {
+      "rows": 6379,
+      "flips": 2450,
+      "junk": 272,
+      "out_of_band_after": 274,
+      "flags": [
+        "corrupt_year:2015:249992.0",
+        "flips:2450",
+        "junk:272"
+      ]
+    },
+    "000937": {
+      "rows": 6439,
+      "flips": 2295,
+      "junk": 487,
+      "out_of_band_after": 691,
+      "flags": [
+        "corrupt_year:2019:35928.5",
+        "corrupt_year:2020:31468.3",
+        "flips:2295",
+        "junk:487"
+      ]
+    },
+    "301487": {
+      "rows": 715,
+      "flips": 715,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": [
+        "flips:715"
+      ]
+    },
+    "600519": {
+      "rows": 6036,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    },
+    "600795": {
+      "rows": 6365,
+      "flips": 0,
+      "junk": 0,
+      "out_of_band_after": 0,
+      "flags": []
+    }
+  }
+}
