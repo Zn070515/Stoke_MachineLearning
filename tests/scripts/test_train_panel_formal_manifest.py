@@ -445,3 +445,136 @@ def test_formal_gate_passes_fresh_market_env_lineage(tmp_path, monkeypatch):
     assert _enforce_formal_manifests(
         ["000001"], str(tmp_path), "2024-01-01", "2024-01-31",
         {"market_env"}) is None
+
+
+# ── §v19 P0.3/§十七: industry_ranking lineage + sector active-stock coverage ──
+# The market_env chain is Canonical Daily + CNINFO Sector Membership → Industry
+# Ranking → Market Env.  These checks run only when a formal run CONSUMES
+# market_env AND the underlying chain files exist — a non-market_env run or an
+# absent industry_ranking/sector_membership file never triggers them.
+
+def _write_fresh_market_env(tmp_path, monkeypatch):
+    """Write a market_env_daily.parquet whose derived lineage matches the
+    CURRENT upstreams (fresh) so the market_env chain gate passes; the
+    downstream industry_ranking / sector-coverage checks run under it."""
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
+
+    me_dir = tmp_path / "a_shares" / "market_breadth"
+    me_dir.mkdir(parents=True)
+    out = me_dir / "market_env_daily.parquet"
+    df = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_adv_ratio": [0.6],
+        "market_turnover_z": [1.0],
+        "mkt_cap_total_z": [0.0], "avg_account_cap_z": [0.0],
+        "investor_new_num": [1.0], "investor_new_z": [0.0],
+    }, index=pd.to_datetime(["2024-01-02"]))
+    df.index.name = "date"
+    df.to_parquet(str(out))
+    write_asset_manifest(
+        str(out), MARKET_ENV_ASSET, df, parts={"price": {}, "account": {}},
+        upstream_roots={"daily": "AAA"}, transform_code_hash="ccc",
+        transform_config_hash="ddd")
+    # fresh: compute_lineage recomputes the SAME lineage the manifest records
+    monkeypatch.setattr(
+        "scripts.production.build_market_env.compute_lineage",
+        lambda data_dir, parts: {
+            "upstream_roots": {"daily": "AAA"},
+            "transform_code_hash": "ccc", "transform_config_hash": "ddd"})
+    return str(tmp_path)
+
+
+def _write_industry_ranking(data_dir, upstream_roots):
+    """Write industry_ranking.parquet + a valid INDUSTRY_RANKING_ASSET manifest
+    carrying the given recorded upstream_roots lineage."""
+    from scripts.production.download_industry_ranking import INDUSTRY_RANKING_ASSET
+    from stoke_ml.data.asset_contract import write_asset_manifest
+
+    ir_path = os.path.join(data_dir, "a_shares", "industry_ranking.parquet")
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"]),
+        "sector_code": ["SEC0001"], "sector_name": ["制造业"],
+        "change_pct": [0.5], "ret_std": [0.1], "n_stocks": [3],
+        "up_count": [2], "down_count": [1], "rank": [1],
+        "leader": ["000001"], "leader_change": [0.9],
+    })
+    df.to_parquet(ir_path, index=False, compression="lz4")
+    write_asset_manifest(
+        ir_path, INDUSTRY_RANKING_ASSET, df,
+        upstream_roots=upstream_roots, transform_code_hash="ccc",
+        transform_config_hash="ddd",
+        membership_source="pit", pit_alignment="verified")
+    return ir_path
+
+
+def _write_sector_membership(data_dir, coverage_by_year):
+    """Write sector_membership.parquet + a valid SECTOR_MEMBERSHIP_ASSET manifest
+    carrying the given per-year coverage audit."""
+    from scripts.production.download_sector_membership import SECTOR_MEMBERSHIP_ASSET
+    from stoke_ml.data.asset_contract import write_asset_manifest
+
+    sm_path = os.path.join(data_dir, "a_shares", "sector_membership.parquet")
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"]),
+        "stock_code": ["000001"], "sector_code": ["C"], "sector_name": ["制造业"],
+    })
+    df.to_parquet(sm_path, index=False, compression="lz4")
+    write_asset_manifest(sm_path, SECTOR_MEMBERSHIP_ASSET, df,
+                         coverage_by_year=coverage_by_year)
+    return sm_path
+
+
+def test_formal_gate_aborts_stale_industry_ranking_lineage(tmp_path, monkeypatch):
+    """§v19 P0.3: a market_env run whose industry_ranking lineage is stale — its
+    sector_membership upstream changed WITHOUT an industry_ranking rebuild (the
+    §十四 "Tuesday bug") — must abort with an INDUSTRY-RANKING STALE diagnosis."""
+    from scripts.production.train_panel_panel import _enforce_formal_manifests
+
+    data_dir = _write_fresh_market_env(tmp_path, monkeypatch)
+    _write_industry_ranking(
+        data_dir, {"daily": "AAA", "sector_membership": "BBB"})
+    # force stale: the real lineage recomputes a DIFFERENT sector_membership root
+    monkeypatch.setattr(
+        "scripts.production.download_industry_ranking.compute_lineage",
+        lambda data_dir, prov: {
+            "upstream_roots": {"daily": "AAA", "sector_membership": "ZZZ"},
+            "transform_code_hash": "ccc", "transform_config_hash": "ddd"})
+
+    with pytest.raises(SystemExit) as ei:
+        _enforce_formal_manifests(["000001"], data_dir, "2024-01-01",
+                                  "2024-01-31", {"market_env"})
+    msg = str(ei.value)
+    assert "INDUSTRY-RANKING STALE" in msg
+    assert "sector_membership" in msg
+    assert "download_industry_ranking.py" in msg
+
+
+def test_formal_gate_aborts_low_sector_coverage(tmp_path, monkeypatch):
+    """§v19 §十七: a market_env run over a year whose sector chain active-stock
+    coverage is below the 0.80 floor must abort with the coverage diagnosis."""
+    from scripts.production.train_panel_panel import _enforce_formal_manifests
+
+    data_dir = _write_fresh_market_env(tmp_path, monkeypatch)
+    _write_sector_membership(data_dir, {"2024": 0.5})
+
+    with pytest.raises(SystemExit) as ei:
+        _enforce_formal_manifests(["000001"], data_dir, "2024-01-01",
+                                  "2024-12-31", {"market_env"})
+    msg = str(ei.value)
+    assert "sector active-stock coverage" in msg
+    assert "2024=0.50" in msg
+    assert "< 0.8" in msg
+
+
+def test_formal_gate_passes_adequate_sector_coverage(tmp_path, monkeypatch):
+    """§v19 §十七 positive control: per-year coverage at/above the 0.80 floor
+    passes the gate (no SystemExit) — the coverage check must not false-positive
+    abort a valid run."""
+    from scripts.production.train_panel_panel import _enforce_formal_manifests
+
+    data_dir = _write_fresh_market_env(tmp_path, monkeypatch)
+    _write_sector_membership(data_dir, {"2024": 0.9})
+
+    assert _enforce_formal_manifests(
+        ["000001"], data_dir, "2024-01-01", "2024-12-31",
+        {"market_env"}) is None

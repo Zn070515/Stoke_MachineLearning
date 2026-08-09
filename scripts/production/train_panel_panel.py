@@ -1469,6 +1469,15 @@ def _fmt_manifest_problem(path: str, report: dict) -> str:
     return f"{path}: " + "; ".join(report.get("mismatches") or ["manifest mismatch"])
 
 
+#: §v19 §十七: a formal market_env run requires, per calendar year in its date
+#: range, that the sector chain's active-stock coverage meet this floor.  The
+#: floor is read from the sector_membership asset manifest's per-year audit
+#: (``coverage_by_year``: fraction of stocks ACTIVE that year with an asserted
+#: CNINFO gate); a year below it means the sector inputs cannot honestly support
+#: a headline market_env over that era.
+SECTOR_COVERAGE_THRESHOLD = 0.80
+
+
 def _enforce_formal_manifests(
     stock_list: list[str],
     data_dir: str,
@@ -1632,6 +1641,80 @@ def _enforce_formal_manifests(
                             f"{path}: DERIVED-ASSET STALE — "
                             + "; ".join(lineage["mismatches"])
                             + "; rebuild with build_market_env.py")
+                    # §v19 P0.3: industry_ranking is the MIDDLE link of the chain
+                    # Canonical Daily + CNINFO Sector Membership → Industry
+                    # Ranking → Market Env.  A sector_membership change without an
+                    # industry_ranking rebuild flips upstream_roots.
+                    # sector_membership → STALE → the market_env chain fails (the
+                    # §十四 "Tuesday bug"): the derived market_env would otherwise
+                    # look fresh while silently built from stale sector inputs.
+                    ir_path = os.path.join(data_dir, "a_shares",
+                                           "industry_ranking.parquet")
+                    if os.path.isfile(ir_path):
+                        from scripts.production.download_industry_ranking import (
+                            INDUSTRY_RANKING_ASSET,
+                            compute_lineage as ir_lineage,
+                        )
+                        ir_report = validate_asset_manifest(
+                            ir_path, INDUSTRY_RANKING_ASSET)
+                        if not ir_report["ok"]:
+                            problems.append(
+                                _fmt_manifest_problem(ir_path, ir_report))
+                        else:
+                            # Rebuild the ranking lineage from CURRENT on-disk
+                            # upstreams (two-arg form: result_columns derive from
+                            # the on-disk parquet — safe, the file exists) and
+                            # compare to the write-time snapshot recorded in the
+                            # manifest.  The manifest's membership_source /
+                            # pit_alignment feed the config identity.
+                            prov = {
+                                "membership_source": (ir_report["manifest"] or {}).get(
+                                    "membership_source", "pit"),
+                                "pit_alignment": (ir_report["manifest"] or {}).get(
+                                    "pit_alignment", "verified"),
+                            }
+                            ir_now = ir_lineage(data_dir, prov)
+                            ir_line = validate_derived_asset(
+                                ir_report["manifest"] or {},
+                                current_upstream_roots=ir_now["upstream_roots"],
+                                current_transform_code_hash=ir_now["transform_code_hash"],
+                                current_transform_config_hash=ir_now["transform_config_hash"],
+                            )
+                            if ir_line["stale"]:
+                                problems.append(
+                                    f"{ir_path}: INDUSTRY-RANKING STALE — "
+                                    + "; ".join(ir_line["mismatches"])
+                                    + "; rebuild with download_industry_ranking.py")
+                    # §v19 §十七: a formal market_env run requires, per calendar
+                    # year in its date range, that the sector chain's active-stock
+                    # coverage meet the floor — a pre-gate era (or a no-gate
+                    # universe) cannot feed a headline market_env.  A missing year
+                    # reads as 0.0 (fail-closed).
+                    sm_path = os.path.join(data_dir, "a_shares",
+                                           "sector_membership.parquet")
+                    if os.path.isfile(sm_path):
+                        from scripts.production.download_sector_membership import (
+                            SECTOR_MEMBERSHIP_ASSET,
+                        )
+                        sm_report = validate_asset_manifest(
+                            sm_path, SECTOR_MEMBERSHIP_ASSET)
+                        if not sm_report["ok"]:
+                            problems.append(
+                                _fmt_manifest_problem(sm_path, sm_report))
+                        else:
+                            cov = (sm_report["manifest"] or {}).get(
+                                "coverage_by_year", {})
+                            start_y = int(pd.to_datetime(start_date).year)
+                            end_y = int(pd.to_datetime(end_date).year)
+                            for y in range(start_y, end_y + 1):
+                                frac = cov.get(str(y), 0.0)
+                                if frac < SECTOR_COVERAGE_THRESHOLD:
+                                    problems.append(
+                                        f"{sm_path}: sector active-stock coverage "
+                                        f"{y}={frac:.2f} < {SECTOR_COVERAGE_THRESHOLD} "
+                                        "(§v19 §十七) — re-run "
+                                        "download_sector_membership.py / expand "
+                                        "CNINFO gate history")
         else:
             problems.append(
                 f"{ch}: consumed channel is not loaded by load_aux_data and "
