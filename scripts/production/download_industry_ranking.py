@@ -294,20 +294,30 @@ def _transform_code_hash() -> str:
 
 
 def compute_lineage(data_dir: str, provenance: dict,
-                    result_columns: list[str]) -> dict:
+                    result_columns: list[str] | None = None) -> dict:
     """The §v19 P0#2 derivation lineage, recomputable at read time.
 
     ``main`` records this at write time in the INDUSTRY_RANKING_ASSET manifest;
     a downstream formal gate recomputes it from the CURRENT on-disk upstreams /
     this builder's current source / the recorded config and compares via
-    ``asset_contract.validate_derived_asset``.  ``result_columns`` is the actual
-    output column list of the built ranking, so the recorded config identity is
-    the truth of what was written.
+    ``asset_contract.validate_derived_asset``.
+
+    ``result_columns`` is the actual output column list of the built ranking, so
+    the recorded config identity is the truth of what was written.  It defaults
+    to ``None`` — then the columns are derived from the on-disk
+    ``industry_ranking.parquet`` (the two-arg gate contract, mirroring
+    ``build_market_env.compute_lineage(data_dir, parts)``).  This is safe because
+    ``main`` calls :func:`compute_lineage` AFTER the ``AtomicCommit`` block
+    commits, so the parquet is on disk at both write-time and gate-time and the
+    derived columns equal ``list(result.columns)`` exactly.
     """
     from scripts.production.data_quality_gate import dataset_fingerprint
     from stoke_ml.models.panel.code_tree_hash import hash_json
     base = os.path.join(data_dir, "a_shares")
     mem_path = os.path.join(base, "sector_membership.parquet")
+    if result_columns is None:
+        result_columns = list(pd.read_parquet(
+            os.path.join(base, "industry_ranking.parquet")).columns)
     return {
         "upstream_roots": {
             "daily": dataset_fingerprint(data_dir, ["daily"]),

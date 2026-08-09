@@ -203,3 +203,29 @@ def test_compute_lineage_tracks_upstream_roots(tmp_path):
     assert lineage2["upstream_roots"]["sector_membership"] != first
     # the daily upstream (untouched) is stable across the membership rewrite
     assert lineage2["upstream_roots"]["daily"] == lineage["upstream_roots"]["daily"]
+
+
+def test_compute_lineage_two_arg_derives_columns_from_disk(tmp_path):
+    """The two-arg form (the Task 4 formal-gate contract, mirroring
+    build_market_env.compute_lineage(data_dir, parts)) derives output_columns
+    from the on-disk industry_ranking.parquet, so its lineage dict equals the
+    write-time three-arg form exactly."""
+    base = tmp_path / "a_shares"
+    (base / "daily").mkdir(parents=True)
+    _write_daily(base, "600519", ["2024-01-02", "2024-01-03"])
+    mem = pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-03"],
+        "stock_code": ["600519", "600519"],
+        "sector_code": ["C", "C"],
+        "sector_name": ["制造业", "制造业"],
+    })
+    _write_membership(base, mem)
+    result, prov = dir_mod.build_industry_ranking(str(base))
+    # persist the ranking exactly as main() does after its AtomicCommit block
+    result.to_parquet(base / "industry_ranking.parquet", index=False)
+
+    two_arg = dir_mod.compute_lineage(str(base.parent), prov)
+    three_arg = dir_mod.compute_lineage(
+        str(base.parent), prov, list(result.columns))
+    assert two_arg == three_arg
+    assert set(two_arg["upstream_roots"]) == {"daily", "sector_membership"}
