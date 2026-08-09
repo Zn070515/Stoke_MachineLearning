@@ -720,6 +720,48 @@ def test_validate_market_env_with_all_seven_columns_passes(tmp_path):
     assert report["ok"], report
 
 
+def test_every_column_contract_declaring_asset_is_enforced():
+    """§v19 P1#5 (#78): no asset declares a column_contract that is left dormant
+    — every declaring data_type is in the enforced set."""
+    from stoke_ml.data.asset_contract import _ENFORCED_COLUMN_CONTRACT_DATA_TYPES
+    from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
+    from stoke_ml.data.fundamental_storage import FUNDAMENTAL_ASSET
+    from stoke_ml.data.market_wide_storage import MARKET_WIDE_ASSETS
+
+    declaring = {MARKET_ENV_ASSET.data_type, FUNDAMENTAL_ASSET.data_type} | {
+        a.data_type for a in MARKET_WIDE_ASSETS.values() if a.column_contract}
+    assert declaring <= set(_ENFORCED_COLUMN_CONTRACT_DATA_TYPES)
+    for expected in ("market_env_daily", "margin", "northbound",
+                     "dragon_tiger", "fundamentals"):
+        assert expected in _ENFORCED_COLUMN_CONTRACT_DATA_TYPES
+
+
+def test_fundamentals_file_without_roa_current_ratio_passes(tmp_path):
+    """§v19 P1#5 (#78): roa / current_ratio are OPTIONAL in the fundamentals
+    contract — financial issuers (banks / brokers / insurers) do not report
+    them, so a file lacking those columns validates OK once fundamentals is
+    enforced."""
+    import pandas as pd
+
+    from stoke_ml.data.asset_contract import (
+        validate_asset_manifest, write_asset_manifest)
+    from stoke_ml.data.fundamental_storage import FUNDAMENTAL_ASSET
+
+    df = pd.DataFrame({
+        "stock_code": ["000001"],
+        "report_date": pd.to_datetime(["2024-06-30"]),
+        "disclose_date": pd.to_datetime(["2024-08-31"]),
+        "roe": [10.0], "eps": [1.0], "revenue_yoy": [0.1], "profit_yoy": [0.2],
+        "debt_ratio": [90.0], "gross_margin": [0.3], "net_margin": [0.4],
+        "total_revenue": [1e9], "net_profit": [2e8],
+    })
+    p = tmp_path / "fundamental.parquet"
+    df.to_parquet(str(p), index=False)
+    write_asset_manifest(str(p), FUNDAMENTAL_ASSET, df)
+    report = validate_asset_manifest(str(p), FUNDAMENTAL_ASSET)
+    assert report["ok"], report
+
+
 # ── §v19 P0#2: validate_derived_asset lineage freshness ────────────────────
 
 def test_validate_derived_asset_ok_and_stale():
@@ -749,3 +791,52 @@ def test_validate_derived_asset_ok_and_stale():
         current_transform_config_hash="y")
     assert not missing["ok"] and missing["stale"]
     assert any("no recorded lineage" in m for m in missing["mismatches"])
+
+
+def test_validate_derived_asset_transform_code_hash_mismatch_stale():
+    from stoke_ml.data.asset_contract import validate_derived_asset
+    manifest = {
+        "upstream_roots": {"daily": "AAA", "industry_ranking": "BBB"},
+        "transform_code_hash": "ccc",
+        "transform_config_hash": "ddd",
+    }
+    report = validate_derived_asset(
+        manifest,
+        current_upstream_roots={"daily": "AAA", "industry_ranking": "BBB"},
+        current_transform_code_hash="EEE",
+        current_transform_config_hash="ddd")
+    assert not report["ok"] and report["stale"]
+    assert any("transform_code_hash" in m for m in report["mismatches"])
+
+
+def test_validate_derived_asset_transform_config_hash_mismatch_stale():
+    from stoke_ml.data.asset_contract import validate_derived_asset
+    manifest = {
+        "upstream_roots": {"daily": "AAA", "industry_ranking": "BBB"},
+        "transform_code_hash": "ccc",
+        "transform_config_hash": "ddd",
+    }
+    report = validate_derived_asset(
+        manifest,
+        current_upstream_roots={"daily": "AAA", "industry_ranking": "BBB"},
+        current_transform_code_hash="ccc",
+        current_transform_config_hash="DDD")
+    assert not report["ok"] and report["stale"]
+    assert any("transform_config_hash" in m for m in report["mismatches"])
+
+
+def test_validate_derived_asset_partial_lineage_stale():
+    from stoke_ml.data.asset_contract import validate_derived_asset
+    manifest = {
+        "upstream_roots": {"daily": "AAA", "industry_ranking": "BBB"},
+        "transform_code_hash": "ccc",
+        # transform_config_hash deliberately omitted — partial lineage
+    }
+    report = validate_derived_asset(
+        manifest,
+        current_upstream_roots={"daily": "AAA", "industry_ranking": "BBB"},
+        current_transform_code_hash="ccc",
+        current_transform_config_hash="ddd")
+    assert not report["ok"] and report["stale"]
+    assert any("no recorded lineage" in m for m in report["mismatches"])
+    assert any("transform_config_hash" in m for m in report["mismatches"])

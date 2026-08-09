@@ -124,6 +124,26 @@ class TestRegistry:
         for name in ("daily_equity", "margin", "northbound", "dragon_tiger", "fundamentals"):
             assert name in CONTRACTS
 
+    def test_aux_channel_contracts_aligned_with_writers(self):
+        """§v19 P1#5 (#78): every per-stock aux channel's column_contract must be a
+        subset of what its writer actually persists — a required column the writer
+        never emits would make enforcement self-contradictory."""
+        from stoke_ml.data.sources.a_shares.dragon_tiger_source import LHB_COLS
+        from stoke_ml.data.sources.a_shares.fundamental_source import FUNDAMENTAL_COLS
+        from stoke_ml.data.sources.a_shares.margin_source import MARGIN_COLS
+        from stoke_ml.data.sources.a_shares.northbound_source import NB_COLS
+        checks = {
+            "margin": MARGIN_COLS,
+            "northbound": NB_COLS,
+            "dragon_tiger": LHB_COLS,
+            "fundamentals": FUNDAMENTAL_COLS,
+        }
+        for name, writer_cols in checks.items():
+            c = get_contract(name)
+            assert set(c.required_columns) <= set(writer_cols), (
+                f"{name} contract requires columns the writer never emits: "
+                f"{set(c.required_columns) - set(writer_cols)}")
+
     def test_daily_contract_matches_real_schema(self):
         c = DAILY_EQUITY
         assert c.primary_key == ("stock_code", "date")

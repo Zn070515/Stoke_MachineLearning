@@ -61,11 +61,11 @@ from the file, so not cross-checked):
    manifest-visible event, not a silent re-label.
 6. **Schema** — ``column_contract``, the name of a column-schema contract in
    ``contract.py`` (recorded for provenance AND enforced by
-   ``validate_asset_manifest`` for market_env_daily: every ``required_columns``
-   of the contract must be present in the file, §v19-11).  The other declaring
-   assets (FUNDAMENTALS / margin / northbound / dragon_tiger) record their
-   column_contract for provenance but are NOT enforced yet — their contracts do
-   not match their writers (dormant, see ``_ENFORCED_COLUMN_CONTRACT_DATA_TYPES``).
+   ``validate_asset_manifest``: every ``required_columns`` of the contract must
+   be present in the file, §v19-11).  Every asset that declares a
+   column_contract (market_env_daily / margin / northbound / dragon_tiger /
+   fundamentals) is enforced — the contracts were aligned with their writers
+   (§v19 P1#5, #78), so an enforced read never trips on its own schema.
 7. **Atomic commit** — write via temp + ``os.replace``; the manifest itself is
    written atomically with ``atomic_write_json``.
 
@@ -272,11 +272,10 @@ class DataAssetContract:
     #: DatetimeIndex when the column is absent.
     extent_column: str | None = None
     #: Name of a column-schema contract in ``contract.py`` governing this
-    #: asset.  Recorded in the manifest for provenance; enforced by
-    #: ``validate_asset_manifest`` for market_env_daily only — every
-    #: ``required_columns`` of the contract must be present in the file, while
-    #: optional columns are never demanded (§v19-11).  The other declaring
-    #: assets stay dormant until their contracts match their writers (see
+    #: asset.  Recorded in the manifest for provenance AND enforced by
+    #: ``validate_asset_manifest`` — every ``required_columns`` of the contract
+    #: must be present in the file, while optional columns are never demanded
+    #: (§v19-11).  Every declaring asset is enforced (see
     #: ``_ENFORCED_COLUMN_CONTRACT_DATA_TYPES``).
     column_contract: str | None = None
     #: HOW the effective date of a stored value is determined — one of
@@ -454,15 +453,17 @@ def write_asset_manifest(
 
 
 #: Data types whose ``column_contract`` is ACTUALLY enforced at validate time.
-#: Other assets (FUNDAMENTALS / margin / northbound / dragon_tiger) also declare
-#: a column_contract, but their contracts do NOT yet match their writers (e.g.
-#: dragon_tiger's contract demands `net_buy` while the real writer emits
-#: LHB_COLS `net_amount`; fundamentals' contract demands `roa`/`current_ratio`
-#: which 87/89 legacy files lack) — enforcing them would break formal runs on
-#: default-on channels.  They stay DORMANT until a follow-up aligns each
-#: contract with its writer (§v19 P1#5).
+#: Every asset that declares a column_contract is enforced (§v19 P1#5, #78):
+#: each contract was aligned with its writer before un-scoping —
+#: dragon_tiger now mirrors LHB_COLS (lhb_reason / net_amount), and
+#: fundamentals' roa / current_ratio are optional because financial issuers
+#: (banks / brokers / insurers) do not report them.
 _ENFORCED_COLUMN_CONTRACT_DATA_TYPES: frozenset[str] = frozenset({
     "market_env_daily",
+    "margin",
+    "northbound",
+    "dragon_tiger",
+    "fundamentals",
 })
 
 
@@ -517,10 +518,10 @@ def validate_asset_manifest(
     # §v19-11: an ENFORCED asset that declares a column_contract is schema-checked
     # here — every REQUIRED column of the contract must be present in the file
     # (optional columns are never demanded).  An unregistered contract name is a
-    # manifest misdeclaration, not a silent pass.  Only market_env_daily is
-    # enforced today; the other declaring assets stay dormant because their
-    # contracts do not yet match their writers (see
-    # _ENFORCED_COLUMN_CONTRACT_DATA_TYPES).
+    # manifest misdeclaration, not a silent pass.  Every declaring asset
+    # (market_env_daily / margin / northbound / dragon_tiger / fundamentals) is
+    # enforced — each contract was aligned with its writer before un-scoping
+    # (see _ENFORCED_COLUMN_CONTRACT_DATA_TYPES).
     if (asset.column_contract
             and asset.data_type in _ENFORCED_COLUMN_CONTRACT_DATA_TYPES):
         try:

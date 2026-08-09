@@ -612,9 +612,10 @@ DRAGON_TIGER = DataContract(
     dataset_name="dragon_tiger",
     primary_key=("stock_code", "date"),
     required_columns=(
-        "date", "stock_code", "type", "reason", "net_buy",
+        "date", "stock_code", "stock_name", "lhb_reason",
+        "buy_amount", "sell_amount", "net_amount",
     ),
-    units={"net_buy": "CNY"},
+    units={"net_amount": "CNY"},
     price_basis="n/a",
     timezone="Asia/Shanghai",
     calendar="SSE_SZSE",
@@ -626,8 +627,8 @@ FUNDAMENTALS = DataContract(
     primary_key=("stock_code", "report_date"),
     required_columns=(
         "stock_code", "report_date", "disclose_date",
-        "roe", "roa", "eps", "revenue_yoy", "profit_yoy",
-        "debt_ratio", "current_ratio", "gross_margin", "net_margin",
+        "roe", "eps", "revenue_yoy", "profit_yoy",
+        "debt_ratio", "gross_margin", "net_margin",
         "total_revenue", "net_profit",
     ),
     units={},
@@ -639,6 +640,11 @@ FUNDAMENTALS = DataContract(
         "roe": "NaN before first disclosure",
         "eps": "NaN for loss-making periods without EPS",
     },
+    # Financial institutions (banks / brokers / insurers) do not disclose
+    # liquidity (流动比率) or asset-return (总资产报酬率) ratios — the source
+    # emits no such rows for ~90 such issuers, so these columns are present
+    # only when the issuer reports them (§v19 P1#5, #78).
+    optional_columns=("roa", "current_ratio"),
 )
 
 MARKET_ENV = DataContract(
