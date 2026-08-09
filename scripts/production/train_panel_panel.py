@@ -1670,9 +1670,19 @@ def _enforce_formal_manifests(
                             prov = {
                                 "membership_source": (ir_report["manifest"] or {}).get(
                                     "membership_source", "pit"),
+                                # Conservative default ("proxy"): a legacy manifest
+                                # that predates pit_alignment must NEVER be claimed
+                                # strict-PIT if pit_alignment ever joins the config
+                                # identity — matching build_market_env's consumer side.
                                 "pit_alignment": (ir_report["manifest"] or {}).get(
-                                    "pit_alignment", "verified"),
+                                    "pit_alignment", "proxy"),
                             }
+                            # The dataset_fingerprint(data_dir, ["daily"]) inside
+                            # ir_lineage is a deliberate duplicate of the market_env
+                            # lineage check above (not cached): the daily Merkle walk
+                            # costs ~0.25s per formal run, both calls return the
+                            # identical digest, and caching risks a subtle stale-cache
+                            # bug exactly at the thing this gate exists to catch.
                             ir_now = ir_lineage(data_dir, prov)
                             ir_line = validate_derived_asset(
                                 ir_report["manifest"] or {},
@@ -1702,12 +1712,20 @@ def _enforce_formal_manifests(
                             problems.append(
                                 _fmt_manifest_problem(sm_path, sm_report))
                         else:
+                            # The recorded coverage_by_year is TRUSTED (not recomputed
+                            # from the on-disk sector_membership.parquet): the
+                            # industry_ranking lineage check above already catches ANY
+                            # membership change via _file_sha256(sector_membership.parquet)
+                            # and STALE-fails the chain.
                             cov = (sm_report["manifest"] or {}).get(
                                 "coverage_by_year", {})
                             start_y = int(pd.to_datetime(start_date).year)
                             end_y = int(pd.to_datetime(end_date).year)
                             for y in range(start_y, end_y + 1):
-                                frac = cov.get(str(y), 0.0)
+                                # `or 0.0` also guards a JSON null (None < 0.80 would
+                                # raise a cryptic TypeError); a missing year reads 0.0
+                                # → fail-closed.
+                                frac = cov.get(str(y)) or 0.0
                                 if frac < SECTOR_COVERAGE_THRESHOLD:
                                     problems.append(
                                         f"{sm_path}: sector active-stock coverage "
