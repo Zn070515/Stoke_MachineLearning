@@ -207,6 +207,29 @@ def test_build_industry_advance_fails_closed_on_bare_parquet(bme, tmp_path):
         "require_valid_manifest" in str(ei.value)
 
 
+def test_build_industry_advance_proxy_when_manifest_lacks_pit(bme, tmp_path):
+    """§二十: a PRESENT ranking whose manifest carries NO explicit pit_alignment
+    is reported conservatively as ``proxy`` — a proxy pit must never silently
+    upgrade to the strict headline."""
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_industry_ranking import INDUSTRY_RANKING_ASSET
+    daily = tmp_path / "a_shares"
+    daily.mkdir(parents=True, exist_ok=True)
+    rows = pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-02"],
+        "sector_code": ["SEC0000", "SEC0001"],
+        "change_pct": [0.01, -0.02],
+    })
+    rows.to_parquet(daily / "industry_ranking.parquet", index=False)
+    # manifest written WITHOUT the pit_alignment key (a future writer / edited
+    # manifest dropping the key) — must NOT be misreported as verified.
+    write_asset_manifest(str(daily / "industry_ranking.parquet"),
+                         INDUSTRY_RANKING_ASSET, rows)
+    series, pit = bme.build_industry_advance(str(daily))
+    assert pit == "proxy"
+    assert not series.empty
+
+
 # ── (b) account part: proxy when no real publish date ─────────────────────
 
 def test_account_part_proxy_without_publish_date(bme, tmp_path):

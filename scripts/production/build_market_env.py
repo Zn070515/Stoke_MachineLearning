@@ -140,9 +140,11 @@ def build_industry_advance(base: str) -> tuple[pd.Series, str]:
     parquet is never silently trusted as market breadth.  The returned
     ``pit_alignment`` is read from the manifest's ``pit_alignment`` (``"verified"``
     for the PIT sector-membership path, ``"proxy"`` when the legacy snapshot
-    fallback was forced); the absent-file case returns ``(empty, "verified")``
-    because a missing ranking is not a manifest problem — the required-price-
-    column assertion downstream handles absence.
+    fallback was forced); a present manifest that carries NO explicit
+    ``pit_alignment`` defaults conservatively to ``"proxy"`` — a proxy pit must
+    never silently upgrade to the strict headline.  The absent-file case
+    returns ``(empty, "verified")`` because a missing ranking is not a manifest
+    problem — the required-price-column assertion downstream handles absence.
     """
     path = os.path.join(base, "industry_ranking.parquet")
     if not os.path.exists(path):
@@ -159,7 +161,10 @@ def build_industry_advance(base: str) -> tuple[pd.Series, str]:
     adv = d.groupby("date")["change_pct"].apply(
         lambda x: float((x > 0).mean()))
     report = validate_asset_manifest(path, INDUSTRY_RANKING_ASSET, df=raw)
-    pit = report["manifest"].get("pit_alignment") or "verified"
+    # conservative: a manifest with no explicit pit_alignment is treated as
+    # proxy — a proxy pit must never silently upgrade to the strict headline
+    # (§v19 §二十).
+    pit = (report["manifest"] or {}).get("pit_alignment") or "proxy"
     return adv.rename("market_adv_ratio"), pit
 
 
