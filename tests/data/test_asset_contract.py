@@ -680,3 +680,41 @@ def test_validate_asset_manifest_enforces_column_contract(tmp_path):
     report = validate_asset_manifest(str(p2), asset)
     assert not report["ok"]
     assert any("missing_required_column:market_adv_ratio" in m for m in report["mismatches"])
+
+
+def test_validate_unregistered_contract_name_is_a_mismatch(tmp_path):
+    """An ENFORCED asset (market_env_daily) declaring an unregistered
+    column_contract name is a manifest misdeclaration, not a silent pass."""
+    asset = DataAssetContract(
+        data_type="market_env_daily", partition="single_file",
+        extent_column="date", column_contract="no_such_contract")
+    df = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_adv_ratio": [0.6],
+        "market_turnover_z": [1.0]}, index=pd.to_datetime(["2024-01-02"]))
+    df.index.name = "date"
+    p = tmp_path / "me.parquet"
+    df.to_parquet(str(p))
+    write_asset_manifest(str(p), asset, df)
+    report = validate_asset_manifest(str(p), asset)
+    assert not report["ok"]
+    assert any("no registered DataContract" in m for m in report["mismatches"])
+
+
+def test_validate_market_env_with_all_seven_columns_passes(tmp_path):
+    """The most common real market_env shape — all 3 PRICE + 4 ACCOUNT columns
+    present — validates OK (account columns are optional, not forbidden)."""
+    asset = DataAssetContract(
+        data_type="market_env_daily", partition="single_file",
+        extent_column="date", column_contract="market_env_daily")
+    df = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_adv_ratio": [0.6],
+        "market_turnover_z": [1.0],
+        "mkt_cap_total_z": [0.1], "avg_account_cap_z": [0.2],
+        "investor_new_num": [123], "investor_new_z": [0.3],
+    }, index=pd.to_datetime(["2024-01-02"]))
+    df.index.name = "date"
+    p = tmp_path / "me.parquet"
+    df.to_parquet(str(p))
+    write_asset_manifest(str(p), asset, df)
+    report = validate_asset_manifest(str(p), asset)
+    assert report["ok"], report
