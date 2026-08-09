@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 # feature ``{prefix}_days_since == 0`` marks (0 = event day).  The aux_close
 # check restricts these channels to event rows; per-date-price channels
 # (block_trade/board/sector/shareholder) compare every row.
+# Keys are the *_processed dir names AUX_CLOSE_DIRS resolves via
+# processed_data_type(CHANNEL_SOURCE[ch]) — keep in sync if a channel dir
+# is ever renamed, or ``.get(d)`` silently reverts to per-date comparison.
 _FFILL_CLOSE_EVENT = {
     "dividend_processed": "dv_days_since",
     "lockup_processed": "lu_days_since",

@@ -1567,7 +1567,7 @@ class TestAuxCloseAligned:
         daily.mkdir(parents=True, exist_ok=True)
         # Aux fixture dirs the check globs (``A_SHARES / <dir> / *.parquet``)
         # must exist so the parquet writers have a target.
-        for aux in ("board_processed", "dividend_processed"):
+        for aux in ("board_processed", "dividend_processed", "lockup_processed"):
             (root / aux).mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr("scripts.production.data_quality_gate.A_SHARES", root)
         monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily)
@@ -1632,3 +1632,51 @@ class TestAuxCloseAligned:
         res = check_aux_close_aligned(0)
         assert res.passed is False
         assert any("dividend_processed" in f for f, _d in res.issues)
+
+    def test_forward_filled_lockup_compares_event_rows_only(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        # Lockup mirrors dividend: event on day 1 (lu_days_since == 0) with
+        # close = daily 10.0, forward-filled constant while daily drifts.
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [10.0, 10.0, 10.0, 10.0, 10.0],
+            "lu_days_since": [0, 1, 2, 3, 4],
+        }).to_parquet(root / "lockup_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is True
+        assert res.issues == []
+
+    def test_no_event_file_passes_without_rows_scanned(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        # A no-event file (dv_days_since all -1) has no genuine close to
+        # validate: the event-row filter yields an empty set, nothing is
+        # compared, and the file must PASS without contributing rows_scanned.
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [np.nan, np.nan, np.nan, np.nan, np.nan],
+            "dv_days_since": [-1, -1, -1, -1, -1],
+        }).to_parquet(root / "dividend_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is True
+        assert res.issues == []
+        assert res.rows_scanned == 0
+
+    def test_missing_event_col_fails_closed(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        # A dividend_processed parquet WITHOUT dv_days_since cannot be
+        # restricted to event rows — both read attempts request the column and
+        # raise, so the file must be flagged fail-closed (never silently
+        # reverting to per-date comparison, which would false-positive).
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [10.0, 10.0, 10.0, 10.0, 10.0],
+        }).to_parquet(root / "dividend_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is False
+        assert any(
+            f.startswith("dividend_processed") and d == "no_ohlc/read_err"
+            for f, d in res.issues
+        )
