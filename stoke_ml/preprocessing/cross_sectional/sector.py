@@ -100,6 +100,21 @@ class SectorBroadcaster(PreprocessingStep):
         else:
             return df
 
+        # A fully-unknown sector assignment (no PIT membership row, snapshot-map
+        # miss, or all history before the snapshot valid_from) yields an all-NaN
+        # float64 key that pandas rejects when merging against the str sector
+        # panel.  No valid sector → no sector broadcast, same as the
+        # sector_features-empty path above.  Only short-circuit the *numeric*
+        # all-NaN key: an object/str all-NaN key (e.g. the `.where()` output
+        # before the valid_from) still merges cleanly and must keep the
+        # zeroed-broadcast behavior.
+        if (
+            "sector_code" in df.columns
+            and pd.api.types.is_numeric_dtype(df["sector_code"])
+            and df["sector_code"].isna().all()
+        ):
+            return df
+
         # Drop any previously-broadcast sector columns so a re-run never
         # produces suffixed duplicates from the merge below.
         stale = [c for c in df.columns if c.startswith("momentum_")]

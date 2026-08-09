@@ -101,3 +101,36 @@ class TestSectorBroadcasterPIT:
         )
         assert (out["sector_code"] == "SEC0000").all()
         assert (out["momentum_5d"] == 0.05).all()
+
+
+def test_transform_handles_all_nan_sector_code():
+    """A stock with no valid sector assignment (all-NaN float64 sector_code
+    key) must not crash merging against a str sector panel — sector features
+    are simply absent (unknown sector)."""
+    sb = SectorBroadcaster()
+    industry_ranking = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        "sector_code": ["A", "A", "B"],
+        "sector_name": ["s1", "s1", "s2"],
+        "change_pct": [0.5, -0.2, 0.3],
+        "up_count": [10, 8, 5],
+        "down_count": [2, 4, 6],
+        "rank": [1, 1, 2],
+        "leader": ["000001", "000001", "000002"],
+    })
+    sector_features = sb.build_sector_features(industry_ranking)
+
+    base = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        "stock_code": ["920305", "920305", "920305"],
+        "close": [10.0, 10.1, 10.2],
+    })
+    base["sector_code"] = float("nan")  # float64 all-NaN, as .where() produces
+
+    out = sb.transform(base, sector_features=sector_features)
+    assert len(out) == 3  # unchanged, no crash
+    # no sector_* broadcast columns (unknown sector); the sector_code key
+    # column itself is not a broadcast column and survives.
+    assert not any(
+        c.startswith("sector_") and c != "sector_code" for c in out.columns
+    )
