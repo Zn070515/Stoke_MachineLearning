@@ -312,7 +312,7 @@ def test_fundamental_ablation_v1_profile():
     fc = prof.coverage_contracts["fundamental"]
     assert fc.metric == "stock_coverage"
     assert fc.threshold == 0.90
-    assert fc.requires == ("date_coverage", 0.90)
+    assert fc.requires is None
 
 
 def test_fundamental_ablation_v1_gates_deny_revision_safe():
@@ -342,8 +342,8 @@ def test_fundamental_ablation_v1_gates_deny_revision_safe():
 def test_fundamental_ablation_v1_gates_allow_revised_resolves():
     """§v19 P1#6: the MATCHING run (--vintage-policy allow-revised) resolves the
     frozen profile — fundamental joins the required set, the enforced policy
-    equals the profile's declared allow-revised, and the composite fundamental
-    contract rides the coverage gate."""
+    equals the profile's declared allow-revised, and the fundamental
+    stock_coverage contract rides the coverage gate."""
     import types
     from scripts.production.train_panel_gates import _resolve_required_set
 
@@ -363,5 +363,49 @@ def test_fundamental_ablation_v1_gates_allow_revised_resolves():
     # the enforced policy IS the profile's declared allow-revised
     assert _headline().vintage_policy == "revision-safe"
     assert profile_for("fundamental_ablation_v1").vintage_policy == "allow-revised"
-    assert contracts["fundamental"] == CoverageContract(
-        "stock_coverage", 0.90, requires=("date_coverage", 0.90))
+    assert contracts["fundamental"] == CoverageContract("stock_coverage", 0.90)
+
+
+def test_fundamental_ablation_v1_contract_decidable_in_formal_mode():
+    """§v19 P1#6: the fundamental contract is DECIDABLE by the formal gate — a
+    manifest where fundamental carries ONLY stock_coverage (the metric
+    _finalize_channel actually writes for per-stock channels, with NO
+    date_coverage key) must NOT abort.  A composite date_coverage requirement
+    would be unverifiable on every formal path (live/store finalize writes only
+    stock_coverage; the prebuilt has_* probe has no fundamental flag), so it
+    would formal-abort here — exactly the defect this test guards."""
+    import types
+    from scripts.production.train_panel_gates import (
+        _enforce_channel_coverage, _resolve_required_set,
+    )
+
+    args = types.SimpleNamespace(
+        feature_profile="fundamental_ablation_v1",
+        vintage_policy="allow-revised",
+        no_require_quality_gate=False,
+        no_formal=False,
+        require_aux_channels="",
+        allow_fundamental_ablation=False,
+    )
+    required_set, contracts, profile_name = _resolve_required_set(args)
+    assert profile_name == "fundamental_ablation_v1"
+    assert "fundamental" in required_set
+    assert contracts["fundamental"].metric == "stock_coverage"
+    assert contracts["fundamental"].requires is None
+
+    manifest = {}
+    for ch in required_set:
+        manifest[ch] = {"requested": True, "required": True,
+                        "loaded_stocks": 100, "coverage": 1.0,
+                        "stock_coverage": 1.0, "date_coverage": 1.0,
+                        "era_coverage": 1.0,
+                        "era_observable_stock_fraction": 1.0,
+                        "errors": 0, "status": "OK"}
+    # fundamental is a per-stock channel: _finalize_channel writes ONLY
+    # stock_coverage — strip date_coverage to prove the contract needs no other
+    # metric (a composite requirement would formal-abort as unverifiable).
+    manifest["fundamental"] = {"requested": True, "required": True,
+                               "loaded_stocks": 100, "coverage": 1.0,
+                               "stock_coverage": 1.0, "errors": 0,
+                               "status": "OK"}
+    _enforce_channel_coverage(required_set, manifest, contracts, formal=True)
