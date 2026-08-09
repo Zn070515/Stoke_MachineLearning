@@ -790,3 +790,84 @@ def parse_era_coverage(asset_manifest: dict) -> dict:
     report["era_covered"] = min(covered / total, 1.0)
     report["not_observed"] = False
     return report
+
+
+# ── §v19 P0#2: derived-asset derivation lineage freshness ──────────────────
+#
+# A DERIVED asset (market_env_daily) is a transform of upstream assets.  Its
+# manifest records a WRITE-TIME snapshot of the derivation lineage
+# (``upstream_roots`` / ``transform_code_hash`` / ``transform_config_hash``);
+# ``validate_derived_asset`` recomputes those three keys from the CURRENT
+# on-disk upstreams / current transform source / recorded config ``parts`` and
+# reports whether the on-disk derived asset is still FRESH (built from exactly
+# what is on disk RIGHT NOW).  This is a SEPARATE concern from
+# ``validate_asset_manifest`` — integrity ("the file matches its manifest")
+# vs freshness ("the asset was built from the current inputs / code / config").
+
+
+#: The three derivation-lineage keys a derived asset manifest records (§v18-7).
+_DERIVED_LINEAGE_KEYS = (
+    "upstream_roots", "transform_code_hash", "transform_config_hash",
+)
+
+
+def validate_derived_asset(
+    manifest: dict,
+    *,
+    current_upstream_roots: dict,
+    current_transform_code_hash: str,
+    current_transform_config_hash: str,
+) -> dict:
+    """Freshness/lineage gate for a DERIVED asset manifest (§v19 P0#2).
+
+    ``manifest`` is the on-disk ``{parquet}.manifest.json`` (a write-time
+    snapshot of the derivation).  The ``current_*`` arguments are recomputed
+    from the assets/code/config on disk RIGHT NOW.  Returns::
+
+        {
+          "ok": bool,
+          "stale": bool,           # False when lineage is recorded and current
+          "mismatches": [str, ...],
+        }
+
+    Integrity (the file matches its manifest) is a SEPARATE check — this is
+    freshness: "was this derived asset built from the CURRENT upstreams /
+    transform code / transform config".  Any recorded key that no longer
+    matches its recomputed value means STALE → the asset must be rebuilt.
+    A manifest with NO recorded lineage is stale-by-default (fail-closed):
+    a pre-lineage derived asset cannot prove freshness.
+    """
+    recorded = {
+        k: manifest.get(k)
+        for k in _DERIVED_LINEAGE_KEYS
+        if k in manifest
+    }
+    if len(recorded) != len(_DERIVED_LINEAGE_KEYS):
+        return {
+            "ok": False,
+            "stale": True,
+            "mismatches": [
+                "no recorded lineage (missing "
+                f"{sorted(set(_DERIVED_LINEAGE_KEYS) - set(recorded))}) — "
+                "derived asset predates the lineage extension; rebuild"],
+        }
+    current = {
+        "upstream_roots": current_upstream_roots,
+        "transform_code_hash": current_transform_code_hash,
+        "transform_config_hash": current_transform_config_hash,
+    }
+    mismatches: list[str] = []
+    if recorded["upstream_roots"] != current["upstream_roots"]:
+        diffs = []
+        keys = sorted(set(recorded["upstream_roots"]) | set(current["upstream_roots"]))
+        for k in keys:
+            r = recorded["upstream_roots"].get(k)
+            c = current["upstream_roots"].get(k)
+            if r != c:
+                diffs.append(f"upstream_roots.{k}: recorded={r!r} current={c!r}")
+        mismatches.append("upstream_roots changed: " + "; ".join(diffs))
+    for key in ("transform_code_hash", "transform_config_hash"):
+        if recorded[key] != current[key]:
+            mismatches.append(
+                f"{key}: recorded={recorded[key]!r} current={current[key]!r}")
+    return {"ok": not mismatches, "stale": bool(mismatches), "mismatches": mismatches}

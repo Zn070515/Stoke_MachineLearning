@@ -336,6 +336,29 @@ def _transform_code_hash() -> str:
     return _file_sha256(os.path.abspath(__file__))
 
 
+def _transform_config_hash(parts: dict) -> str:
+    """Config identity of a market_env build (§v18-7): output columns + parts."""
+    return hash_json({
+        "output_columns": sorted(OUTPUT_COLUMNS),
+        "parts": parts,
+    })
+
+
+def compute_lineage(data_dir: str, parts: dict) -> dict:
+    """The §v19 P0#2 derivation lineage, recomputable at read time.
+
+    ``write_market_env`` records this at write time; the formal gate
+    (``train_panel_panel._enforce_formal_manifests``) recomputes it from the
+    CURRENT on-disk upstreams / this builder's current source / the recorded
+    ``parts`` and compares via :func:`asset_contract.validate_derived_asset`.
+    """
+    return {
+        "upstream_roots": _upstream_roots(data_dir),
+        "transform_code_hash": _transform_code_hash(),
+        "transform_config_hash": _transform_config_hash(parts),
+    }
+
+
 def write_market_env(data_dir: str, df: pd.DataFrame, parts: dict) -> str:
     """Atomically write the parquet + MARKET_ENV_ASSET manifest, then self-check.
 
@@ -355,12 +378,7 @@ def write_market_env(data_dir: str, df: pd.DataFrame, parts: dict) -> str:
         df.to_parquet(ac.tmp_path, compression="lz4")
     write_asset_manifest(
         out_path, MARKET_ENV_ASSET, df, parts=parts,
-        upstream_roots=_upstream_roots(data_dir),
-        transform_code_hash=_transform_code_hash(),
-        transform_config_hash=hash_json({
-            "output_columns": sorted(OUTPUT_COLUMNS),
-            "parts": parts,
-        }),
+        **compute_lineage(data_dir, parts),
     )
     reread = pd.read_parquet(out_path)
     check_asset_read(out_path, MARKET_ENV_ASSET, reread, require_valid_manifest=True)

@@ -718,3 +718,34 @@ def test_validate_market_env_with_all_seven_columns_passes(tmp_path):
     write_asset_manifest(str(p), asset, df)
     report = validate_asset_manifest(str(p), asset)
     assert report["ok"], report
+
+
+# ── §v19 P0#2: validate_derived_asset lineage freshness ────────────────────
+
+def test_validate_derived_asset_ok_and_stale():
+    from stoke_ml.data.asset_contract import validate_derived_asset
+    manifest = {
+        "upstream_roots": {"daily": "AAA", "industry_ranking": "BBB"},
+        "transform_code_hash": "ccc",
+        "transform_config_hash": "ddd",
+    }
+    ok = validate_derived_asset(
+        manifest,
+        current_upstream_roots={"daily": "AAA", "industry_ranking": "BBB"},
+        current_transform_code_hash="ccc",
+        current_transform_config_hash="ddd")
+    assert ok["ok"] and not ok["stale"]
+
+    stale = validate_derived_asset(
+        manifest,
+        current_upstream_roots={"daily": "ZZZ", "industry_ranking": "BBB"},
+        current_transform_code_hash="ccc",
+        current_transform_config_hash="ddd")
+    assert not stale["ok"] and stale["stale"]
+    assert any("upstream_roots.daily" in m for m in stale["mismatches"])
+
+    missing = validate_derived_asset(
+        {"rows": 5}, current_upstream_roots={}, current_transform_code_hash="x",
+        current_transform_config_hash="y")
+    assert not missing["ok"] and missing["stale"]
+    assert any("no recorded lineage" in m for m in missing["mismatches"])

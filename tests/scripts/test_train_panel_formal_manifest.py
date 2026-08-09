@@ -373,3 +373,75 @@ def test_load_aux_data_defaults_formal_false(tp, tmp_path):
         required_channels={"guba"})
     assert manifest["guba"]["status"] == "OK"
     assert not result["000001"]["guba"].empty
+
+
+# ── §v19 P0#2: market_env derived-asset lineage freshness gate ─────────────
+
+def test_formal_gate_aborts_stale_market_env_lineage(tmp_path, monkeypatch):
+    """§v19 P0#2: a market_env whose manifest lineage no longer matches the
+    CURRENT upstreams must abort a formal run with a STALE diagnosis."""
+    from scripts.production.train_panel_panel import _enforce_formal_manifests
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
+
+    me_dir = tmp_path / "a_shares" / "market_breadth"
+    me_dir.mkdir(parents=True)
+    out = me_dir / "market_env_daily.parquet"
+    df = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_adv_ratio": [0.6],
+        "market_turnover_z": [1.0],
+        "mkt_cap_total_z": [0.0], "avg_account_cap_z": [0.0],
+        "investor_new_num": [1.0], "investor_new_z": [0.0],
+    }, index=pd.to_datetime(["2024-01-02"]))
+    df.index.name = "date"
+    df.to_parquet(str(out))
+    write_asset_manifest(
+        str(out), MARKET_ENV_ASSET, df, parts={"price": {}, "account": {}},
+        upstream_roots={"daily": "AAA"}, transform_code_hash="ccc",
+        transform_config_hash="ddd")
+    # force stale: the real compute_lineage returns DIFFERENT upstreams
+    monkeypatch.setattr(
+        "scripts.production.build_market_env.compute_lineage",
+        lambda data_dir, parts: {
+            "upstream_roots": {"daily": "ZZZ"},
+            "transform_code_hash": "ccc", "transform_config_hash": "ddd"})
+
+    with pytest.raises(SystemExit) as ei:
+        _enforce_formal_manifests(["000001"], str(tmp_path), "2024-01-01",
+                                  "2024-01-31", {"market_env"})
+    assert "DERIVED-ASSET STALE" in str(ei.value)
+
+
+def test_formal_gate_passes_fresh_market_env_lineage(tmp_path, monkeypatch):
+    """§v19 P0#2 positive control: a market_env whose lineage MATCHES the
+    CURRENT upstreams / transform code / config passes the gate (no SystemExit)
+    — the freshness check must not false-positive abort a valid run."""
+    from scripts.production.train_panel_panel import _enforce_formal_manifests
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
+
+    me_dir = tmp_path / "a_shares" / "market_breadth"
+    me_dir.mkdir(parents=True)
+    out = me_dir / "market_env_daily.parquet"
+    df = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_adv_ratio": [0.6],
+        "market_turnover_z": [1.0],
+        "mkt_cap_total_z": [0.0], "avg_account_cap_z": [0.0],
+        "investor_new_num": [1.0], "investor_new_z": [0.0],
+    }, index=pd.to_datetime(["2024-01-02"]))
+    df.index.name = "date"
+    df.to_parquet(str(out))
+    write_asset_manifest(
+        str(out), MARKET_ENV_ASSET, df, parts={"price": {}, "account": {}},
+        upstream_roots={"daily": "AAA"}, transform_code_hash="ccc",
+        transform_config_hash="ddd")
+    # fresh: compute_lineage recomputes the SAME lineage the manifest records
+    monkeypatch.setattr(
+        "scripts.production.build_market_env.compute_lineage",
+        lambda data_dir, parts: {
+            "upstream_roots": {"daily": "AAA"},
+            "transform_code_hash": "ccc", "transform_config_hash": "ddd"})
+
+    assert _enforce_formal_manifests(
+        ["000001"], str(tmp_path), "2024-01-01", "2024-01-31",
+        {"market_env"}) is None

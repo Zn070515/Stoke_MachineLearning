@@ -1516,7 +1516,10 @@ def _enforce_formal_manifests(
     from stoke_ml.data.announcement_storage import AnnouncementStorage
     from stoke_ml.data.broadcast_assets import INDUSTRY_ASSET, MARKET_ENV_ASSET
     from stoke_ml.data.etf_storage import ETF_FLOW_ASSET
-    from stoke_ml.data.asset_contract import validate_asset_manifest
+    from stoke_ml.data.asset_contract import (
+        validate_asset_manifest,
+        validate_derived_asset,
+    )
 
     problems: list[str] = []
     code_set = set(stock_list)
@@ -1606,6 +1609,29 @@ def _enforce_formal_manifests(
                 report = validate_asset_manifest(path, asset)
                 if not report["ok"]:
                     problems.append(_fmt_manifest_problem(path, report))
+                elif ch == "market_env":
+                    # §v19 P0#2: market_env is a DERIVED asset — integrity
+                    # (file matches manifest) passed above; NOW check freshness
+                    # (was it built from the CURRENT upstreams / transform code
+                    # / transform config?).  The lineage is recomputed from
+                    # what is on disk right now; the recorded ``parts`` come
+                    # from the manifest (the write-time config snapshot).  A
+                    # stale lineage means the on-disk file predates a change to
+                    # its inputs or builder → FAIL, rebuild required.
+                    from scripts.production.build_market_env import compute_lineage
+                    parts = (report["manifest"] or {}).get("parts", {})
+                    lineage_now = compute_lineage(data_dir, parts)
+                    lineage = validate_derived_asset(
+                        report["manifest"] or {},
+                        current_upstream_roots=lineage_now["upstream_roots"],
+                        current_transform_code_hash=lineage_now["transform_code_hash"],
+                        current_transform_config_hash=lineage_now["transform_config_hash"],
+                    )
+                    if lineage["stale"]:
+                        problems.append(
+                            f"{path}: DERIVED-ASSET STALE — "
+                            + "; ".join(lineage["mismatches"])
+                            + "; rebuild with build_market_env.py")
         else:
             problems.append(
                 f"{ch}: consumed channel is not loaded by load_aux_data and "
