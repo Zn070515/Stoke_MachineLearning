@@ -220,8 +220,37 @@ def test_industry_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
 
 # ── download_industry_ranking ─────────────────────────────────────────
 
+def _qfq_frame(code, dates, amounts):
+    """A well-formed qfq daily batch that survives the RESEARCH_QFQ_DAILY
+    formal contract (full OHLC + volume + amount + stock_code + pct_change)."""
+    dates = list(pd.to_datetime(dates))
+    n = len(dates)
+    closes = [10.0 + 0.1 * i for i in range(n)]
+    df = pd.DataFrame({
+        "date": dates,
+        "open": closes,
+        "high": [c + 0.5 for c in closes],
+        "low": [c - 0.5 for c in closes],
+        "close": closes,
+        "volume": [1e6] * n,
+        "amount": list(amounts),
+        "stock_code": code,
+    })
+    pct = pd.Series([float("nan")] * n)
+    if n > 1:
+        closes_s = pd.Series(closes, dtype="float64")
+        pct.iloc[1:] = 100.0 * closes_s.pct_change().iloc[1:].to_numpy()
+    df["pct_change"] = pct
+    df.attrs["source"] = "test"
+    df.attrs["adjustment_mode"] = "qfq"
+    return df
+
+
 def _industry_ranking_fixtures(tmp_path):
-    """stock_sector_cache.csv + one daily parquet under the _fake_cfg data_dir."""
+    """stock_sector_cache.csv + one canonical daily file under the _fake_cfg
+    data_dir.  The daily file must be canonical (parquet + valid manifest):
+    the §v19 P0#4 refactor reads daily via require_valid_manifest=True, so a
+    bare parquet without a manifest would abort the build instead of feeding it."""
     data_dir = tmp_path / "data"
     daily = data_dir / "a_shares" / "daily"
     daily.mkdir(parents=True, exist_ok=True)
@@ -229,10 +258,9 @@ def _industry_ranking_fixtures(tmp_path):
         "stock_code": ["600519"],
         "sector": ["白酒"],
     }).to_csv(data_dir / "a_shares" / "stock_sector_cache.csv", index=False)
-    pd.DataFrame({
-        "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
-        "pct_change": [0.01, -0.005],
-    }).to_parquet(daily / "600519.parquet")
+    from stoke_ml.data.storage import DataStorage
+    DataStorage(str(data_dir)).save_daily(_qfq_frame(
+        "600519", ["2024-01-02", "2024-01-03"], [1e8, 2e8]))
 
 
 def test_industry_ranking_success_writes_manifest(tmp_path, monkeypatch):
