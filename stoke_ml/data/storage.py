@@ -533,8 +533,14 @@ class DataStorage:
                     batch_segments=batch_segments,
                 )
                 # Contract manifest written atomically alongside the parquet,
-                # still under the lock so readers see a consistent pair.
-                _write_manifest(base, code, combined, segments, run_id)
+                # still under the lock so readers see a consistent pair.  The
+                # schema_hash must describe the ACTUAL bytes on disk — the
+                # round-tripped ``back`` frame, whose ``date`` dtype can differ
+                # from the in-memory ``combined`` (e.g. datetime64[ns] in memory
+                # round-trips to datetime64[ms] on disk).  Hashing ``combined``
+                # would record a schema_hash that validate_manifest can never
+                # match.
+                _write_manifest(base, code, back, segments, run_id)
             finally:
                 _release_lock(handle)
 
