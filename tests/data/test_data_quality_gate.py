@@ -33,6 +33,7 @@ from scripts.production.data_quality_gate import (
     _manifest_contract_full_scan,
     _read_requested_file,
     _sample_files,
+    check_aux_close_aligned,
     check_contract_schema,
     check_daily_internal,
     check_datasets,
@@ -1551,3 +1552,83 @@ class TestCalendarArtifactAndFreshness:
         res = check_datasets(0)
         assert res.passed is False
         assert any("stale=" in d for _f, d in res.issues)
+
+
+class TestAuxCloseAligned:
+    """§T19: aux processed close must equal canonical daily (basis-drift
+    canary).  Per-date-price channels (board_processed) compare every row;
+    forward-filled-close channels (dividend/lockup) compare only at genuine
+    event rows (``dv_days_since == 0``), where close is a real daily price."""
+
+    @staticmethod
+    def _setup(tmp_path, monkeypatch):
+        root = tmp_path / "a_shares"
+        daily = root / "daily"
+        daily.mkdir(parents=True, exist_ok=True)
+        # Aux fixture dirs the check globs (``A_SHARES / <dir> / *.parquet``)
+        # must exist so the parquet writers have a target.
+        for aux in ("board_processed", "dividend_processed"):
+            (root / aux).mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("scripts.production.data_quality_gate.A_SHARES", root)
+        monkeypatch.setattr("scripts.production.data_quality_gate.DAILY_DIR", daily)
+        # _load_daily caches by code; a fresh dir per test must not read a
+        # prior test's cached frame.
+        monkeypatch.setattr("scripts.production.data_quality_gate._DAILY_CACHE", {})
+        return root, daily
+
+    def _write_daily(self, daily_dir, code, closes):
+        _daily(TRADE_DATES, closes, code=code).to_parquet(
+            daily_dir / f"{code}.parquet", index=False
+        )
+
+    def test_per_date_channel_matching_close_passes(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [10.0, 10.5, 10.2, 10.8, 10.4],
+        }).to_parquet(root / "board_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is True
+        assert res.issues == []
+
+    def test_per_date_channel_basis_drift_fails(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        # Embedded close drifted +5 off canonical daily — must fail.
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [15.0, 15.5, 15.2, 15.8, 15.4],
+        }).to_parquet(root / "board_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is False
+        assert any("board_processed" in f for f, _d in res.issues)
+
+    def test_forward_filled_close_compares_event_rows_only(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        # Event on the first day (dv_days_since == 0): close = daily 10.0, then
+        # forward-filled as a constant while daily drifts — genuine dividend
+        # semantics, must PASS (only the event row is compared).
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [10.0, 10.0, 10.0, 10.0, 10.0],
+            "dv_days_since": [0, 1, 2, 3, 4],
+        }).to_parquet(root / "dividend_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is True
+        assert res.issues == []
+
+    def test_forward_filled_channel_event_row_drift_still_fails(self, tmp_path, monkeypatch):
+        root, daily = self._setup(tmp_path, monkeypatch)
+        self._write_daily(daily, "000001", [10.0, 10.5, 10.2, 10.8, 10.4])
+        # Event-row close drifted +0.3 off daily (10.3 vs 10.0) — the canary
+        # must STILL fire at event rows even under the event-row restriction.
+        pd.DataFrame({
+            "date": pd.to_datetime(TRADE_DATES),
+            "close": [10.3, 10.3, 10.3, 10.3, 10.3],
+            "dv_days_since": [0, 1, 2, 3, 4],
+        }).to_parquet(root / "dividend_processed" / "000001.parquet", index=False)
+        res = check_aux_close_aligned(0)
+        assert res.passed is False
+        assert any("dividend_processed" in f for f, _d in res.issues)

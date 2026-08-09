@@ -48,6 +48,18 @@ from stoke_ml.utils.error_summary import classify_error
 
 logger = logging.getLogger(__name__)
 
+# Channels whose processed ``close`` is a forward-filled state byproduct, not
+# a per-date price: the event-date close is merged from canonical daily, then
+# ``_fill_to_daily`` carries it as a constant between events (aggregator.py).
+# ``close`` is meaningful only at genuine event rows, which the event-time
+# feature ``{prefix}_days_since == 0`` marks (0 = event day).  The aux_close
+# check restricts these channels to event rows; per-date-price channels
+# (block_trade/board/sector/shareholder) compare every row.
+_FFILL_CLOSE_EVENT = {
+    "dividend_processed": "dv_days_since",
+    "lockup_processed": "lu_days_since",
+}
+
 
 def check_datasets(sample: int) -> _g.CheckResult:
     """Required-dataset pre-gate: empty/missing data must FAIL."""
@@ -171,7 +183,14 @@ def check_aux_pct_aligned(sample: int) -> _g.CheckResult:
 
 
 def check_aux_close_aligned(sample: int) -> _g.CheckResult:
-    """Processed OHLC must equal canonical daily close (调整基准漂移)."""
+    """Processed OHLC must equal canonical daily close (调整基准漂移).
+
+    Per-date-price channels (block_trade/board/sector/shareholder) are compared
+    on every row.  Forward-filled-close channels (dividend/lockup) embed a
+    state byproduct — the event-date close carried as a constant between
+    events — so they are compared only at genuine event rows
+    (``{prefix}_days_since == 0``), where close is a real daily price.
+    """
     res = _g.CheckResult("aux_close_aligned", True, "")
     files = []
     for d in _g.AUX_CLOSE_DIRS:
@@ -183,12 +202,18 @@ def check_aux_close_aligned(sample: int) -> _g.CheckResult:
     for fp in files:
         d = os.path.basename(os.path.dirname(fp))
         code = Path(fp).stem
+        ev_col = _FFILL_CLOSE_EVENT.get(d)
+        read_cols = ["date"] + OHLC
+        retry_cols = ["date", "close"]
+        if ev_col is not None:
+            read_cols.append(ev_col)
+            retry_cols.append(ev_col)
         try:
-            a = pd.read_parquet(fp, columns=["date"] + OHLC)
+            a = pd.read_parquet(fp, columns=read_cols)
         except Exception:
             # Some event dirs embed only close (no open/high/low); retry that.
             try:
-                a = pd.read_parquet(fp, columns=["date", "close"])
+                a = pd.read_parquet(fp, columns=retry_cols)
             except Exception:
                 res.issues.append((f"{d}/{code}", "no_ohlc/read_err"))
                 res.passed = False
@@ -197,6 +222,11 @@ def check_aux_close_aligned(sample: int) -> _g.CheckResult:
             res.issues.append((f"{d}/{code}", "missing_col"))
             res.passed = False
             continue
+        if ev_col is not None:
+            # Forward-filled-close channels: restrict to genuine event rows
+            # where close is a real daily price.  ev_col is guaranteed present
+            # because the reads above requested it (a missing column raises).
+            a = a[a[ev_col] == 0]
         daily = _g._load_daily(
             code, ["date"] + [c for c in ["open", "high", "low", "close"] if c in a]
         )
