@@ -87,6 +87,21 @@
 - `stock_industry_map.parquet`：无 manifest（无 consumer / formal gate 要求，T9 不改）。
 - **cninfo announcement-sentiment 路径**（`a_shares/cninfo_announcements/sentiment/`）：无 storage/manifest 支持 —— formal 模式下显式拒绝（`use --prebuilt or add a DataAssetContract writer`），T9 维持显式排除，不补 writer。
 
+### 行业分类真 PIT（v19 P0#1，CNINFO 事件溯源）
+
+`scripts/production/download_sector_membership.py` 拉取 CNINFO
+`stock_industry_change_cninfo` 逐股行业分类变更事件（列：新证券简称 / 行业
+门类 / 机构名称 / 证券代码 / 变更日期 / 分类标准…），构建真 PIT 的
+`a_shares/sector_membership.parquet`（列 `[date, stock_code, sector_code,
+sector_name]`，CSRC 门类 A-S 级别，合并证监会 2001 / 2012 / 中国上市公司协会
+改名；逐事件区间边界 + dropna 后建边界，不做 present-backfill）。逐股缓存
+在 `a_shares/sector_membership_pit/_stocks/{code}.json`，支持断点续爬。
+`download_industry_ranking.py` 优先读这份 membership（date+stock_code INNER
+join → 诚实剔除未分类日），缺失时回退历史快照——`market_adv_ratio` 等市场
+宽度指标因此成为**真 PIT**。注意：`industry` 通道的 `channel_vintage` 声明
+仍标 `pit_alignment=proxy`（v18 §二十-9，代码未改）；数据已 PIT，正式 vintage
+标签升级留待后续独立决策。
+
 ### 正式研究 Prebuilt 主线（§P2-16，T14 收口）
 
 正式研究的 canonical 流程（各阶段产物在括号中）：
@@ -95,21 +110,22 @@
 
 即：原始数据下载（`download_*.py`）→ 质量门报告（`reports/data_quality_gate.json`，formal 必检）→ `build_features.py --panel-mode` 一次性构建面板特征（`data/features_panel/`）→ 每份特征 parquet 携带 sidecar manifest（`--require-feature-manifest` 默认开）→ 可选 `--panel-store` 流式固化 → 训练直接读 `--prebuilt data/features_panel`（`train_panel.py`）。面板特征只构建一次，训练循环不再在线做特征工程。
 
-门禁规则（`_require_prebuilt_mainline`，T14）：**formal 研究**（quality gate 强制 且 非 `--no-formal`）且**解析后股票数 > 1000** 且 无 `--prebuilt` / 无完整 `--panel-store` → 启动即拒绝，提示先构建 prebuilt 特征。`--universe all` 无论模式一律拒绝（5530 只无法在 RAM 内做特征工程，§七-P0）。在线特征工程保留给 debug / smoke / 小宇宙 / 特征开发；逃生口是 `--no-formal`（探索性）/ `--no-require-quality-gate`（dev smoke）。minute 模式无 prebuilt 产物，豁免计数门禁。
+门禁规则（`_require_prebuilt_mainline`，v19 P0#3 收口，取代 T14 的 >1000 阈值规则）：**formal 研究**（quality gate 强制 且 非 `--no-formal`）一律要求 `--prebuilt`（prebuilt 特征主线）或完整 `--panel-store`，不再有股票数阈值逃生口——缺则启动即拒绝，提示先构建 prebuilt 特征。`--universe all` 无论模式一律拒绝（5530 只无法在 RAM 内做特征工程，§七-P0）。在线特征工程降级为 debug / smoke / 探索性路径（逃生口 `--no-formal` / `--no-require-quality-gate`）。minute 模式无 prebuilt 产物，豁免。
 
-### Formal 训练主线（v18 §二十-4 声明）
+### Formal 训练主线（v19 P0#3 收口，取代 v18 §二十-4 的 >1000 阈值声明）
 
 Formal 研究统一走 Prebuilt Feature → PanelStore → Training 主线
 （Raw Assets → Formal Asset Gate → Prebuilt Feature Artifact → Feature
 Manifest → Streaming PanelStore → Train）。Live FeaturePipeline 保留为
-Feature 开发 / Debug / Smoke / 小规模快速实验路径。
+Feature 开发 / Debug / Smoke / 探索性快速实验路径。
 
-- `--universe all`（全市场）与 formal 研究 >1000 股票（`_PREBUILT_MAINLINE_THRESHOLD`）
-  强制 `--prebuilt`：live 数学输入（raw → in-memory transform）与 prebuilt
+- v18 曾以 `_PREBUILT_MAINLINE_THRESHOLD`（解析后股票数 > 1000）作为 formal
+  的阈值逃生口；v19 P0#3 收口——formal 研究**一律**要求 prebuilt / 完整
+  store，无股票数阈值。live 数学输入（raw → in-memory transform）与 prebuilt
   （raw → preprocess_new_data → processed → build_features）不是同一套输入，
   formal 大实验不维护两套 Feature Source 语义。
-- 阈值以下的 formal 小 universe / smoke 允许 live，作为开发路径；正式
-  Lockbox 主结论一律 prebuilt。
+- 逃生口是 `--no-formal`（探索性）/ `--no-require-quality-gate`（dev smoke），
+  不是股票数阈值。`--universe all` 无论模式一律拒绝。
 - 不删除 live 路径——只做门禁 + 文档。
 
 ### Lockbox 声明：revision-safe headline_v1 含 industry proxy（v18 §二十-9）
