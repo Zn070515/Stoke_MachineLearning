@@ -43,7 +43,7 @@ def market_of_code(code6: str) -> str | None:
     Every provider derives its exchange prefix from this — never from its own
     leading-digit heuristic.  Caliber:
       * SH 上海: ``6xxxxx`` (600/601/603/605/688/689 主板 / 科创板)
-      * SZ 深圳: ``0xxxxx`` / ``3xxxxx`` (000/001/002/003/300/301 主板 / 创业板)
+      * SZ 深圳: ``0xxxxx`` / ``3xxxxx`` (000/001/002/003/300/301/302 主板 / 创业板)
       * BJ 北交所: ``43 / 83 / 87 / 88 / 920``
     Returns ``None`` for anything else (indices, B-shares, funds, ...).
 
@@ -162,7 +162,7 @@ def a_share_equity_segment(code6: str) -> str | None:
     Prefix-based classification (§十), the practical filter for a daily K-line
     store:
       * SH 主板 / 科创板: ``600 / 601 / 603 / 605 / 688 / 689``
-      * SZ 主板 / 创业板: ``000 / 001 / 002 / 003 / 300 / 301``
+      * SZ 主板 / 创业板: ``000 / 001 / 002 / 003 / 300 / 301 / 302``
       * BJ 北交所:        ``43 / 83 / 87 / 88 / 920``
     Everything else — 100xxx indices, 200xxx (SZ B股), 500xxx funds,
     900xxx (SH B股), the 000300/399xxx index ranges that fall outside the
@@ -173,7 +173,7 @@ def a_share_equity_segment(code6: str) -> str | None:
     """
     if code6.startswith(("600", "601", "603", "605", "688", "689")):
         return "SH"
-    if code6.startswith(("000", "001", "002", "003", "300", "301")):
+    if code6.startswith(("000", "001", "002", "003", "300", "301", "302")):
         return "SZ"
     if code6.startswith(_BJ_PREFIXES):
         return "BJ"

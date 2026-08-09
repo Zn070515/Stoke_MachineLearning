@@ -114,7 +114,8 @@ class TestAShareEquitySegment:
             assert a_share_equity_segment(c) == "SH", c
 
     def test_sz_main_and_chinext(self):
-        for c in ("000001", "001979", "002594", "003816", "300750", "301269"):
+        for c in ("000001", "001979", "002594", "003816", "300750", "301269",
+                  "302132"):
             assert a_share_equity_segment(c) == "SZ", c
 
     def test_bj(self):
@@ -132,7 +133,7 @@ class TestIsAShareEquityCode:
 
     @pytest.mark.parametrize("code", [
         "600519", "000001", "688981", "300750", "430001",
-        "002594", "301269", "689009", "601318", "920001",
+        "002594", "301269", "689009", "601318", "920001", "302132",
     ])
     def test_equity_true(self, code):
         assert is_a_share_equity_code(code) is True
