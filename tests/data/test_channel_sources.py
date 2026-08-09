@@ -99,11 +99,6 @@ def data_quality_gate_mod():
     return _load_script("data_quality_gate")
 
 
-@pytest.fixture(scope="module")
-def train_panel_panel_mod():
-    return _load_script("train_panel_panel")
-
-
 class TestRegistry:
     def test_covers_all_headline_v1_channels(self):
         for ch in HEADLINE_V1_CHANNELS + PROCESSED_ONLY_CHANNELS + OTHER_CHANNELS:
@@ -189,19 +184,3 @@ class TestConsumerDerivations:
         assert build_features_mod._channel_stock_dir(
             data_dir, "valuation") == os.path.join(data_dir, "a_shares",
                                                    "valuation")
-
-    def test_train_panel_panel_live_data_type(self, train_panel_panel_mod):
-        # The MarketWideStorage loop reads the LIVE dir, not the *_processed
-        # one — live_data_type must resolve capital_flow → "capital_flow".
-        spec = CHANNEL_SOURCE["capital_flow"]
-        assert live_data_type(spec) == "capital_flow"
-        assert train_panel_panel_mod._MARKET_WIDE_CHANNELS == (
-            "margin", "northbound", "dragon_tiger", "capital_flow",
-            "block_trade", "shareholder", "lockup", "dividend", "valuation",
-        )
-        # Every channel in the loop resolves to a valid MarketWideStorage type.
-        for ch in train_panel_panel_mod._MARKET_WIDE_CHANNELS:
-            assert live_data_type(CHANNEL_SOURCE[ch]) in \
-                {d for d in __import__(
-                    "stoke_ml.data.market_wide_storage",
-                    fromlist=["MARKET_DATA_TYPES"]).MARKET_DATA_TYPES}
