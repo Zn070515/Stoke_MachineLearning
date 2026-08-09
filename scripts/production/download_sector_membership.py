@@ -54,6 +54,20 @@ logger = logging.getLogger(__name__)
 #: (raise), never a silent empty-gate that would look like a legit no-gate stock.
 _CNINFO_REQUIRED_COLS = frozenset({"分类标准", "行业门类", "变更日期"})
 
+#: The CNINFO schema akshare returns after its column rename (no 最新记录标识).
+#: A stock with ZERO records gets normalized to an empty frame carrying THESE
+#: columns, so it parses + caches as a legitimate no-gate stock (excluded), not
+#: a failure that is re-fetched on every run (§v19 P0#1 review #1).
+_CNINFO_STANDARD_COLUMNS = [
+    "新证券简称", "行业中类", "行业大类", "行业次类", "行业门类",
+    "机构名称", "行业编码", "分类标准", "分类标准编码", "证券代码", "变更日期",
+]
+
+
+def _empty_cninfo_frame() -> pd.DataFrame:
+    """A zero-row DataFrame carrying the standard CNINFO columns."""
+    return pd.DataFrame(columns=_CNINFO_STANDARD_COLUMNS)
+
 _MAX_WORKERS = 8
 _FETCH_ATTEMPTS = 3
 _FETCH_BACKOFF_BASE = 2.0
@@ -72,24 +86,32 @@ def parse_cninfo_events(stock_code: str, events: pd.DataFrame) -> pd.DataFrame:
     """CNINFO change events → per-date long membership ``[date, stock_code,
     sector_code, sector_name]`` (证监会 门类 level, honest-PIT: gate asserted
     only from its first CSRC event's 变更日期 forward).
+
+    Interval boundaries are taken from EVERY CSRC-standard event's 变更日期, so
+    a change to an UNRECOGNIZED 门类 name ends the previous interval exactly at
+    its 变更日期 − 1 — the previous gate is never asserted PAST the event that
+    disproves it (reverse-PIT, the mirror of present-backfill).  The gate-letter
+    mapping only decorates each interval; an unrecognized gate yields
+    ``sector_code=None`` and that interval is EXCLUDED from the returned rows.
     """
     from stoke_ml.data.csrc_gate import CSRC_STANDARD_LABELS, csrc_gate_code
+    empty = pd.DataFrame(columns=["date", "stock_code", "sector_code", "sector_name"])
     if events is None or events.empty:
-        return pd.DataFrame(columns=["date", "stock_code", "sector_code", "sector_name"])
+        return empty
     sub = events[events["分类标准"].isin(CSRC_STANDARD_LABELS)].copy()
+    if sub.empty:
+        return empty
     sub["变更日期"] = pd.to_datetime(sub["变更日期"], errors="coerce")
     sub = sub.dropna(subset=["变更日期"])
     if sub.empty:
-        return pd.DataFrame(columns=["date", "stock_code", "sector_code", "sector_name"])
+        return empty
     # the most recent gate per change date (a rename can emit several rows same-day)
     sub = sub.sort_values("变更日期")
     latest = sub.groupby("变更日期").last().reset_index()
     latest["sector_code"] = latest["行业门类"].map(csrc_gate_code)
     latest["sector_name"] = latest["行业门类"]
-    latest = latest.dropna(subset=["sector_code"]).sort_values("变更日期")
-    if latest.empty:
-        return pd.DataFrame(columns=["date", "stock_code", "sector_code", "sector_name"])
-    # expand each interval to every day in the stock's daily span
+    latest = latest.sort_values("变更日期")
+    # interval boundaries from EVERY CSRC-standard event (see docstring)
     rows: list[dict] = []
     for i, (_, row) in enumerate(latest.iterrows()):
         start = row["变更日期"]
@@ -98,7 +120,9 @@ def parse_cninfo_events(stock_code: str, events: pd.DataFrame) -> pd.DataFrame:
         rows.append({"date": start, "stock_code": stock_code,
                      "sector_code": row["sector_code"],
                      "sector_name": row["sector_name"], "_end": end})
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    # drop intervals whose gate letter is unrecognized (excluded, never asserted)
+    return out.dropna(subset=["sector_code"])
 
 
 def _expand(intervals: pd.DataFrame, days: pd.DatetimeIndex) -> pd.DataFrame:
@@ -124,8 +148,13 @@ def _write_intervals_cache(path: str, intervals: pd.DataFrame) -> None:
         "sector_name": str(iv["sector_name"]),
     } for _, iv in intervals.iterrows()]
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    # Atomic write (tmp + os.replace): a crash mid-write must never leave a
+    # truncated cache file — a present-but-unreadable cache would make the stock
+    # permanently failed (§v19 P0#1 review #3).
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"intervals": payload}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def _load_intervals_cache(path: str) -> pd.DataFrame:
@@ -148,7 +177,16 @@ _LAST_FETCH_AT = 0.0
 
 
 def _rate_limited_fetch(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """One CNINFO call, gated by a global min-interval so 8 workers stay polite."""
+    """One CNINFO call, gated by a global min-interval so 8 workers stay polite.
+
+    akshare's ``stock_industry_change_cninfo`` builds ``pd.DataFrame([])`` (0×0)
+    when a stock has ZERO records and then indexes ``temp_df["变更日期"]`` on a
+    column-less frame → deterministic ``KeyError``.  That is a LEGITIMATE "stock
+    has no CSRC gate" result, so it is normalized HERE to an empty frame carrying
+    the standard CNINFO columns — it parses + caches as empty (excluded), and
+    never burns the retry/backoff loop on a non-transient error (§v19 P0#1
+    review #1).
+    """
     global _LAST_FETCH_AT
     with _FETCH_LOCK:
         wait = _LAST_FETCH_AT + _FETCH_INTERVAL - time.time()
@@ -156,8 +194,13 @@ def _rate_limited_fetch(stock_code: str, start_date: str, end_date: str) -> pd.D
             time.sleep(wait)
         _LAST_FETCH_AT = time.time()
     import akshare as ak
-    return ak.stock_industry_change_cninfo(
-        symbol=stock_code, start_date=start_date, end_date=end_date)
+    try:
+        return ak.stock_industry_change_cninfo(
+            symbol=stock_code, start_date=start_date, end_date=end_date)
+    except KeyError:
+        logger.info("sector_membership[%s]: CNINFO returned no records — "
+                    "legit-empty (no CSRC gate), not a failure", stock_code)
+        return _empty_cninfo_frame()
 
 
 def _fetch_cninfo_events(stock_code: str, start_date: str, end_date: str,
@@ -268,7 +311,16 @@ def main() -> None:
         intervals = intervals_by_code.get(code)
         if intervals is None or intervals.empty:
             continue
-        d = storage.load_daily(code, "1970-01-01", "2099-12-31")
+        try:
+            d = storage.load_daily(code, "1970-01-01", "2099-12-31")
+        except Exception as exc:
+            # A crawl is best-effort: a corrupt daily must not abort the whole
+            # run.  Skip this stock's expansion; the coverage audit stays honest
+            # because no membership rows are claimed for it (§v19 P0#1 review #7).
+            logger.warning("sector_membership[%s]: daily read failed — skipping "
+                           "this stock's expansion (coverage audit stays honest): "
+                           "%s", code, str(exc)[:120])
+            continue
         if d is None or d.empty:
             continue
         days = pd.DatetimeIndex(pd.to_datetime(d["date"]).drop_duplicates()

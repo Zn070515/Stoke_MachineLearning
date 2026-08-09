@@ -68,6 +68,10 @@ def test_build_industry_ranking_uses_pit_membership(tmp_path):
     df = dir_mod.build_industry_ranking(str(base))
     assert set(df["sector_code"]) == {"J", "C"}
     assert set(df["sector_name"]) == {"金融业", "制造业"}
+    # daily data exists on 2024-01-04 but the membership asserts no gate there →
+    # that date is excluded from the sector aggregates (honest unclassified,
+    # never present-backfilled).  §v19 P0#1 review #4c.
+    assert (df["date"] == pd.Timestamp("2024-01-04")).sum() == 0
 
 
 def test_build_industry_ranking_excludes_unclassified_stocks(tmp_path):
