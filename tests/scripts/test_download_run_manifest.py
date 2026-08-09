@@ -296,3 +296,5 @@ def test_all_production_downloaders_use_fail_closed_run_manifest():
         m = importlib.import_module(f"scripts.production.{mod}")
         src = inspect.getsource(m)
         assert "write_run_manifest_or_exit" in src, f"{mod} not migrated"
+        assert "write_run_manifest(" not in src, \
+            f"{mod} still calls legacy write_run_manifest"
