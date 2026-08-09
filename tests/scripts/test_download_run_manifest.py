@@ -265,8 +265,12 @@ def _industry_ranking_fixtures(tmp_path):
 
 
 def test_industry_ranking_success_writes_manifest(tmp_path, monkeypatch):
+    # §v19 P0.2: snapshot fallback is OPT-IN — the fixture has no
+    # sector_membership.parquet, so main() needs the CLI flag to build over the
+    # legacy current-snapshot cache instead of failing closed.
     _industry_ranking_fixtures(tmp_path)
-    rc = _run(monkeypatch, tmp_path, dindr)
+    rc = _run(monkeypatch, tmp_path, dindr,
+              argv=("--allow-snapshot-sector-fallback",))
     assert rc is None
     assert _manifest_path(tmp_path, dindr).is_file()
 
@@ -274,7 +278,8 @@ def test_industry_ranking_success_writes_manifest(tmp_path, monkeypatch):
 def test_industry_ranking_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
     _industry_ranking_fixtures(tmp_path)
     monkeypatch.setattr(dm, "write_run_manifest", _boom)
-    rc = _run(monkeypatch, tmp_path, dindr)
+    rc = _run(monkeypatch, tmp_path, dindr,
+              argv=("--allow-snapshot-sector-fallback",))
     assert rc == 1
     assert not _manifest_path(tmp_path, dindr).is_file()
 

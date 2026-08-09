@@ -5,16 +5,26 @@ The genuine-PIT contract under test: when ``sector_membership.parquet`` (per-dat
 ``build_industry_ranking`` joins every daily row to it on ``(date, stock_code)``
 — a stock with NO asserted CSRC gate that date is EXCLUDED from the sector
 aggregates (honest unclassified, never present-backfilled with today's
-classification).  With the PIT artifact absent it falls back to the legacy
-snapshot cache (SEC#### codes) so the historical behavior is preserved.
+classification).
+
+§v19 P0.2 (fail-closed): snapshot fallback is OPT-IN — without
+``allow_snapshot_fallback=True`` a missing ``sector_membership.parquet`` aborts
+the build (never a silent proxy-PIT ranking).  §v19 P0.3: a PRESENT membership
+parquet must first pass its own ``SECTOR_MEMBERSHIP_ASSET`` manifest check before
+it can feed the derivation.
 
 The daily files must be canonical (parquet + valid manifest) because the
 builder reads them via ``require_valid_manifest=True`` (§v19 P0#4) — a bare
 parquet without a manifest would abort the build, not feed it.
 """
+import pytest
 import pandas as pd
 
 from scripts.production import download_industry_ranking as dir_mod
+from scripts.production.download_sector_membership import (
+    SECTOR_MEMBERSHIP_ASSET,
+)
+from stoke_ml.data.asset_contract import write_asset_manifest
 
 
 def _qfq_frame(code, dates, amounts):
@@ -51,6 +61,17 @@ def _write_daily(base, code, dates):
         code, dates, amounts))
 
 
+def _write_membership(base, mem):
+    """Write ``sector_membership.parquet`` the way download_sector_membership.py
+    does: parquet + SECTOR_MEMBERSHIP_ASSET manifest (the builder now validates,
+    §v19 P0.3)."""
+    mem_path = base / "sector_membership.parquet"
+    mem.attrs["source"] = "test"
+    mem.to_parquet(mem_path, index=False)
+    write_asset_manifest(str(mem_path), SECTOR_MEMBERSHIP_ASSET, mem)
+    return mem_path
+
+
 def test_build_industry_ranking_uses_pit_membership(tmp_path):
     """industry_ranking must derive sectors from sector_membership.parquet
     (per-date) rather than the current-snapshot cache."""
@@ -64,8 +85,10 @@ def test_build_industry_ranking_uses_pit_membership(tmp_path):
         "sector_code": ["J", "J", "C", "C"],
         "sector_name": ["金融业", "金融业", "制造业", "制造业"],
     })
-    mem.to_parquet(base / "sector_membership.parquet", index=False)
-    df = dir_mod.build_industry_ranking(str(base))
+    _write_membership(base, mem)
+    df, prov = dir_mod.build_industry_ranking(str(base))
+    assert prov["pit_alignment"] == "verified"
+    assert prov["membership_source"] == "pit"
     assert set(df["sector_code"]) == {"J", "C"}
     assert set(df["sector_name"]) == {"金融业", "制造业"}
     # daily data exists on 2024-01-04 but the membership asserts no gate there →
@@ -89,8 +112,10 @@ def test_build_industry_ranking_excludes_unclassified_stocks(tmp_path):
         "sector_code": ["J", "J"],
         "sector_name": ["金融业", "金融业"],
     })
-    mem.to_parquet(base / "sector_membership.parquet", index=False)
-    df = dir_mod.build_industry_ranking(str(base))
+    _write_membership(base, mem)
+    df, prov = dir_mod.build_industry_ranking(str(base))
+    assert prov["pit_alignment"] == "verified"
+    assert prov["membership_source"] == "pit"
     assert set(df["sector_code"]) == {"J"}
     # the unclassified stock must never surface as a constituent or leader
     assert not (df["leader"] == "000002").any()
@@ -98,8 +123,9 @@ def test_build_industry_ranking_excludes_unclassified_stocks(tmp_path):
 
 
 def test_build_industry_ranking_falls_back_to_snapshot_cache(tmp_path):
-    """Without sector_membership.parquet the builder falls back to the legacy
-    snapshot cache (SEC#### short codes) — the pre-P0#1 behavior is preserved."""
+    """Snapshot fallback is OPT-IN (§v19 P0.2): with allow_snapshot_fallback=True
+    a missing sector_membership.parquet uses the legacy current-snapshot cache
+    (SEC#### short codes) and reports pit_alignment='proxy'."""
     base = tmp_path / "a_shares"
     (base / "daily").mkdir(parents=True)
     _write_daily(base, "600519", ["2024-01-02", "2024-01-03"])
@@ -107,6 +133,73 @@ def test_build_industry_ranking_falls_back_to_snapshot_cache(tmp_path):
         "stock_code": ["600519"],
         "sector": ["白酒"],
     }).to_csv(base / "stock_sector_cache.csv", index=False)
-    df = dir_mod.build_industry_ranking(str(base))
+    df, prov = dir_mod.build_industry_ranking(
+        str(base), allow_snapshot_fallback=True)
+    assert prov["pit_alignment"] == "proxy"
+    assert prov["membership_source"] == "snapshot_fallback"
     assert set(df["sector_code"]) == {"SEC0000"}
     assert set(df["sector_name"]) == {"白酒"}
+
+
+def test_build_industry_ranking_fails_closed_without_membership(tmp_path):
+    """§v19 P0.2: default (no flag) + missing sector_membership.parquet → the
+    build FAILS closed — never a silent proxy-PIT snapshot ranking."""
+    base = tmp_path / "a_shares"
+    (base / "daily").mkdir(parents=True)
+    _write_daily(base, "600519", ["2024-01-02", "2024-01-03"])
+    # no sector_membership.parquet and no stock_sector_cache.csv
+    with pytest.raises(SystemExit) as ei:
+        dir_mod.build_industry_ranking(str(base))
+    assert "sector_membership.parquet missing" in str(ei.value)
+
+
+def test_build_industry_ranking_rejects_bare_membership(tmp_path):
+    """§v19 P0.3: a PRESENT sector_membership.parquet with NO manifest (a bare /
+    pre-manifest file) fails the SECTOR_MEMBERSHIP_ASSET check → SystemExit."""
+    base = tmp_path / "a_shares"
+    (base / "daily").mkdir(parents=True)
+    _write_daily(base, "600519", ["2024-01-02", "2024-01-03"])
+    mem = pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-03"],
+        "stock_code": ["600519", "600519"],
+        "sector_code": ["C", "C"],
+        "sector_name": ["制造业", "制造业"],
+    })
+    # bare parquet — NO write_asset_manifest sidecar
+    mem.to_parquet(base / "sector_membership.parquet", index=False)
+    with pytest.raises(SystemExit) as ei:
+        dir_mod.build_industry_ranking(str(base))
+    assert "sector_membership.parquet FAILED its asset manifest check" in str(ei.value)
+
+
+def test_compute_lineage_tracks_upstream_roots(tmp_path):
+    """compute_lineage returns the three §v19 P0#2 keys; changing the
+    sector_membership.parquet bytes flips upstream_roots['sector_membership']
+    while the unchanged daily upstream stays stable."""
+    base = tmp_path / "a_shares"
+    (base / "daily").mkdir(parents=True)
+    _write_daily(base, "600519", ["2024-01-02", "2024-01-03"])
+    mem_path = base / "sector_membership.parquet"
+    pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-03"],
+        "stock_code": ["600519", "600519"],
+        "sector_code": ["C", "C"],
+        "sector_name": ["制造业", "制造业"],
+    }).to_parquet(mem_path, index=False)
+    prov = {"membership_source": "pit", "pit_alignment": "verified"}
+    lineage = dir_mod.compute_lineage(str(base.parent), prov, ["date"])
+    assert set(lineage) == {"upstream_roots", "transform_code_hash",
+                            "transform_config_hash"}
+    assert set(lineage["upstream_roots"]) == {"daily", "sector_membership"}
+    first = lineage["upstream_roots"]["sector_membership"]
+    # rewrite the membership parquet with DIFFERENT bytes → upstream root flips
+    pd.DataFrame({
+        "date": ["2024-01-02"],
+        "stock_code": ["600519"],
+        "sector_code": ["J"],
+        "sector_name": ["金融业"],
+    }).to_parquet(mem_path, index=False)
+    lineage2 = dir_mod.compute_lineage(str(base.parent), prov, ["date"])
+    assert lineage2["upstream_roots"]["sector_membership"] != first
+    # the daily upstream (untouched) is stable across the membership rewrite
+    assert lineage2["upstream_roots"]["daily"] == lineage["upstream_roots"]["daily"]
