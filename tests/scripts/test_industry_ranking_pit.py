@@ -170,6 +170,8 @@ def test_build_industry_ranking_rejects_bare_membership(tmp_path):
     with pytest.raises(SystemExit) as ei:
         dir_mod.build_industry_ranking(str(base))
     assert "sector_membership.parquet FAILED its asset manifest check" in str(ei.value)
+    # the actionable reason (a bare / pre-manifest file) is surfaced, not swallowed
+    assert "manifest missing" in str(ei.value)
 
 
 def test_compute_lineage_tracks_upstream_roots(tmp_path):

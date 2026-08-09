@@ -13,9 +13,13 @@ Output: single market-wide ``industry_ranking.parquet`` for SectorBroadcaster.
 daily row is joined on ``(date, stock_code)``, so a stock with no asserted CSRC
 gate that date is EXCLUDED (honest unclassified, never present-backfilled).  The
 legacy ``stock_sector_cache.csv`` snapshot (SEC#### short codes) is only the
-fallback for when the PIT artifact is absent.  §v19 P0#4: every daily file is
-read through the canonical validated store (``require_valid_manifest=True``) and
-ANY invalid file aborts the whole build — no silent skip.
+fallback for when the PIT artifact is absent, and it is OPT-IN: the build FAILS
+CLOSED by default when ``sector_membership.parquet`` is missing — pass
+``--allow-snapshot-sector-fallback`` to force the legacy cache, which records
+``pit_alignment='proxy'`` (never the strict ``'verified'`` headline).  §v19 P0#4:
+every daily file is read through the canonical validated store
+(``require_valid_manifest=True``) and ANY invalid file aborts the whole build —
+no silent skip.
 
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_industry_ranking.py
@@ -135,11 +139,15 @@ def build_industry_ranking(
         )
         report = validate_asset_manifest(membership_path, SECTOR_MEMBERSHIP_ASSET)
         if not report["ok"]:
+            # A bare (pre-manifest) parquet reports its actionable signal in
+            # ``reason`` (no ``mismatches``) — fall back to it so the failure is
+            # never a stray "; " with the cause swallowed (§v19 P0.3).
+            msg = "; ".join(report.get("mismatches") or
+                            ([report["reason"]] if report.get("reason") else []))
             raise SystemExit(
                 "download_industry_ranking: sector_membership.parquet FAILED its "
-                "asset manifest check (§v19 P0.3): "
-                + "; ".join(report.get("mismatches") or [])
-                + "; re-run download_sector_membership.py")
+                f"asset manifest check (§v19 P0.3): {msg}; "
+                "re-run download_sector_membership.py")
         mem = pd.read_parquet(membership_path)
         mem["date"] = pd.to_datetime(mem["date"], errors="coerce")
         mem["stock_code"] = normalize_stock_code_series(mem["stock_code"])
@@ -316,8 +324,13 @@ def compute_lineage(data_dir: str, provenance: dict,
     base = os.path.join(data_dir, "a_shares")
     mem_path = os.path.join(base, "sector_membership.parquet")
     if result_columns is None:
-        result_columns = list(pd.read_parquet(
-            os.path.join(base, "industry_ranking.parquet")).columns)
+        ranking_path = os.path.join(base, "industry_ranking.parquet")
+        if not os.path.isfile(ranking_path):
+            raise FileNotFoundError(
+                "compute_lineage: industry_ranking.parquet not on disk — the "
+                "two-arg form requires the asset to exist (call sites: main() "
+                "post-AtomicCommit, formal gate after isfile check)")
+        result_columns = list(pd.read_parquet(ranking_path).columns)
     return {
         "upstream_roots": {
             "daily": dataset_fingerprint(data_dir, ["daily"]),
