@@ -56,16 +56,39 @@ def _rewrite_manifest(path: str, mutator) -> None:
         json.dump(manifest, f)
 
 
+def _fundamental_frame(report_dates, disclose_dates=None):
+    """A FUNDAMENTALS-contract-conformant frame (every required column present).
+    §v19-11 enforcement demands them at validate time, so a partial frame is no
+    longer a valid fundamentals file."""
+    n = len(report_dates)
+    if disclose_dates is None:
+        disclose_dates = report_dates
+    return pd.DataFrame({
+        "stock_code": ["000001"] * n,
+        "report_date": pd.to_datetime(report_dates),
+        "disclose_date": pd.to_datetime(disclose_dates),
+        "roe": [10.0 + i for i in range(n)],
+        "roa": [5.0 + i for i in range(n)],
+        "eps": [1.0 + i for i in range(n)],
+        "revenue_yoy": [0.1 + i for i in range(n)],
+        "profit_yoy": [0.15 + i for i in range(n)],
+        "debt_ratio": [0.5] * n,
+        "current_ratio": [1.5] * n,
+        "gross_margin": [0.3] * n,
+        "net_margin": [0.1] * n,
+        "total_revenue": [1e9 * (i + 1) for i in range(n)],
+        "net_profit": [1e8 * (i + 1) for i in range(n)],
+    })
+
+
 # ── round-trip ─────────────────────────────────────────────────────────────
 
 def test_fundamental_round_trip_writes_valid_manifest(tmp_path):
     storage = FundamentalStorage(str(tmp_path))
-    df = pd.DataFrame({
-        "stock_code": ["000001"] * 3,
-        "report_date": pd.to_datetime(["2024-03-31", "2024-06-30", "2024-09-30"]),
-        "disclose_date": pd.to_datetime(["2024-04-30", "2024-08-31", "2024-10-31"]),
-        "roe": [10.0, 11.0, 12.0],
-    })
+    df = _fundamental_frame(
+        ["2024-03-31", "2024-06-30", "2024-09-30"],
+        ["2024-04-30", "2024-08-31", "2024-10-31"],
+    )
     storage.save(df)
 
     path = os.path.join(
@@ -443,12 +466,7 @@ def test_validate_cross_checks_vintage_tamper(tmp_path):
 def test_vintage_extension_leaves_original_contracts_untouched(tmp_path):
     """The v15 T9 assets (None vintage) keep OLD manifest shape + validate."""
     storage = FundamentalStorage(str(tmp_path))
-    storage.save(pd.DataFrame({
-        "stock_code": ["000001"],
-        "report_date": pd.to_datetime(["2024-06-30"]),
-        "disclose_date": pd.to_datetime(["2024-08-31"]),
-        "roe": [11.0],
-    }))
+    storage.save(_fundamental_frame(["2024-06-30"], ["2024-08-31"]))
     path = os.path.join(str(tmp_path), "a_shares", "fundamentals", "2024",
                         "Q2", "000001.parquet")
     m = _manifest_of(path)
@@ -624,3 +642,41 @@ def test_downloader_era_fields_missing_manifest_is_empty(tmp_path):
     """A stock with no downloader manifest maps to {} — not_observed, no crash."""
     assert downloader_era_fields(
         os.path.join(str(tmp_path), "a_shares", "news_raw"), "999999") == {}
+
+
+# ── §v19-11 column_contract enforcement ─────────────────────────────────────
+
+def test_validate_asset_manifest_enforces_column_contract(tmp_path):
+    """An asset that declares a ``column_contract`` is schema-checked at
+    validate: every REQUIRED column of the contract must be present in the file,
+    while optional columns are never demanded."""
+    import pandas as pd
+
+    from stoke_ml.data.asset_contract import (
+        DataAssetContract, validate_asset_manifest, write_asset_manifest)
+
+    asset = DataAssetContract(
+        data_type="market_env_daily", partition="single_file",
+        extent_column="date", column_contract="market_env_daily")
+    p = tmp_path / "me.parquet"
+    # only the 3 PRICE columns -> valid under the split contract (the ACCOUNT
+    # part is optional, so its absence is schema-valid)
+    price_only = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_adv_ratio": [0.6],
+        "market_turnover_z": [1.0]}, index=pd.to_datetime(["2024-01-02"]))
+    price_only.index.name = "date"
+    price_only.to_parquet(str(p))
+    write_asset_manifest(str(p), asset, price_only)
+    assert validate_asset_manifest(str(p), asset)["ok"]
+
+    # missing a REQUIRED price column -> must fail
+    p2 = tmp_path / "bad.parquet"
+    bad = pd.DataFrame({
+        "high_low_ratio": [0.5], "market_turnover_z": [1.0],
+        "mkt_cap_total_z": [0.0]}, index=pd.to_datetime(["2024-01-02"]))
+    bad.index.name = "date"
+    bad.to_parquet(str(p2))
+    write_asset_manifest(str(p2), asset, bad)
+    report = validate_asset_manifest(str(p2), asset)
+    assert not report["ok"]
+    assert any("missing_required_column:market_adv_ratio" in m for m in report["mismatches"])

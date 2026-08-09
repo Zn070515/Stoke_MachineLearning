@@ -648,3 +648,16 @@ class TestSplitContracts:
     def test_raw_contract_rejects_qfq_semantics_documented(self):
         # raw contract has no pct_change (computed only after qfq normalization)
         assert "pct_change" not in RAW_UNQUOTED_DAILY.required_columns
+
+
+class TestMarketEnvSplit:
+    """§v19-11: the market_env broadcast contract splits PRICE (required) from
+    ACCOUNT (optional) — a file carrying only the price part is schema-valid."""
+
+    def test_market_env_contract_price_required_account_optional(self):
+        from stoke_ml.data.contract import get_contract
+        c = get_contract("market_env_daily")
+        price = {"high_low_ratio", "market_adv_ratio", "market_turnover_z"}
+        account = {"mkt_cap_total_z", "avg_account_cap_z", "investor_new_num", "investor_new_z"}
+        assert set(c.required_columns) == price
+        assert set(c.optional_columns) == account

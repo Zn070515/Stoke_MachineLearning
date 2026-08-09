@@ -60,7 +60,9 @@ from the file, so not cross-checked):
    training admission is judged against — a vintage re-declaration is a
    manifest-visible event, not a silent re-label.
 6. **Schema** — ``column_contract``, the name of a column-schema contract in
-   ``contract.py`` (recorded for provenance; enforcement is a separate gate).
+   ``contract.py`` (recorded for provenance AND enforced by
+   ``validate_asset_manifest``: every ``required_columns`` of the contract must
+   be present in the file, §v19-11).
 7. **Atomic commit** — write via temp + ``os.replace``; the manifest itself is
    written atomically with ``atomic_write_json``.
 
@@ -89,6 +91,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from stoke_ml.data import channel_vintage as _cv
+from stoke_ml.data.contract import get_contract as _get_contract
 from stoke_ml.data.download_resume import read_stock_manifest
 
 logger = logging.getLogger(__name__)
@@ -266,8 +269,9 @@ class DataAssetContract:
     #: DatetimeIndex when the column is absent.
     extent_column: str | None = None
     #: Name of a column-schema contract in ``contract.py`` governing this
-    #: asset.  Recorded in the manifest for provenance; schema enforcement is
-    #: a separate gate and is deliberately NOT applied here.
+    #: asset.  Recorded in the manifest for provenance AND enforced by
+    #: ``validate_asset_manifest``: every ``required_columns`` of the contract
+    #: must be present in the file; optional columns are never demanded (§v19-11).
     column_contract: str | None = None
     #: HOW the effective date of a stored value is determined — one of
     #: ``"record_date"`` / ``"event_date"`` / ``"post_close_next_trading_day"``
@@ -491,6 +495,24 @@ def validate_asset_manifest(
         for key, value in actual.items()
         if manifest.get(key) != value
     ]
+    # §v19-11: an asset that declares a column_contract is schema-checked here —
+    # every REQUIRED column of the contract must be present in the file (optional
+    # columns are never demanded).  An unregistered contract name is a manifest
+    # misdeclaration, not a silent pass.
+    if asset.column_contract:
+        try:
+            col_contract = _get_contract(asset.column_contract)
+        except KeyError:
+            mismatches.append(
+                f"column_contract: manifest={asset.column_contract!r} has no "
+                f"registered DataContract")
+        else:
+            missing_required = [
+                c for c in col_contract.required_columns
+                if c not in actual_df.columns]
+            if missing_required:
+                mismatches.append(
+                    "missing_required_column:" + ",".join(missing_required))
     for key in ("data_type", "partition"):
         expected = getattr(asset, key)
         if manifest.get(key) != expected:

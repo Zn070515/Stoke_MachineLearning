@@ -73,6 +73,11 @@ class DataContract:
     # df.attrs, as a non-empty column, or in the strongly-bound manifest
     # (e.g. daily K-line requires source + adjustment_mode).
     required_metadata: tuple[str, ...] = ()
+    #: Columns that MAY be present but are not required (e.g. the market_env
+    #: ACCOUNT part is proxy-PIT and ablation-only — a file missing them is
+    #: still schema-valid).  Enforcement: required columns must all be present;
+    #: optional columns are never demanded (§v19-11).
+    optional_columns: tuple[str, ...] = ()
 
 
 # ── validators ────────────────────────────────────────────────────────────
@@ -641,6 +646,11 @@ MARKET_ENV = DataContract(
     primary_key=("date",),  # DatetimeIndex-backed broadcast file
     required_columns=(
         "high_low_ratio", "market_adv_ratio", "market_turnover_z",
+    ),
+    # The ACCOUNT part is proxy-PIT and ablation-only (§T5): a market_env file
+    # written before account_stats coverage — or by a builder that only ships
+    # the PRICE part — is still schema-valid.  Never demanded.
+    optional_columns=(
         "mkt_cap_total_z", "avg_account_cap_z",
         "investor_new_num", "investor_new_z",
     ),

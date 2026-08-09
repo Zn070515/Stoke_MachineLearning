@@ -27,8 +27,26 @@ def _manifest_of(parquet_path: str) -> dict:
         return json.load(f)
 
 
-def _broadcast_frame():
-    """An index-dated frame shaped like download_industry.py's output."""
+def _broadcast_frame(asset=None):
+    """An index-dated frame shaped like the broadcast assets' output.
+
+    ``MARKET_ENV_ASSET`` declares ``column_contract="market_env_daily"``, so its
+    frame must carry the 3 required PRICE columns (the ACCOUNT part is optional
+    and its absence is schema-valid, §v19-11); ``INDUSTRY_ASSET`` carries the
+    sector-return columns download_industry.py produces.
+    """
+    if asset is MARKET_ENV_ASSET:
+        return pd.DataFrame(
+            {
+                "high_low_ratio": [0.5, 0.4, 0.6],
+                "market_adv_ratio": [0.6, 0.55, 0.7],
+                "market_turnover_z": [1.0, -0.5, 0.2],
+            },
+            index=pd.DatetimeIndex(
+                pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+                name="date",
+            ),
+        )
     return pd.DataFrame(
         {
             "银行": [0.5, -0.1, 0.2],
@@ -43,7 +61,7 @@ def _broadcast_frame():
 
 @pytest.mark.parametrize("asset", [INDUSTRY_ASSET, MARKET_ENV_ASSET])
 def test_broadcast_index_extent_round_trip(tmp_path, asset):
-    df = _broadcast_frame()
+    df = _broadcast_frame(asset)
     path = os.path.join(str(tmp_path), f"{asset.data_type}.parquet")
     df.to_parquet(path)
     write_asset_manifest(path, asset, df)
@@ -64,7 +82,7 @@ def test_broadcast_index_extent_round_trip(tmp_path, asset):
 
 @pytest.mark.parametrize("asset", [INDUSTRY_ASSET, MARKET_ENV_ASSET])
 def test_broadcast_tamper_detected(tmp_path, asset):
-    df = _broadcast_frame()
+    df = _broadcast_frame(asset)
     path = os.path.join(str(tmp_path), f"{asset.data_type}.parquet")
     df.to_parquet(path)
     write_asset_manifest(path, asset, df)
@@ -82,7 +100,7 @@ def test_broadcast_tamper_detected(tmp_path, asset):
 @pytest.mark.parametrize("asset", [INDUSTRY_ASSET, MARKET_ENV_ASSET])
 def test_broadcast_legacy_manifestless_read_is_lenient(tmp_path, asset):
     """A manifest-less broadcast file (predates the contract) reads fine."""
-    df = _broadcast_frame()
+    df = _broadcast_frame(asset)
     path = os.path.join(str(tmp_path), f"{asset.data_type}.parquet")
     df.to_parquet(path)
 

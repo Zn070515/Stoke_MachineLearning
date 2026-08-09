@@ -28,6 +28,21 @@ def _frame(dates, code="000001", extra=None):
     return df
 
 
+def _contract_conformant_frame(data_type, dates, code="000001", extra=None):
+    """A frame that satisfies the channel's column_contract — every REQUIRED
+    column of the contract present (§v19-11 enforcement demands them at
+    validate).  Channels without a column_contract keep the plain ``_frame``."""
+    df = _frame(dates, code=code, extra=extra)
+    asset = MARKET_WIDE_ASSETS[data_type]
+    if asset and asset.column_contract:
+        from stoke_ml.data.contract import get_contract
+        contract = get_contract(asset.column_contract)
+        for col in contract.required_columns:
+            if col not in df.columns:
+                df[col] = 0.0
+    return df
+
+
 def _storage(tmp_path, data_type="margin"):
     return MarketWideStorage(str(tmp_path), data_type)
 
@@ -71,7 +86,10 @@ class TestAssetContract:
     def test_adopted_channel_round_trip_writes_valid_manifest(self, tmp_path,
                                                               data_type):
         s = _storage(tmp_path, data_type)
-        s.save(_frame(["2024-01-02", "2024-01-03"], extra={"v2": 1.0}))
+        # §v19-11: an adopted channel with a column_contract must be written with
+        # every REQUIRED column present, or validate_asset_manifest rejects it.
+        s.save(_contract_conformant_frame(
+            data_type, ["2024-01-02", "2024-01-03"], extra={"v2": 1.0}))
 
         path = os.path.join(str(tmp_path), "a_shares", data_type,
                             "000001.parquet")
