@@ -26,6 +26,7 @@ from scripts.production.download_sector_membership import (
     _active_stocks_by_year,
     _coverage_by_year,
     _expand_stock,
+    _expansion_bucket,
     _fetch_stock,
     _load_intervals_cache,
     _parser_hash,
@@ -268,6 +269,44 @@ def test_fetch_stock_refetches_mismatched_cache(monkeypatch, tmp_path,
     assert rewritten["parser_hash"] == _parser_hash()
 
 
+def test_fetch_stock_recovers_from_unreadable_cache(monkeypatch, tmp_path):
+    """§v19 §十九: a corrupt/unreadable cache JSON is NOT a permanent failure —
+    it is removed and refetched once (fail closed on the FILE, not the stock),
+    then rewritten as a valid current-schema cache."""
+    import akshare as ak
+
+    monkeypatch.setattr(
+        "scripts.production.download_sector_membership.time.sleep",
+        lambda *_: None,
+    )
+    cache_dir = str(tmp_path / "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "000001.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{ this is not valid json !!!")
+
+    calls = {"n": 0}
+
+    def _events(*a, **k):
+        calls["n"] += 1
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["制造业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["C36"],
+            "变更日期": ["2011-06-30"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260809")
+    assert calls["n"] == 1  # the corrupt cache was NOT trusted → refetched
+    assert not got.empty
+    with open(path, "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["cache_version"] == _CACHE_VERSION
+    assert rewritten["parser_hash"] == _parser_hash()
+
+
 def _one_interval() -> pd.DataFrame:
     return pd.DataFrame({
         "date": [pd.Timestamp("2011-06-30")],
@@ -331,6 +370,19 @@ def test_expand_stock_expands_over_own_daily_days():
     assert len(out) == 3
     assert set(out["date"].astype(str)) == {"2011-06-30", "2011-07-01",
                                             "2011-07-04"}
+
+
+def test_expansion_bucket_never_upgrades_fetch_failed_to_complete():
+    """§v19 §十五: a code ABSENT from intervals_by_code (its CNINFO fetch never
+    succeeded — it is already in fetch_failed) must be classified
+    ``fetch_failed``, NEVER the ``no_gate`` bucket that would mark it
+    complete.  Only an EMPTY frame (a real no-CSRC-records result) is no_gate."""
+    # fetch never succeeded → None → fetch_failed (loop `continue`s; NOT complete)
+    assert _expansion_bucket(None) == "fetch_failed"
+    # legit no-gate → empty frame → no_gate (loop adds to complete)
+    assert _expansion_bucket(pd.DataFrame()) == "no_gate"
+    # non-empty intervals → expand
+    assert _expansion_bucket(_one_interval()) == "expand"
 
 
 # ── §v19 §十六: active-stock coverage denominator ───────────────────────────

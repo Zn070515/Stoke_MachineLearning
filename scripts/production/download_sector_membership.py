@@ -28,6 +28,7 @@ Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_sector_membership.py
 """
 import datetime as dt
+import functools
 import hashlib
 import inspect
 import json
@@ -171,6 +172,23 @@ def _expand_stock(intervals: pd.DataFrame, storage: DataStorage,
     return _expand(intervals, days)
 
 
+def _expansion_bucket(intervals: pd.DataFrame | None) -> str:
+    """Which bucket the expansion step lands a code in.
+
+    ``"fetch_failed"`` — ``None`` means the CNINFO fetch never succeeded (the
+    code is already in ``fetch_failed``), NOT a legit no-gate.  ``"no_gate"`` —
+    an empty frame is a legitimate "no CSRC records" result (→ ``complete``).
+    ``"expand"`` — non-empty intervals need the canonical daily formal read +
+    expansion.  Distinguishing ``None`` from empty is what keeps a failed stock
+    out of ``complete`` (§v19 §十五).
+    """
+    if intervals is None:
+        return "fetch_failed"
+    if intervals.empty:
+        return "no_gate"
+    return "expand"
+
+
 # ── per-stock interval cache (resumable crawl) ──────────────────────────────
 
 #: Cache payload schema version (§v19 §十九).  Bump when the cache format or
@@ -179,12 +197,16 @@ def _expand_stock(intervals: pd.DataFrame, storage: DataStorage,
 _CACHE_VERSION = "v2"
 
 
+@functools.lru_cache(maxsize=1)
 def _parser_hash() -> str:
     """Deterministic digest of the parse logic (gate map + labels + source).
 
     The cache must be invalidated whenever the same raw CNINFO events would
     parse into DIFFERENT intervals, so the digest covers both the CSRC gate
-    mapping and ``parse_cninfo_events`` itself (§v19 §十九).
+    mapping and ``parse_cninfo_events`` itself (§v19 §十九).  Memoized — it is
+    read on every cache check in the crawl (hot path), and the inputs are the
+    module-level gate map + static function source, so the result is constant
+    for the life of the process.
     """
     return hashlib.sha256(
         (repr(sorted(CSRC_GATE_CODES.items())) + "|"
@@ -314,25 +336,35 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
     when the cached payload's version/parser-hash/source/range all match the
     current run.  A mismatched or legacy cache is NOT trusted: it is removed
     and refetched once (fail closed — one-time full crawl is the honest
-    behavior) (§v19 §十九).  An empty return is a LEGITIMATE result (the stock
-    has no CSRC gate) — it is still cached so a re-run skips it.
+    behavior) (§v19 §十九).  An unreadable/corrupt cache is treated as a
+    mismatch (removed + refetched) so a bad cache file never permanently fails
+    a stock.  An empty return is a LEGITIMATE result (the stock has no CSRC
+    gate) — it is still cached so a re-run skips it.
     """
     cache_path = os.path.join(cache_dir, f"{stock_code}.json")
     if os.path.isfile(cache_path):
-        intervals, meta = _load_intervals_cache(cache_path)
-        if (meta.get("cache_version") == _CACHE_VERSION
-                and meta.get("parser_hash") == _parser_hash()
-                and meta.get("source") == "cninfo"
-                and meta.get("start_date") == start_date
-                and meta.get("end_date") == end_date):
-            return intervals
-        logger.info("sector_membership[%s]: cache mismatch — refetching "
-                    "(version=%r, parser_ok=%s, source=%r, range=%s..%s)",
-                    stock_code, meta.get("cache_version"),
-                    meta.get("parser_hash") == _parser_hash(),
-                    meta.get("source"), meta.get("start_date"),
-                    meta.get("end_date"))
-        os.remove(cache_path)
+        try:
+            intervals, meta = _load_intervals_cache(cache_path)
+        except (OSError, ValueError, TypeError) as exc:
+            # A corrupt/unreadable cache must NOT permanently fail a stock —
+            # treat it as a mismatch, remove it, and refetch once (§v19 §十九).
+            logger.warning("sector_membership[%s]: unreadable cache (%s) — "
+                           "removing and refetching", stock_code, str(exc)[:120])
+            os.remove(cache_path)
+        else:
+            if (meta.get("cache_version") == _CACHE_VERSION
+                    and meta.get("parser_hash") == _parser_hash()
+                    and meta.get("source") == "cninfo"
+                    and meta.get("start_date") == start_date
+                    and meta.get("end_date") == end_date):
+                return intervals
+            logger.info("sector_membership[%s]: cache mismatch — refetching "
+                        "(version=%r, parser_ok=%s, source=%r, range=%s..%s)",
+                        stock_code, meta.get("cache_version"),
+                        meta.get("parser_hash") == _parser_hash(),
+                        meta.get("source"), meta.get("start_date"),
+                        meta.get("end_date"))
+            os.remove(cache_path)
     events = _fetch_cninfo_events(stock_code, start_date, end_date)
     _ensure_parseable(events)
     intervals = parse_cninfo_events(stock_code, events)
@@ -444,11 +476,16 @@ def main() -> None:
     frames: list[pd.DataFrame] = []
     expansion_failed: list[str] = []
     for code in codes:
-        intervals = intervals_by_code.get(code)
-        if intervals is None or intervals.empty:
+        bucket = _expansion_bucket(intervals_by_code.get(code))
+        if bucket == "fetch_failed":
+            # CNINFO fetch never succeeded — already in fetch_failed; NEVER
+            # upgrade a failed stock to complete (§v19 §十五).
+            continue
+        if bucket == "no_gate":
             # legit no-gate: no CSRC records → no intervals to expand
             complete.add(code)
             continue
+        intervals = intervals_by_code[code]
         try:
             exp = _expand_stock(intervals, storage, code)
         except (ValueError, OSError) as exc:
