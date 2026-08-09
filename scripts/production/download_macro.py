@@ -10,7 +10,7 @@ from datetime import datetime
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 from stoke_ml.data.generation_store import write_generation
 from stoke_ml.data.sources.a_shares.macro_source import MacroSource
 
@@ -58,14 +58,11 @@ def main():
         logger.error("macro_daily: %s", str(e)[:120])
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/macro",
-            requested=["macro_daily"], failed=failed, complete=done,
-            success_count=len(done),
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/macro",
+        requested=["macro_daily"], failed=failed, complete=done,
+        success_count=len(done),
+    )
 
 
 if __name__ == "__main__":

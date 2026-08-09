@@ -16,7 +16,7 @@ import pandas as pd
 from stoke_ml.config import load_config
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.pledge_source import PledgeSource
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -152,14 +152,11 @@ def main():
                       len(combined), n_stocks, combined_path)
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/pledge",
-            requested=codes, failed=failed_codes, complete=done_codes,
-            success_count=success,
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/pledge",
+        requested=codes, failed=failed_codes, complete=done_codes,
+        success_count=success,
+    )
 
     elapsed = time.time() - start_time
     logger.info("Done: %d success, %d fail in %.1f min",

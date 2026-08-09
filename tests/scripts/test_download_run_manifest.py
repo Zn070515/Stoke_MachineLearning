@@ -18,6 +18,7 @@ failure still exits non-zero there too.
 No network, no real downloads: source classes are monkeypatched to synthetic
 fixtures; ``load_config`` is monkeypatched to a temp data_dir.
 """
+import importlib
 import os
 import sys
 
@@ -276,3 +277,22 @@ def test_industry_ranking_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
     rc = _run(monkeypatch, tmp_path, dindr)
     assert rc == 1
     assert not _manifest_path(tmp_path, dindr).is_file()
+
+
+# ── P1#7: every remaining production downloader is fail-closed ─────────
+
+MIGRATED = [
+    "download_analyst", "download_cninfo_announcements", "download_datacenter",
+    "download_etf_flow", "download_fundamentals", "download_index_hist",
+    "download_macro", "download_minute", "download_ipo_st", "download_pledge",
+    "download_shareholder", "download_valuation",
+]
+
+
+def test_all_production_downloaders_use_fail_closed_run_manifest():
+    import inspect
+
+    for mod in MIGRATED:
+        m = importlib.import_module(f"scripts.production.{mod}")
+        src = inspect.getsource(m)
+        assert "write_run_manifest_or_exit" in src, f"{mod} not migrated"

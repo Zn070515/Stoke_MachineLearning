@@ -26,7 +26,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.cninfo_source import CninfoSource
 from stoke_ml.data.sources.a_shares.announcement_source import AnnouncementSource
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 from stoke_ml.features.news_nlp import compute_raw_sentiment, NewsSentimentAnalyzer
 
 sys.stderr.reconfigure(line_buffering=True)
@@ -268,15 +268,12 @@ def main():
             failed_codes.append(code)
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/announcements",
-            start_date=args.start, end_date=end_date,
-            requested=codes, failed=failed_codes, complete=done_codes,
-            success_count=success,
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/announcements",
+        start_date=args.start, end_date=end_date,
+        requested=codes, failed=failed_codes, complete=done_codes,
+        success_count=success,
+    )
 
     logger.info("Done: %d/%d stocks with announcements", success, len(codes))
 

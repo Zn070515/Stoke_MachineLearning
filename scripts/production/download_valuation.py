@@ -70,7 +70,7 @@ def main():
     from stoke_ml.config import load_config
     from stoke_ml.data.download_cli import parse_stock_codes_arg
     from stoke_ml.data.market_wide_storage import MarketWideStorage
-    from stoke_ml.data.download_manifest import write_run_manifest
+    from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
     cfg = load_config()
     data_dir = cfg.project.data_dir
@@ -154,15 +154,12 @@ def main():
     bs.logout()
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/valuation",
-            start_date=args.start, end_date=args.end,
-            requested=to_download, failed=failed_codes, complete=done_codes,
-            success_count=len(done_codes),
-        )
-    except Exception as exc:
-        _log(f"run manifest write failed: {exc}")
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/valuation",
+        start_date=args.start, end_date=args.end,
+        requested=to_download, failed=failed_codes, complete=done_codes,
+        success_count=len(done_codes),
+    )
 
     _log(f"Done: {len(to_download)} stocks, {errors} errors, {time.time()-t0:.0f}s")
 

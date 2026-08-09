@@ -12,7 +12,7 @@ import time
 from stoke_ml.config import load_config
 from stoke_ml.data.sources.a_shares.etf_flow_source import SectorETFFlowSource
 from stoke_ml.data.etf_storage import ETFStorage
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -81,16 +81,13 @@ def main():
         time.sleep(args.sleep)
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/etf_flow",
-            start_date=args.start, end_date=args.end,
-            requested=requested_sectors,
-            failed=failed_sectors, complete=done_sectors,
-            success_count=len(done_sectors),
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/etf_flow",
+        start_date=args.start, end_date=args.end,
+        requested=requested_sectors,
+        failed=failed_sectors, complete=done_sectors,
+        success_count=len(done_sectors),
+    )
 
     logger.info("Done: %d total rows", total_rows)
 

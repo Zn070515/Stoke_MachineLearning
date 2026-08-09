@@ -38,7 +38,7 @@ import time
 import pandas as pd
 
 from stoke_ml.config import load_config
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 INDICES = {
     "000300": ("query_hs300_stocks", "沪深300"),
@@ -144,16 +144,17 @@ def _finalize(data_dir, start_date, end_date, requested, failed,
 
     Returns a non-zero exit code when the run is not fully successful.  The
     manifest is ALWAYS written (a partial run is recorded honestly, §五-5); a
-    manifest-write failure RAISES — a run that cannot record its own coverage
-    must fail loudly, never be swallowed (§七).
+    manifest-write failure exits non-zero via write_run_manifest_or_exit — a
+    run that cannot record its own coverage must fail loudly, never be
+    swallowed (§七).
     """
-    write_run_manifest(
+    write_run_manifest_or_exit(
         data_dir, "a_shares/index_constituents_hist",
         start_date=start_date, end_date=end_date,
         requested=requested, failed=failed, complete=complete,
         success_count=len(complete),
         skipped_existing_count=skipped_existing,
-    )  # no try/except: a manifest-write failure must propagate → non-zero exit
+    )  # write_run_manifest_or_exit: a manifest-write failure logs + exits non-zero
     if failed:
         # A partial run can never pass for complete (download_manifest.py's own
         # principle): the manifest records the partial status AND the process

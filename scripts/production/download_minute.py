@@ -28,7 +28,7 @@ from stoke_ml.data.sources.a_shares.minute_source import MinuteSource
 from stoke_ml.data.sources.a_shares.minute_source_sina_direct import SinaDirectMinuteSource
 from stoke_ml.data.sources.a_shares.minute_source_tencent import TencentMinuteSource
 from stoke_ml.data.minute_storage import MinuteStorage
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 _SOURCE_FACTORY = {
     "akshare": MinuteSource,
@@ -236,14 +236,11 @@ def main():
         _log(f"Stored minute data for {len(stored)} stocks @ {args.frequency}min")
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, f"a_shares/minute/{args.frequency}min",
-            requested=codes, failed=failed_codes, complete=done_codes,
-            success_count=success,
-        )
-    except Exception as exc:
-        _log(f"run manifest write failed: {exc}")
+    write_run_manifest_or_exit(
+        data_dir, f"a_shares/minute/{args.frequency}min",
+        requested=codes, failed=failed_codes, complete=done_codes,
+        success_count=success,
+    )
 
     _LOG_FILE.close()
 

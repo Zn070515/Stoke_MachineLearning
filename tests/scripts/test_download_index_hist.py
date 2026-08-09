@@ -5,7 +5,8 @@ Covers:
   half-open interval ``in_date <= d < out_date`` every consumer reads holds),
   never the last-present snapshot month.
 - _finalize: the run-manifest write is never swallowed; partial runs exit
-  non-zero and skip the membership rebuild; manifest-write failures propagate.
+  non-zero and skip the membership rebuild; manifest-write failures exit
+  non-zero via write_run_manifest_or_exit.
 
 None of these touch the network or baostock.
 """
@@ -145,14 +146,17 @@ def test_finalize_partial_run_exits_nonzero_and_skips_membership(tmp_path):
     assert not os.path.isfile(base / "membership.parquet")
 
 
-def test_finalize_manifest_write_failure_propagates(tmp_path, monkeypatch):
-    import scripts.production.download_index_hist as dih
+def test_finalize_manifest_write_failure_exits_nonzero(tmp_path, monkeypatch):
+    from stoke_ml.data import download_manifest as dm
 
     def _boom(*args, **kwargs):
         raise RuntimeError("disk on fire")
 
-    monkeypatch.setattr(dih, "write_run_manifest", _boom)
+    # write_run_manifest_or_exit internally calls the shared write_run_manifest;
+    # patching the helper makes it raise, which or_exit converts to SystemExit(1).
+    monkeypatch.setattr(dm, "write_run_manifest", _boom)
     data_dir, snap, base, requested = _finalize_args(tmp_path)
-    with pytest.raises(RuntimeError, match="disk on fire"):
+    with pytest.raises(SystemExit) as excinfo:
         _call_finalize(data_dir, base, snap, requested,
                        failed=[], complete=set(requested))
+    assert excinfo.value.code == 1

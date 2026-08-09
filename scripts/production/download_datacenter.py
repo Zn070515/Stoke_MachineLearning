@@ -37,7 +37,7 @@ from stoke_ml.config import load_config
 from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.market_wide_storage import MarketWideStorage
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 from stoke_ml.data.sources.a_shares.capital_flow_source import CapitalFlowSource
 from stoke_ml.data.sources.a_shares.limit_up_source import LimitUpSource, SENTIMENT_COLS
 from stoke_ml.data.sources.a_shares.datacenter_sources import (
@@ -257,15 +257,12 @@ def main():
                 logger.warning("  concept_blocks: download failed: %s", str(e)[:100])
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/datacenter",
-            start_date=args.start, end_date=args.end,
-            requested=to_download, failed=failed_types, complete=done_types,
-            success_count=len(done_types),
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/datacenter",
+        start_date=args.start, end_date=args.end,
+        requested=to_download, failed=failed_types, complete=done_types,
+        success_count=len(done_types),
+    )
 
     logger.info("Done.")
 

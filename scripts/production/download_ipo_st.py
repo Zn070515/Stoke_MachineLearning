@@ -11,7 +11,7 @@ import pandas as pd
 
 from stoke_ml.config import load_config
 from stoke_ml.data.sources.a_shares.ipo_st_source import IPOStSource
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -53,15 +53,11 @@ def main():
     # §五.3: the manifest is the completion record — if it cannot be written the
     # run must fail loudly, not warn, or a consumer sees a verifiable universe
     # where none was actually recorded.
-    try:
-        write_run_manifest(
-            cfg.project.data_dir, "a_shares/universe",
-            requested=list(data.keys()), failed=failed, complete=done,
-            success_count=len(done),
-        )
-    except Exception as exc:
-        logger.error("run manifest write failed: %s", exc)
-        raise SystemExit(1)
+    write_run_manifest_or_exit(
+        cfg.project.data_dir, "a_shares/universe",
+        requested=list(data.keys()), failed=failed, complete=done,
+        success_count=len(done),
+    )
 
     logger.info("Done.")
 

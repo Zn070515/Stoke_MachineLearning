@@ -18,7 +18,7 @@ from stoke_ml.data.calendar import get_research_calendar
 from stoke_ml.data.download_cli import parse_stock_codes_arg
 from stoke_ml.data.sources.a_shares.fundamental_source import FundamentalSource
 from stoke_ml.data.fundamental_storage import FundamentalStorage
-from stoke_ml.data.download_manifest import write_run_manifest
+from stoke_ml.data.download_manifest import write_run_manifest_or_exit
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -106,15 +106,12 @@ def main():
         done_codes.add(code)
 
     # Unified run manifest (§五-5): a partial run can never pass for complete.
-    try:
-        write_run_manifest(
-            data_dir, "a_shares/fundamentals",
-            start_date=args.start, end_date=args.end,
-            requested=codes, failed=failed_codes, complete=done_codes,
-            success_count=success,
-        )
-    except Exception as exc:
-        logger.warning("run manifest write failed: %s", exc)
+    write_run_manifest_or_exit(
+        data_dir, "a_shares/fundamentals",
+        start_date=args.start, end_date=args.end,
+        requested=codes, failed=failed_codes, complete=done_codes,
+        success_count=success,
+    )
 
     logger.info("Done: %d success, %d fail, %d empty, %d total quarters",
                 success, fail, empty, total_rows)
