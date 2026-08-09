@@ -490,3 +490,6 @@ def test_build_turnover_daily_fails_closed_on_bad_daily(bme, tmp_path):
         bme.build_turnover_daily(str(base))
     assert "manifest missing" in str(ei.value) or \
         "require_valid_manifest" in str(ei.value)
+    # the count is interpolated (not a literal "%d/%d" placeholder)
+    assert "1/2 daily files FAILED" in str(ei.value)
+    assert "%d/%d" not in str(ei.value)

@@ -105,14 +105,15 @@ def build_turnover_daily(base: str) -> pd.Series:
         except (ValueError, OSError) as exc:
             problems.append(f"{code}: {exc}")
             continue
-        if d is None or d.empty:
+        if d.empty:
             continue
         amounts.append(d.groupby(d["date"])["amount"].sum())
     if problems:
         raise SystemExit(
-            "build_market_env: %d/%d daily files FAILED canonical validation — "
-            "refusing to build a turnover series over incomplete inputs "
-            "(§v19 P0#4):\n  " + "\n  ".join(problems[:20]))
+            f"build_market_env: {len(problems)}/{len(codes)} daily files "
+            "FAILED canonical validation — refusing to build a turnover "
+            "series over incomplete inputs (§v19 P0#4):\n  "
+            + "\n  ".join(problems[:20]))
     if not amounts:
         return pd.Series(dtype="float64")
     tot = pd.concat(amounts).groupby(level=0).sum()
