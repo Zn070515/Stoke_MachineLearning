@@ -44,9 +44,7 @@ Run:
 from __future__ import annotations
 
 import argparse
-import glob
 import hashlib
-import logging
 import os
 
 import numpy as np
@@ -66,8 +64,6 @@ from stoke_ml.data.asset_contract import (
 from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
 from stoke_ml.features.aux_cols import MARKET_ENV_COLS
 from stoke_ml.models.panel.code_tree_hash import hash_json
-
-logger = logging.getLogger(__name__)
 
 # The exact consumer-facing column order (matches aux_cols.MARKET_ENV_COLS).
 OUTPUT_COLUMNS: tuple[str, ...] = tuple(MARKET_ENV_COLS)
@@ -91,21 +87,32 @@ def build_turnover_daily(base: str) -> pd.Series:
     """Sum 'amount' across all daily flat files per date -> z-scored turnover.
 
     ``base`` is the ``a_shares`` dir (``data_dir/a_shares``).  Same-day trade
-    data, so this is the VERIFIED price part.
+    data, so this is the VERIFIED price part.  §v19 P0#4: a formal builder must
+    NEVER silently skip an unreadable / un-manifested daily file — every daily
+    parquet is read through ``DataStorage``'s canonical validated path
+    (``require_valid_manifest=True``), and ANY file that fails validation aborts
+    the whole build (a missing stock would silently change market turnover).
     """
-    amounts = []
-    for f in glob.glob(os.path.join(base, "daily", "[0-9][0-9][0-9][0-9][0-9][0-9].parquet")):
+    from stoke_ml.data.storage import DataStorage
+    storage = DataStorage(os.path.dirname(base))
+    codes = storage.list_stocks("a_shares")
+    problems: list[str] = []
+    amounts: list[pd.Series] = []
+    for code in codes:
         try:
-            d = pd.read_parquet(f, columns=["date", "amount"])
-            d["date"] = pd.to_datetime(d["date"]).dt.normalize()
-            amounts.append(d.groupby("date")["amount"].sum())
-        except Exception as e:
-            # A formal production builder must never SILENTLY skip a source file
-            # — an unreadable daily parquet produces an incomplete turnover series
-            # with no trace.  Warn with the exact path so the gap is diagnosable.
-            logger.warning("build_market_env: skipping unreadable daily file %s: %s",
-                           f, e)
+            d = storage.load_daily(code, "1970-01-01", "2099-12-31",
+                                   require_valid_manifest=True)
+        except (ValueError, OSError) as exc:
+            problems.append(f"{code}: {exc}")
             continue
+        if d is None or d.empty:
+            continue
+        amounts.append(d.groupby(d["date"])["amount"].sum())
+    if problems:
+        raise SystemExit(
+            "build_market_env: %d/%d daily files FAILED canonical validation — "
+            "refusing to build a turnover series over incomplete inputs "
+            "(§v19 P0#4):\n  " + "\n  ".join(problems[:20]))
     if not amounts:
         return pd.Series(dtype="float64")
     tot = pd.concat(amounts).groupby(level=0).sum()

@@ -83,34 +83,46 @@ def _write_industry(tmp_path):
     return daily
 
 
-def _write_daily_file(daily_dir, code, df, *, run_id="run-1",
-                      updated="2026-08-08T00:00:00+00:00"):
-    """Write a daily parquet + its manifest sidecar — the canonical write path
-    (§v18-8).  The dataset fingerprint binds the per-stock MANIFEST content
-    hash (per-write bookkeeping excluded), so every daily file carries a
-    manifest, exactly like production."""
-    from stoke_ml.data.asset_contract import schema_hash
-    df.to_parquet(daily_dir / f"{code}.parquet", index=False)
-    (daily_dir / f"{code}.manifest.json").write_text(json.dumps({
-        "stock": code,
-        "rows": int(len(df)),
-        "schema_hash": schema_hash(df),
-        "source": "test",
-        "start": df["date"].min().strftime("%Y-%m-%d"),
-        "end": df["date"].max().strftime("%Y-%m-%d"),
-        "run_id": run_id,
-        "updated": updated,
-    }), encoding="utf-8")
+def _qfq_frame(code, dates, amounts):
+    """A well-formed qfq daily batch that survives the RESEARCH_QFQ_DAILY
+    formal contract.  The §v19 P0#4 fail-closed read path runs
+    ``validate_contract(..., formal=True)``, so a date+amount-only frame (the
+    old fixture) no longer passes — it lacks the full OHLC schema / stock_code /
+    pct_change, and its amount/volume must stay within the economic band."""
+    dates = list(pd.to_datetime(dates))
+    n = len(dates)
+    closes = [10.0 + 0.1 * i for i in range(n)]
+    df = pd.DataFrame({
+        "date": dates,
+        "open": closes,
+        "high": [c + 0.5 for c in closes],
+        "low": [c - 0.5 for c in closes],
+        "close": closes,
+        "volume": [1e6] * n,
+        "amount": list(amounts),
+        "stock_code": code,
+    })
+    pct = pd.Series([float("nan")] * n)
+    if n > 1:
+        closes_s = pd.Series(closes, dtype="float64")
+        pct.iloc[1:] = 100.0 * closes_s.pct_change().iloc[1:].to_numpy()
+    df["pct_change"] = pct
+    df.attrs["source"] = "test"
+    df.attrs["adjustment_mode"] = "qfq"
+    return df
 
 
 def _write_daily(tmp_path):
-    daily = tmp_path / "a_shares" / "daily"
-    daily.mkdir(parents=True, exist_ok=True)
+    """Write canonical daily files (parquet + manifest) via the storage API —
+    the manifest is guaranteed consistent with the parquet and the frame
+    survives the formal contract, which the fail-closed §v19 P0#4 read path
+    now requires."""
+    from stoke_ml.data.storage import DataStorage
+    store = DataStorage(str(tmp_path))
     for code in ("000001", "000002"):
-        _write_daily_file(daily, code, pd.DataFrame({
-            "date": pd.to_datetime(["2024-07-03", "2024-07-04", "2024-07-05"]),
-            "amount": [1e9, 1.1e9, 1.2e9],
-        }))
+        store.save_daily(_qfq_frame(
+            code, ["2024-07-03", "2024-07-04", "2024-07-05"],
+            [1e8, 2e8, 3e8]))
 
 
 def _build_full(tmp_path, bme, *, publish_col=None):
@@ -151,12 +163,9 @@ def test_build_market_env_price_cols_from_real_upstream(bme, tmp_path):
     hl = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"],
                        "high20": [10.0, 12.0], "low20": [8.0, 9.0]})
     hl.to_parquet(daily / "market_breadth" / "highs_lows.parquet", index=False)
-    d = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"],
-                      "amount": [1e6, 2e6], "open": [10.0, 10.5],
-                      "high": [11.0, 11.5], "low": [9.0, 9.5],
-                      "close": [10.5, 11.0], "volume": [1e5, 1.2e5]})
-    (daily / "daily").mkdir(exist_ok=True)
-    d.to_parquet(daily / "daily" / "000001.parquet", index=False)
+    from stoke_ml.data.storage import DataStorage
+    DataStorage(str(tmp_path)).save_daily(_qfq_frame(
+        "000001", ["2024-01-02", "2024-01-03"], [1e6, 2e6]))
     df, parts = bme.build_market_env(str(tmp_path))
     assert set(bme.MARKET_ENV_PRICE_COLS) <= set(df.columns)
     # 2024-01-02: sector0 +0.01 (adv), sector1 -0.02 (decl) → 0.5
@@ -268,7 +277,16 @@ def test_write_market_env_lineage_veracity_and_freshness(bme, tmp_path):
     # manifest content digest (schema_hash of the new values) changes.
     daily_dir = tmp_path / "a_shares" / "daily"
     d = pd.read_parquet(daily_dir / "000001.parquet")
-    _write_daily_file(daily_dir, "000001", d.assign(amount=d["amount"] * 2.0))
+    # mutate a PRICE field (not amount — a 2x amount would break the formal
+    # amount/volume economic-consistency band) and re-write through the same
+    # canonical path, so the parquet AND its manifest are rewritten together.
+    from stoke_ml.data.storage import DataStorage
+    mut = d.copy()
+    for c in ("open", "high", "low", "close"):
+        mut[c] = d[c] * 2.0
+    mut.attrs["source"] = "test"
+    mut.attrs["adjustment_mode"] = "qfq"
+    DataStorage(str(tmp_path)).save_daily(mut)
     df3, parts3 = bme.build_market_env(str(tmp_path))
     out3 = bme.write_market_env(str(tmp_path), df3, parts3)
     with open(out3 + ".manifest.json", encoding="utf-8") as f:
@@ -356,26 +374,23 @@ def test_empty_input_dir_fails_loudly(bme, tmp_path, monkeypatch):
 
 # ── legacy script superseded marker ───────────────────────────────────────
 
-# ── quality: unreadable source files are warned, never silently skipped ─────
+# ── quality: unreadable daily files ABORT the turnover build (§v19 P0#4) ─────
 
-def test_turnover_scan_logs_unreadable_file(bme, tmp_path, caplog):
-    """A corrupt daily parquet is skipped with a WARNING (not silently) so an
-    incomplete turnover series leaves a diagnosable trace."""
-    import logging
+def test_turnover_fails_closed_on_corrupt_file(bme, tmp_path):
+    """§v19 P0#4: a corrupt daily parquet (manifest present but bytes
+    unreadable) ABORTS the whole build — the old warn-and-skip would silently
+    drop a stock from market turnover."""
+    from stoke_ml.data.storage import DataStorage
+    store = DataStorage(str(tmp_path))
+    store.save_daily(_qfq_frame("000001", ["2024-07-03", "2024-07-04"],
+                                [1e8, 2e8]))
     daily = tmp_path / "a_shares" / "daily"
-    daily.mkdir(parents=True, exist_ok=True)
-    # one valid file (the glob finds something) + one corrupt file
-    pd.DataFrame({
-        "date": pd.to_datetime(["2024-07-03", "2024-07-04"]),
-        "amount": [1e9, 1.1e9],
-    }).to_parquet(daily / "000001.parquet", index=False)
-    (daily / "000002.parquet").write_bytes(b"NOT A PARQUET FILE")
-    with caplog.at_level(logging.WARNING):
-        turn = bme.build_turnover_daily(str(tmp_path / "a_shares"))
-    assert any("000002.parquet" in r.message for r in caplog.records), (
-        "the unreadable file must be named in a warning log record")
-    # the valid file's turnover still contributes to the series
-    assert not turn.empty
+    # corrupt the parquet bytes while leaving its valid manifest in place
+    (daily / "000001.parquet").write_bytes(b"NOT A PARQUET FILE")
+    with pytest.raises(SystemExit) as ei:
+        bme.build_turnover_daily(str(tmp_path / "a_shares"))
+    assert "000001" in str(ei.value), (
+        "the corrupt file must be named in the abort message")
 
 
 # ── quality: account_stats with an unexpected schema degrades, never crashes ─
@@ -453,3 +468,25 @@ def test_legacy_script_marked_superseded():
         head = f.read(400)
     assert "build_market_env.py" in head
     assert "SUPERSEDED" in head
+
+
+# ── quality: a manifest-less daily file ABORTS the build (§v19 P0#4) ────────
+
+def test_build_turnover_daily_fails_closed_on_bad_daily(bme, tmp_path):
+    """§v19 P0#4: a present daily parquet WITHOUT a valid manifest must ABORT
+    the whole turnover build — never a silent skip that would quietly drop a
+    stock from market turnover."""
+    from stoke_ml.data.storage import DataStorage
+    base = tmp_path / "a_shares"
+    daily = base / "daily"
+    daily.mkdir(parents=True)
+    # one healthy stock, written via the canonical path (parquet + manifest)
+    DataStorage(str(tmp_path)).save_daily(_qfq_frame(
+        "000001", ["2024-01-02", "2024-01-03"], [1e8, 2e8]))
+    # a stock whose parquet exists but whose manifest is MISSING
+    bad = _qfq_frame("000002", ["2024-01-02"], [5e7])
+    bad.to_parquet(daily / "000002.parquet", index=False)
+    with pytest.raises(SystemExit) as ei:
+        bme.build_turnover_daily(str(base))
+    assert "manifest missing" in str(ei.value) or \
+        "require_valid_manifest" in str(ei.value)
