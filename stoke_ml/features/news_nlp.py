@@ -126,6 +126,7 @@ class NewsSentimentAnalyzer:
                     model=model_name,
                     device=device,
                     batch_size=32 if device != -1 else 8,
+                    model_kwargs={"low_cpu_mem_usage": False},
                 )
                 _ = self._pipe("测试")  # warm-up
                 self._model_name = model_name
@@ -145,6 +146,7 @@ class NewsSentimentAnalyzer:
                 device=device,
                 batch_size=32 if device != -1 else 8,
                 local_files_only=True,
+                model_kwargs={"low_cpu_mem_usage": False},
             )
             _ = self._pipe("测试")
             self._model_name = model_name
