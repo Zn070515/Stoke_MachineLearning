@@ -220,11 +220,10 @@ def main():
 
     universe_resolved = list(stock_list)
 
-    # §P2-16: formal research on a large universe must use the prebuilt
-    # feature mainline (or a complete --panel-store); live feature engineering
-    # is for debug/smoke/small-universe/feature-dev runs.  Minute mode has no
-    # prebuilt artifact, so it is exempt from the count gate.  The --universe
-    # all refusal fires here too (5530 > any threshold, and by name).
+    # §v19 P0#3: ANY formal-research run must use the prebuilt feature
+    # mainline (or a complete --panel-store); live feature engineering is for
+    # debug/smoke/exploratory runs.  Minute mode has no prebuilt artifact, so
+    # it is exempt.  The --universe all refusal fires here too.
     _require_prebuilt_mainline(
         args.universe, args.prebuilt, store_complete=_store_load,
         n_resolved=len(universe_resolved),

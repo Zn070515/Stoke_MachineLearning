@@ -1038,7 +1038,7 @@ def test_require_prebuilt_mainline_large_formal_refuses_live(tp):
         tp._require_prebuilt_mainline(
             "csi800", None, n_resolved=1500, formal_research=True)
     msg = str(ei.value).lower()
-    assert "prebuilt" in msg and ("csi800" in msg or "1500" in msg)
+    assert "prebuilt" in msg and "no-formal" in msg
 
 
 def test_require_prebuilt_mainline_large_formal_allows_prebuilt_and_store(tp):
@@ -1049,22 +1049,33 @@ def test_require_prebuilt_mainline_large_formal_allows_prebuilt_and_store(tp):
         "csi800", None, store_complete=True, n_resolved=1500, formal_research=True)
 
 
+def test_require_prebuilt_mainline_formal_allows_prebuilt_any_size(tp):
+    tp._require_prebuilt_mainline("random", "data/features_panel",
+                                  n_resolved=500, formal_research=True)
+    tp._require_prebuilt_mainline("random", None, n_resolved=500,
+                                  formal_research=True, store_complete=True)
+
+
 def test_require_prebuilt_mainline_large_nonformal_allowed(tp):
     """exploratory/dev-smoke (formal_research=False) large live universe allowed."""
     tp._require_prebuilt_mainline("csi800", None, n_resolved=1500, formal_research=False)
 
 
-def test_require_prebuilt_mainline_small_formal_allowed(tp):
-    """formal research on a small universe is fine live."""
-    tp._require_prebuilt_mainline("random", None, n_resolved=500, formal_research=True)
-
-
-def test_require_prebuilt_mainline_threshold_boundary(tp):
-    """n_resolved == threshold is OK; strictly above it is refused (formal+live)."""
-    tp._require_prebuilt_mainline("random", None, n_resolved=1000, formal_research=True)
+def test_require_prebuilt_mainline_small_formal_refused(tp):
+    # §v19 P0#3 收口: a small formal run may NO LONGER use live feature
+    # engineering — formal named-profile research is prebuilt-only.
     with pytest.raises(SystemExit):
-        tp._require_prebuilt_mainline(
-            "random", None, n_resolved=1001, formal_research=True)
+        tp._require_prebuilt_mainline("random", None, n_resolved=500,
+                                      formal_research=True)
+
+
+def test_require_prebuilt_mainline_threshold_escape_hatch_gone(tp):
+    """§v19 P0#3 收口: the count threshold is no longer consulted — a formal+live
+    run is refused at ANY resolved size, including the legacy boundary (1000)."""
+    for n in (1000, 1001):
+        with pytest.raises(SystemExit):
+            tp._require_prebuilt_mainline("random", None, n_resolved=n,
+                                          formal_research=True)
 
 
 def test_panel_memory_gb_formula(tp):
