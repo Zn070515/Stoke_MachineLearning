@@ -360,6 +360,34 @@ FEATURE_PROFILES: dict[str, FeatureProfile] = {
     ),
 }
 
+# §v19 P1#6: the FROZEN fundamental-ablation opt-in.  ``fundamental`` is a
+# ``latest_revised``-sourced channel (denied under the ``revision-safe`` policy
+# that headline_v1 declares), so this profile is the explicit, frozen opt-in
+# that validates under ``allow-revised`` — SUPERSEDING the
+# ``--allow-fundamental-ablation`` CLI override as the canonical ablation route
+# (an ablation study now names a reproducible recipe instead of a run-time flag).
+# It is built from the headline_v1 base so the required-channel set is a
+# GUARANTEED superset (headline_v1 + fundamental), never a hand-typed list that
+# can drift.  The fundamental coverage contract is COMPOSITE — stock_coverage
+# >= 0.90 AND date_coverage >= 0.90 must BOTH hold (the same composite form the
+# era-coverage contracts use), so an ablation run only proceeds when the
+# fundamental channel is actually covered on both the stock and the date axis.
+# This entry is inserted AFTER the dict literal (not inside it) because the
+# base-reference ``FEATURE_PROFILES["headline_v1"]`` cannot be resolved during
+# the literal's own evaluation (the global is not bound yet).
+FEATURE_PROFILES["fundamental_ablation_v1"] = FeatureProfile(
+    name="fundamental_ablation_v1",
+    required_channels=FEATURE_PROFILES["headline_v1"].required_channels
+        + ("fundamental",),
+    coverage_contracts={
+        **FEATURE_PROFILES["headline_v1"].coverage_contracts,
+        "fundamental": CoverageContract(
+            "stock_coverage", 0.90,
+            requires=("date_coverage", 0.90)),
+    },
+    vintage_policy="allow-revised",
+)
+
 
 def profile_for(profile_name: str | None) -> FeatureProfile | None:
     """The profile for ``profile_name``, or None when it is not configured.

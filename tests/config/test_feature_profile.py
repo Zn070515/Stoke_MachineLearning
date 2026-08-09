@@ -249,8 +249,11 @@ def test_headline_v1_vintage_policy_is_revision_safe():
     assert _headline().vintage_policy == "revision-safe"
 
 
-def test_headline_v1_is_the_only_shipped_profile():
-    assert set(FEATURE_PROFILES) == {"headline_v1"}
+def test_shipped_profiles_exact_set():
+    """§v19 P1#6: the shipped profiles are exactly headline_v1 (the
+    revision-safe formal baseline) + fundamental_ablation_v1 (the frozen
+    allow-revised ablation opt-in) — no unplanned profile rides along."""
+    assert set(FEATURE_PROFILES) == {"headline_v1", "fundamental_ablation_v1"}
 
 
 # ── resolve_required_channels / minimum_coverage / profile_for ─────────
@@ -290,3 +293,75 @@ def test_profile_for_known_profile():
 def test_profile_for_none_or_unknown_is_none():
     for name in (None, "", "none", "bogus"):
         assert profile_for(name) is None, name
+
+
+# ── fundamental_ablation_v1 (§v19 P1#6) ───────────────────────────────
+
+def test_fundamental_ablation_v1_profile():
+    """§v19 P1#6: the frozen fundamental-ablation profile — an explicit opt-in
+    for the fundamental channel that headlines as a superset of headline_v1 and
+    validates under allow-revised (fundamental is a latest_revised channel,
+    denied under the revision-safe policy headline_v1 declares)."""
+    prof = profile_for("fundamental_ablation_v1")
+    assert prof is not None
+    assert "fundamental" in prof.required_channels
+    # superset of headline_v1
+    base = profile_for("headline_v1")
+    assert set(base.required_channels) <= set(prof.required_channels)
+    assert prof.vintage_policy == "allow-revised"
+    fc = prof.coverage_contracts["fundamental"]
+    assert fc.metric == "stock_coverage"
+    assert fc.threshold == 0.90
+    assert fc.requires == ("date_coverage", 0.90)
+
+
+def test_fundamental_ablation_v1_gates_deny_revision_safe():
+    """§v19 P1#6: train_panel_gates enforces ``args_vintage == profile.vintage_policy``
+    (§二十-1) — a run with --feature-profile fundamental_ablation_v1 and
+    --vintage-policy revision-safe must be REFUSED (fundamental is denied under
+    revision-safe, so the recipe the profile names would not match the channels
+    the pipeline actually opens)."""
+    import types
+    from scripts.production.train_panel_gates import _resolve_required_set
+
+    args = types.SimpleNamespace(
+        feature_profile="fundamental_ablation_v1",
+        vintage_policy="revision-safe",  # mismatched — profile declares allow-revised
+        no_require_quality_gate=False,
+        no_formal=False,
+        require_aux_channels="",
+        allow_fundamental_ablation=False,
+    )
+    with pytest.raises(SystemExit) as ei:
+        _resolve_required_set(args)
+    msg = str(ei.value)
+    assert "allow-revised" in msg
+    assert "fundamental_ablation_v1" in msg
+
+
+def test_fundamental_ablation_v1_gates_allow_revised_resolves():
+    """§v19 P1#6: the MATCHING run (--vintage-policy allow-revised) resolves the
+    frozen profile — fundamental joins the required set, the enforced policy
+    equals the profile's declared allow-revised, and the composite fundamental
+    contract rides the coverage gate."""
+    import types
+    from scripts.production.train_panel_gates import _resolve_required_set
+
+    args = types.SimpleNamespace(
+        feature_profile="fundamental_ablation_v1",
+        vintage_policy="allow-revised",
+        no_require_quality_gate=False,
+        no_formal=False,
+        require_aux_channels="",
+        allow_fundamental_ablation=False,
+    )
+    required_set, contracts, profile_name = _resolve_required_set(args)
+    assert profile_name == "fundamental_ablation_v1"
+    assert "fundamental" in required_set
+    # headline_v1's channels all survive — the ablation profile is a superset
+    assert set(_headline().required_channels) <= required_set
+    # the enforced policy IS the profile's declared allow-revised
+    assert _headline().vintage_policy == "revision-safe"
+    assert profile_for("fundamental_ablation_v1").vintage_policy == "allow-revised"
+    assert contracts["fundamental"] == CoverageContract(
+        "stock_coverage", 0.90, requires=("date_coverage", 0.90))
