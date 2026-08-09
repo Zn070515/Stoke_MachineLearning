@@ -87,7 +87,7 @@
 - `stock_industry_map.parquet`：无 manifest（无 consumer / formal gate 要求，T9 不改）。
 - **cninfo announcement-sentiment 路径**（`a_shares/cninfo_announcements/sentiment/`）：无 storage/manifest 支持 —— formal 模式下显式拒绝（`use --prebuilt or add a DataAssetContract writer`），T9 维持显式排除，不补 writer。
 
-### 行业分类真 PIT（v19 P0#1，CNINFO 事件溯源）
+### 行业分类真 PIT（v19 P0#1 + 行业链 provenance closeout，CNINFO 事件溯源）
 
 `scripts/production/download_sector_membership.py` 拉取 CNINFO
 `stock_industry_change_cninfo` 逐股行业分类变更事件（列：新证券简称 / 行业
@@ -95,12 +95,70 @@
 `a_shares/sector_membership.parquet`（列 `[date, stock_code, sector_code,
 sector_name]`，CSRC 门类 A-S 级别，合并证监会 2001 / 2012 / 中国上市公司协会
 改名；逐事件区间边界 + dropna 后建边界，不做 present-backfill）。逐股缓存
-在 `a_shares/sector_membership_pit/_stocks/{code}.json`，支持断点续爬。
+在 `a_shares/sector_membership_pit/_stocks/{code}.json`，支持断点续爬
+（§十九：缓存携带 `cache_version`/`parser_hash`/`source`/区间，不匹配即整体重爬一次；
+§十八：CNINFO 空结果仅认 `KeyError('变更日期')` 签名，其它列索引 KeyError 一律 re-raise）。
+run manifest 记录 `coverage_by_year`——**活动股分母**（§十六，读每只 daily
+manifest 的 start/end 算当年 active 股票数），早期年份远高于旧 universe 分母
+（2002+ 均 ≥ 97.8%）。`complete` 仅在 fetch + 正式 daily 读取
+（`require_valid_manifest=True`）+ 展开全部成功后授予（§十五）。
+
 `download_industry_ranking.py` 优先读这份 membership（date+stock_code INNER
-join → 诚实剔除未分类日），缺失时回退历史快照——`market_adv_ratio` 等市场
-宽度指标因此成为**真 PIT**。注意：`industry` 通道的 `channel_vintage` 声明
-仍标 `pit_alignment=proxy`（v18 §二十-9，代码未改）；数据已 PIT，正式 vintage
-标签升级留待后续独立决策。
+join → 诚实剔除未分类日），读取前用 `validate_asset_manifest` 校验（§十三）。
+**缺 membership 时默认 fail-closed（P0.2）**：必须显式传
+`--allow-snapshot-sector-fallback` 才回退历史快照，且产物 manifest 标
+`pit_alignment="proxy"`（绝不进 strict headline）。产物写 `INDUSTRY_RANKING_ASSET`
+manifest（§十四）：`upstream_roots.daily`（daily manifest-root Merkle digest）+
+`upstream_roots.sector_membership`（文件 sha256）+ transform_code/config_hash。
+formal gate 用同一 `compute_lineage` 重算比对（§十四）——`sector_membership`
+变了但 industry_ranking 没重建 → `upstream_roots.sector_membership` 翻转 →
+STALE → market_env 链 fail（Tuesday bug 兜住）。`market_adv_ratio` 是
+**证监会门类广谱涨跌比率**（§二十，A-S 门类等权正收益占比，非单行业指标）；
+`build_market_env` 消费时用 `check_asset_read(require_valid_manifest=True)`
+校验 ranking，并把 pit 声明进 `parts.price.industry_advance_pit`（manifest 缺
+key 时保守标 `proxy`，绝不静默升级为 `verified`）。formal 的 `market_env` 运行
+还要求每年 sector 活动股覆盖 ≥ `SECTOR_COVERAGE_THRESHOLD=0.80`（§十七，
+缺失年份按 0.0 fail-closed）。
+
+注意：`industry` 通道的 `channel_vintage` 声明仍标 `pit_alignment=proxy`
+（v18 §二十-9，代码未改）；数据已 PIT，正式 vintage 标签升级留待后续独立决策。
+
+### v19 日线库迁移 + aux 通道重建（#85 / #88 / #100 / #103）
+
+**迁移**（#85 Phase 1/2）：daily 库归一化手/股混合单位（逐行 ×100）并把
+provenance 统一为 qfq。迁移改变价格与 `pct_change`，使所有**内嵌 daily 价格**
+的下游 aux `*_processed` 通道与预构建特征全部失效（board / block_trade /
+industry_ranking / dividend / lockup / shareholder 等）。
+
+**重建**（#88 / #100）：用 `preprocess_new_data.py --type <ch>` 重跑各通道。
+- pandas 3.0 日期 dtype 严格化（ms/us merge `MergeError`）在 read 层修复
+  （`stoke_ml/data/date_normalize.py::as_date_us`）：daily / aux 读盘后统一
+  `datetime64[us]`，flat 优先路径与 year/month 分区路径一致。
+- 结构性 schema 演化（如 SectorBroadcaster 以派生指标替换原始排行列
+  `leader_change/n_stocks/ret_std/sector_name`）触发 replace_range 的
+  dropped_cols 拒绝 → `--force` 显式绕过；date-loss 审计全过（重建产物
+  missing_vs_daily=0，完整覆盖 canonical daily 日历；manifest missing_dates
+  均为旧文件独有行、无消费方）。
+- 事件通道（board/block_trade/dividend/lockup/shareholder）结构性稀疏，
+  formal 默认 strict 质量门全拦 → `--allow-degraded` 写降级产物。
+
+**Gate aux_close 语义**（#103）：`check_aux_close_aligned` 的 close 比较分两类
+——per-date-price 通道（block_trade/board/sector/shareholder）**逐行**比较；
+forward-filled-close 通道（dividend/lockup）的 close 是事件日 close 前向填充的
+state byproduct（`aggregator._fill_to_daily`），只在**真实事件行**
+（`dv_days_since==0` / `lu_days_since==0`，事件时间特征）比较——事件行 close
+与 daily 精确相等，basis-drift canary 保留。
+
+**重建后全量质量门**（2026-08-10，`data_quality_gate.py` 全扫，报告
+`reports/data_quality_gate.json`）：datasets / daily_internal /
+`aux_pct_aligned`（max_diff=0，board + sector 全量）/ `aux_close_aligned`
+（max_abs_diff=0，6 通道全量）/ sparsity / ohlc_sanity / contract_schema /
+manifest 全 PASS；**唯一 FAIL 是 `feature_pct`**（25 只，与迁移前同一批代码、
+max_diff 逐字一致——特征层未重建）。
+
+**已知残留**（#89 pending）：109GB 预构建特征（`data/features/` 全量 +
+`data/features_panel/` 面板）未重建 → gate `feature_pct` 仍 FAIL（特征层
+pct_change 与 daily 不一致来自迁移前旧特征）。#89 重建特征面板后收口。
 
 ### 正式研究 Prebuilt 主线（§P2-16，T14 收口）
 

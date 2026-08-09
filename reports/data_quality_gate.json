@@ -1,13 +1,45 @@
 {
-  "timestamp": "2026-08-03T18:43:30.457251",
-  "passed": true,
+  "timestamp": "2026-08-10T00:25:21.580577",
+  "passed": false,
+  "quality_gate_version": "3.0",
+  "data_root": "D:\\Projects\\Stoke_MachineLearning\\data",
+  "calendar_version": "2026-08-04",
+  "calendar_artifact_hash": "6d9f9094a0cfa468",
+  "calendar_artifact_path": "D:\\Projects\\Stoke_MachineLearning\\data\\exchange_calendar\\a_shares.parquet",
+  "calendar_artifact_present": true,
+  "contract_version": "35b233111e1477f1",
+  "required_datasets": [
+    "daily"
+  ],
+  "dataset_paths": {
+    "daily": "D:\\Projects\\Stoke_MachineLearning\\data\\a_shares\\daily"
+  },
+  "profile": "bootstrap",
+  "scope": "full",
+  "sample_size": 0,
+  "sample_seed": 20240804,
+  "scanned_files": 5530,
+  "total_files": 5530,
+  "manifest_contract_full_scan": true,
+  "data_manifest_hash": "be335c2d14ce5a6a",
   "checks": [
+    {
+      "name": "datasets",
+      "passed": true,
+      "summary": "OK files=5530 rows=16256235 unreadable=0 datasets=daily",
+      "files_scanned": 5530,
+      "rows_scanned": 16256235,
+      "unreadable_files": 0,
+      "issue_count": 0,
+      "sample_issues": []
+    },
     {
       "name": "daily_internal",
       "passed": true,
       "summary": "max_diff=0.000000 pollution_rows=0 problem_files=0",
       "files_scanned": 5530,
-      "rows_scanned": 16254161,
+      "rows_scanned": 16250705,
+      "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
     },
@@ -16,7 +48,8 @@
       "passed": true,
       "summary": "max_diff=0.00000000 problem_files=0",
       "files_scanned": 11060,
-      "rows_scanned": 22042882,
+      "rows_scanned": 32501410,
+      "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
     },
@@ -24,26 +57,130 @@
       "name": "aux_close_aligned",
       "passed": true,
       "summary": "max_abs_diff=0.000000 problem_files=0",
-      "files_scanned": 32286,
-      "rows_scanned": 88171528,
+      "files_scanned": 32296,
+      "rows_scanned": 161900349,
+      "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
     },
     {
       "name": "feature_pct",
-      "passed": true,
-      "summary": "max_diff=0.000060 problem_files=0",
+      "passed": false,
+      "summary": "max_diff=25789.990859 problem_files=25",
       "files_scanned": 5530,
-      "rows_scanned": 16259691,
-      "issue_count": 0,
-      "sample_issues": []
+      "rows_scanned": 16256078,
+      "unreadable_files": 0,
+      "issue_count": 25,
+      "sample_issues": [
+        {
+          "file": "000333",
+          "detail": "md=8694.6825 poll_zero=0"
+        },
+        {
+          "file": "000338",
+          "detail": "md=897.1731 poll_zero=0"
+        },
+        {
+          "file": "000408",
+          "detail": "md=7089.9489 poll_zero=0"
+        },
+        {
+          "file": "000429",
+          "detail": "md=1396.5779 poll_zero=0"
+        },
+        {
+          "file": "000520",
+          "detail": "md=39.0162 poll_zero=0"
+        },
+        {
+          "file": "000568",
+          "detail": "md=25789.9909 poll_zero=0"
+        },
+        {
+          "file": "000596",
+          "detail": "md=53.3956 poll_zero=0"
+        },
+        {
+          "file": "000651",
+          "detail": "md=18290.0324 poll_zero=0"
+        },
+        {
+          "file": "000708",
+          "detail": "md=3491.9444 poll_zero=0"
+        },
+        {
+          "file": "000830",
+          "detail": "md=1495.4407 poll_zero=0"
+        },
+        {
+          "file": "000858",
+          "detail": "md=17090.8201 poll_zero=0"
+        },
+        {
+          "file": "000895",
+          "detail": "md=5093.4104 poll_zero=0"
+        },
+        {
+          "file": "000933",
+          "detail": "md=2093.9490 poll_zero=0"
+        },
+        {
+          "file": "000937",
+          "detail": "md=1592.8205 poll_zero=0"
+        },
+        {
+          "file": "001914",
+          "detail": "md=49.9056 poll_zero=0"
+        },
+        {
+          "file": "002001",
+          "detail": "md=4291.2821 poll_zero=0"
+        },
+        {
+          "file": "002003",
+          "detail": "md=296.0870 poll_zero=0"
+        },
+        {
+          "file": "002043",
+          "detail": "md=1389.7119 poll_zero=0"
+        },
+        {
+          "file": "002088",
+          "detail": "md=3089.8204 poll_zero=0"
+        },
+        {
+          "file": "002110",
+          "detail": "md=1992.4901 poll_zero=0"
+        },
+        {
+          "file": "002372",
+          "detail": "md=2589.9160 poll_zero=0"
+        },
+        {
+          "file": "002506",
+          "detail": "md=984.2462 poll_zero=0"
+        },
+        {
+          "file": "002847",
+          "detail": "md=6289.9452 poll_zero=0"
+        },
+        {
+          "file": "300684",
+          "detail": "md=561.3396 poll_zero=0"
+        },
+        {
+          "file": "302132",
+          "detail": "md=67.3918 poll_zero=0"
+        }
+      ]
     },
     {
       "name": "sparsity",
       "passed": true,
-      "summary": "event-sparse features=580 (showing 200) min_nz=0.0",
+      "summary": "event-sparse features=843 (showing 200) min_nz=0.0 avg_finite_cov=0.994",
       "files_scanned": 5530,
       "rows_scanned": 0,
+      "unreadable_files": 0,
       "issue_count": 200,
       "sample_issues": [
         {
@@ -175,6 +312,10 @@
           "detail": "nz=0.0"
         },
         {
+          "file": "super_ratio_std20",
+          "detail": "nz=0.0"
+        },
+        {
           "file": "super_ratio_accel",
           "detail": "nz=0.0"
         },
@@ -188,6 +329,10 @@
         },
         {
           "file": "large_ratio_ma20",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "large_ratio_std20",
           "detail": "nz=0.0"
         },
         {
@@ -207,6 +352,10 @@
           "detail": "nz=0.0"
         },
         {
+          "file": "mid_ratio_std20",
+          "detail": "nz=0.0"
+        },
+        {
           "file": "mid_ratio_accel",
           "detail": "nz=0.0"
         },
@@ -223,30 +372,283 @@
           "detail": "nz=0.0"
         },
         {
+          "file": "small_ratio_std20",
+          "detail": "nz=0.0"
+        },
+        {
           "file": "small_ratio_accel",
           "detail": "nz=0.0"
         },
         {
           "file": "main_ratio_ma5",
           "detail": "nz=0.0"
-        },
-        {
-          "file": "main_ratio_ma10",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "main_ratio_ma20",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "main_ratio_accel",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "transfer_ratio_ma5",
-          "detail": "nz=0.0"
         }
       ]
+    },
+    {
+      "name": "ohlc_sanity",
+      "passed": true,
+      "summary": "dup_dates=0 weekend_rows=0 problem_files=0",
+      "files_scanned": 5530,
+      "rows_scanned": 16256235,
+      "unreadable_files": 0,
+      "issue_count": 0,
+      "sample_issues": []
+    },
+    {
+      "name": "contract_schema",
+      "passed": true,
+      "summary": "problem_files=0",
+      "files_scanned": 5530,
+      "rows_scanned": 0,
+      "unreadable_files": 0,
+      "issue_count": 0,
+      "sample_issues": []
+    },
+    {
+      "name": "manifest",
+      "passed": true,
+      "summary": "problem_files=0",
+      "files_scanned": 5530,
+      "rows_scanned": 0,
+      "unreadable_files": 0,
+      "issue_count": 0,
+      "sample_issues": []
+    }
+  ],
+  "vintage_policy": "revision-safe",
+  "channel_vintage": [
+    {
+      "channel": "sentiment",
+      "source_vintage": "immutable_snapshot",
+      "transform": "model_versioned",
+      "pit_alignment": "verified",
+      "rationale": "Immutable published news text/headlines; a correction appears as a new article, never a rewrite of a stored row.  The sentiment score is FinBERT-derived (model_versioned): regenerable if the model version changes, so the model version must be RECORDED.",
+      "allowed": true
+    },
+    {
+      "channel": "guba",
+      "source_vintage": "immutable_snapshot",
+      "transform": "model_versioned",
+      "pit_alignment": "verified",
+      "rationale": "Immutable published forum posts keyed by post_id; stored sentiment is a snapshot of the post as fetched.  The sentiment score is model-derived (model_versioned): regenerable if the model version changes, so the model version must be RECORDED.",
+      "allowed": true
+    },
+    {
+      "channel": "comment",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Immutable published rating/comment snapshots keyed by date; a rating for date T is what was knowable at T.",
+      "allowed": true
+    },
+    {
+      "channel": "announcement",
+      "source_vintage": "immutable_snapshot",
+      "transform": "model_versioned",
+      "pit_alignment": "verified",
+      "rationale": "Immutable disclosure events; a 更正/restatement appears as a NEW announcement rather than overwriting the original row.  The sentiment score is model-derived (model_versioned): regenerable if the model version changes, so the model version must be RECORDED.",
+      "allowed": true
+    },
+    {
+      "channel": "margin",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Daily 融资融券 balance is an exchange snapshot recorded for the day; not later rewritten.",
+      "allowed": true
+    },
+    {
+      "channel": "northbound",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Daily northbound flow/holding is an exchange snapshot recorded for the day.",
+      "allowed": true
+    },
+    {
+      "channel": "dragon_tiger",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Daily 龙虎榜 seat/amount data is an exchange snapshot recorded for the trading day it occurred.",
+      "allowed": true
+    },
+    {
+      "channel": "capital_flow",
+      "source_vintage": "immutable_snapshot",
+      "transform": "formula_versioned",
+      "pit_alignment": "verified",
+      "rationale": "Daily 资金流向 is a VENDOR-COMPUTED series (formula_versioned): the vendor's money-flow formula derives the value, so a formula/definition change can regenerate history — the version must be RECORDED, not the channel denied.  Stored as an as-of daily snapshot, recorded for the day.",
+      "allowed": true
+    },
+    {
+      "channel": "etf_flow",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Daily sector ETF flow is a snapshot recorded for the day.",
+      "allowed": true
+    },
+    {
+      "channel": "block_trade",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Daily 大宗交易 records are exchange-reported events recorded for the trading day.",
+      "allowed": true
+    },
+    {
+      "channel": "lockup",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Lockup 解禁 schedule is an event list; each unlock date is recorded as an immutable event.",
+      "allowed": true
+    },
+    {
+      "channel": "dividend",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Dividend 分红 schedule is an event list (ex-date/amount); each event is recorded as an immutable snapshot.",
+      "allowed": true
+    },
+    {
+      "channel": "board",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "打板/limit-up ecology features are realized daily price actions, not restated after the fact.",
+      "allowed": true
+    },
+    {
+      "channel": "limit_up",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Deferred (NOT yet in the default feature set).  Realized daily limit-up ecology, immutable once recorded.",
+      "allowed": true
+    },
+    {
+      "channel": "topic",
+      "source_vintage": "immutable_snapshot",
+      "transform": "model_versioned",
+      "pit_alignment": "verified",
+      "rationale": "Ablation-only (OFF by default).  Derived from immutable news titles with a frozen global_frozen model; note the §七 PIT corpus concern, which is a leakage issue separate from vintage.  The topic score is model-derived (model_versioned): regenerable if the model version changes, so the model version must be RECORDED.",
+      "allowed": true
+    },
+    {
+      "channel": "daily_qfq",
+      "source_vintage": "immutable_snapshot",
+      "transform": "formula_versioned",
+      "pit_alignment": "proxy",
+      "rationale": "Raw OHLC + adjustment-factor history are immutable snapshots; the 前复权 (qfq) re-anchoring is a formula transform (formula_versioned) that recomputes ALL historical adjusted closes whenever a new dividend/split occurs, so today's qfq history embeds future corporate actions.  Because of that, its alignment to 'what was knowable at T' is only a PROXY, not verified.  The repo chose the RESEARCH_QFQ_DAILY contract knowing this; this label does not hide it.",
+      "allowed": true
+    },
+    {
+      "channel": "market_env",
+      "source_vintage": "immutable_snapshot",
+      "transform": "formula_versioned",
+      "pit_alignment": "proxy",
+      "rationale": "§T5 split: the broadcast market_env_daily.parquet carries two parts.  The PRICE part (high/low breadth, market turnover, industry advance) is SAME-DAY trade data → verified PIT.  The ACCOUNT part (monthly investor/mkt-cap stats) has a real publish date the raw source does NOT record, so its alignment is only a PROXY (month-end proxy date).  One file carries both, so the channel-level label is the STRICTER of the two (proxy); the per-part split is declared in feature_profile + the manifest 'parts' field.",
+      "allowed": true
+    },
+    {
+      "channel": "market_env_account",
+      "source_vintage": "immutable_snapshot",
+      "transform": "formula_versioned",
+      "pit_alignment": "proxy",
+      "rationale": "§T5: the ACCOUNT sub-part of the market_env file (monthly investor/mkt-cap stats).  The published values are immutable point-in-time snapshots (no later revision rewrites the past publication) and the daily market_env_daily.parquet stores formula-derived z-scores → formula_versioned.  Its decision-date alignment is only a PROXY (month-end proxy date while the raw source records no real publish date), so it is ablation-only (use_market_env_account OFF by default, mirroring topic) and is NOT scale-invariant (absolute counts) — denied under headline-strict, never required.",
+      "allowed": true
+    },
+    {
+      "channel": "industry",
+      "source_vintage": "immutable_snapshot",
+      "transform": "formula_versioned",
+      "pit_alignment": "proxy",
+      "rationale": "Daily industry ranking is computed from realized prices via a formula (formula_versioned) — the qfq price series is versioned (recomputed on every corporate action), so the ranking inherits that; its membership also derives from the sector classification, which is restructured historically (a documented caveat).  Alignment to 'what was knowable at T' is only a PROXY, so the label stays honest while the channel remains admissible.",
+      "allowed": true
+    },
+    {
+      "channel": "shareholder",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "股东户数/holdings registry snapshots are published and can be corrected or restated by the issuer; stored form is latest-revised history aligned to its disclosure date.",
+      "allowed": false
+    },
+    {
+      "channel": "pledge",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "股权质押 registry records can be corrected/restated by the exchange; stored form is latest-revised history aligned to its event date.",
+      "allowed": false
+    },
+    {
+      "channel": "sector",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "行业分类 is restructured historically (历史行业分类重构); today's sector for a stock may not equal its classification at an earlier date.",
+      "allowed": false
+    },
+    {
+      "channel": "concept",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "概念分类 is restructured historically; today's concept membership may embed later reclassification.",
+      "allowed": false
+    },
+    {
+      "channel": "index_membership",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "Index constituents are backfilled/restructured historically; today's membership for date T may embed later changes.",
+      "allowed": false
+    },
+    {
+      "channel": "fundamental",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "Financial statements are restated/corrected (财报更正); a value read today for report_date T may embed revisions made after T.  Stored as latest-revised history aligned to disclose_date.",
+      "allowed": false
+    },
+    {
+      "channel": "macro",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "Macro statistical series are revised (宏观统计修订, e.g. PMI/M2/CPI/PPI); a value read today for date T may embed statistical revisions made after T.",
+      "allowed": false
+    },
+    {
+      "channel": "earnings",
+      "source_vintage": "latest_revised",
+      "transform": "raw",
+      "pit_alignment": "proxy",
+      "rationale": "Analyst earnings forecasts are repeatedly revised; today's forecast mapped to an earlier target date is the latest revision, not the original.",
+      "allowed": false
+    },
+    {
+      "channel": "valuation",
+      "source_vintage": "latest_revised",
+      "transform": "formula_versioned",
+      "pit_alignment": "proxy",
+      "rationale": "Valuation is computed from price × fundamentals via a formula (formula_versioned); it inherits the fundamental revision risk (and the qfq price revision), so its source is latest-revised and its alignment is only a PROXY.",
+      "allowed": false
+    },
+    {
+      "channel": "market_env_refine",
+      "source_vintage": "latest_revised",
+      "transform": "formula_versioned",
+      "pit_alignment": "proxy",
+      "rationale": "Macro regime-refine features are derived from macro series via a formula (formula_versioned); they inherit the macro statistical-revision risk, so their source is latest-revised and their alignment is only a PROXY.",
+      "allowed": false
     }
   ]
 }
