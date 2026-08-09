@@ -98,6 +98,12 @@ _MARKET_ENV_REFINE_COLS = frozenset(
 #     scrub drops it whenever ``use_market_env_account`` is OFF (the default),
 #     and ``aux_aligner._merge_market_env`` merges it ONLY when the ablation
 #     flag is ON or the account part is verified.
+# §二十: ``market_adv_ratio`` is the CSRC broad-sector advance ratio — the
+# fraction of 证监会 门类 sectors (A–S) with positive equal-weighted return,
+# derived from the PIT ``industry_ranking``.  Its per-source PIT is recorded
+# in the market_env manifest's ``parts.price.industry_advance_pit``
+# (``"verified"`` for the PIT membership path, ``"proxy"`` only when the legacy
+# snapshot fallback was forced).
 MARKET_ENV_PRICE_COLS: frozenset[str] = frozenset({
     "high_low_ratio", "market_adv_ratio", "market_turnover_z",
 })

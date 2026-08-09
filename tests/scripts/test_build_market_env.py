@@ -71,7 +71,12 @@ def _write_highs_lows(tmp_path):
 def _write_industry(tmp_path):
     """§v18-5: the REAL market_adv_ratio upstream is download_industry_ranking.py's
     a_shares/industry_ranking.parquet (date/sector_code/change_pct), not the
-    legacy industry/industry_ranking_computed.parquet (date/ind_return)."""
+    legacy industry/industry_ranking_computed.parquet (date/ind_return).
+
+    §二十: the fixture writes the INDUSTRY_RANKING_ASSET manifest too (mirroring
+    download_industry_ranking.main) because build_industry_advance now consumes
+    the ranking fail-closed (require_valid_manifest=True) — a bare parquet
+    without its manifest is no longer a valid input."""
     daily = tmp_path / "a_shares"
     daily.mkdir(parents=True, exist_ok=True)
     rows = pd.DataFrame({
@@ -80,6 +85,10 @@ def _write_industry(tmp_path):
         "change_pct": [0.01, -0.02, 0.00, 0.03],
     })
     rows.to_parquet(daily / "industry_ranking.parquet", index=False)
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_industry_ranking import INDUSTRY_RANKING_ASSET
+    write_asset_manifest(str(daily / "industry_ranking.parquet"), INDUSTRY_RANKING_ASSET,
+                         rows, pit_alignment="verified", membership_source="pit")
     return daily
 
 
@@ -146,6 +155,15 @@ def test_price_part_declared_verified(bme, tmp_path):
         assert c in df.columns
 
 
+def test_price_part_declares_industry_advance_pit(bme, tmp_path):
+    """§二十: the market_adv_ratio source (industry_ranking) is validated on
+    consumption and its per-source PIT is threaded through to the manifest's
+    parts declaration — the fixture's ranking is PIT-membership derived, so the
+    advance source is ``verified``."""
+    _, parts = _build_full(tmp_path, bme)
+    assert parts["price"]["industry_advance_pit"] == "verified"
+
+
 def test_build_market_env_asserts_full_price_cols(bme, tmp_path):
     """§v18-5: a builder that cannot produce the full MARKET_ENV_PRICE_COLS set
     must FAIL, not write a partial asset with a valid manifest."""
@@ -170,6 +188,23 @@ def test_build_market_env_price_cols_from_real_upstream(bme, tmp_path):
     assert set(bme.MARKET_ENV_PRICE_COLS) <= set(df.columns)
     # 2024-01-02: sector0 +0.01 (adv), sector1 -0.02 (decl) → 0.5
     assert abs(df.loc["2024-01-02", "market_adv_ratio"] - 0.5) < 1e-9
+
+
+def test_build_industry_advance_fails_closed_on_bare_parquet(bme, tmp_path):
+    """§二十: a PRESENT industry_ranking.parquet WITHOUT its INDUSTRY_RANKING_ASSET
+    manifest must ABORT the advance build (require_valid_manifest=True, fail-
+    closed) — a bare ranking is never silently trusted as market breadth."""
+    daily = tmp_path / "a_shares"
+    daily.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-02"],
+        "sector_code": ["SEC0000", "SEC0001"],
+        "change_pct": [0.01, -0.02],
+    }).to_parquet(daily / "industry_ranking.parquet", index=False)
+    with pytest.raises(ValueError) as ei:
+        bme.build_industry_advance(str(daily))
+    assert "manifest missing" in str(ei.value) or \
+        "require_valid_manifest" in str(ei.value)
 
 
 # ── (b) account part: proxy when no real publish date ─────────────────────

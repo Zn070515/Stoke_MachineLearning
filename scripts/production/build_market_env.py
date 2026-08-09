@@ -17,6 +17,11 @@ price/account split:
 
   - **price part** (``high_low_ratio`` / ``market_adv_ratio`` /
     ``market_turnover_z``): same-day trade data → ``pit_alignment="verified"``.
+    ``market_adv_ratio`` is the CSRC broad-sector advance ratio (fraction of
+    证监会 门类 sectors A–S with positive equal-weighted return) derived from the
+    PIT ``industry_ranking``; its per-source PIT is recorded in ``parts`` as
+    ``industry_advance_pit`` (``"verified"`` for the PIT membership path,
+    ``"proxy"`` only when the legacy snapshot fallback was forced).
   - **account part** (``mkt_cap_total_z`` / ``avg_account_cap_z`` /
     ``investor_new_num`` / ``investor_new_z``): monthly account statistics
     whose real publish date is NOT determinable from the shipped
@@ -51,6 +56,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.production.data_quality_gate import dataset_fingerprint
+from scripts.production.download_industry_ranking import INDUSTRY_RANKING_ASSET
 from stoke_ml.config import load_config
 from stoke_ml.config.feature_profile import (
     MARKET_ENV_ACCOUNT_COLS,
@@ -59,6 +65,7 @@ from stoke_ml.config.feature_profile import (
 from stoke_ml.data.asset_contract import (
     AtomicCommit,
     check_asset_read,
+    validate_asset_manifest,
     write_asset_manifest,
 )
 from stoke_ml.data.broadcast_assets import MARKET_ENV_ASSET
@@ -120,29 +127,40 @@ def build_turnover_daily(base: str) -> pd.Series:
     return _z(tot)
 
 
-def build_industry_advance(base: str) -> pd.Series:
-    """Fraction of sectors with positive change_pct per date (§v18-5).
+def build_industry_advance(base: str) -> tuple[pd.Series, str]:
+    """(Fraction of sectors with positive change_pct per date, pit_alignment).
 
     ``base`` is the ``a_shares`` dir.  The real upstream is
     ``download_industry_ranking.py``'s ``a_shares/industry_ranking.parquet``
     (date/sector_code/change_pct — sector equal-weighted return), NOT the
     legacy ``industry/industry_ranking_computed.parquet`` (date/ind_return)
-    that no production pipeline writes.  Same-day trade data → VERIFIED part.
+    that no production pipeline writes.  §二十: a PRESENT ranking must first
+    pass its own INDUSTRY_RANKING_ASSET manifest check
+    (``require_valid_manifest=True``, fail-closed) — a bare or tampered
+    parquet is never silently trusted as market breadth.  The returned
+    ``pit_alignment`` is read from the manifest's ``pit_alignment`` (``"verified"``
+    for the PIT sector-membership path, ``"proxy"`` when the legacy snapshot
+    fallback was forced); the absent-file case returns ``(empty, "verified")``
+    because a missing ranking is not a manifest problem — the required-price-
+    column assertion downstream handles absence.
     """
     path = os.path.join(base, "industry_ranking.parquet")
     if not os.path.exists(path):
-        return pd.Series(dtype="float64")
+        return pd.Series(dtype="float64"), "verified"
     raw = pd.read_parquet(path)
+    check_asset_read(path, INDUSTRY_RANKING_ASSET, raw, require_valid_manifest=True)
     if "date" not in raw.columns or "change_pct" not in raw.columns:
-        return pd.Series(dtype="float64")
+        return pd.Series(dtype="float64"), "verified"
     d = raw[["date", "change_pct"]].copy()
     d["date"] = pd.to_datetime(d["date"]).dt.normalize()
     d = d.dropna(subset=["change_pct"])
     if d.empty:
-        return pd.Series(dtype="float64")
+        return pd.Series(dtype="float64"), "verified"
     adv = d.groupby("date")["change_pct"].apply(
         lambda x: float((x > 0).mean()))
-    return adv.rename("market_adv_ratio")
+    report = validate_asset_manifest(path, INDUSTRY_RANKING_ASSET, df=raw)
+    pit = report["manifest"].get("pit_alignment") or "verified"
+    return adv.rename("market_adv_ratio"), pit
 
 
 def _resolve_account_dates(acc: pd.DataFrame) -> tuple[pd.Series, str]:
@@ -216,7 +234,7 @@ def build_market_env(data_dir: str) -> tuple[pd.DataFrame, dict]:
     hl = _build_high_low_ratio(base)
     if not hl.empty:
         series["high_low_ratio"] = hl
-    adv = build_industry_advance(base)
+    adv, adv_pit = build_industry_advance(base)
     if not adv.empty:
         series["market_adv_ratio"] = adv
     turn = build_turnover_daily(base)
@@ -260,8 +278,12 @@ def build_market_env(data_dir: str) -> tuple[pd.DataFrame, dict]:
         "price": {
             "columns": sorted(MARKET_ENV_PRICE_COLS),
             "pit_alignment": "verified",
-            "note": "same-day trade data (high/low breadth, market turnover, "
-                    "industry advance ratio)",
+            "industry_advance_pit": adv_pit,
+            "note": "same-day trade data (high/low breadth, market turnover); "
+                    "market_adv_ratio is the CSRC broad-sector advance ratio — "
+                    "fraction of 证监会 门类 sectors (A–S) with positive "
+                    "equal-weighted return, derived from the PIT "
+                    "industry_ranking (§二十)",
         },
         "account": {
             "columns": sorted(MARKET_ENV_ACCOUNT_COLS),
