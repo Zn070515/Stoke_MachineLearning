@@ -507,9 +507,13 @@ def _write_industry_ranking(data_dir, upstream_roots):
     return ir_path
 
 
-def _write_sector_membership(data_dir, coverage_by_year):
+def _write_sector_membership(data_dir, coverage_by_year,
+                             coverage_by_year_daily=None):
     """Write sector_membership.parquet + a valid SECTOR_MEMBERSHIP_ASSET manifest
-    carrying the given per-year coverage audit."""
+    carrying the given per-year coverage audit (the gate reads
+    ``coverage_by_year`` — per-year p05 daily; the richer
+    ``coverage_by_year_daily`` is written alongside but not consumed by the
+    gate)."""
     from scripts.production.download_sector_membership import SECTOR_MEMBERSHIP_ASSET
     from stoke_ml.data.asset_contract import write_asset_manifest
 
@@ -519,8 +523,10 @@ def _write_sector_membership(data_dir, coverage_by_year):
         "stock_code": ["000001"], "sector_code": ["C"], "sector_name": ["制造业"],
     })
     df.to_parquet(sm_path, index=False, compression="lz4")
-    write_asset_manifest(sm_path, SECTOR_MEMBERSHIP_ASSET, df,
-                         coverage_by_year=coverage_by_year)
+    kwargs = {"coverage_by_year": coverage_by_year}
+    if coverage_by_year_daily is not None:
+        kwargs["coverage_by_year_daily"] = coverage_by_year_daily
+    write_asset_manifest(sm_path, SECTOR_MEMBERSHIP_ASSET, df, **kwargs)
     return sm_path
 
 
@@ -550,8 +556,9 @@ def test_formal_gate_aborts_stale_industry_ranking_lineage(tmp_path, monkeypatch
 
 
 def test_formal_gate_aborts_low_sector_coverage(tmp_path, monkeypatch):
-    """§v19 §十七: a market_env run over a year whose sector chain active-stock
-    coverage is below the 0.80 floor must abort with the coverage diagnosis."""
+    """§v19 §十七 (V14 §五): a market_env run over a year whose sector chain
+    per-year p05 daily active-stock coverage is below the 0.80 floor must abort
+    with the coverage diagnosis."""
     from scripts.production.train_panel_panel import _enforce_formal_manifests
 
     data_dir = _write_fresh_market_env(tmp_path, monkeypatch)
@@ -562,7 +569,7 @@ def test_formal_gate_aborts_low_sector_coverage(tmp_path, monkeypatch):
                                   "2024-12-31", {"market_env"})
     msg = str(ei.value)
     assert "sector active-stock coverage" in msg
-    assert "2024=0.50" in msg
+    assert "p05 daily (bar-based) = 0.50" in msg
     assert "< 0.8" in msg
 
 
@@ -578,3 +585,30 @@ def test_formal_gate_passes_adequate_sector_coverage(tmp_path, monkeypatch):
     assert _enforce_formal_manifests(
         ["000001"], data_dir, "2024-01-01", "2024-12-31",
         {"market_env"}) is None
+
+
+def test_formal_gate_reads_coverage_by_year_with_rich_daily_field(
+        tmp_path, monkeypatch):
+    """V14 §五: the gate reads the per-year p05 in ``coverage_by_year`` even
+    when the manifest ALSO carries the richer ``coverage_by_year_daily`` audit —
+    at/above threshold passes, a below-threshold p05 aborts regardless of the
+    daily field."""
+    from scripts.production.train_panel_panel import _enforce_formal_manifests
+
+    rich_daily = {"2024": {"mean": 0.99, "p05": 0.98, "days": 240,
+                           "days_below_0_80": 0, "days_below_0_95": 1}}
+    # p05 (0.98) at/above 0.80 → passes despite a sub-0.95 day in the audit.
+    data_dir = _write_fresh_market_env(tmp_path, monkeypatch)
+    _write_sector_membership(data_dir, {"2024": 0.98},
+                             coverage_by_year_daily=rich_daily)
+    assert _enforce_formal_manifests(
+        ["000001"], data_dir, "2024-01-01", "2024-12-31",
+        {"market_env"}) is None
+    # p05 (0.79) below 0.80 → aborts, daily field present or not.
+    data_dir2 = _write_fresh_market_env(tmp_path / "low", monkeypatch)
+    _write_sector_membership(data_dir2, {"2024": 0.79},
+                             coverage_by_year_daily=rich_daily)
+    with pytest.raises(SystemExit) as ei:
+        _enforce_formal_manifests(["000001"], data_dir2, "2024-01-01",
+                                  "2024-12-31", {"market_env"})
+    assert "p05 daily (bar-based) = 0.79" in str(ei.value)

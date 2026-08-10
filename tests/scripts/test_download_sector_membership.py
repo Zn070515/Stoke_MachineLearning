@@ -23,16 +23,18 @@ import pytest
 from scripts.production.download_sector_membership import (
     _CACHE_VERSION,
     _FETCH_ATTEMPTS,
-    _active_stocks_by_year,
     _coverage_by_year,
     _expand_stock,
     _expansion_bucket,
     _fetch_stock,
     _load_intervals_cache,
     _parser_hash,
+    _traded_counts_by_day,
     _write_intervals_cache,
+    _write_membership_asset,
     parse_cninfo_events,
 )
+from stoke_ml.data.storage import DataStorage
 
 
 def test_parse_cninfo_events_merges_csrc_labels_and_expands():
@@ -385,48 +387,142 @@ def test_expansion_bucket_never_upgrades_fetch_failed_to_complete():
     assert _expansion_bucket(_one_interval()) == "expand"
 
 
-# ── §v19 §十六: active-stock coverage denominator ───────────────────────────
+# ── §v19 §十六 (V14 §五/§六): bar-based daily active-stock coverage ──────────
 
-def test_coverage_by_year_uses_active_denominator():
-    """§v19 §十六: the coverage denominator is the stocks ACTIVE that year, not
-    the whole universe — a stock with no membership rows that year (pre-gate or
-    no-gate) lowers the fraction; a year with no rows reports 0.0."""
-    membership = pd.DataFrame({
-        "date": pd.to_datetime(["2010-03-15", "2010-06-01", "2010-09-01",
-                                "2010-11-20", "2010-12-05"]),
-        "stock_code": ["000001", "000002", "000003", "000004", "000005"],
-        "sector_code": ["C", "C", "C", "C", "C"],
-        "sector_name": ["制造业"] * 5,
+def _qfq_frame(code, dates):
+    """A well-formed qfq daily batch that survives the RESEARCH_QFQ_DAILY formal
+    contract (full OHLC + volume + amount + stock_code + pct_change)."""
+    dates = list(pd.to_datetime(dates))
+    n = len(dates)
+    closes = [10.0 + 0.1 * i for i in range(n)]
+    df = pd.DataFrame({
+        "date": dates,
+        "open": closes,
+        "high": [c + 0.5 for c in closes],
+        "low": [c - 0.5 for c in closes],
+        "close": closes,
+        "volume": [1e6] * n,
+        "amount": [1e8 * (i + 1) for i in range(n)],
+        "stock_code": code,
     })
-    out = _coverage_by_year(membership, {2010: 10, 2011: 10})
-    assert out == {"2010": 0.5, "2011": 0.0}
+    pct = pd.Series([float("nan")] * n)
+    if n > 1:
+        closes_s = pd.Series(closes, dtype="float64")
+        pct.iloc[1:] = 100.0 * closes_s.pct_change().iloc[1:].to_numpy()
+    df["pct_change"] = pct
+    df.attrs["source"] = "test"
+    df.attrs["adjustment_mode"] = "qfq"
+    return df
 
 
-def test_coverage_by_year_empty_membership_is_zero_for_all_active_years():
-    out = _coverage_by_year(pd.DataFrame(), {2010: 10, 2011: 10})
-    assert out == {"2010": 0.0, "2011": 0.0}
+def _write_daily(tmp_path, code, dates):
+    DataStorage(str(tmp_path)).save_daily(_qfq_frame(code, dates))
 
 
-def test_active_stocks_by_year_counts_manifest_span(tmp_path):
-    """A stock is active every year in its daily manifest [start, end]; a
-    missing/unreadable manifest is ignored (that stock counts nowhere)."""
-    daily_dir = str(tmp_path / "daily")
-    os.makedirs(daily_dir, exist_ok=True)
-    for code, start, end in [
-        ("000001", "2005-01-01", "2026-08-09"),
-        ("000002", "2010-06-01", "2020-12-31"),
-        ("000003", "2015-03-01", "2018-08-09"),
-    ]:
-        with open(os.path.join(daily_dir, f"{code}.manifest.json"),
-                  "w", encoding="utf-8") as f:
-            json.dump({"start": start, "end": end}, f)
-    out = _active_stocks_by_year(
-        daily_dir, ["000001", "000002", "000003", "000999"])
-    # 000999 has no manifest → never counted (conservative)
-    assert out[2005] == 1   # only 000001
-    assert out[2010] == 2   # 000001 + 000002
-    assert out[2015] == 3   # all three active in 2015
-    assert out[2018] == 3   # 000003 active through 2018
-    assert out[2021] == 1   # only 000001
-    assert 2006 in out      # gap-free span years are counted
-    assert 2004 not in out  # pre-span years are not
+def test_coverage_by_year_is_bar_based_daily_not_year_unique():
+    """§五 counterexample: 100 stocks each with a membership row ONLY on the last
+    trading day of 2020 must NOT report year coverage 1.0 (the old year-unique
+    metric counted a stock as covered for a whole year on ANY membership day).
+    The bar-based per-day metric reports ~1 classified day of ~261 → p05 ≈ 0."""
+    dates = pd.date_range("2020-01-02", "2020-12-31", freq="B")
+    traded = {pd.Timestamp(d): 100 for d in dates}
+    mem = pd.DataFrame({
+        "date": pd.to_datetime(["2020-12-31"] * 100),
+        "stock_code": [f"{i:06d}" for i in range(100)],
+        "sector_code": ["C"] * 100,
+        "sector_name": ["制造业"] * 100,
+    })
+    cov, daily = _coverage_by_year(mem, traded)
+    assert cov["2020"] < 0.01                      # ≈ 1/261, NOT 1.0
+    assert daily["2020"]["days"] == len(dates)
+    assert daily["2020"]["days_below_0_80"] == len(dates) - 1
+    assert daily["2020"]["days_below_0_95"] == len(dates) - 1
+
+
+def test_coverage_by_year_full_daily_coverage_reports_one():
+    """Positive control: all traded stocks classified on every day → per-day
+    coverage 1.0 → year p05 1.0."""
+    dates = pd.date_range("2020-01-02", "2020-12-31", freq="B")
+    traded = {pd.Timestamp(d): 2 for d in dates}
+    rows = []
+    for i, d in enumerate(dates):
+        rows.append({"date": d, "stock_code": "000001",
+                     "sector_code": "C", "sector_name": "制造业"})
+        rows.append({"date": d, "stock_code": "000002",
+                     "sector_code": "C", "sector_name": "制造业"})
+    mem = pd.DataFrame(rows)
+    cov, daily = _coverage_by_year(mem, traded)
+    assert cov["2020"] == 1.0
+    assert daily["2020"]["days_below_0_80"] == 0
+    assert daily["2020"]["days_below_0_95"] == 0
+
+
+def test_coverage_by_year_empty_membership_is_zero():
+    """A year with trading days but NO membership reads 0.0 (fail-closed), and
+    the richer audit still reports the day count."""
+    dates = pd.date_range("2020-01-02", "2020-12-31", freq="B")
+    traded = {pd.Timestamp(d): 100 for d in dates}
+    cov, daily = _coverage_by_year(pd.DataFrame(), traded)
+    assert cov["2020"] == 0.0
+    assert daily["2020"]["days"] == len(dates)
+    assert daily["2020"]["days_below_0_80"] == len(dates)
+
+
+def test_traded_counts_by_day_is_bar_based_denominator(tmp_path):
+    """§五: the active-stock denominator is BAR-BASED — a stock whose manifest
+    SPAN covers a day but that has NO bar that day is NOT active that day and
+    must not depress coverage.  ``000002`` has no 2020-01-02 bar, so only
+    ``000001`` is active then (coverage 1.0, not 1/2)."""
+    _write_daily(tmp_path, "000001", ["2020-01-02", "2020-01-03"])
+    _write_daily(tmp_path, "000002", ["2020-01-03"])   # no 2020-01-02 bar
+    storage = DataStorage(str(tmp_path))
+    traded = _traded_counts_by_day(storage, storage.list_stocks("a_shares"))
+    assert traded[pd.Timestamp("2020-01-02")] == 1    # only 000001
+    assert traded[pd.Timestamp("2020-01-03")] == 2
+    # 000001 is classified both days; 000002 has no bar on 01-02 and no gate.
+    mem = pd.DataFrame({
+        "date": pd.to_datetime(["2020-01-02", "2020-01-03"]),
+        "stock_code": ["000001", "000001"],
+        "sector_code": ["C", "C"], "sector_name": ["制造业", "制造业"],
+    })
+    cov, daily = _coverage_by_year(mem, traded)
+    # 2020-01-02: only 000001 trades → coverage 1.0 (a manifest-span denominator
+    # would count 000002 as active → 0.5).  Only 2020-01-03 (000002 trades but
+    # is unclassified → 0.5) falls below the floor.
+    assert daily["2020"]["days_below_0_80"] == 1
+    assert daily["2020"]["days_below_0_95"] == 1
+
+
+def test_traded_counts_fail_closed_on_missing_manifest(tmp_path):
+    """§六: a requested stock whose daily MANIFEST is missing/unreadable must
+    RAISE the coverage audit — never silently drop the stock (which would shrink
+    the denominator and inflate coverage)."""
+    _write_daily(tmp_path, "000001", ["2020-01-02", "2020-01-03"])
+    _write_daily(tmp_path, "000002", ["2020-01-03"])
+    os.remove(os.path.join(str(tmp_path), "a_shares", "daily",
+                           "000002.manifest.json"))
+    storage = DataStorage(str(tmp_path))
+    with pytest.raises(ValueError):
+        _traded_counts_by_day(storage, storage.list_stocks("a_shares"))
+
+
+def test_manifest_writes_coverage_by_year_daily(tmp_path):
+    """The asset manifest carries BOTH the gate-facing ``coverage_by_year``
+    (per-year p05) AND the richer ``coverage_by_year_daily`` audit."""
+    dates = pd.date_range("2020-01-02", "2020-12-31", freq="B")
+    traded = {pd.Timestamp(d): 100 for d in dates}
+    mem = pd.DataFrame({
+        "date": pd.to_datetime(["2020-12-31"] * 100),
+        "stock_code": [f"{i:06d}" for i in range(100)],
+        "sector_code": ["C"] * 100,
+        "sector_name": ["制造业"] * 100,
+    })
+    cov, daily = _coverage_by_year(mem, traded)
+    out = str(tmp_path / "sector_membership.parquet")
+    _write_membership_asset(out, mem, cov, daily)
+    with open(out + ".manifest.json", "r", encoding="utf-8") as f:
+        m = json.load(f)
+    assert m["coverage_by_year"]["2020"] == cov["2020"]
+    assert m["coverage_by_year_daily"]["2020"]["days"] == len(dates)
+    assert m["coverage_by_year_daily"]["2020"]["days_below_0_80"] == \
+        len(dates) - 1

@@ -14,8 +14,9 @@ classification onto historical rows; it only asserts what CNINFO proves.
 Output: ``a_shares/sector_membership.parquet``
     ``[date, stock_code, sector_code, sector_name]`` — per-date long membership
     over each stock's OWN trading days (from ``DataStorage.load_daily``),
-    plus a per-year coverage audit in the asset manifest (``coverage_by_year``)
-    and a fail-closed run manifest.
+    plus a per-year coverage audit in the asset manifest (``coverage_by_year``
+    = per-year p05 of the BAR-BASED daily active-stock coverage, §五; and the
+    richer ``coverage_by_year_daily``) and a fail-closed run manifest.
 
 Resumability: per-stock parsed intervals are cached under
 ``a_shares/sector_membership_pit/_stocks/{code}.json``; a re-run skips already-
@@ -39,6 +40,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import pandas as pd
 
 from stoke_ml.config import load_config
@@ -372,56 +374,108 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
     return intervals
 
 
-# ── per-year coverage audit ──────────────────────────────────────────────────
+# ── per-year coverage audit (bar-based, V14 §五/§六) ─────────────────────────
 
-def _active_stocks_by_year(daily_dir: str, codes: list[str]) -> dict[int, int]:
-    """``{calendar year: count of stocks whose daily span covers that year}``.
+def _traded_counts_by_day(storage: DataStorage,
+                          codes: list[str]) -> dict[pd.Timestamp, int]:
+    """``{trading day: count of stocks with a daily bar that day}``.
 
-    A stock is active for every year in ``[start_year, end_year]`` taken from
-    its ``daily/{code}.manifest.json`` ``start``/``end`` (ISO).  A missing or
-    unreadable manifest is ignored — that stock is active NOWHERE
-    (conservative), so the coverage denominator never over-counts (§v19 §十六).
+    The bar-based active-stock denominator (V14 §五): a stock counts as active on
+    day ``d`` ONLY if it has a daily K-line bar on ``d`` — exactly the universe
+    the real chain (``download_industry_ranking``) sees when it INNER-joins
+    daily bars on ``(date, stock_code)``.  The read is the SAME canonical formal
+    read (``require_valid_manifest=True``) the chain uses, so a stock whose daily
+    manifest is missing or unreadable RAISES — it would abort the chain's build
+    too, and silently dropping it would shrink the denominator and INFLATE
+    coverage (V14 §六, the anti-conservative defect).
     """
-    counts: dict[int, int] = {}
+    traded: dict[pd.Timestamp, int] = {}
     for code in codes:
-        try:
-            with open(os.path.join(daily_dir, f"{code}.manifest.json"),
-                      "r", encoding="utf-8") as f:
-                m = json.load(f)
-            start_s = m.get("start")
-            end_s = m.get("end")
-            if not start_s or not end_s:
-                continue
-            start = pd.Timestamp(start_s).year
-            end = pd.Timestamp(end_s).year
-        except (OSError, ValueError, TypeError, AttributeError,
-                json.JSONDecodeError):
+        d = storage.load_daily(code, "1970-01-01", "2099-12-31",
+                               require_valid_manifest=True)
+        if d is None or d.empty:
             continue
-        for y in range(start, end + 1):
-            counts[y] = counts.get(y, 0) + 1
-    return counts
+        for x in pd.to_datetime(d["date"]).dt.normalize():
+            traded[x] = traded.get(x, 0) + 1
+    return traded
 
 
-def _coverage_by_year(membership: pd.DataFrame,
-                      active_by_year: dict[int, int]) -> dict:
-    """``{year: fraction of stocks ACTIVE that year with an asserted gate}``.
+def _coverage_by_year(
+    membership: pd.DataFrame,
+    traded_by_day: dict[pd.Timestamp, int],
+) -> tuple[dict, dict]:
+    """Per-year coverage audit from the bar-based per-day coverage.
 
-    The honest-PIT audit the review demanded: pre-gate years (and no-gate
-    stocks) simply have no membership rows, so the per-year fraction against
-    the stocks actually trading that year reveals exactly how far back CNINFO
-    can assert a classification (§v19 §十六).  A year with no membership rows
-    reports ``0.0``; an empty membership reports ``0.0`` for every active year.
+    ``coverage[d] = classified_stocks_traded_on_d / stocks_traded_on_d`` where
+    the denominator is ``traded_by_day`` (bar-based, V14 §五) and the numerator
+    is the number of stocks with an asserted CSRC gate row on ``d`` — membership
+    rows are bar-aligned (every row sits on one of the stock's own trading days),
+    so no manifest-span definition is involved.
+
+    Returns ``(coverage_by_year, coverage_by_year_daily)``:
+
+    * ``coverage_by_year``: ``{str(year): p05 daily coverage}`` (rounded 4dp) —
+      the shape the formal gate reads.  A year with trading days but no
+      membership (or no trading days) reads ``0.0`` (fail-closed).
+    * ``coverage_by_year_daily``: ``{str(year): {mean, p05, days,
+      days_below_0_80, days_below_0_95}}`` — the richer audit.
     """
-    if membership is None or membership.empty:
-        return {str(int(y)): 0.0 for y in active_by_year}
-    g = membership.copy()
-    g["year"] = pd.to_datetime(g["date"]).dt.year
-    cov = g.groupby("year")["stock_code"].nunique()
-    out = {}
-    for y, active in active_by_year.items():
-        v = cov.get(y, 0) / max(int(active), 1)
-        out[str(int(y))] = float(round(v, 4))
-    return out
+    days = pd.DatetimeIndex(
+        sorted({pd.Timestamp(d).normalize() for d in traded_by_day}))
+    if membership is not None and not membership.empty:
+        g = membership.copy()
+        g["_d"] = pd.to_datetime(g["date"]).dt.normalize()
+        classified = (g.groupby("_d").size()
+                      .reindex(days, fill_value=0).astype(int))
+    else:
+        classified = pd.Series(0, index=days, dtype=int)
+    traded = pd.Series(
+        [int(traded_by_day.get(d, 0)) for d in days], index=days, dtype=int)
+    cov = np.where(traded > 0, classified / np.maximum(traded, 1), np.nan)
+    years = sorted({pd.Timestamp(d).year for d in days})
+    coverage_by_year: dict[str, float] = {}
+    coverage_by_year_daily: dict[str, dict] = {}
+    for y in years:
+        ymask = np.array([pd.Timestamp(d).year == y for d in days])
+        valid = cov[ymask]
+        n_days = int(ymask.sum())
+        valid = valid[~np.isnan(valid)]
+        if len(valid) == 0:
+            p05 = 0.0
+            mean = 0.0
+            below80 = 0
+            below95 = 0
+        else:
+            p05 = float(np.percentile(valid, 5))
+            mean = float(valid.mean())
+            below80 = int((valid < 0.80).sum())
+            below95 = int((valid < 0.95).sum())
+        coverage_by_year[str(y)] = round(p05, 4)
+        coverage_by_year_daily[str(y)] = {
+            "mean": round(mean, 4),
+            "p05": round(p05, 4),
+            "days": n_days,
+            "days_below_0_80": below80,
+            "days_below_0_95": below95,
+        }
+    return coverage_by_year, coverage_by_year_daily
+
+
+def _write_membership_asset(out_path: str, membership: pd.DataFrame,
+                            coverage_by_year: dict,
+                            coverage_by_year_daily: dict) -> dict:
+    """Atomically write the membership parquet + asset manifest carrying the
+    per-year coverage audit — both the gate-facing ``coverage_by_year`` (p05
+    daily) and the richer ``coverage_by_year_daily`` field."""
+    membership.attrs["source"] = (
+        "CNINFO industry-classification change history "
+        "(AKShare stock_industry_change_cninfo)")
+    with AtomicCommit(out_path) as ac:
+        membership.to_parquet(ac.tmp_path, index=False, compression="lz4")
+    return write_asset_manifest(
+        out_path, SECTOR_MEMBERSHIP_ASSET, membership,
+        coverage_by_year=coverage_by_year,
+        coverage_by_year_daily=coverage_by_year_daily)
 
 
 def main() -> None:
@@ -508,20 +562,17 @@ def main() -> None:
     membership = membership.sort_values(["date", "stock_code"]).reset_index(drop=True)
     membership = membership[["date", "stock_code", "sector_code", "sector_name"]]
 
-    # 3. Write parquet + asset manifest + per-year coverage audit.  The
-    #    coverage denominator is the stocks ACTIVE each year (from each daily
-    #    manifest's start/end span), not the whole universe (§v19 §十六).
+    # 3. Write parquet + asset manifest + per-year coverage audit.  The metric
+    #    is BAR-BASED (V14 §五): per trading day d,
+    #    coverage[d] = (stocks with an asserted gate row on d) /
+    #                  (stocks with a daily bar on d).
+    #    The denominator is read from each stock's canonical formal daily read
+    #    (the same read the real chain performs) and FAILS CLOSED on a missing /
+    #    unreadable manifest — never a silently shrunk denominator (V14 §六).
     out_path = os.path.join(base, "sector_membership.parquet")
-    daily_dir = os.path.join(base, "daily")
-    active_by_year = _active_stocks_by_year(daily_dir, codes)
-    coverage = _coverage_by_year(membership, active_by_year)
-    membership.attrs["source"] = (
-        "CNINFO industry-classification change history "
-        "(AKShare stock_industry_change_cninfo)")
-    with AtomicCommit(out_path) as ac:
-        membership.to_parquet(ac.tmp_path, index=False, compression="lz4")
-    write_asset_manifest(out_path, SECTOR_MEMBERSHIP_ASSET, membership,
-                         coverage_by_year=coverage)
+    traded_by_day = _traded_counts_by_day(storage, codes)
+    coverage, coverage_daily = _coverage_by_year(membership, traded_by_day)
+    _write_membership_asset(out_path, membership, coverage, coverage_daily)
     logger.info("Saved %d membership rows (%d stocks) to %s",
                 len(membership), membership["stock_code"].nunique(), out_path)
 
@@ -536,8 +587,8 @@ def main() -> None:
     )
     logger.info("Run manifest: %d requested, %d complete, %d failed",
                 len(codes), len(complete), len(failed))
-    logger.info("Per-year gate coverage (fraction of stocks ACTIVE that year "
-                "with an asserted 门类 gate):")
+    logger.info("Per-year gate coverage (p05 of BAR-BASED daily active-stock "
+                "coverage — stocks traded that day with an asserted 门类 gate):")
     if coverage:
         for y in sorted(coverage):
             logger.info("  %s: %.1f%%", y, coverage[y] * 100.0)

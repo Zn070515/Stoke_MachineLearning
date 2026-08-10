@@ -1469,12 +1469,16 @@ def _fmt_manifest_problem(path: str, report: dict) -> str:
     return f"{path}: " + "; ".join(report.get("mismatches") or ["manifest mismatch"])
 
 
-#: §v19 §十七: a formal market_env run requires, per calendar year in its date
-#: range, that the sector chain's active-stock coverage meet this floor.  The
-#: floor is read from the sector_membership asset manifest's per-year audit
-#: (``coverage_by_year``: fraction of stocks ACTIVE that year with an asserted
-#: CNINFO gate); a year below it means the sector inputs cannot honestly support
-#: a headline market_env over that era.
+#: §v19 §十七 (V14 §五): a formal market_env run requires, per calendar year in
+#: its date range, that the sector chain's active-stock coverage meet this floor.
+#: ``coverage_by_year`` is the per-year p05 of the BAR-BASED DAILY active-stock
+#: coverage (stocks traded that day with an asserted CNINFO gate / stocks traded
+#: that day), the same universe the real chain sees when it INNER-joins daily
+#: bars on ``(date, stock_code)``.  The measurement probe
+#: (scripts/diagnostics/_probe_sector_daily_coverage.py) confirms every year
+#: 2000+ has p05 ≥ 0.976, so the default ``--start 2000-01-01`` and this 0.80
+#: floor both stay valid; a year below the floor means the sector inputs cannot
+#: honestly support a headline market_env over that era.
 SECTOR_COVERAGE_THRESHOLD = 0.80
 
 
@@ -1698,8 +1702,10 @@ def _enforce_formal_manifests(
                     # §v19 §十七: a formal market_env run requires, per calendar
                     # year in its date range, that the sector chain's active-stock
                     # coverage meet the floor — a pre-gate era (or a no-gate
-                    # universe) cannot feed a headline market_env.  A missing year
-                    # reads as 0.0 (fail-closed).
+                    # universe) cannot feed a headline market_env.  The value is
+                    # the per-year p05 of the BAR-BASED daily active-stock
+                    # coverage (V14 §五).  A missing year reads as 0.0
+                    # (fail-closed).
                     sm_path = os.path.join(data_dir, "a_shares",
                                            "sector_membership.parquet")
                     if os.path.isfile(sm_path):
@@ -1729,8 +1735,9 @@ def _enforce_formal_manifests(
                                 if frac < SECTOR_COVERAGE_THRESHOLD:
                                     problems.append(
                                         f"{sm_path}: sector active-stock coverage "
-                                        f"{y}={frac:.2f} < {SECTOR_COVERAGE_THRESHOLD} "
-                                        "(§v19 §十七) — re-run "
+                                        f"{y}: p05 daily (bar-based) = {frac:.2f} "
+                                        f"< {SECTOR_COVERAGE_THRESHOLD} (§v19 §十七/"
+                                        "V14 §五) — re-run "
                                         "download_sector_membership.py / expand "
                                         "CNINFO gate history")
         else:

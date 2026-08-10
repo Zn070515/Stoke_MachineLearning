@@ -99,10 +99,18 @@ sector_name]`，CSRC 门类 A-S 级别，合并证监会 2001 / 2012 / 中国上
 在 `a_shares/sector_membership_pit/_stocks/{code}.json`，支持断点续爬
 （§十九：缓存携带 `cache_version`/`parser_hash`/`source`/区间，不匹配即整体重爬一次；
 §十八：CNINFO 空结果仅认 `KeyError('变更日期')` 签名，其它列索引 KeyError 一律 re-raise）。
-run manifest 记录 `coverage_by_year`——**活动股分母**（§十六，读每只 daily
-manifest 的 start/end 算当年 active 股票数），早期年份远高于旧 universe 分母
-（2002+ 均 ≥ 97.8%）。`complete` 仅在 fetch + 正式 daily 读取
-（`require_valid_manifest=True`）+ 展开全部成功后授予（§十五）。
+run manifest 记录 `coverage_by_year`——**每年 p05 日频活动股覆盖率（bar-based，
+V14 §五）**：`coverage[d] = 当日有 CSRC 门类断言且交易的股票 / 当日有 daily bar
+的股票`（分母读每只 daily 的 bar 日期，正式读 `require_valid_manifest=True`，
+与 real chain 的 INNER join 同 universe；不做 manifest-span 分母——那会在
+2015-2018 停牌潮虚造 dip）。同时记录更细的 `coverage_by_year_daily`
+（`{mean, p05, days, days_below_0_80, days_below_0_95}`）。测量探针
+`scripts/diagnostics/_probe_sector_daily_coverage.py` 证实 bar-based 下 2000+
+每年 p05 ≥ 0.976、frac(days≥0.80)=1.0，故默认 `--start 2000-01-01` 与 0.80 门槛
+均维持有效（旧 year-unique 口径的「2002+ 均 ≥97.8%」已废弃）。§六：任一 requested
+股票 daily manifest 缺失/不可读 → coverage 审计直接 raise（fail-closed），绝不静默
+缩小分母。`complete` 仅在 fetch + 正式 daily 读取（`require_valid_manifest=True`）
++ 展开全部成功后授予（§十五）。
 
 `download_industry_ranking.py` 优先读这份 membership（date+stock_code INNER
 join → 诚实剔除未分类日），读取前用 `validate_asset_manifest` 校验（§十三）。
@@ -122,7 +130,8 @@ key 时保守标 `proxy`，绝不静默升级为 `verified`）。`highs_lows` �
 present 但 manifest 缺失 / tamper 即拒绝，文件整体缺失仍按 absent 降级。
 formal 的 `market_env` 运行
 还要求每年 sector 活动股覆盖 ≥ `SECTOR_COVERAGE_THRESHOLD=0.80`（§十七，
-缺失年份按 0.0 fail-closed）。
+指标即 `coverage_by_year` 的**每年 p05 日频 bar-based 覆盖率**，V14 §五；
+实测 2000+ 每年 p05 ≥ 0.976，全部达标；缺失年份按 0.0 fail-closed）。
 
 注意：`industry` 通道的 `channel_vintage` 声明仍标 `pit_alignment=proxy`
 （v18 §二十-9，代码未改）；数据已 PIT，正式 vintage 标签升级留待后续独立决策。
