@@ -30,6 +30,20 @@ Design notes
 - Each worker process builds its OWN ``AShareDownloader`` and ``DataStorage``
   (both hold per-process circuit-breaker / connection / lock state and must not
   be shared across processes).
+
+Known limitation: the qfq-anchor seam
+-------------------------------------
+Each tail fetch is a fresh 前复权 (qfq) batch anchored to the LATEST date, while
+the stored history keeps its migrated anchor.  When a corporate action
+(dividend / split) occurs INSIDE the stale window, the two anchors differ and a
+price-level seam appears exactly at the merge boundary.  ``save_daily``'s §八-2
+gate only compares the ``adjust`` LABEL ("qfq") — both sides carry it — so the
+seam is not detected.  This is accepted for the unblock: August is low
+corporate-action season, and a full re-download would re-anchor the history but
+reintroduce the migration risk this incremental refresh exists to avoid.  The
+panel feature build that consumes the refreshed daily inherits the same seam, so
+the formal gate's return / ``feature_pct`` series stays internally self-
+consistent even though cross-window price levels are not perfectly comparable.
 """
 from __future__ import annotations
 
@@ -59,10 +73,15 @@ def manifest_end(data_dir: str, code: str) -> str | None:
     """Best-known last trading day on disk for ``code``.
 
     The per-stock contract manifest's ``end`` field is authoritative.  When it
-    is missing/unparseable, fall back to the flat parquet's max ``date`` (the
-    manifest may be absent for a legacy file).  Returns ``None`` when neither
-    yields a usable end — the caller then cannot compute a tail window and must
-    not fetch a full history.
+    is missing, unparseable (bad JSON) or holds a non-date value, fall back to
+    the flat parquet's max ``date`` (the manifest may be absent for a legacy
+    file).  Returns ``None`` when neither yields a usable end — the caller then
+    cannot compute a tail window and must not fetch a full history.
+
+    The end VALUE is validated (parses as a real date) before it is trusted: a
+    manifest that parses as JSON but carries ``"end": "garbage"`` must NOT crash
+    the parent process when ``needs_refresh``/``tail_start_of`` parse it — it is
+    routed to the parquet fallback and, failing that, to ``unknown``.
     """
     daily_dir = os.path.join(data_dir, "a_shares", "daily")
     manifest_path = os.path.join(daily_dir, f"{code}.manifest.json")
@@ -74,7 +93,13 @@ def manifest_end(data_dir: str, code: str) -> str | None:
         except (OSError, ValueError):
             end = None
     if end:
-        return str(end)
+        try:
+            parsed = pd.Timestamp(str(end))
+            if pd.isna(parsed):
+                raise ValueError(f"{end!r} parses to NaT")
+            return parsed.strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001 - non-date manifest end → parquet fallback
+            pass
     try:
         dates = pd.read_parquet(
             os.path.join(daily_dir, f"{code}.parquet"), columns=["date"]
@@ -172,8 +197,8 @@ def main() -> None:
         description="Bring stale daily K-line tails current (incremental, "
                     "existing files only)")
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--jobs", type=int, default=8,
-                        help="Worker processes (default: 8)")
+    parser.add_argument("--jobs", type=int, default=4,
+                        help="Worker processes (default: 4)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the refresh plan counts without fetching")
     parser.add_argument("--codes", type=str, default=None,

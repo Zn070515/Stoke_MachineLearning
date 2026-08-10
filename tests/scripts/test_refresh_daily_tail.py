@@ -129,6 +129,14 @@ def test_manifest_end_none_when_unreadable(tmp_path):
     assert manifest_end(str(tmp_path), "000003") is None
 
 
+def test_manifest_end_unparseable_manifest_end_falls_back_to_parquet(tmp_path):
+    # The manifest parses as JSON but its ``end`` value is not a date.  The
+    # parquet's max date must be used instead of crashing on the bad value.
+    _write_fake_stock(str(tmp_path), "000004", "2026-07-23",
+                      manifest_end="garbage")
+    assert manifest_end(str(tmp_path), "000004") == "2026-07-23"
+
+
 # ── build_plan: dry-run counts ─────────────────────────────────────────────
 
 def test_build_plan_counts_and_tail_starts(tmp_path):
@@ -160,3 +168,43 @@ def test_build_plan_unknown_end(tmp_path):
     assert current == ["000001"]
     assert plan == []
     assert unknown == ["000002"]
+
+
+def test_build_plan_unparseable_manifest_end_does_not_raise(tmp_path):
+    # I-2: a manifest whose ``end`` is a non-date must NOT crash the parent
+    # process inside build_plan.  With a readable parquet it falls back to the
+    # parquet date (→ refresh); with an unreadable parquet it routes to unknown.
+    target = "2026-08-07"
+    _write_fake_stock(str(tmp_path), "000001", "2026-07-23",
+                      manifest_end="garbage")                 # fallback → refresh
+    _write_unreadable_parquet(str(tmp_path), "000002")        # fallback fails → unknown
+    with open(os.path.join(str(tmp_path), "a_shares", "daily",
+                           "000002.manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"stock": "000002", "end": "garbage"}, f)
+
+    current, plan, unknown = build_plan(
+        ["000001", "000002"], str(tmp_path), target, CAL)
+
+    assert current == []
+    assert [p["code"] for p in plan] == ["000001"]
+    assert plan[0]["tail_start"] == "2026-07-24"  # day after the parquet date
+    assert unknown == ["000002"]
+
+
+def test_build_plan_never_fetches_full_history_for_old_end(tmp_path):
+    # I-4: a stock whose manifest end is far in the past must still fetch ONLY
+    # from the next trading day after that end — never from history start.
+    target = "2026-08-07"
+    _write_fake_stock(str(tmp_path), "000001", "2015-01-01")
+
+    current, plan, unknown = build_plan(
+        ["000001"], str(tmp_path), target, CAL)
+
+    assert current == []
+    assert unknown == []
+    assert len(plan) == 1
+    # 2015-01-01 is 元旦; trading resumes Monday 2015-01-05.  The tail start is
+    # a 2015 near-date — NOT 2000-01-04 (history start) or anything at the
+    # requested window's base.
+    assert plan[0]["tail_start"] == "2015-01-05"
+    assert plan[0]["tail_start"].startswith("2015-")
