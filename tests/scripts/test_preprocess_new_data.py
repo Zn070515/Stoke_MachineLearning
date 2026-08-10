@@ -41,7 +41,7 @@ class _FakeStorageFactory:
         return _RAW.copy()
 
     def save(self, df, replace_range=False, *, degrade_threshold=0.2,
-             provenance=None, replace_window=None):
+             provenance=None, replace_window=None, force=False):
         self.saved.append(df.copy())
         return 0
 
@@ -69,7 +69,7 @@ def _quality_pipeline():
 def _args(**overrides):
     base = dict(
         no_formal=False, allow_degraded=False, strict=False,
-        save_to=None, degrade_threshold=0.2,
+        force=False, save_to=None, degrade_threshold=0.2,
         start="2024-01-01", end="2024-12-31",
     )
     base.update(overrides)
