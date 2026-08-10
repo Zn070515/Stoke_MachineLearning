@@ -62,6 +62,7 @@ import pandas as pd
 
 from scripts.production.data_quality_gate import dataset_fingerprint
 from scripts.production.download_industry_ranking import INDUSTRY_RANKING_ASSET
+from scripts.production.download_market_breadth import HIGH_LOWS_ASSET
 from stoke_ml.config import load_config
 from stoke_ml.config.feature_profile import (
     MARKET_ENV_ACCOUNT_COLS,
@@ -322,11 +323,20 @@ def build_market_env(data_dir: str) -> tuple[pd.DataFrame, dict]:
 
 
 def _build_high_low_ratio(base: str) -> pd.Series:
-    """high20/(high20+low20) breadth from highs_lows.parquet (VERIFIED part)."""
+    """high20/(high20+low20) breadth from highs_lows.parquet (VERIFIED part).
+
+    §v19: a PRESENT highs_lows must first pass its own HIGH_LOWS_ASSET manifest
+    check (``require_valid_manifest=True``, fail-closed) — a bare or tampered
+    parquet is never silently trusted as market breadth.  The absent-file case
+    returns empty (a missing file is not a manifest problem; the
+    required-price-column assertion downstream handles absence), matching the
+    ``build_industry_advance`` convention.
+    """
     path = os.path.join(base, "market_breadth", "highs_lows.parquet")
     if not os.path.exists(path):
         return pd.Series(dtype="float64")
     hl = pd.read_parquet(path)
+    check_asset_read(path, HIGH_LOWS_ASSET, hl, require_valid_manifest=True)
     if "date" not in hl.columns or "high20" not in hl.columns or "low20" not in hl.columns:
         return pd.Series(dtype="float64")
     hl["date"] = pd.to_datetime(hl["date"]).dt.normalize()

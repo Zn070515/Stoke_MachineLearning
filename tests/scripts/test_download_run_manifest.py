@@ -98,6 +98,45 @@ def test_market_breadth_manifest_failure_exits_nonzero(tmp_path, monkeypatch):
     assert not _manifest_path(tmp_path, dmb).is_file()
 
 
+def test_market_breadth_writes_valid_high_lows_asset_manifest(tmp_path, monkeypatch):
+    """§v19: writing market_breadth/highs_lows.parquet ALSO writes a valid
+    HIGH_LOWS_ASSET manifest (per-file content manifest) — the same
+    write_asset_manifest pattern sector_membership / industry_ranking use — so
+    build_market_env's formal read can verify the file.  The manifest honestly
+    declares the channel's vintage: same-day trade breadth → verified PIT."""
+    from stoke_ml.data.asset_contract import validate_asset_manifest
+    from scripts.production.download_market_breadth import HIGH_LOWS_ASSET
+
+    class _BreadthHL:
+        def fetch_all(self):
+            return {
+                "highs_lows": pd.DataFrame({
+                    "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                    "close": [2982.0, 2957.0],
+                    "high20": [202, 74],
+                    "low20": [886, 2145],
+                }),
+                "account_stats": pd.DataFrame({
+                    "数据日期": ["2026-08"],
+                    "新增投资者-数量": [1.0],
+                    "沪深总市值": [1.0],
+                    "沪深户均市值": [1.0],
+                }),
+            }
+
+    rc = _run(monkeypatch, tmp_path, dmb, MarketBreadthSource=_BreadthHL)
+    assert rc is None
+    assert _manifest_path(tmp_path, dmb).is_file()
+    hl = os.path.join(str(tmp_path / "data"), "a_shares", "market_breadth",
+                      "highs_lows.parquet")
+    assert os.path.isfile(hl)
+    report = validate_asset_manifest(hl, HIGH_LOWS_ASSET)
+    assert report["ok"], report["mismatches"]
+    # honest vintage: same-day trade breadth is verified-by-nature PIT
+    assert report["manifest"]["vintage_source"] == "immutable_snapshot"
+    assert report["manifest"]["vintage_pit"] == "verified"
+
+
 # ── download_index_constituent ───────────────────────────────────────
 
 class _ConstituentSource:

@@ -234,6 +234,18 @@ CHANNEL_VINTAGE: tuple[ChannelVintageStatus, ...] = (
         rationale="Daily 大宗交易 records are exchange-reported events recorded "
                   "for the trading day.",
     ),
+    ChannelVintageStatus(
+        channel="highs_lows",
+        source_vintage="immutable_snapshot",
+        transform="raw",
+        pit_alignment="verified",
+        rationale="Daily market-wide new-high/new-low breadth counts (high20/"
+                  "low20) are an exchange/statistics snapshot recorded for the "
+                  "trading day, not later rewritten.  Stored as-fetched (raw) — "
+                  "the breadth ratio is derived downstream.  Same-day trade "
+                  "data → verified PIT, matching the market_env price part's "
+                  "high/low breadth declaration.",
+    ),
     # ── immutable_snapshot: immutable event schedules ─────────────────────────
     ChannelVintageStatus(
         channel="lockup",

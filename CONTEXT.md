@@ -83,6 +83,7 @@
 **通道采用状态（T9 收口）**：
 - `industry_returns.parquet`（`INDUSTRY_ASSET`）：`download_industry.py` 原子写 + manifest；formal gate 校验。
 - `market_env_daily.parquet`（`MARKET_ENV_ASSET`）：`build_market_env.py` 原子写 + manifest（含 price/account 分列 `parts`）；formal gate 校验。
+- `market_breadth/highs_lows.parquet`（`HIGH_LOWS_ASSET`，`download_market_breadth.py`）：market_env PRICE 上游，写 parquet 后原子写 manifest（same-day 广度 → verified PIT）；`build_market_env` 消费时 `check_asset_read(require_valid_manifest=True)` fail-closed。
 - `forecasts.parquet` / `express.parquet`（`EARNINGS_ASSET`，`download_earnings.py` `_accumulate` 对两个文件写 manifest）：**governance-only** —— earnings 是 `latest_revised` 源（revision-safe 不要求，manifest 只记录 provenance / 统一治理），不进 formal required 集。
 - `stock_industry_map.parquet`：无 manifest（无 consumer / formal gate 要求，T9 不改）。
 - **cninfo announcement-sentiment 路径**（`a_shares/cninfo_announcements/sentiment/`）：无 storage/manifest 支持 —— formal 模式下显式拒绝（`use --prebuilt or add a DataAssetContract writer`），T9 维持显式排除，不补 writer。
@@ -116,7 +117,10 @@ STALE → market_env 链 fail（Tuesday bug 兜住）。`market_adv_ratio` 是
 **证监会门类广谱涨跌比率**（§二十，A-S 门类等权正收益占比，非单行业指标）；
 `build_market_env` 消费时用 `check_asset_read(require_valid_manifest=True)`
 校验 ranking，并把 pit 声明进 `parts.price.industry_advance_pit`（manifest 缺
-key 时保守标 `proxy`，绝不静默升级为 `verified`）。formal 的 `market_env` 运行
+key 时保守标 `proxy`，绝不静默升级为 `verified`）。`highs_lows` 同理：
+`_build_high_low_ratio` 读 `HIGH_LOWS_ASSET` manifest fail-closed —— 文件
+present 但 manifest 缺失 / tamper 即拒绝，文件整体缺失仍按 absent 降级。
+formal 的 `market_env` 运行
 还要求每年 sector 活动股覆盖 ≥ `SECTOR_COVERAGE_THRESHOLD=0.80`（§十七，
 缺失年份按 0.0 fail-closed）。
 

@@ -64,12 +64,21 @@ def _write_account_stats(tmp_path, *, publish_col=None):
 def _write_highs_lows(tmp_path):
     br = tmp_path / "a_shares" / "market_breadth"
     br.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({
+    rows = pd.DataFrame({
         "date": ["2024-07-03", "2024-07-04", "2024-07-05"],
         "close": [2982.38, 2957.57, 2949.93],
         "high20": [202, 74, 135],
         "low20": [886, 2145, 579],
-    }).to_parquet(br / "highs_lows.parquet", index=False)
+    })
+    rows.to_parquet(br / "highs_lows.parquet", index=False)
+    # §v19: highs_lows is a GOVERNED asset — the fixture writes its
+    # HIGH_LOWS_ASSET manifest too (mirroring download_market_breadth.main)
+    # because _build_high_low_ratio now consumes the file fail-closed
+    # (require_valid_manifest=True): a bare parquet without its manifest is no
+    # longer a valid input.
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_market_breadth import HIGH_LOWS_ASSET
+    write_asset_manifest(str(br / "highs_lows.parquet"), HIGH_LOWS_ASSET, rows)
 
 
 def _write_industry(tmp_path):
@@ -222,6 +231,12 @@ def test_build_market_env_price_cols_from_real_upstream(bme, tmp_path):
     hl = pd.DataFrame({"date": ["2024-01-02", "2024-01-03"],
                        "high20": [10.0, 12.0], "low20": [8.0, 9.0]})
     hl.to_parquet(daily / "market_breadth" / "highs_lows.parquet", index=False)
+    # §v19: highs_lows is consumed fail-closed — the fixture writes its
+    # HIGH_LOWS_ASSET manifest (mirroring download_market_breadth.main).
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_market_breadth import HIGH_LOWS_ASSET
+    write_asset_manifest(str(daily / "market_breadth" / "highs_lows.parquet"),
+                         HIGH_LOWS_ASSET, hl)
     from stoke_ml.data.storage import DataStorage
     DataStorage(str(tmp_path)).save_daily(_qfq_frame(
         "000001", ["2024-01-02", "2024-01-03"], [1e6, 2e6]))
@@ -269,6 +284,63 @@ def test_build_industry_advance_proxy_when_manifest_lacks_pit(bme, tmp_path):
     series, pit = bme.build_industry_advance(str(daily))
     assert pit == "proxy"
     assert not series.empty
+
+
+# ── highs_lows is a governed asset: formal read, fail-closed (§v19) ────────
+
+def test_high_low_ratio_computed_from_valid_asset(bme, tmp_path):
+    """A PRESENT highs_lows.parquet WITH a valid HIGH_LOWS_ASSET manifest is
+    read formally and high_low_ratio is computed as before — no regression."""
+    _write_highs_lows(tmp_path)
+    series = bme._build_high_low_ratio(str(tmp_path / "a_shares"))
+    assert not series.empty
+    assert abs(series.loc["2024-07-03"] - 202 / (202 + 886)) < 1e-9
+    assert abs(series.loc["2024-07-04"] - 74 / (74 + 2145)) < 1e-9
+
+
+def test_high_low_ratio_fails_closed_on_bare_parquet(bme, tmp_path):
+    """§v19: a PRESENT highs_lows.parquet WITHOUT its HIGH_LOWS_ASSET manifest
+    must ABORT the breadth build (require_valid_manifest=True, fail-closed) — a
+    bare highs_lows is never silently trusted as market breadth."""
+    br = tmp_path / "a_shares" / "market_breadth"
+    br.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "date": ["2024-07-03", "2024-07-04"],
+        "close": [2982.38, 2957.57],
+        "high20": [202, 74],
+        "low20": [886, 2145],
+    }).to_parquet(br / "highs_lows.parquet", index=False)
+    with pytest.raises(ValueError) as ei:
+        bme.build_market_env(str(tmp_path))
+    assert "manifest missing" in str(ei.value) or \
+        "require_valid_manifest" in str(ei.value)
+
+
+def test_high_low_ratio_fails_closed_on_tampered_manifest(bme, tmp_path):
+    """§v19: a PRESENT highs_lows.parquet whose HIGH_LOWS_ASSET manifest is
+    tampered (schema_hash rewritten) must ABORT the formal read — a content-
+    drifted file is never silently trusted as market breadth."""
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_market_breadth import HIGH_LOWS_ASSET
+    br = tmp_path / "a_shares" / "market_breadth"
+    br.mkdir(parents=True, exist_ok=True)
+    rows = pd.DataFrame({
+        "date": ["2024-07-03", "2024-07-04"],
+        "close": [2982.38, 2957.57],
+        "high20": [202, 74],
+        "low20": [886, 2145],
+    })
+    rows.to_parquet(br / "highs_lows.parquet", index=False)
+    write_asset_manifest(str(br / "highs_lows.parquet"), HIGH_LOWS_ASSET, rows)
+    mpath = str(br / "highs_lows.parquet.manifest.json")
+    with open(mpath, encoding="utf-8") as f:
+        m = json.load(f)
+    m["schema_hash"] = "deadbeef"
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(m, f)
+    with pytest.raises(ValueError) as ei:
+        bme.build_market_env(str(tmp_path))
+    assert "require_valid_manifest" in str(ei.value)
 
 
 # ── (b) account part: proxy when no real publish date ─────────────────────
@@ -546,10 +618,16 @@ def test_price_part_gaps_are_nan_not_zero(bme, tmp_path):
     _write_daily(tmp_path)
     # highs_lows covers ONLY 2024-07-03 (missing 07-04 / 07-05)
     br = tmp_path / "a_shares" / "market_breadth"
-    pd.DataFrame({
+    hl = pd.DataFrame({
         "date": ["2024-07-03"], "close": [2982.38],
         "high20": [202], "low20": [886],
-    }).to_parquet(br / "highs_lows.parquet", index=False)
+    })
+    hl.to_parquet(br / "highs_lows.parquet", index=False)
+    # §v19: highs_lows is consumed fail-closed — write its HIGH_LOWS_ASSET
+    # manifest (mirroring download_market_breadth.main).
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_market_breadth import HIGH_LOWS_ASSET
+    write_asset_manifest(str(br / "highs_lows.parquet"), HIGH_LOWS_ASSET, hl)
     df, _ = bme.build_market_env(str(tmp_path))
     # the union index includes 07-04 (industry + daily cover it); high_low_ratio
     # is a genuine gap there → NaN, not 0.0
