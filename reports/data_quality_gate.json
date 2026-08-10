@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-10T14:07:19.298230",
+  "timestamp": "2026-08-10T15:09:29.968414",
   "passed": true,
   "quality_gate_version": "3.0",
   "data_root": "D:\\Projects\\Stoke_MachineLearning\\data",
@@ -317,8 +317,27 @@
       "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
+    },
+    {
+      "name": "universe",
+      "passed": true,
+      "summary": "OK requested=5530 present=5530 missing=0 degraded=0",
+      "files_scanned": 5530,
+      "rows_scanned": 0,
+      "unreadable_files": 0,
+      "issue_count": 0,
+      "sample_issues": []
     }
   ],
+  "universe_reconciliation": {
+    "ok": true,
+    "requested_count": 5530,
+    "present_count": 5530,
+    "missing_count": 0,
+    "degraded_count": 0,
+    "missing_codes": [],
+    "degraded_codes": []
+  },
   "vintage_policy": "revision-safe",
   "channel_vintage": [
     {
