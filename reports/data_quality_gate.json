@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-10T00:25:21.580577",
-  "passed": false,
+  "timestamp": "2026-08-10T14:07:19.298230",
+  "passed": true,
   "quality_gate_version": "3.0",
   "data_root": "D:\\Projects\\Stoke_MachineLearning\\data",
   "calendar_version": "2026-08-04",
@@ -9,26 +9,30 @@
   "calendar_artifact_present": true,
   "contract_version": "35b233111e1477f1",
   "required_datasets": [
-    "daily"
+    "daily",
+    "features",
+    "features_panel"
   ],
   "dataset_paths": {
-    "daily": "D:\\Projects\\Stoke_MachineLearning\\data\\a_shares\\daily"
+    "daily": "D:\\Projects\\Stoke_MachineLearning\\data\\a_shares\\daily",
+    "features": "D:\\Projects\\Stoke_MachineLearning\\data\\features",
+    "features_panel": "D:\\Projects\\Stoke_MachineLearning\\data\\features_panel"
   },
-  "profile": "bootstrap",
+  "profile": "formal",
   "scope": "full",
   "sample_size": 0,
   "sample_seed": 20240804,
-  "scanned_files": 5530,
-  "total_files": 5530,
+  "scanned_files": 16590,
+  "total_files": 16590,
   "manifest_contract_full_scan": true,
-  "data_manifest_hash": "be335c2d14ce5a6a",
+  "data_manifest_hash": "700a5e172bf3d792",
   "checks": [
     {
       "name": "datasets",
       "passed": true,
-      "summary": "OK files=5530 rows=16256235 unreadable=0 datasets=daily",
-      "files_scanned": 5530,
-      "rows_scanned": 16256235,
+      "summary": "OK files=16590 rows=48929829 unreadable=0 datasets=daily,features,features_panel",
+      "files_scanned": 16590,
+      "rows_scanned": 48929829,
       "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
@@ -38,7 +42,7 @@
       "passed": true,
       "summary": "max_diff=0.000000 pollution_rows=0 problem_files=0",
       "files_scanned": 5530,
-      "rows_scanned": 16250705,
+      "rows_scanned": 16304413,
       "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
@@ -48,7 +52,7 @@
       "passed": true,
       "summary": "max_diff=0.00000000 problem_files=0",
       "files_scanned": 11060,
-      "rows_scanned": 32501410,
+      "rows_scanned": 32608826,
       "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
@@ -58,131 +62,38 @@
       "passed": true,
       "summary": "max_abs_diff=0.000000 problem_files=0",
       "files_scanned": 32296,
-      "rows_scanned": 161900349,
+      "rows_scanned": 162432922,
       "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
     },
     {
       "name": "feature_pct",
-      "passed": false,
-      "summary": "max_diff=25789.990859 problem_files=25",
+      "passed": true,
+      "summary": "max_diff=0.000060 problem_files=0",
       "files_scanned": 5530,
-      "rows_scanned": 16256078,
+      "rows_scanned": 16309943,
       "unreadable_files": 0,
-      "issue_count": 25,
-      "sample_issues": [
-        {
-          "file": "000333",
-          "detail": "md=8694.6825 poll_zero=0"
-        },
-        {
-          "file": "000338",
-          "detail": "md=897.1731 poll_zero=0"
-        },
-        {
-          "file": "000408",
-          "detail": "md=7089.9489 poll_zero=0"
-        },
-        {
-          "file": "000429",
-          "detail": "md=1396.5779 poll_zero=0"
-        },
-        {
-          "file": "000520",
-          "detail": "md=39.0162 poll_zero=0"
-        },
-        {
-          "file": "000568",
-          "detail": "md=25789.9909 poll_zero=0"
-        },
-        {
-          "file": "000596",
-          "detail": "md=53.3956 poll_zero=0"
-        },
-        {
-          "file": "000651",
-          "detail": "md=18290.0324 poll_zero=0"
-        },
-        {
-          "file": "000708",
-          "detail": "md=3491.9444 poll_zero=0"
-        },
-        {
-          "file": "000830",
-          "detail": "md=1495.4407 poll_zero=0"
-        },
-        {
-          "file": "000858",
-          "detail": "md=17090.8201 poll_zero=0"
-        },
-        {
-          "file": "000895",
-          "detail": "md=5093.4104 poll_zero=0"
-        },
-        {
-          "file": "000933",
-          "detail": "md=2093.9490 poll_zero=0"
-        },
-        {
-          "file": "000937",
-          "detail": "md=1592.8205 poll_zero=0"
-        },
-        {
-          "file": "001914",
-          "detail": "md=49.9056 poll_zero=0"
-        },
-        {
-          "file": "002001",
-          "detail": "md=4291.2821 poll_zero=0"
-        },
-        {
-          "file": "002003",
-          "detail": "md=296.0870 poll_zero=0"
-        },
-        {
-          "file": "002043",
-          "detail": "md=1389.7119 poll_zero=0"
-        },
-        {
-          "file": "002088",
-          "detail": "md=3089.8204 poll_zero=0"
-        },
-        {
-          "file": "002110",
-          "detail": "md=1992.4901 poll_zero=0"
-        },
-        {
-          "file": "002372",
-          "detail": "md=2589.9160 poll_zero=0"
-        },
-        {
-          "file": "002506",
-          "detail": "md=984.2462 poll_zero=0"
-        },
-        {
-          "file": "002847",
-          "detail": "md=6289.9452 poll_zero=0"
-        },
-        {
-          "file": "300684",
-          "detail": "md=561.3396 poll_zero=0"
-        },
-        {
-          "file": "302132",
-          "detail": "md=67.3918 poll_zero=0"
-        }
-      ]
+      "issue_count": 0,
+      "sample_issues": []
     },
     {
       "name": "sparsity",
       "passed": true,
-      "summary": "event-sparse features=843 (showing 200) min_nz=0.0 avg_finite_cov=0.994",
+      "summary": "event-sparse features=917 (showing 200) min_nz=0.0 avg_finite_cov=0.994",
       "files_scanned": 5530,
       "rows_scanned": 0,
       "unreadable_files": 0,
       "issue_count": 200,
       "sample_issues": [
+        {
+          "file": "earnings_staleness_days",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "earnings_is_stale",
+          "detail": "nz=0.0"
+        },
         {
           "file": "comment_attention",
           "detail": "nz=0.0"
@@ -240,6 +151,22 @@
           "detail": "nz=0.0"
         },
         {
+          "file": "shareholder_staleness_days",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "shareholder_is_stale",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "has_gap_unlock_return_30d",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "lu_intensity_20d",
+          "detail": "nz=0.0"
+        },
+        {
           "file": "transfer_ratio",
           "detail": "nz=0.0"
         },
@@ -252,23 +179,19 @@
           "detail": "nz=0.0"
         },
         {
-          "file": "market_state_strong",
-          "detail": "nz=0.0"
-        },
-        {
           "file": "market_state_ice",
           "detail": "nz=0.0"
         },
         {
-          "file": "market_state_frenzy",
+          "file": "ret_std",
           "detail": "nz=0.0"
         },
         {
-          "file": "sector_relative_strength",
+          "file": "n_stocks",
           "detail": "nz=0.0"
         },
         {
-          "file": "sector_alpha",
+          "file": "leader_change",
           "detail": "nz=0.0"
         },
         {
@@ -285,6 +208,26 @@
         },
         {
           "file": "is_concept_leader",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "market_env_staleness_days",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "market_env_is_stale",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "has_gap_unlock_return_30d_ma5",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "has_gap_unlock_return_30d_ma10",
+          "detail": "nz=0.0"
+        },
+        {
+          "file": "has_gap_unlock_return_30d_ma20",
           "detail": "nz=0.0"
         },
         {
@@ -342,46 +285,6 @@
         {
           "file": "mid_ratio_ma5",
           "detail": "nz=0.0"
-        },
-        {
-          "file": "mid_ratio_ma10",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "mid_ratio_ma20",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "mid_ratio_std20",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "mid_ratio_accel",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "small_ratio_ma5",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "small_ratio_ma10",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "small_ratio_ma20",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "small_ratio_std20",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "small_ratio_accel",
-          "detail": "nz=0.0"
-        },
-        {
-          "file": "main_ratio_ma5",
-          "detail": "nz=0.0"
         }
       ]
     },
@@ -390,7 +293,7 @@
       "passed": true,
       "summary": "dup_dates=0 weekend_rows=0 problem_files=0",
       "files_scanned": 5530,
-      "rows_scanned": 16256235,
+      "rows_scanned": 16309943,
       "unreadable_files": 0,
       "issue_count": 0,
       "sample_issues": []
@@ -496,6 +399,14 @@
       "transform": "raw",
       "pit_alignment": "verified",
       "rationale": "Daily 大宗交易 records are exchange-reported events recorded for the trading day.",
+      "allowed": true
+    },
+    {
+      "channel": "highs_lows",
+      "source_vintage": "immutable_snapshot",
+      "transform": "raw",
+      "pit_alignment": "verified",
+      "rationale": "Daily market-wide new-high/new-low breadth counts (high20/low20) are an exchange/statistics snapshot recorded for the trading day, not later rewritten.  Stored as-fetched (raw) — the breadth ratio is derived downstream.  Same-day trade data → verified PIT, matching the market_env price part's high/low breadth declaration.",
       "allowed": true
     },
     {

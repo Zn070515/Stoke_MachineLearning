@@ -4,6 +4,8 @@ A股（5530只，2000–2026）三阶段深度学习预测系统：反封锁爬�
 
 > A-share (5530 stocks, 2000–2026) deep learning stock prediction: anti-block crawler → data pipeline → feature engineering → model training → backtesting.
 
+> **⚠️ 数据不在远端**：`data/`（全部 parquet）被 gitignore，只存在于开发机本地。remote clone 无法重跑 Quality Gate、重建特征或复验 gate 报告。远程审阅者请先读 [`DATA_NOT_ON_REMOTE.md`](DATA_NOT_ON_REMOTE.md) —— 它列明了 remote-only 无法验证的断言、已发现的本地盲区、以及 fresh clone 的失败模式。
+
 ---
 
 ## 项目结构
@@ -38,10 +40,17 @@ data/a_shares/
 ├── pledge_processed/{stock}.parquet             股权质押 (FE v2, 5列)
 ├── index_membership_processed/{stock}.parquet   指数成分 (FE v2, 3列, Baostock月度重建)
 ├── market_breadth/market_env_daily.parquet      市场环境面板 (FE v2, 全市场日频)
+├── block_trade_processed/{code}.parquet         大宗交易 (FE特征化, 日频)
+├── board_processed/{code}.parquet               打板 (FE特征化, 日频)
+├── dividend_processed/{code}.parquet            分红送转 (FE特征化, 日频)
+├── industry_ranking_processed/{code}.parquet    行业排名 (FE特征化, 日频)
+├── lockup_processed/{code}.parquet              限售解禁 (FE特征化, 日频)
+├── shareholder_processed/{code}.parquet         股东户数 (FE特征化, 日频)
 ├── exchange_calendar/{market}.parquet        官方交易日历 (verified_until 2026-12-31)
 └── macro/macro_daily.parquet                    宏观数据 (SHIBOR/汇率/CPI/利差)
 
-data/features/{code}.parquet                     预构建特征 (5530 × 3744列, 109GB)
+data/features/{code}.parquet                     预构建特征 (扁平, 5530 × 3744列, 109GB)
+data/features_panel/{code}.parquet               预构建特征 (Panel模式, 截面z-score)
 
 stoke_ml/
 ├── crawler/          6层反封锁爬虫 (TLS/指纹/代理池/限速/熔断/Playwright降级)
@@ -320,6 +329,22 @@ PYTHONPATH=. ./.venv/Scripts/python scripts/production/compare_pipelines.py --st
 | `preprocessing.concept.top_n` | 100 | 概念板块编码数量 |
 
 > FE v2 维度开关（`use_pledge` / `use_market_env` / `use_market_env_refine` / `use_index_membership`）不在 config.yaml 中——由 `scripts/production/build_features.py` CLI 控制。
+
+## 数据质量门禁 (Quality Gate)
+
+数据层每次变更（迁移 / 重建 / 尾部刷新）后由 formal gate 把关，训练前强制预构建特征绑定（formal-prebuilt-only）：
+
+```bash
+# quick 冒烟 (300 抽样, 交换分层固定种子)
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/data_quality_gate.py --quick --profile formal --require daily,features,features_panel
+
+# 全量 formal gate (扫全部文件, 权威判定)
+PYTHONPATH=. ./.venv/Scripts/python scripts/production/data_quality_gate.py --profile formal --require daily,features,features_panel
+```
+
+- 检查项：`datasets` / `daily_internal` / `aux_pct_aligned` / `aux_close_aligned` / `feature_pct` / `sparsity` / `ohlc_sanity` / `contract_schema` / `manifest` / `universe`
+- 最新结果落盘：`reports/data_quality_gate.json`
+- **注意**：`feature_pct` 读的是扁平 `data/features/`（FEAT_DIR 硬编码，与 `--require` 无关），所以 panel 模式重建不改变它的判定；gate 报告是**数据断言**，数据不在远端，无法在 clone 上重跑 —— 详见 [`DATA_NOT_ON_REMOTE.md`](DATA_NOT_ON_REMOTE.md)
 
 ## 已知问题
 
