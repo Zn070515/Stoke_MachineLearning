@@ -309,6 +309,242 @@ def test_fetch_stock_recovers_from_unreadable_cache(monkeypatch, tmp_path):
     assert rewritten["parser_hash"] == _parser_hash()
 
 
+# ── V14 §八: range-extension — daily runs fetch only the tail ───────────────
+
+def test_fetch_stock_extends_cache_fetches_only_tail(monkeypatch, tmp_path):
+    """V14 §八: a same-start, later-end cache with matching provenance is
+    EXTENDED — the network is hit ONCE for ONLY the tail window (start one day
+    past the cached end, NOT the full 36y range), the new change event merges
+    into the intervals, and the cache is rewritten with the new end_date."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           _one_interval(), "19900101", "20260809")
+
+    calls = []
+
+    def _events(*a, **k):
+        calls.append((a, k))
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["金融业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["J66"],
+            "变更日期": ["2026-08-10"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    # fetch called once, for the TAIL window only: a one-day boundary overlap at
+    # the cached end (catches late-published same-day records) + the new day —
+    # NOT the full 36y range start
+    assert len(calls) == 1
+    assert calls[0][1]["start_date"] == "20260809"
+    assert calls[0][1]["end_date"] == "20260810"
+    # merged: [2011-06-30, 2026-08-09] C then [2026-08-10, 2099-12-31] J
+    assert len(got) == 2
+    assert got["date"].iloc[0] == pd.Timestamp("2011-06-30")
+    assert got["_end"].iloc[0] == pd.Timestamp("2026-08-09")
+    assert got["sector_code"].iloc[0] == "C"
+    assert got["date"].iloc[1] == pd.Timestamp("2026-08-10")
+    assert got["_end"].iloc[1] == pd.Timestamp("2099-12-31")
+    assert got["sector_code"].iloc[1] == "J"
+    # cache rewritten with the new end_date
+    with open(os.path.join(cache_dir, "000001.json"), "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["start_date"] == "19900101"
+    assert rewritten["end_date"] == "20260810"
+
+
+def test_fetch_stock_extends_cache_with_no_new_events_advances_meta(
+        monkeypatch, tmp_path):
+    """V14 §八: the common daily case — the tail window has NO new change events,
+    so the cached intervals are unchanged (the last interval still runs to
+    end-of-time) and only the cache meta end_date advances."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           _one_interval(), "19900101", "20260809")
+
+    calls = []
+
+    def _empty_events(*a, **k):
+        calls.append((a, k))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _empty_events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    assert len(calls) == 1
+    assert calls[0][1]["start_date"] == "20260809"  # one-day boundary overlap
+    assert calls[0][1]["end_date"] == "20260810"
+    assert len(got) == 1
+    assert got["date"].iloc[0] == pd.Timestamp("2011-06-30")
+    assert got["_end"].iloc[0] == pd.Timestamp("2099-12-31")
+    with open(os.path.join(cache_dir, "000001.json"), "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["end_date"] == "20260810"
+
+
+def test_fetch_stock_extends_cache_same_gate_is_contiguous_not_double_counted(
+        monkeypatch, tmp_path):
+    """V14 §八: a rename under the SAME gate (no code change) yields two
+    contiguous same-code intervals with a clean boundary at the new event date —
+    disjoint day coverage, no double counting."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           _one_interval(), "19900101", "20260809")
+
+    def _events(*a, **k):
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["制造业"],   # same gate C — standard rename only
+            "分类标准": ["中国上市公司协会上市公司行业分类标准"],
+            "行业编码": ["C36"],
+            "变更日期": ["2026-08-10"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    assert len(got) == 2
+    assert got["sector_code"].iloc[0] == "C"
+    assert got["_end"].iloc[0] == pd.Timestamp("2026-08-09")
+    assert got["sector_code"].iloc[1] == "C"
+    assert got["date"].iloc[1] == pd.Timestamp("2026-08-10")
+
+
+def test_fetch_stock_extends_cache_unrecognized_gate_caps_prior_interval(
+        monkeypatch, tmp_path):
+    """V14 §八: reverse-PIT is preserved across the extension — a tail change to
+    an UNRECOGNIZED 门类 ends the cached last interval at the event date − 1 and
+    contributes no rows (its own interval is excluded), never asserting the old
+    gate past the event that disproves it."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           _one_interval(), "19900101", "20260809")
+
+    def _events(*a, **k):
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["新行业门类"],   # not in CSRC_GATE_CODES
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["X99"],
+            "变更日期": ["2026-08-10"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    assert len(got) == 1
+    assert got["sector_code"].iloc[0] == "C"
+    assert got["_end"].iloc[0] == pd.Timestamp("2026-08-09")
+    assert not (got["date"] > pd.Timestamp("2026-08-09")).any()
+
+
+def test_fetch_stock_shrunk_end_refetches_full_range(monkeypatch, tmp_path):
+    """V14 §八: a requested end EARLIER than the cached end is NOT silently
+    truncated — the cache is discarded and the stock is refetched over the full
+    requested range (fail-closed), exactly as before."""
+    import akshare as ak
+
+    monkeypatch.setattr(
+        "scripts.production.download_sector_membership.time.sleep",
+        lambda *_: None,
+    )
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           _one_interval(), "19900101", "20260809")
+
+    calls = []
+
+    def _events(*a, **k):
+        calls.append((a, k))
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["制造业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["C36"],
+            "变更日期": ["2011-06-30"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    _fetch_stock("000001", cache_dir, "19900101", "20260808")
+    assert len(calls) == 1
+    assert calls[0][1]["start_date"] == "19900101"   # full range, NOT the tail
+    assert calls[0][1]["end_date"] == "20260808"
+
+
+def test_fetch_stock_extends_only_when_provenance_matches(monkeypatch, tmp_path):
+    """V14 §八: range-extension is ONLY valid when the cache provenance matches —
+    a parser_hash mismatch on an EXTENDED request is still a fail-closed FULL
+    refetch (never a trusted tail), and the cache is rewritten under the current
+    schema."""
+    import akshare as ak
+
+    monkeypatch.setattr(
+        "scripts.production.download_sector_membership.time.sleep",
+        lambda *_: None,
+    )
+    cache_dir = str(tmp_path / "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "000001.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "cache_version": _CACHE_VERSION,
+            "parser_hash": "0" * 12,   # parser logic changed → NOT trusted
+            "source": "cninfo",
+            "start_date": "19900101",
+            "end_date": "20260809",
+            "intervals": [{
+                "date": "2011-06-30", "end": "2099-12-31", "stock_code": "000001",
+                "sector_code": "C", "sector_name": "制造业",
+            }],
+        }, f, ensure_ascii=False)
+
+    calls = []
+
+    def _events(*a, **k):
+        calls.append((a, k))
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["制造业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["C36"],
+            "变更日期": ["2011-06-30"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    assert len(calls) == 1
+    assert calls[0][1]["start_date"] == "19900101"   # full range, NOT the tail
+    assert not got.empty
+
+
+def test_fetch_stock_extends_cached_empty_without_network(monkeypatch, tmp_path):
+    """V14 §八: a no-gate stock cached EMPTY extends by advancing the cache meta —
+    the network is never hit (a stock with no CSRC records never gains them)."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           pd.DataFrame(), "19900101", "20260809")
+    monkeypatch.setattr(
+        ak, "stock_industry_change_cninfo",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("network must not be hit for a no-gate stock")),
+    )
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    assert got.empty
+    with open(os.path.join(cache_dir, "000001.json"), "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["start_date"] == "19900101"
+    assert rewritten["end_date"] == "20260810"
+
+
 def _one_interval() -> pd.DataFrame:
     return pd.DataFrame({
         "date": [pd.Timestamp("2011-06-30")],

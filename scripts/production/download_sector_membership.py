@@ -23,7 +23,13 @@ Resumability: per-stock parsed intervals are cached under
 fetched stocks.  The cache payload is versioned (``cache_version`` + a
 ``parser_hash`` digest of the parse logic), so a parser or gate-map change is
 detected and forces a fail-closed refetch instead of trusting stale intervals
-(§v19 §十九).
+(§v19 §十九).  A same-start, LATER-END cache is range-EXTENDED (V14 §八): only
+the tail window past the cached end is fetched (with a one-day boundary overlap
+to catch late-published same-day records), merged with the cached intervals,
+and the cache is rewritten with the new end_date — so the daily run
+(``main()`` sets ``end_date = today``) fetches only what is new since the last
+run, not the full 36y history.  Everything else stays fail-closed (different
+start, shrunken range, provenance drift, unreadable cache → full refetch once).
 
 Usage:
   PYTHONPATH=. ./.venv/Scripts/python scripts/production/download_sector_membership.py
@@ -191,7 +197,7 @@ def _expansion_bucket(intervals: pd.DataFrame | None) -> str:
     return "expand"
 
 
-# ── per-stock interval cache (resumable crawl) ──────────────────────────────
+# ── per-stock interval cache (resumable crawl + range-extension, V14 §八) ───
 
 #: Cache payload schema version (§v19 §十九).  Bump when the cache format or
 #: the parser semantics change; a mismatched version forces a fail-closed
@@ -266,6 +272,103 @@ def _load_intervals_cache(path: str) -> tuple[pd.DataFrame, dict]:
     return (iv.drop(columns=["end"]), meta)
 
 
+# ── range-extension (V14 §八): merge a tail fetch into a cached interval set ──
+
+def _valid_cached_end(cached_end: str) -> bool:
+    """True when ``cached_end`` is a well-formed ``%Y%m%d`` date.
+
+    A malformed ``end_date`` meta must never drive a range-extension (which
+    would otherwise feed a garbage tail window into the fetch) — it is treated
+    as a cache mismatch and refetched fail-closed instead."""
+    try:
+        dt.datetime.strptime(cached_end, "%Y%m%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _first_new_event_date(tail_events: pd.DataFrame,
+                          d_last: pd.Timestamp) -> pd.Timestamp | None:
+    """Earliest CSRC-standard tail event date STRICTLY past the cached last
+    interval's start — the boundary the first genuinely-new change imposes on
+    the cached end-of-time interval.
+
+    Events on or before ``d_last`` are re-fetches of change records the cache
+    already encodes (the overlap re-reads the cached-end boundary day to catch
+    late-published same-day records); they must not re-split the cached history.
+    An UNRECOGNIZED 门类 keeps its date as a boundary (reverse-PIT: it still
+    ends the prior interval even though its own interval is excluded)."""
+    if tail_events is None or tail_events.empty:
+        return None
+    sub = tail_events[tail_events["分类标准"].isin(CSRC_STANDARD_LABELS)]
+    if sub.empty:
+        return None
+    d = pd.to_datetime(sub["变更日期"], errors="coerce").dropna()
+    d = d[d > d_last]
+    if d.empty:
+        return None
+    return d.min()
+
+
+def _merge_tail_events(stock_code: str, cached_intervals: pd.DataFrame,
+                       tail_events: pd.DataFrame) -> pd.DataFrame:
+    """Merge cached intervals with a freshly-fetched tail batch into ONE frame.
+
+    The cached intervals are preserved AS-IS except the LAST one: the first
+    genuinely-new tail change (any gate, recognized or not) caps a cached last
+    end-of-time interval at its date − 1, then the recognized tail intervals
+    that start after the cached last interval's start are appended.  A cached
+    last interval that already ends BEFORE end-of-time (a trailing unclassified
+    boundary encoded in its ``_end``) is left untouched, so an internal
+    unrecognized-gate boundary inside the cached history is never rewritten or
+    resurrected.  A tail with no new change events leaves the cached intervals
+    unchanged (only the cache meta end_date advances).
+    """
+    d_last = pd.Timestamp(cached_intervals["date"].iloc[-1])
+    first_new = _first_new_event_date(tail_events, d_last)
+    if first_new is None:
+        return cached_intervals
+    merged = cached_intervals
+    last_idx = len(merged) - 1
+    if pd.Timestamp(merged["_end"].iloc[last_idx]) >= pd.Timestamp("2099-12-31"):
+        last = merged.iloc[[last_idx]].copy()
+        last["_end"] = first_new - pd.Timedelta(days=1)
+        merged = pd.concat([merged.iloc[:last_idx], last], ignore_index=True)
+    tail_intervals = parse_cninfo_events(stock_code, tail_events)
+    tail_new = tail_intervals[tail_intervals["date"] > d_last]
+    if not tail_new.empty:
+        merged = pd.concat([merged, tail_new], ignore_index=True)
+    return merged
+
+
+def _extend_cached_intervals(stock_code: str, cache_path: str,
+                             intervals: pd.DataFrame, start_date: str,
+                             cached_end: str, end_date: str) -> pd.DataFrame:
+    """Extend a same-start, later-end cache (V14 §八): fetch ONLY the tail.
+
+    The tail window is ``[cached_end, end_date]`` — a ONE-DAY boundary overlap
+    (the original fetch's end was inclusive, so the cached_end day is re-read)
+    that catches a change record with ``变更日期`` == the cached end that CNINFO
+    published a day late and the previous run therefore missed.  The tail is
+    merged into the cached intervals and the cache is rewritten with the new
+    ``end_date``.
+
+    A no-gate stock cached EMPTY never gains records — its cache meta is simply
+    advanced (no network call).  A tail fetch / schema failure RAISES without
+    touching the cache, so the still-valid cached range survives for a later
+    retry (the stock lands in ``fetch_failed`` this run, never a silent trust
+    of a range that did not extend).
+    """
+    if intervals.empty:
+        _write_intervals_cache(cache_path, intervals, start_date, end_date)
+        return intervals
+    events = _fetch_cninfo_events(stock_code, cached_end, end_date)
+    _ensure_parseable(events)
+    merged = _merge_tail_events(stock_code, intervals, events)
+    _write_intervals_cache(cache_path, merged, start_date, end_date)
+    return merged
+
+
 # ── CNINFO fetch (rate-limited, retried) ─────────────────────────────────────
 
 _FETCH_LOCK = threading.Lock()
@@ -335,13 +438,24 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
     """Fetch + parse one stock's CSRC intervals, caching them; raises on failure.
 
     A cache hit (from a prior run) skips the network call entirely — but only
-    when the cached payload's version/parser-hash/source/range all match the
-    current run.  A mismatched or legacy cache is NOT trusted: it is removed
-    and refetched once (fail closed — one-time full crawl is the honest
-    behavior) (§v19 §十九).  An unreadable/corrupt cache is treated as a
-    mismatch (removed + refetched) so a bad cache file never permanently fails
-    a stock.  An empty return is a LEGITIMATE result (the stock has no CSRC
-    gate) — it is still cached so a re-run skips it.
+    when the cached payload's version/parser-hash/source/start-range match the
+    current run AND the requested end equals the cached end (§v19 §十九).
+
+    A SAME-START, LATER-END cache is range-EXTENDED (V14 §八): only the tail
+    window past the cached end is fetched, merged with the cached intervals, and
+    the cache is rewritten with the new end_date — so a daily run (``main()``
+    sets ``end_date = today``) fetches only what is new since the last run, not
+    the full 36y history.  Extension is ONLY trusted when the provenance
+    matches; a tail-fetch failure propagates WITHOUT discarding the cache (the
+    cached range is still valid, and the next run can retry the extension).
+
+    Every other mismatch is fail-closed: a different start, a shrunken range
+    (requested end earlier than cached end — never silently truncated), a
+    version/parser/source drift, a malformed ``end_date`` meta, or an
+    unreadable/corrupt cache is NOT trusted — it is removed and refetched once
+    (one-time full crawl is the honest behavior).  An empty return is a
+    LEGITIMATE result (the stock has no CSRC gate) — it is still cached so a
+    re-run skips it.
     """
     cache_path = os.path.join(cache_dir, f"{stock_code}.json")
     if os.path.isfile(cache_path):
@@ -354,12 +468,20 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
                            "removing and refetching", stock_code, str(exc)[:120])
             os.remove(cache_path)
         else:
-            if (meta.get("cache_version") == _CACHE_VERSION
-                    and meta.get("parser_hash") == _parser_hash()
-                    and meta.get("source") == "cninfo"
-                    and meta.get("start_date") == start_date
-                    and meta.get("end_date") == end_date):
+            provenance_ok = (meta.get("cache_version") == _CACHE_VERSION
+                             and meta.get("parser_hash") == _parser_hash()
+                             and meta.get("source") == "cninfo"
+                             and meta.get("start_date") == start_date)
+            cached_end = meta.get("end_date")
+            if provenance_ok and cached_end == end_date:
                 return intervals
+            if (provenance_ok and cached_end is not None
+                    and cached_end < end_date
+                    and _valid_cached_end(cached_end)):
+                # V14 §八: same start, later end → fetch ONLY the tail.
+                return _extend_cached_intervals(
+                    stock_code, cache_path, intervals, start_date,
+                    cached_end, end_date)
             logger.info("sector_membership[%s]: cache mismatch — refetching "
                         "(version=%r, parser_ok=%s, source=%r, range=%s..%s)",
                         stock_code, meta.get("cache_version"),
