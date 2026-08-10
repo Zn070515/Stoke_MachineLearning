@@ -27,10 +27,13 @@ from stoke_ml.data.sources.a_shares.base import AShareSourceBase
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_SOURCE_ORDER = ("efinance", "akshare", "tushare", "baostock")
+
+
 class AShareDownloader:
     """Multi-source A-share data downloader with automatic failover."""
 
-    def __init__(self):
+    def __init__(self, source_preference: list[str] | tuple[str, ...] | None = None):
         # Lazy source imports: the online providers carry
         # optional crawler deps (curl_cffi), so importing this module — or even
         # constructing the downloader for an offline/mock-sourced test — must
@@ -41,12 +44,20 @@ class AShareDownloader:
         from stoke_ml.data.sources.a_shares.tushare_source import TushareSource
         from stoke_ml.data.sources.a_shares.baostock_source import BaostockSource
 
-        self._sources: list[AShareSourceBase] = [
-            EfinanceSource(),
-            AKShareSource(),
-            TushareSource(),
-            BaostockSource(),
-        ]
+        registry = {
+            "efinance": EfinanceSource,
+            "akshare": AKShareSource,
+            "tushare": TushareSource,
+            "baostock": BaostockSource,
+        }
+        order = list(source_preference) if source_preference else list(DEFAULT_SOURCE_ORDER)
+        unknown = [name for name in order if name not in registry]
+        if unknown:
+            raise ValueError(
+                f"unknown source name(s) in source_preference: {unknown} "
+                f"(known: {sorted(registry)})"
+            )
+        self._sources: list[AShareSourceBase] = [registry[name]() for name in order]
         self._failure_counts: dict[str, int] = {}
         self._circuit_open: dict[str, float] = {}
         self._cooldown_sec = 300
@@ -126,70 +137,83 @@ class AShareDownloader:
                 start_date, backfill_end,
             )
             try:
-                bs_source = self._sources[-1]  # Baostock is last in priority list
-                bs_df = bs_source.fetch_daily(
-                    stock_code, start_date, str(backfill_end)
+                # Look up Baostock BY NAME, not by position: once
+                # source_preference rotation can put another vendor last (e.g.
+                # efinance in a rotated shard), a positional ``_sources[-1]``
+                # lookup would ask the wrong source for the pre-2015 backfill.
+                bs_source = next(
+                    (s for s in self._sources if s.SOURCE_NAME == "baostock"), None
                 )
-                if len(bs_df) > 0:
-                    rebased, ratio = self._stitch_segments(bs_df, df)
-                    if ratio is not None and 0.5 <= ratio <= 2.0:
-                        # Row-level source provenance: record which provider
-                        # fed which part BEFORE the concat mutates the frames
-                        # Stamped after concat because pd.concat
-                        # copies attrs from the FIRST frame only.
-                        n_backfill = int(len(rebased))
-                        n_primary = int(len(df))
-                        segs = []
-                        if n_backfill:
-                            segs.append({
-                                "source": "baostock", "adjust": "qfq",
-                                "start": str(
-                                    pd.to_datetime(rebased["date"]).min().date()),
-                                "end": str(
-                                    pd.to_datetime(rebased["date"]).max().date()),
-                                "rows": n_backfill,
-                            })
-                        segs.append({
-                            "source": source_used, "adjust": "qfq",
-                            "start": got_start_str,
-                            "end": str(pd.to_datetime(df["date"]).max().date()),
-                            "rows": n_primary,
-                        })
-                        df = pd.concat([rebased, df], ignore_index=True)
-                        df = df.sort_values("date").reset_index(drop=True)
-                        df = df.drop_duplicates(subset="date", keep="last")
-                        df.attrs["source_segments"] = segs
-                        df.attrs["backfilled_from"] = "baostock"
-                        df.attrs["backfill_rejected"] = None
-                        logger.info(
-                            "  %s: stitched %d + %d = %d rows [%s → %s] "
-                            "(seam rebase ratio=%.4f)",
-                            stock_code, n_backfill, n_primary, len(df),
-                            str(pd.to_datetime(df["date"]).min().date()),
-                            str(pd.to_datetime(df["date"]).max().date()),
-                            ratio,
-                        )
-                    elif ratio is not None:
-                        logger.error(
-                            "  %s: 前复权 anchor gap %.2f× at the %s/%s seam — "
-                            "REFUSING to splice (would mask a unit, stock-code, "
-                            "or raw-vs-qfq error as a seam); keeping primary "
-                            "data only",
-                            stock_code, ratio, start_date, got_start_str,
-                        )
-                        df.attrs["backfill_rejected"] = f"ratio={ratio:.2f}"
-                    else:
-                        logger.error(
-                            "  %s: Baostock backfill has no overlap with primary "
-                            "(%s), cannot calibrate seam — REFUSING to splice "
-                            "(naive append would inject a fake price jump); "
-                            "keeping primary data only",
-                            stock_code, got_start_str,
-                        )
-                        df.attrs["backfill_rejected"] = "no_overlap"
+                if bs_source is None:
+                    logger.warning(
+                        "  %s: baostock not in source list, skipping backfill",
+                        stock_code,
+                    )
                 else:
-                    logger.info("  %s: Baostock backfill returned empty, keeping %d rows",
-                                stock_code, len(df))
+                    bs_df = bs_source.fetch_daily(
+                        stock_code, start_date, str(backfill_end)
+                    )
+                    if len(bs_df) > 0:
+                        rebased, ratio = self._stitch_segments(bs_df, df)
+                        if ratio is not None and 0.5 <= ratio <= 2.0:
+                            # Row-level source provenance: record which provider
+                            # fed which part BEFORE the concat mutates the frames
+                            # Stamped after concat because pd.concat
+                            # copies attrs from the FIRST frame only.
+                            n_backfill = int(len(rebased))
+                            n_primary = int(len(df))
+                            segs = []
+                            if n_backfill:
+                                segs.append({
+                                    "source": "baostock", "adjust": "qfq",
+                                    "start": str(
+                                        pd.to_datetime(rebased["date"]).min().date()),
+                                    "end": str(
+                                        pd.to_datetime(rebased["date"]).max().date()),
+                                    "rows": n_backfill,
+                                })
+                            segs.append({
+                                "source": source_used, "adjust": "qfq",
+                                "start": got_start_str,
+                                "end": str(pd.to_datetime(df["date"]).max().date()),
+                                "rows": n_primary,
+                            })
+                            df = pd.concat([rebased, df], ignore_index=True)
+                            df = df.sort_values("date").reset_index(drop=True)
+                            df = df.drop_duplicates(subset="date", keep="last")
+                            df.attrs["source_segments"] = segs
+                            df.attrs["backfilled_from"] = "baostock"
+                            df.attrs["backfill_rejected"] = None
+                            logger.info(
+                                "  %s: stitched %d + %d = %d rows [%s → %s] "
+                                "(seam rebase ratio=%.4f)",
+                                stock_code, n_backfill, n_primary, len(df),
+                                str(pd.to_datetime(df["date"]).min().date()),
+                                str(pd.to_datetime(df["date"]).max().date()),
+                                ratio,
+                            )
+                        elif ratio is not None:
+                            logger.error(
+                                "  %s: 前复权 anchor gap %.2f× at the %s/%s seam — "
+                                "REFUSING to splice (would mask a unit, stock-code, "
+                                "or raw-vs-qfq error as a seam); keeping primary "
+                                "data only",
+                                stock_code, ratio, start_date, got_start_str,
+                            )
+                            df.attrs["backfill_rejected"] = f"ratio={ratio:.2f}"
+                        else:
+                            logger.error(
+                                "  %s: Baostock backfill has no overlap with primary "
+                                "(%s), cannot calibrate seam — REFUSING to splice "
+                                "(naive append would inject a fake price jump); "
+                                "keeping primary data only",
+                                stock_code, got_start_str,
+                            )
+                            df.attrs["backfill_rejected"] = "no_overlap"
+                    else:
+                        logger.info(
+                            "  %s: Baostock backfill returned empty, keeping %d rows",
+                            stock_code, len(df))
             except Exception as e:
                 logger.warning("  %s: Baostock backfill failed: %s", stock_code, e)
 

@@ -22,9 +22,12 @@ import pandas as pd
 import pytest
 
 from scripts.production.refresh_daily_tail import (
+    SOURCE_ORDERS,
     build_plan,
     manifest_end,
     needs_refresh,
+    shard_plan,
+    source_order_for,
     tail_start_of,
 )
 from stoke_ml.data.calendar import TradingCalendar
@@ -208,3 +211,50 @@ def test_build_plan_never_fetches_full_history_for_old_end(tmp_path):
     # requested window's base.
     assert plan[0]["tail_start"] == "2015-01-05"
     assert plan[0]["tail_start"].startswith("2015-")
+
+
+# ── shard_plan / source_order_for: sharded + source-rotated runs ──────────
+
+def test_shard_plan_partitions_disjoint_cover():
+    plan = [{"code": i} for i in range(10)]
+    parts = [shard_plan(plan, 3, s) for s in range(3)]
+    for s in range(3):
+        assert [p["code"] for p in parts[s]] == [
+            i for i in range(10) if i % 3 == s
+        ]
+    union = [p["code"] for part in parts for p in part]
+    assert sorted(union) == list(range(10))          # covers the whole plan
+    for s in range(3):
+        for t in range(s + 1, 3):
+            assert not {p["code"] for p in parts[s]} & {p["code"] for p in parts[t]}
+
+
+def test_shard_plan_single_shard_returns_all():
+    plan = [{"code": i} for i in range(10)]
+    assert shard_plan(plan, 1, 0) == plan
+
+
+def test_source_order_cycles():
+    assert source_order_for(0) == SOURCE_ORDERS[0]
+    assert source_order_for(1) == SOURCE_ORDERS[1]
+    assert source_order_for(2) == SOURCE_ORDERS[2]
+    assert source_order_for(3) == SOURCE_ORDERS[0]   # cycles every 3 shards
+    assert source_order_for(6) == SOURCE_ORDERS[0]
+    assert source_order_for(4) == SOURCE_ORDERS[1]
+
+
+def test_shard_plan_slices_the_real_plan(tmp_path):
+    target = "2026-08-07"
+    for code in ("000001", "000002", "000003"):
+        _write_fake_stock(str(tmp_path), code, "2026-08-06")  # all to refresh
+    current, plan, unknown = build_plan(
+        ["000001", "000002", "000003"], str(tmp_path), target, CAL)
+    assert [p["code"] for p in plan] == ["000001", "000002", "000003"]
+    assert unknown == []
+    shard0 = [p["code"] for p in shard_plan(plan, 2, 0)]
+    shard1 = [p["code"] for p in shard_plan(plan, 2, 1)]
+    assert shard0 == ["000001", "000003"]   # indices 0, 2 (i ≡ 0 mod 2)
+    assert shard1 == ["000002"]             # index 1
+    # The shards are interleaved, not contiguous, so the concat order differs;
+    # the sorted union must still equal the full plan.
+    assert sorted(shard0 + shard1) == sorted(p["code"] for p in plan)

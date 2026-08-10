@@ -28,8 +28,23 @@ Design notes
   ``no_new_data``, NOT a failure.  A worker exception is a per-stock ``failed``
   and never kills the pool.
 - Each worker process builds its OWN ``AShareDownloader`` and ``DataStorage``
-  (both hold per-process circuit-breaker / connection / lock state and must not
-  be shared across processes).
+  ONCE, via ``Pool.initializer`` (``_init_worker``) — both hold per-process
+  circuit-breaker / connection / lock state and must not be shared across
+  processes, but they ARE reused across every stock that one worker touches so
+  the breaker accumulates.
+
+Sharded parallel runs
+---------------------
+``--shards N`` requires launching N OS processes, each with a distinct
+``--shard-id`` in ``[0, N)``; the plan is round-robin partitioned
+(interleaved, see ``shard_plan``) so shard *i* owns indices ``i (mod N)`` and
+sees a mix of 000/002/300/600/688 codes.  Each shard prefers a DIFFERENT
+primary source (efinance / akshare / baostock rotation, see ``SOURCE_ORDERS``)
+so concurrent request volume is spread across vendors instead of every worker
+hammering EastMoney, which throttles under load.  Each worker reuses ONE
+downloader (built in ``Pool.initializer``) so the per-source failover circuit
+breaker accumulates across all of that worker's stocks and self-heals to the
+next source for 300s when a vendor starts throttling.
 
 Known limitation: the qfq-anchor seam
 -------------------------------------
@@ -67,6 +82,32 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Source-order rotation for sharded runs: each shard prefers a DIFFERENT
+# primary source so parallel request volume is spread across vendors instead
+# of hammering EastMoney (which throttles under concurrent load).  The rotation
+# is a function of shard_id only.  Baostock stays in every rotation because the
+# pre-2015 backfill path requires it.
+SOURCE_ORDERS: tuple[tuple[str, ...], ...] = (
+    ("efinance", "akshare", "baostock", "tushare"),
+    ("akshare", "baostock", "efinance", "tushare"),
+    ("baostock", "efinance", "akshare", "tushare"),
+)
+
+
+def shard_plan(plan: list[dict], shards: int, shard_id: int) -> list[dict]:
+    """Round-robin partition of a refresh plan: indices i ≡ shard_id (mod shards).
+
+    Interleaving (rather than contiguous chunks) spreads the SORTED code list
+    evenly across shards, so each shard sees a mix of 000/002/300/600/688
+    codes and each vendor's primary load stays balanced.
+    """
+    return [p for i, p in enumerate(plan) if i % shards == shard_id]
+
+
+def source_order_for(shard_id: int) -> tuple[str, ...]:
+    """Primary-source rotation for a shard (cycles through SOURCE_ORDERS)."""
+    return SOURCE_ORDERS[shard_id % len(SOURCE_ORDERS)]
 
 
 def manifest_end(data_dir: str, code: str) -> str | None:
@@ -160,25 +201,38 @@ def build_plan(
     return current, plan, unknown
 
 
+_WORKER_DOWNLOADER = None
+_WORKER_STORAGE = None
+
+
+def _init_worker(data_dir: str, source_order: tuple[str, ...]) -> None:
+    """Build the per-process downloader + storage ONCE per worker.
+
+    Constructing inside the initializer (not per task) lets the failover
+    circuit breaker accumulate across every stock a worker touches: when a
+    shard's preferred source starts being throttled, 15 failures open its
+    breaker and the worker self-heals to the next source for 300s.
+    """
+    global _WORKER_DOWNLOADER, _WORKER_STORAGE
+    _WORKER_DOWNLOADER = AShareDownloader(source_preference=list(source_order))
+    _WORKER_STORAGE = DataStorage(data_dir)
+
+
 def _process_one(task: tuple) -> dict:
     """Fetch the missing tail for one stock inside a dedicated worker process.
 
-    The downloader and storage are constructed HERE, per process: the failover
-    downloader carries per-process circuit-breaker/connection state and the
-    storage holds a per-file writer lock, neither of which may be shared across
-    processes.  Any exception is converted to a per-stock ``failed`` result so
-    a crashing stock never kills the pool.
+    Uses the worker's shared downloader/storage (see ``_init_worker``).  Any
+    exception is converted to a per-stock ``failed`` result so a crashing
+    stock never kills the pool.
     """
-    code, tail_start, end, data_dir = task
+    code, tail_start, end = task
     try:
-        downloader = AShareDownloader()
-        storage = DataStorage(data_dir)
-        df = downloader.fetch_daily(code, tail_start, end)
+        df = _WORKER_DOWNLOADER.fetch_daily(code, tail_start, end)
         if df.empty:
             return {"code": code, "status": "no_new_data", "rows": 0}
         # Canonical non-destructive merge: preserves migrated history, enforces
         # the §八-2 price-basis gate, and stamps the fetched df's attrs.
-        storage.save_daily(df)
+        _WORKER_STORAGE.save_daily(df)
         dates = pd.to_datetime(df["date"])
         return {
             "code": code,
@@ -199,6 +253,12 @@ def main() -> None:
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--jobs", type=int, default=4,
                         help="Worker processes (default: 4)")
+    parser.add_argument("--shards", type=int, default=1,
+                        help="Total shard count; each shard is a separate OS "
+                             "process (default: 1 = no sharding)")
+    parser.add_argument("--shard-id", type=int, default=0,
+                        help="0-based shard index this process handles "
+                             "(default: 0)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the refresh plan counts without fetching")
     parser.add_argument("--codes", type=str, default=None,
@@ -211,6 +271,13 @@ def main() -> None:
 
     if args.jobs < 1:
         logger.error("--jobs must be >= 1 (got %d)", args.jobs)
+        sys.exit(2)
+    if args.shards < 1:
+        logger.error("--shards must be >= 1 (got %d)", args.shards)
+        sys.exit(2)
+    if not (0 <= args.shard_id < args.shards):
+        logger.error("--shard-id must be in [0, %d) (got %d)",
+                     args.shards, args.shard_id)
         sys.exit(2)
 
     cfg = load_config(args.config)
@@ -244,24 +311,27 @@ def main() -> None:
         sys.exit(2)
 
     current, plan, unknown = build_plan(codes, data_dir, target_end, cal)
+    plan = shard_plan(plan, args.shards, args.shard_id)
+    src_order = source_order_for(args.shard_id)
     logger.info(
-        "target_end=%s codes=%d current=%d to_refresh=%d unknown_end=%d",
-        target_end, len(codes), len(current), len(plan), len(unknown))
+        "target_end=%s codes=%d current=%d to_refresh=%d unknown_end=%d "
+        "shard=%d/%d source_order=%s",
+        target_end, len(codes), len(current), len(plan), len(unknown),
+        args.shard_id, args.shards, ",".join(src_order))
     for code in unknown:
         logger.warning(
             "%s: unknown end (no usable manifest/parquet date) — skipping, "
             "cannot compute a tail window", code)
 
     if args.dry_run:
-        logger.info("DRY RUN: no fetch.  Refresh plan:")
+        logger.info("DRY RUN: no fetch.  Refresh plan (shard %d/%d slice):",
+                    args.shard_id, args.shards)
         logger.info("  current (skip): %d", len(current))
         logger.info("  to refresh:     %d", len(plan))
         logger.info("  unknown-end:    %d", len(unknown))
         sys.exit(0)
 
-    tasks = [
-        (p["code"], p["tail_start"], target_end, data_dir) for p in plan
-    ]
+    tasks = [(p["code"], p["tail_start"], target_end) for p in plan]
     refreshed: list[dict] = []
     no_new_data: list[str] = []
     failed: list[str] = []
@@ -270,7 +340,10 @@ def main() -> None:
     if tasks:
         logger.info("Refreshing %d stocks to %s (%d workers)",
                     len(tasks), target_end, args.jobs)
-        with multiprocessing.Pool(args.jobs) as pool:
+        with multiprocessing.Pool(
+            args.jobs, initializer=_init_worker,
+            initargs=(data_dir, src_order),
+        ) as pool:
             try:
                 for i, res in enumerate(pool.imap_unordered(_process_one, tasks), 1):
                     status = res["status"]

@@ -323,3 +323,81 @@ class TestDownloadValuationBsCode:
     def test_bs_code_raises_on_index(self, _bs_code):
         with pytest.raises(UnsupportedMarketError):
             _bs_code("100000")
+
+
+class TestSourcePreference:
+    """AShareDownloader(source_preference=...) reorders the source list.
+
+    The pre-2015 backfill path must find Baostock by SOURCE_NAME, not by
+    position — once source rotation makes ``_sources[-1]`` ambiguous (a rotated
+    shard may put efinance last), a positional lookup would ask the wrong vendor
+    for the backfill.
+    """
+
+    def test_default_order_is_canonical(self):
+        dl = AShareDownloader()
+        assert [s.SOURCE_NAME for s in dl._sources] == [
+            "efinance", "akshare", "tushare", "baostock"]
+
+    def test_preference_reorders_sources(self):
+        dl = AShareDownloader(source_preference=["baostock", "efinance"])
+        assert [s.SOURCE_NAME for s in dl._sources] == ["baostock", "efinance"]
+
+    def test_preference_accepts_tuple(self):
+        dl = AShareDownloader(source_preference=("baostock",))
+        assert [s.SOURCE_NAME for s in dl._sources] == ["baostock"]
+
+    def test_unknown_source_name_raises(self):
+        with pytest.raises(ValueError):
+            AShareDownloader(source_preference=["efinance", "bogus"])
+
+    @staticmethod
+    def _backfill_primary_frame():
+        idx = pd.date_range("2015-01-02", "2015-01-30", freq="B")
+        return pd.DataFrame({
+            "date": idx,
+            "open": [10.0] * len(idx), "high": [10.5] * len(idx),
+            "low": [9.8] * len(idx), "close": [10.2] * len(idx),
+            "volume": [1e6] * len(idx), "amount": [1e8] * len(idx),
+            "pct_change": [0.5] * len(idx),
+        })
+
+    @staticmethod
+    def _backfill_bs_frame():
+        idx = pd.date_range("2014-12-15", "2015-01-02", freq="B")
+        return pd.DataFrame({
+            "date": idx,
+            "open": [10.0] * len(idx), "high": [10.5] * len(idx),
+            "low": [9.8] * len(idx), "close": [10.0] * len(idx),
+            "volume": [1e6] * len(idx), "amount": [1e8] * len(idx),
+            "pct_change": [0.5] * len(idx),
+        })
+
+    def test_backfill_still_targets_baostock_when_not_last(self):
+        akshare = _FakeSource(
+            "akshare", markets={"SH", "SZ"}, frame=self._backfill_primary_frame())
+        baostock = _FakeSource(
+            "baostock", markets={"SH", "SZ"}, frame=self._backfill_bs_frame())
+        efinance = _FakeSource(
+            "efinance", markets={"SH", "SZ"}, frame=pd.DataFrame())
+        dl = AShareDownloader(
+            source_preference=["akshare", "baostock", "efinance"])
+        dl._sources = [akshare, baostock, efinance]
+        dl._failure_counts = {}
+        dl._circuit_open = {}
+
+        out = dl.fetch_daily("000001", "2014-01-01", "2015-01-31")
+
+        assert not out.empty
+        # The pre-2015 backfill must have been served by the baostock source
+        # found BY NAME — never by ``_sources[-1]`` (which here is efinance).
+        assert akshare.fetch_calls == 1
+        assert baostock.fetch_calls == 1
+        assert efinance.fetch_calls == 0
+        assert out.attrs["backfilled_from"] == "baostock"
+        assert out.attrs["backfill_rejected"] is None
+        # The stitched frame reaches back into the baostock-only window.
+        assert (
+            pd.to_datetime(out["date"]).min().date()
+            < pd.Timestamp("2015-01-02").date()
+        )
