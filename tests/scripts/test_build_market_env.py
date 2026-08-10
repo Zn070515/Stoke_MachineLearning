@@ -6,7 +6,11 @@ consumer-facing parquet (``a_shares/market_breadth/market_env_daily.parquet``,
 7 columns on a DatetimeIndex) but declares the price/account split honestly:
 
   - PRICE part (high_low_ratio / market_adv_ratio / market_turnover_z):
-    same-day trade data → ``pit_alignment="verified"``.
+    a composite — high_low_ratio and market_turnover_z are same-day trade data
+    (verified by nature), but market_adv_ratio inherits its PIT from
+    industry_ranking, so the part's ``pit_alignment`` is the WEAKEST
+    constituent: ``"verified"`` only when ``industry_advance_pit == "verified"``,
+    otherwise ``"proxy"``.
   - ACCOUNT part (mkt_cap_total_z / avg_account_cap_z / investor_new_num /
     investor_new_z): monthly account statistics → ``"proxy"`` when the raw
     source records no real publish date (the shipped account_stats.parquet
@@ -189,9 +193,11 @@ def test_price_part_pit_proxy_when_advance_proxy(bme, tmp_path):
         "change_pct": [0.01, -0.02],
     })
     rows.to_parquet(daily / "industry_ranking.parquet", index=False)
-    # manifest WITHOUT the pit_alignment key → build_industry_advance reports proxy
+    # explicit "proxy" key — faithful to the documented snapshot-sector fallback
+    # path (NOT the missing-key default, which is covered separately by
+    # test_build_industry_advance_proxy_when_manifest_lacks_pit)
     write_asset_manifest(str(daily / "industry_ranking.parquet"),
-                         INDUSTRY_RANKING_ASSET, rows)
+                         INDUSTRY_RANKING_ASSET, rows, pit_alignment="proxy")
     _write_highs_lows(tmp_path)
     _write_daily(tmp_path)
     df, parts = bme.build_market_env(str(tmp_path))

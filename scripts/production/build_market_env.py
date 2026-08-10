@@ -16,7 +16,12 @@ over a DatetimeIndex named ``date`` — exactly what ``aux_aligner._merge_market
 price/account split:
 
   - **price part** (``high_low_ratio`` / ``market_adv_ratio`` /
-    ``market_turnover_z``): same-day trade data → ``pit_alignment="verified"``.
+    ``market_turnover_z``): a COMPOSITE — ``high_low_ratio`` and
+    ``market_turnover_z`` are same-day trade data (verified by nature), but
+    ``market_adv_ratio`` inherits its PIT from ``industry_ranking``.  The part's
+    ``pit_alignment`` is therefore the WEAKEST constituent: ``"verified"`` ONLY
+    when ``industry_advance_pit == "verified"``, otherwise ``"proxy"`` (§二十: a
+    proxy constituent must never be smuggled inside a "verified" part).
     ``market_adv_ratio`` is the CSRC broad-sector advance ratio (fraction of
     证监会 门类 sectors A–S with positive equal-weighted return) derived from the
     PIT ``industry_ranking``; its per-source PIT is recorded in ``parts`` as
@@ -235,7 +240,9 @@ def build_market_env(data_dir: str) -> tuple[pd.DataFrame, dict]:
     base = os.path.join(data_dir, "a_shares")
     series: dict[str, pd.Series] = {}
 
-    # price part — same-day trade data, VERIFIED PIT
+    # price part — COMPOSITE: high_low_ratio + market_turnover_z are same-day
+    # trade data (verified by nature), but market_adv_ratio inherits its PIT
+    # from industry_ranking; the part's pit_alignment is the WEAKEST constituent
     hl = _build_high_low_ratio(base)
     if not hl.empty:
         series["high_low_ratio"] = hl
