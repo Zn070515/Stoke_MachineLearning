@@ -279,11 +279,15 @@ def _valid_cached_end(cached_end: str) -> bool:
 
     A malformed ``end_date`` meta must never drive a range-extension (which
     would otherwise feed a garbage tail window into the fetch) — it is treated
-    as a cache mismatch and refetched fail-closed instead."""
+    as a cache mismatch and refetched fail-closed instead.  A NON-string
+    ``end_date`` (hand-edited/corrupt meta) is likewise invalid — it must fail
+    the guard (never raise a TypeError), so the caller refetches fail-closed."""
+    if not isinstance(cached_end, str):
+        return False
     try:
         dt.datetime.strptime(cached_end, "%Y%m%d")
         return True
-    except ValueError:
+    except (ValueError, TypeError):
         return False
 
 
@@ -476,8 +480,8 @@ def _fetch_stock(stock_code: str, cache_dir: str, start_date: str,
             if provenance_ok and cached_end == end_date:
                 return intervals
             if (provenance_ok and cached_end is not None
-                    and cached_end < end_date
-                    and _valid_cached_end(cached_end)):
+                    and _valid_cached_end(cached_end)
+                    and cached_end < end_date):
                 # V14 §八: same start, later end → fetch ONLY the tail.
                 return _extend_cached_intervals(
                     stock_code, cache_path, intervals, start_date,

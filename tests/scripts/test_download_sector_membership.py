@@ -30,6 +30,7 @@ from scripts.production.download_sector_membership import (
     _load_intervals_cache,
     _parser_hash,
     _traded_counts_by_day,
+    _valid_cached_end,
     _write_intervals_cache,
     _write_membership_asset,
     parse_cninfo_events,
@@ -543,6 +544,203 @@ def test_fetch_stock_extends_cached_empty_without_network(monkeypatch, tmp_path)
         rewritten = json.load(f)
     assert rewritten["start_date"] == "19900101"
     assert rewritten["end_date"] == "20260810"
+
+
+def test_fetch_stock_extends_cache_picks_up_boundary_day_late_record(
+        monkeypatch, tmp_path):
+    """V14 §八 (the 1-day boundary overlap): a CSRC-standard change record whose
+    变更日期 == the cached end date — published a day late, so the previous run
+    missed it — is re-read by the one-day overlap and merged as a NEW interval,
+    capping the cached end-of-time interval at its date − 1.  This is the whole
+    point of the boundary overlap: the merge's ``d > d_last`` filter keeps the
+    boundary-day record (d_last is the cached last interval's START, far earlier
+    than the cached END the record sits on)."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           _one_interval(), "19900101", "20260809")
+
+    calls = []
+
+    def _events(*a, **k):
+        calls.append((a, k))
+        # 变更日期 == the cached end date 2026-08-09 (published late; the
+        # previous run, which fetched only through 2026-08-09, missed it)
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["金融业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["J66"],
+            "变更日期": ["2026-08-09"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    # tail fetch over the boundary-overlap window ONLY (not the full 36y range)
+    assert len(calls) == 1
+    assert calls[0][1]["start_date"] == "20260809"
+    assert calls[0][1]["end_date"] == "20260810"
+    # boundary-day interval AND the capped interval:
+    # [2011-06-30, 2026-08-08] C then [2026-08-09, 2099-12-31] J
+    assert len(got) == 2
+    assert got["date"].iloc[0] == pd.Timestamp("2011-06-30")
+    assert got["_end"].iloc[0] == pd.Timestamp("2026-08-08")  # capped at 08-09 − 1
+    assert got["sector_code"].iloc[0] == "C"
+    assert got["date"].iloc[1] == pd.Timestamp("2026-08-09")  # the boundary day
+    assert got["_end"].iloc[1] == pd.Timestamp("2099-12-31")
+    assert got["sector_code"].iloc[1] == "J"
+    with open(os.path.join(cache_dir, "000001.json"), "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["end_date"] == "20260810"
+
+
+def test_fetch_stock_extends_cache_does_not_rewrite_finite_end_last_interval(
+        monkeypatch, tmp_path):
+    """V14 §八 (the ``_end < 2099`` branch): a cached LAST interval that already
+    ends BEFORE end-of-time (a trailing unclassified boundary encoded in a finite
+    ``_end``) is left UNTOUCHED by the merge — never rewritten to first_new − 1,
+    never resurrected — while recognized tail intervals are appended."""
+    import akshare as ak
+
+    cache_dir = str(tmp_path / "cache")
+    cached = pd.DataFrame({
+        "date": [pd.Timestamp("2011-06-30")],
+        "_end": [pd.Timestamp("2024-02-07")],   # trailing unclassified boundary
+        "stock_code": ["000001"],
+        "sector_code": ["C"],
+        "sector_name": ["制造业"],
+    })
+    _write_intervals_cache(os.path.join(cache_dir, "000001.json"),
+                           cached, "19900101", "20260809")
+
+    def _events(*a, **k):
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["金融业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["J66"],
+            "变更日期": ["2026-08-10"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    # the cached finite-_end interval is byte-identical; the recognized tail
+    # interval is appended after it
+    assert len(got) == 2
+    assert got["date"].iloc[0] == pd.Timestamp("2011-06-30")
+    assert got["_end"].iloc[0] == pd.Timestamp("2024-02-07")  # UNTOUCHED
+    assert got["sector_code"].iloc[0] == "C"
+    assert got["date"].iloc[1] == pd.Timestamp("2026-08-10")
+    assert got["_end"].iloc[1] == pd.Timestamp("2099-12-31")
+    assert got["sector_code"].iloc[1] == "J"
+    # the rewritten cache's first interval is byte-identical to the cached one
+    with open(os.path.join(cache_dir, "000001.json"), "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["intervals"][0] == {
+        "date": "2011-06-30", "end": "2024-02-07", "stock_code": "000001",
+        "sector_code": "C", "sector_name": "制造业",
+    }
+
+
+def test_fetch_stock_tail_fetch_failure_preserves_cache(monkeypatch, tmp_path):
+    """V14 §八: a tail-fetch FAILURE raises WITHOUT touching the cache — a bad
+    daily run never destroys a good 36y cache.  The exception propagates (which
+    is exactly what main() catches to land the stock in ``fetch_failed`` this
+    run), and the still-valid cached range survives for a later retry."""
+    import akshare as ak
+
+    monkeypatch.setattr(
+        "scripts.production.download_sector_membership.time.sleep",
+        lambda *_: None,
+    )
+    cache_dir = str(tmp_path / "cache")
+    path = os.path.join(cache_dir, "000001.json")
+    _write_intervals_cache(path, _one_interval(), "19900101", "20260809")
+    with open(path, "rb") as f:
+        before = f.read()
+
+    def _explode(*a, **k):
+        raise RuntimeError("CNINFO tail fetch failed")
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _explode)
+    with pytest.raises(RuntimeError):
+        _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    # fail-closed: the cache file on disk is byte-identical to before
+    with open(path, "rb") as f:
+        after = f.read()
+    assert after == before
+
+
+@pytest.mark.parametrize("bad_end", [
+    20260809,        # non-string (hand-edited/corrupt meta) — an int
+    "not-a-date",    # a well-formed string but a garbage end_date
+])
+def test_fetch_stock_malformed_end_date_meta_refetches_full_range(
+        monkeypatch, tmp_path, bad_end):
+    """V14 §八: a malformed/non-string ``end_date`` cache meta must NOT raise or
+    drive a range-extension (which would feed a garbage tail window into the
+    fetch) — it fails closed into a FULL refetch over the requested range, and
+    the cache is rewritten under the current schema.  ``_valid_cached_end``
+    rejects the non-string BEFORE the ``<`` range comparison, so an int
+    end_date is a cache mismatch, never a TypeError that would leave the stock
+    stuck in ``fetch_failed``."""
+    import akshare as ak
+
+    monkeypatch.setattr(
+        "scripts.production.download_sector_membership.time.sleep",
+        lambda *_: None,
+    )
+    cache_dir = str(tmp_path / "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "000001.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "cache_version": _CACHE_VERSION,
+            "parser_hash": _parser_hash(),
+            "source": "cninfo",
+            "start_date": "19900101",
+            "end_date": bad_end,
+            "intervals": [{
+                "date": "2011-06-30", "end": "2099-12-31", "stock_code": "000001",
+                "sector_code": "C", "sector_name": "制造业",
+            }],
+        }, f, ensure_ascii=False)
+
+    calls = []
+
+    def _events(*a, **k):
+        calls.append((a, k))
+        return pd.DataFrame({
+            "证券代码": ["000001"],
+            "行业门类": ["制造业"],
+            "分类标准": ["证监会行业分类标准（2012）"],
+            "行业编码": ["C36"],
+            "变更日期": ["2011-06-30"],
+        })
+
+    monkeypatch.setattr(ak, "stock_industry_change_cninfo", _events)
+    got = _fetch_stock("000001", cache_dir, "19900101", "20260810")
+    # refetched over the FULL range — NOT a tail extension, no exception, so the
+    # stock is NOT left stuck in fetch_failed
+    assert len(calls) == 1
+    assert calls[0][1]["start_date"] == "19900101"
+    assert calls[0][1]["end_date"] == "20260810"
+    assert not got.empty
+    with open(path, "r", encoding="utf-8") as f:
+        rewritten = json.load(f)
+    assert rewritten["cache_version"] == _CACHE_VERSION
+    assert rewritten["end_date"] == "20260810"
+
+
+def test_valid_cached_end_rejects_non_string_and_garbage():
+    """A non-string ``end_date`` (int/None) or a garbage string is INVALID — it
+    must fail the extension guard (never raise), so it refetches fail-closed."""
+    assert _valid_cached_end("20260809") is True
+    assert _valid_cached_end(20260809) is False     # non-string: no TypeError
+    assert _valid_cached_end(None) is False
+    assert _valid_cached_end("not-a-date") is False
+    assert _valid_cached_end("") is False
 
 
 def _one_interval() -> pd.DataFrame:
