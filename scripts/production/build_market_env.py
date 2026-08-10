@@ -279,16 +279,26 @@ def build_market_env(data_dir: str) -> tuple[pd.DataFrame, dict]:
     out.attrs["source"] = ("derived market-breadth panel "
                            "(build_market_env.py: account_stats/highs_lows/"
                            "industry advance/turnover)")
+    # The price part is a COMPOSITE: high_low_ratio + market_turnover_z are
+    # same-day trade data (verified by nature), but market_adv_ratio inherits
+    # its PIT from industry_ranking — so the part's pit_alignment is the
+    # WEAKEST constituent: verified ONLY when adv_pit == "verified", else proxy
+    # (§二十: a proxy constituent must never be smuggled inside a "verified"
+    # part).
+    price_pit = "verified" if adv_pit == "verified" else "proxy"
     parts = {
         "price": {
             "columns": sorted(MARKET_ENV_PRICE_COLS),
-            "pit_alignment": "verified",
+            "pit_alignment": price_pit,
             "industry_advance_pit": adv_pit,
-            "note": "same-day trade data (high/low breadth, market turnover); "
-                    "market_adv_ratio is the CSRC broad-sector advance ratio — "
-                    "fraction of 证监会 门类 sectors (A–S) with positive "
-                    "equal-weighted return, derived from the PIT "
-                    "industry_ranking (§二十)",
+            "note": "same-day trade data (high/low breadth, market turnover) "
+                    "plus market_adv_ratio — the CSRC broad-sector advance "
+                    "ratio (fraction of 证监会 门类 sectors A–S with positive "
+                    "equal-weighted return) derived from industry_ranking. "
+                    "This part is a COMPOSITE: pit_alignment inherits the "
+                    "WEAKEST constituent, so it is 'verified' ONLY when "
+                    "industry_advance_pit == 'verified', otherwise 'proxy' "
+                    "(§二十)",
         },
         "account": {
             "columns": sorted(MARKET_ENV_ACCOUNT_COLS),

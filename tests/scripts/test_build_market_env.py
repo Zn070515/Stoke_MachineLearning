@@ -164,6 +164,41 @@ def test_price_part_declares_industry_advance_pit(bme, tmp_path):
     assert parts["price"]["industry_advance_pit"] == "verified"
 
 
+def test_price_part_pit_verified_when_advance_verified(bme, tmp_path):
+    """The price part is a COMPOSITE: high_low_ratio + market_turnover_z are
+    same-day trade data (verified by nature), while market_adv_ratio inherits
+    its PIT from industry_ranking.  When that source is verified, the whole
+    part stays ``verified`` (the weakest constituent governs)."""
+    df, parts = _build_full(tmp_path, bme)
+    assert parts["price"]["industry_advance_pit"] == "verified"
+    assert parts["price"]["pit_alignment"] == "verified"
+
+
+def test_price_part_pit_proxy_when_advance_proxy(bme, tmp_path):
+    """§二十 REGRESSION: when the snapshot-sector fallback forces
+    industry_advance_pit == "proxy", the COMPOSITE price part must inherit the
+    WEAKEST constituent and declare ``proxy`` — never a proxy constituent
+    smuggled inside a "verified" part."""
+    from stoke_ml.data.asset_contract import write_asset_manifest
+    from scripts.production.download_industry_ranking import INDUSTRY_RANKING_ASSET
+    daily = tmp_path / "a_shares"
+    daily.mkdir(parents=True, exist_ok=True)
+    rows = pd.DataFrame({
+        "date": ["2024-01-02", "2024-01-02"],
+        "sector_code": ["SEC0000", "SEC0001"],
+        "change_pct": [0.01, -0.02],
+    })
+    rows.to_parquet(daily / "industry_ranking.parquet", index=False)
+    # manifest WITHOUT the pit_alignment key → build_industry_advance reports proxy
+    write_asset_manifest(str(daily / "industry_ranking.parquet"),
+                         INDUSTRY_RANKING_ASSET, rows)
+    _write_highs_lows(tmp_path)
+    _write_daily(tmp_path)
+    df, parts = bme.build_market_env(str(tmp_path))
+    assert parts["price"]["industry_advance_pit"] == "proxy"
+    assert parts["price"]["pit_alignment"] == "proxy"
+
+
 def test_build_market_env_asserts_full_price_cols(bme, tmp_path):
     """§v18-5: a builder that cannot produce the full MARKET_ENV_PRICE_COLS set
     must FAIL, not write a partial asset with a valid manifest."""
