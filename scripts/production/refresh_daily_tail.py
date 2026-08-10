@@ -39,9 +39,11 @@ Sharded parallel runs
 ``--shard-id`` in ``[0, N)``; the plan is round-robin partitioned
 (interleaved, see ``shard_plan``) so shard *i* owns indices ``i (mod N)`` and
 sees a mix of 000/002/300/600/688 codes.  Each shard prefers a DIFFERENT
-primary source (efinance / akshare / baostock rotation, see ``SOURCE_ORDERS``)
-so concurrent request volume is spread across vendors instead of every worker
-hammering EastMoney, which throttles under load.  Each worker reuses ONE
+primary source (see ``SOURCE_ORDERS``) so concurrent request volume is spread
+across vendors instead of every worker hammering EastMoney, which throttles
+under load — EastMoney throttles even a single shard of 4 concurrent efinance
+clients (2026-08-10), so efinance is DEMOTED to a fallback in every rotation and
+akshare / baostock carry the primary load.  Each worker reuses ONE
 downloader (built in ``Pool.initializer``) so the per-source failover circuit
 breaker accumulates across all of that worker's stocks and self-heals to the
 next source for 300s when a vendor starts throttling.
@@ -88,10 +90,14 @@ logger = logging.getLogger(__name__)
 # of hammering EastMoney (which throttles under concurrent load).  The rotation
 # is a function of shard_id only.  Baostock stays in every rotation because the
 # pre-2015 backfill path requires it.
+# EastMoney throttles even a single 4-client shard (measured 2026-08-10:
+# ~70% of efinance-first fetches returned "Connection closed abruptly"), so
+# efinance is DEMOTED to a fallback in every rotation and akshare / baostock
+# carry the primary load.
 SOURCE_ORDERS: tuple[tuple[str, ...], ...] = (
-    ("efinance", "akshare", "baostock", "tushare"),
     ("akshare", "baostock", "efinance", "tushare"),
-    ("baostock", "efinance", "akshare", "tushare"),
+    ("baostock", "akshare", "efinance", "tushare"),
+    ("akshare", "efinance", "baostock", "tushare"),
 )
 
 
