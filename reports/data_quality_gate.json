@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-10T15:09:29.968414",
+  "timestamp": "2026-08-10T18:55:20.563395",
   "passed": true,
   "quality_gate_version": "3.0",
   "data_root": "D:\\Projects\\Stoke_MachineLearning\\data",
@@ -25,7 +25,7 @@
   "scanned_files": 16590,
   "total_files": 16590,
   "manifest_contract_full_scan": true,
-  "data_manifest_hash": "700a5e172bf3d792",
+  "data_manifest_hash": "a020100d4b1b7383",
   "checks": [
     {
       "name": "datasets",
@@ -321,8 +321,8 @@
     {
       "name": "universe",
       "passed": true,
-      "summary": "OK requested=5530 present=5530 missing=0 degraded=0",
-      "files_scanned": 5530,
+      "summary": "OK requested=3 present=3 missing=0 degraded=0",
+      "files_scanned": 3,
       "rows_scanned": 0,
       "unreadable_files": 0,
       "issue_count": 0,
@@ -331,12 +331,24 @@
   ],
   "universe_reconciliation": {
     "ok": true,
-    "requested_count": 5530,
-    "present_count": 5530,
+    "requested_count": 3,
+    "present_count": 3,
     "missing_count": 0,
     "degraded_count": 0,
     "missing_codes": [],
-    "degraded_codes": []
+    "degraded_codes": [],
+    "run_manifest": {
+      "status": "complete",
+      "requested_count": 3,
+      "complete_count": 3,
+      "failed_count": 0,
+      "missing_count": 0,
+      "all_complete": true,
+      "effective_end": "2026-08-07",
+      "latest_available_end": "2026-08-07",
+      "failed": [],
+      "missing": []
+    }
   },
   "vintage_policy": "revision-safe",
   "channel_vintage": [

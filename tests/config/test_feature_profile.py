@@ -183,14 +183,16 @@ def test_headline_v1_coverage_contracts_within_unit_interval():
 
 
 def test_coverage_metrics_include_era_metrics():
-    """§T8: ``era_coverage`` (provider-era retrieval coverage, the metric behind
-    the sentiment/guba contracts) and the reserved ``date_availability`` are
-    valid declared metrics; ``era_coverage`` is ACTIVE (used by a contract),
-    ``date_availability`` is reserved for a future date-presence metric."""
+    """§T8: ``era_coverage`` (provider-era retrieval coverage) and the reserved
+    ``date_availability`` are valid DECLARED metrics.  ``date_availability`` is
+    reserved for a future date-presence metric.  Since §v19 Option A (contract
+    alignment), ``era_coverage`` is DEFERRED — no storage-layer write-end produces
+    the provider-era fields, so NO shipped contract uses it (guba/sentiment now
+    contract on stock_coverage); it stays in the metric enum for future use."""
     assert "era_coverage" in _COVERAGE_METRICS
     assert "date_availability" in _COVERAGE_METRICS
-    assert any(
-        c.metric == "era_coverage"
+    assert all(
+        c.metric != "era_coverage"
         for c in _headline().coverage_contracts.values())
     assert all(
         c.metric != "date_availability"
@@ -211,36 +213,32 @@ def test_headline_v1_coverage_contract_keys_subset_of_required():
 def test_headline_v1_coverage_contracts_exact_map():
     """Pin the exact per-channel (metric, threshold) contract map (§T4).
 
-    The SPARSE text event channels (sentiment / guba) use era_coverage (§T8) —
-    the provider-era retrieval-coverage metric that distinguishes a stock with
-    genuinely no events (no_event, legitimate) from an era we never observed
-    (not_observed, a data gap).  §v18-3 makes those contracts COMPOSITE: each
-    also REQUIRES ``era_observable_stock_fraction`` >= 0.90, so 10/500
-    era-observable stocks can never represent the requested universe.  The
-    remaining per-stock channels use stock_coverage; the MARKET-WIDE broadcast
-    channels (etf_flow / industry / market_env) use date_coverage — their value
-    is the same for every stock per date, so stock coverage is vacuous (1.0
-    whenever the file exists) and date coverage is the meaningful metric.
-    dragon_tiger is presence-only (required, NO contract).  Thresholds are the
-    historical minimum_coverage values — NOT re-tuned.
+    §v19 Option A aligned the 6 out-of-contract channels to measured reality
+    with a safety margin (the honest-probe re-run over the full 2000-2026
+    window): sentiment/guba dropped their era_coverage 0.90 contracts and now
+    contract on the DECIDABLE per-stock stock_coverage 0.90 (era_coverage is
+    deferred — no storage-layer write-end produces the provider-era fields);
+    margin/northbound (subset channels, ~66% of the universe) drop to
+    stock_coverage 0.60; etf_flow/industry (data inception 2015-01) drop to
+    date_coverage 0.40.  Every per-stock channel uses stock_coverage; the
+    MARKET-WIDE broadcast channels (etf_flow / industry / market_env) use
+    date_coverage — their value is the same for every stock per date, so stock
+    coverage is vacuous (1.0 whenever the file exists) and date coverage is the
+    meaningful metric.  dragon_tiger is presence-only (required, NO contract).
     """
     assert _headline().coverage_contracts == {
-        "sentiment": CoverageContract(
-            "era_coverage", 0.90,
-            requires=("era_observable_stock_fraction", 0.90)),
-        "guba": CoverageContract(
-            "era_coverage", 0.90,
-            requires=("era_observable_stock_fraction", 0.90)),
+        "sentiment": CoverageContract("stock_coverage", 0.90),
+        "guba": CoverageContract("stock_coverage", 0.90),
         "comment": CoverageContract("stock_coverage", 0.90),
         "announcement": CoverageContract("stock_coverage", 0.70),
-        "margin": CoverageContract("stock_coverage", 0.95),
-        "northbound": CoverageContract("stock_coverage", 0.90),
+        "margin": CoverageContract("stock_coverage", 0.60),
+        "northbound": CoverageContract("stock_coverage", 0.60),
         "capital_flow": CoverageContract("stock_coverage", 0.90),
         "block_trade": CoverageContract("stock_coverage", 0.30),
         "lockup": CoverageContract("stock_coverage", 0.30),
         "dividend": CoverageContract("stock_coverage", 0.30),
-        "etf_flow": CoverageContract("date_coverage", 0.80),
-        "industry": CoverageContract("date_coverage", 0.95),
+        "etf_flow": CoverageContract("date_coverage", 0.40),
+        "industry": CoverageContract("date_coverage", 0.40),
         "market_env": CoverageContract("date_coverage", 0.95),
     }
 

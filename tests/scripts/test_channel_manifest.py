@@ -560,9 +560,15 @@ def test_probe_era_coverage_none_when_zero_observable(tp, tmp_path):
     assert n_not == 2
 
 
-def test_merge_era_coverage_adds_fields_only_to_present_channels(tp, tmp_path):
+def test_merge_era_coverage_adds_fields_only_to_present_channels(tp, tmp_path,
+                                                                  monkeypatch):
     """The merge stamps era fields on the era-capable channels ALREADY present
-    and leaves non-era channels and absent channels untouched."""
+    and leaves non-era channels and absent channels untouched.  era-capability is
+    injected (sentiment/guba) because §v19 Option A deferred era_coverage in the
+    shipped profiles — this test exercises the MERGE MECHANISM, not the profile."""
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._era_capable_channels",
+        lambda: frozenset({"sentiment", "guba"}))
     data_dir = str(tmp_path / "data")
     _gold_manifest(data_dir, "sentiment", "000001",
                    ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
@@ -585,9 +591,14 @@ def test_merge_era_coverage_adds_fields_only_to_present_channels(tp, tmp_path):
     assert "announcement" not in manifest  # absent channel not created
 
 
-def test_merge_era_coverage_empty_manifest_stays_empty(tp, tmp_path):
+def test_merge_era_coverage_empty_manifest_stays_empty(tp, tmp_path,
+                                                       monkeypatch):
     """A --no-aux build's empty channel manifest stays empty — a channel not
-    actually in the panel is not probed."""
+    actually in the panel is not probed.  era-capability is injected (sentiment)
+    because §v19 Option A deferred era_coverage in the shipped profiles."""
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._era_capable_channels",
+        lambda: frozenset({"sentiment"}))
     data_dir = str(tmp_path / "data")
     _gold_manifest(data_dir, "sentiment", "000001",
                    ("2024-01-01", "2024-01-10"), [["2024-01-01", "2024-01-10"]])
@@ -601,7 +612,8 @@ def test_merge_era_coverage_force_false_migrates_pre_t3_store(tp, monkeypatch):
     ``era_observable_stock_fraction`` — on the force=False store-LOAD path that
     entry is INCOMPLETE for the composite gate, so the merge must RE-PROBE it
     and fill the fraction (denominator = the requested universe, not just the
-    era-observable stocks)."""
+    era-observable stocks).  era-capability is injected (sentiment) because
+    §v19 Option A deferred era_coverage in the shipped profiles."""
     calls = []
 
     def _spy(data_dir, ch, stock_list):
@@ -610,6 +622,9 @@ def test_merge_era_coverage_force_false_migrates_pre_t3_store(tp, monkeypatch):
 
     monkeypatch.setattr(
         "scripts.production.train_panel_panel._probe_era_coverage", _spy)
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._era_capable_channels",
+        lambda: frozenset({"sentiment"}))
     manifest = {"sentiment": {"status": "OK", "era_coverage": 1.0}}
     out = tp._merge_era_coverage(
         manifest, "data", ["000001", "000002", "000003"], force=False)
@@ -634,6 +649,9 @@ def test_merge_era_coverage_force_false_skips_complete_entry(tp, monkeypatch):
 
     monkeypatch.setattr(
         "scripts.production.train_panel_panel._probe_era_coverage", _boom)
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._era_capable_channels",
+        lambda: frozenset({"sentiment"}))
     manifest = {"sentiment": {"status": "OK", "era_coverage": 0.95,
                               "era_observable_stock_fraction": 0.90}}
     out = tp._merge_era_coverage(manifest, "data", ["000001", "000002"],
@@ -647,9 +665,11 @@ def test_era_capable_channels_derives_from_profile_contracts(tp, monkeypatch):
     """§T8 review (Important 2): the era-probe channel set is DERIVED from the
     feature profiles' era_coverage contracts — adding an era contract to a
     profile automatically adds that channel to the probe, so there is NO
-    hard-coded list to keep in sync.  A stock_coverage-contracted channel
-    (comment) is not probed until it declares era_coverage; the union over all
-    profiles keeps the live-default (profile_name=None) probe non-empty."""
+    hard-coded list to keep in sync.  §v19 Option A deferred era_coverage: NO
+    shipped profile declares it (guba/sentiment now contract on stock_coverage),
+    so the live-default (profile_name=None) probe is empty.  A
+    stock_coverage-contracted channel (comment) is not probed until it declares
+    era_coverage."""
     import dataclasses
     from stoke_ml.config.feature_profile import (
         FEATURE_PROFILES,
@@ -657,9 +677,10 @@ def test_era_capable_channels_derives_from_profile_contracts(tp, monkeypatch):
     )
 
     base = tp._era_capable_channels()
-    assert "sentiment" in base and "guba" in base
-    assert base == frozenset({"sentiment", "guba"})   # only era-contracted
-    assert "comment" not in base                      # stock_coverage, not era
+    assert base == frozenset()       # no shipped profile contracts era_coverage
+    assert "sentiment" not in base   # gated on stock_coverage now (§v19 Option A)
+    assert "guba" not in base        # gated on stock_coverage now (§v19 Option A)
+    assert "comment" not in base     # stock_coverage, not era
 
     # Give comment an era_coverage contract → the probe must now cover it.
     updated = dataclasses.replace(
@@ -673,7 +694,7 @@ def test_era_capable_channels_derives_from_profile_contracts(tp, monkeypatch):
         "stoke_ml.config.feature_profile.FEATURE_PROFILES",
         {"headline_v1": updated})
     assert "comment" in tp._era_capable_channels()
-    assert "sentiment" in tp._era_capable_channels()
+    assert "sentiment" not in tp._era_capable_channels()  # still stock_coverage
 
 
 def test_stock_era_coverage_first_existing_partition_wins(tp, tmp_path):
@@ -705,3 +726,220 @@ def test_stock_era_coverage_first_existing_partition_wins(tp, tmp_path):
     cov, no = tp._stock_era_coverage(data_dir, "sentiment", "000001")
     assert no is False
     assert cov == 1.0   # 2024/01's full retrieval — NOT a merge with 2024/02
+
+
+# ── _probe_flagless_channel_coverage (flag-less required channels from disk) ──
+
+def test_probe_flagless_marketwide_presence(tp, tmp_path):
+    """A per-stock flag-less channel (block_trade) is probed as the fraction of
+    stocks with >=1 parquet under the channel's PROCESSED source dir — the dir
+    the prebuilt features actually read."""
+    data_dir = str(tmp_path / "data")
+    bt = os.path.join(data_dir, "a_shares", "block_trade_processed")
+    os.makedirs(bt, exist_ok=True)
+    pd.DataFrame({"date": ["2024-01-02"], "v": [1.0]}).to_parquet(
+        os.path.join(bt, "000001.parquet"))
+    pd.DataFrame({"date": ["2024-01-02"], "v": [1.0]}).to_parquet(
+        os.path.join(bt, "000002.parquet"))
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"block_trade"}, ["000001", "000002", "600519"],
+        data_dir, "2024-01-01", "2024-12-31")
+    e = manifest["block_trade"]
+    assert e["status"] == "OK"
+    assert e["loaded_stocks"] == 2
+    assert e["stock_coverage"] == round(2 / 3, 4)
+    assert e["required"] is True
+
+
+def test_probe_flagless_missing_channel_zero(tp, tmp_path):
+    """A required flag-less channel with NO files on disk is MISSING with 0.0
+    stock coverage — the formal gate must still abort on it (never false-pass)."""
+    data_dir = str(tmp_path / "data")
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"northbound"}, ["000001", "000002"],
+        data_dir, "2024-01-01", "2024-12-31")
+    e = manifest["northbound"]
+    assert e["status"] == "MISSING"
+    assert e["stock_coverage"] == 0.0
+    assert e["loaded_stocks"] == 0
+
+
+def test_probe_flagless_partitioned_files_counted(tp, tmp_path):
+    """Legacy year/month partitioned files (dragon_tiger) are found by the
+    recursive walk — the probe must not only see flat {code}.parquet files."""
+    data_dir = str(tmp_path / "data")
+    dt = os.path.join(data_dir, "a_shares", "dragon_tiger", "2024", "01")
+    os.makedirs(dt, exist_ok=True)
+    pd.DataFrame({"date": ["2024-01-02"], "v": [1.0]}).to_parquet(
+        os.path.join(dt, "000001.parquet"))
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"dragon_tiger"}, ["000001", "000002"],
+        data_dir, "2024-01-01", "2024-12-31")
+    assert manifest["dragon_tiger"]["stock_coverage"] == 0.5
+    assert manifest["dragon_tiger"]["status"] == "OK"
+
+
+def test_probe_flagless_skips_present_channels(tp, tmp_path):
+    """A channel already in the manifest (has_* flag / live load / persisted
+    store) is NOT re-probed — the flagless probe only fills the gaps."""
+    data_dir = str(tmp_path / "data")
+    manifest = {"margin": {"status": "OK", "stock_coverage": 1.0, "required": True}}
+    out = tp._probe_flagless_channel_coverage(
+        manifest, {"margin", "block_trade"}, ["000001"],
+        data_dir, "2024-01-01", "2024-12-31")
+    assert out["margin"] is manifest["margin"]  # untouched
+    assert "block_trade" in out                 # the gap WAS filled
+
+
+def test_probe_flagless_does_not_add_non_required(tp, tmp_path):
+    """Only REQUIRED channels are probed — a non-required flag-less channel is
+    left out entirely (the coverage gate only gates the required set)."""
+    data_dir = str(tmp_path / "data")
+    out = tp._probe_flagless_channel_coverage(
+        {}, set(), ["000001"], data_dir, "2024-01-01", "2024-12-31")
+    assert out == {}
+
+
+def test_probe_flagless_broadcast_date_coverage(tp, tmp_path):
+    """industry is broadcast: date_coverage from the shared parquet, mirroring
+    the live probe."""
+    from stoke_ml.data.calendar import get_research_calendar
+
+    data_dir = str(tmp_path / "data")
+    cal = get_research_calendar(strict=True, data_dir=data_dir)
+    lo, hi = pd.Timestamp("2024-01-01").date(), pd.Timestamp("2024-12-31").date()
+    tdays = cal.get_trading_days(lo, hi)
+    assert tdays
+    ind_dir = os.path.join(data_dir, "a_shares", "industry")
+    os.makedirs(ind_dir, exist_ok=True)
+    pd.DataFrame(
+        np.random.RandomState(0).randn(len(tdays), 3),
+        index=pd.DatetimeIndex(tdays),
+    ).to_parquet(os.path.join(ind_dir, "industry_returns.parquet"))
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"industry"}, ["000001"], data_dir, "2024-01-01", "2024-12-31")
+    e = manifest["industry"]
+    assert e["status"] == "OK"
+    assert e["date_coverage"] == 1.0
+    assert e["loaded_stocks"] is None
+
+
+def test_probe_flagless_etf_flow_window_filtered(tp, tmp_path):
+    """etf_flow date_coverage is window-filtered (data outside [start,end]
+    counts as 0.0 in-window), matching the live-path regression."""
+    from stoke_ml.data.calendar import get_research_calendar
+
+    data_dir = str(tmp_path / "data")
+    cal = get_research_calendar(strict=True, data_dir=data_dir)
+    lo, hi = pd.Timestamp("2024-01-01").date(), pd.Timestamp("2024-12-31").date()
+    tdays = cal.get_trading_days(lo, hi)
+    etf_dir = os.path.join(data_dir, "a_shares", "etf_flow")
+    os.makedirs(etf_dir, exist_ok=True)
+    outside = pd.date_range("2022-01-03", periods=len(tdays), freq="B")
+    pd.DataFrame({
+        "date": outside,
+        "etf_flow_sum": [1.0] * len(outside),
+        "etf_amount_sum": [1.0] * len(outside),
+    }).to_parquet(os.path.join(etf_dir, "sector_banks.parquet"))
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"etf_flow"}, ["000001"], data_dir, "2024-01-01", "2024-12-31")
+    e = manifest["etf_flow"]
+    assert e["status"] == "OK"
+    assert e["date_coverage"] == 0.0
+    assert e["stock_coverage"] == 1.0
+
+
+def test_probe_flagless_unregistered_channel_failed(tp, tmp_path):
+    """A required channel with NO CHANNEL_SOURCE registry entry degrades to
+    FAILED (0.0 coverage), never raises — the formal gate then aborts on it."""
+    import scripts.production.train_panel_panel as panel_mod
+    from stoke_ml.data.channel_sources import CHANNEL_SOURCE
+
+    saved = dict(CHANNEL_SOURCE)
+    try:
+        CHANNEL_SOURCE.pop("lockup", None)
+        manifest = tp._probe_flagless_channel_coverage(
+            {}, {"lockup"}, ["000001"], str(tmp_path / "data"),
+            "2024-01-01", "2024-12-31")
+    finally:
+        CHANNEL_SOURCE.clear()
+        CHANNEL_SOURCE.update(saved)
+    assert manifest["lockup"]["status"] == "FAILED"
+    assert manifest["lockup"]["stock_coverage"] == 0.0
+
+
+# ── _resolve_panel store-load fallback probes flag-less channels (§T4 gap) ──
+
+def test_resolve_panel_store_load_fallback_probes_flagless(tp, tmp_path, monkeypatch):
+    """Regression for the actual gate abort: a LEGACY store (no persisted
+    channel_coverage_manifest) loaded under formal mode with a named profile
+    must probe flag-less required channels from disk — pre-fix, block_trade had
+    no probe in the store path and _enforce_channel_coverage aborted the run."""
+    data_dir = str(tmp_path / "data")
+    bt = os.path.join(data_dir, "a_shares", "block_trade_processed")
+    os.makedirs(bt, exist_ok=True)
+    pd.DataFrame({"date": ["2024-01-02"], "v": [1.0]}).to_parquet(
+        os.path.join(bt, "000001.parquet"))
+    pd.DataFrame({"date": ["2024-01-02"], "v": [1.0]}).to_parquet(
+        os.path.join(bt, "000002.parquet"))
+
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel.load_panel_memmap",
+        lambda path, **kw: {"past_observed": None, "past_observed_cols": []})
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._panel_store_meta",
+        lambda *a, **k: {})
+    monkeypatch.setattr(
+        "scripts.production.train_panel_panel._merge_era_coverage",
+        lambda m, d, s, **k: m)
+
+    class _Args:
+        panel_store = "store"
+        prebuilt = "features_panel"
+        minute = False
+        no_aux = False
+        no_formal = False
+        start = "2024-01-01"
+        end = "2024-12-31"
+        horizon = 1
+        universe = "all"
+        feature_profile = "headline_v1"
+        vintage_policy = "revision-safe"
+        allow_fundamental_ablation = False
+        require_feature_manifest = False
+
+    _panel, manifest = tp._resolve_panel(
+        _Args(), ["000001", "000002", "600519"], 60, data_dir,
+        {"block_trade"}, _store_load=True)
+    assert manifest["block_trade"]["stock_coverage"] == round(2 / 3, 4)
+    assert manifest["block_trade"]["status"] == "OK"
+
+
+def test_probe_flagless_etf_flow_corrupt_file_failed(tp, tmp_path):
+    """A corrupt sector parquet degrades to FAILED (0.0 coverage), never raises
+    out of the probe — a malformed file must not abort the formal gate."""
+    data_dir = str(tmp_path / "data")
+    etf_dir = os.path.join(data_dir, "a_shares", "etf_flow")
+    os.makedirs(etf_dir, exist_ok=True)
+    with open(os.path.join(etf_dir, "sector_banks.parquet"), "wb") as fh:
+        fh.write(b"not-a-parquet")
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"etf_flow"}, ["000001"], data_dir, "2024-01-01", "2024-12-31")
+    e = manifest["etf_flow"]
+    assert e["status"] == "FAILED"
+    assert e["date_coverage"] == 0.0
+    assert e["stock_coverage"] == 0.0
+
+
+def test_probe_flagless_etf_flow_missing_date_col_failed(tp, tmp_path):
+    """A sector parquet lacking a 'date' column degrades to FAILED (0.0), never
+    raises a KeyError out of the probe."""
+    data_dir = str(tmp_path / "data")
+    etf_dir = os.path.join(data_dir, "a_shares", "etf_flow")
+    os.makedirs(etf_dir, exist_ok=True)
+    pd.DataFrame({"v": [1.0, 2.0]}).to_parquet(
+        os.path.join(etf_dir, "sector_banks.parquet"))
+    manifest = tp._probe_flagless_channel_coverage(
+        {}, {"etf_flow"}, ["000001"], data_dir, "2024-01-01", "2024-12-31")
+    assert manifest["etf_flow"]["status"] == "FAILED"
+    assert manifest["etf_flow"]["date_coverage"] == 0.0

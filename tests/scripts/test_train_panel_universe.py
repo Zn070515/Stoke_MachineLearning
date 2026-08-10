@@ -461,6 +461,55 @@ def test_gate_inner_train_membership_row_col_subselection(tp):
     ]
 
 
+def test_mask_stocks_all_kept_returns_same_dict(tp):
+    """Fast-path: all-True keep returns the input dict unchanged (identity),
+    so lazy memmap views are NOT materialized into dense copies."""
+    data = {"a": np.zeros((3, 5)), "b": np.zeros((3,))}
+    out = tp._mask_stocks(data, np.array([True, True, True]))
+    assert out is data
+    assert out["a"] is data["a"]  # no copy
+
+
+def test_mask_stocks_partial_keep_copies_selected(tp):
+    data = {"a": np.arange(6).reshape(3, 2), "b": np.array(["x", "y", "z"])}
+    out = tp._mask_stocks(data, np.array([True, False, True]))
+    assert out["a"].tolist() == [[0, 1], [4, 5]]
+    assert out["b"].tolist() == ["x", "z"]
+
+
+def test_apply_candidate_gates_works_on_readonly_mask(tp):
+    """After the _mask_stocks fast-path the decision mask may be a read-only
+    view; gating must REASSIGN (not &= in place) to avoid ValueError."""
+    dd = {"decision_eligible_mask": np.array([
+        [True, True], [True, True], [True, True],
+    ])}
+    dd["decision_eligible_mask"].flags.writeable = False  # simulate read-only
+    nd_mask = np.array([
+        [True, False], [True, True], [True, True],
+    ])
+    tp._apply_candidate_gates(
+        dd, slice(0, 2), rows=np.array([0, 1, 2]),
+        nd_mask=nd_mask, mem_mask=None)
+    assert dd["decision_eligible_mask"].tolist() == [
+        [True, False], [True, True], [True, True],
+    ]
+
+
+def test_gate_inner_train_membership_works_on_readonly_mask(tp):
+    """Fast-path may hand this a read-only entry_eligible_mask view; the gate
+    must REASSIGN (not &= in place) to avoid ValueError on read-only arrays."""
+    inner = {"entry_eligible_mask": np.ones((2, 3), dtype=bool)}
+    inner["entry_eligible_mask"].flags.writeable = False  # simulate read-only
+    mem = np.zeros((4, 3), dtype=bool)
+    mem[1, 1] = True   # only (grid row 1, col 1) is a member
+    tp._gate_inner_train_membership(
+        inner, mem, rows=np.array([0, 1]), cols=np.arange(3))
+    assert inner["entry_eligible_mask"].tolist() == [
+        [False, False, False],
+        [False, True, False],
+    ]
+
+
 def test_gate_descriptions_default_vs_strict(tp):
     """§八.3 summary labeling: default trains on the broad union (ungated)
     while evaluation gates 未退市 (+ membership when consumed); strict mode
@@ -1752,11 +1801,13 @@ def test_resolve_required_set_cli_default_activates_headline_v1(tp):
     assert name == "headline_v1"
     assert contracts == FEATURE_PROFILES["headline_v1"].coverage_contracts
     # threshold projection still exposed for threshold-only callers
+    # (§v19 Option A: margin/northbound 0.60 subset channels, etf_flow/industry
+    # 0.40 date_coverage for 2015-01 inception, market_env stays 0.95)
     assert {ch: c.threshold for ch, c in contracts.items()} == {
         "sentiment": 0.90, "guba": 0.90, "comment": 0.90,
-        "announcement": 0.70, "margin": 0.95, "northbound": 0.90,
-        "capital_flow": 0.90, "etf_flow": 0.80, "block_trade": 0.30,
-        "lockup": 0.30, "dividend": 0.30, "industry": 0.95,
+        "announcement": 0.70, "margin": 0.60, "northbound": 0.60,
+        "capital_flow": 0.90, "etf_flow": 0.40, "block_trade": 0.30,
+        "lockup": 0.30, "dividend": 0.30, "industry": 0.40,
         "market_env": 0.95}
     assert "margin" in required_set
 
@@ -2048,23 +2099,25 @@ def test_enforce_channel_coverage_era_metric_absent_is_unprobeable(tp, caplog):
     assert any("sentiment" in m for m in caplog.messages)
 
 
-def test_headline_v1_era_contracts_decidable_in_formal_mode(tp, caplog):
-    """§T8 acceptance (4): headline_v1's new sentiment/guba era_coverage 0.90
-    contracts are DECIDABLE by the formal gate — present at era_coverage 1.0
-    they pass; present at 0.50 the run aborts.  (Acceptance (5) regression: a
-    channel NOT declaring era_coverage is still gated on stock_coverage.)"""
+def test_headline_v1_guba_sentiment_contracts_decidable_in_formal_mode(tp, caplog):
+    """§v19 Option A: headline_v1's sentiment/guba contracts are now the
+    DECIDABLE per-stock ``stock_coverage`` 0.90 (era_coverage is deferred — no
+    storage-layer write-end produces the provider-era fields).  Present at
+    stock_coverage 1.0 they pass the formal gate; present at 0.50 the run
+    aborts.  A channel NOT in the contract map is still gated on stock_coverage
+    by default."""
     import logging
     args = _panel_args("revision-safe", feature_profile="headline_v1")
     required_set, contracts, name = tp._resolve_required_set(args)
     assert name == "headline_v1"
-    assert contracts["sentiment"].metric == "era_coverage"
-    assert contracts["guba"].metric == "era_coverage"
+    assert contracts["sentiment"].metric == "stock_coverage"
+    assert contracts["guba"].metric == "stock_coverage"
 
     manifest = _full_manifest(required_set, contracts)
     tp._enforce_channel_coverage(
         required_set, manifest, contracts, formal=True)  # must not abort
 
-    manifest["sentiment"]["era_coverage"] = 0.50
+    manifest["sentiment"]["stock_coverage"] = 0.50
     with caplog.at_level(logging.ERROR, logger="train_panel_mod"):
         with pytest.raises(SystemExit) as ei:
             tp._enforce_channel_coverage(

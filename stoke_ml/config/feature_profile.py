@@ -218,14 +218,22 @@ del _channel, _cols, _col, _COLUMN_OWNER
 #
 # §T8: ERA coverage is the provider-era retrieval coverage — the calendar-day
 # fraction of a stock's provider-observable window that was actually retrieved,
-# per the gold asset manifest's provider-era fields.  It is the metric for the
-# SPARSE text event channels (sentiment / guba): it distinguishes a stock that
-# genuinely had no events (no_event, legitimate) from an era we never observed
-# (not_observed, a data gap).  §v18-3: ``era_observable_stock_fraction`` is the
-# fraction of the REQUESTED universe that is era-observable (n_obs / len(stock_list))
-# — the composite half of the era-coverage contract, so 10 era-observable stocks
-# can never represent a 500-stock requested universe.  ``date_availability`` is
-# reserved for a future date-presence metric (not currently produced).
+# per the gold asset manifest's provider-era fields.  It distinguishes a stock
+# that genuinely had no events (no_event, legitimate) from an era we never
+# observed (not_observed, a data gap).  §v18-3: ``era_observable_stock_fraction``
+# is the fraction of the REQUESTED universe that is era-observable
+# (n_obs / len(stock_list)) — the composite half of the era-coverage contract, so
+# 10 era-observable stocks can never represent a 500-stock requested universe.
+# ``date_availability`` is reserved for a future date-presence metric (not
+# currently produced).
+#
+# §v19 contract alignment (Option A): era_coverage is DEFERRED — NOT usable by a
+# shipped contract yet.  No storage layer has a write-end for the provider-era
+# fields (provider_available_start/end, retrieved_ranges, known_gaps), so no gold
+# asset manifest exists to probe; an era_coverage contract would be UNPROBEABLE
+# and abort every formal build.  headline_v1's sparse text channels (guba /
+# sentiment) therefore contract on the DECIDABLE per-stock ``stock_coverage``.
+# The era probe MECHANISM stays intact for when a write-end lands.
 _COVERAGE_METRICS: frozenset[str] = frozenset({
     "stock_coverage", "cell_coverage", "date_coverage",
     "valid_state_cell_coverage", "era_coverage", "era_observable_stock_fraction",
@@ -304,18 +312,23 @@ class FeatureProfile:
 # default-off board/sector/concept/limit_up/topic dimensions.  ``macro`` is
 # denied under revision-safe, so it is deliberately absent despite defaulting ON.
 #
-# ``coverage_contracts`` thresholds ARE the historical ``minimum_coverage``
-# values — NOT re-tuned (§T4).  The metric split: the SPARSE text event channels
-# (sentiment / guba) declare ``era_coverage`` (§T8) — the provider-era retrieval
-# coverage that separates a stock with genuinely no events (no_event) from an
-# era we never observed (not_observed), so a sparse-but-observed channel is not
-# falsely gated as a data gap; every other per-stock channel declares
-# ``stock_coverage``; the MARKET-WIDE broadcast channels
-# (etf_flow / industry / market_env) declare ``date_coverage`` — their value is
-# the same for every stock per date, so stock coverage is vacuous (1.0 whenever
-# the file exists) and date coverage is the meaningful metric.  dragon_tiger is
-# deliberately absent from the map (presence-only), preserving the convention
-# that a required channel absent from the contract map is presence-only.
+# ``coverage_contracts`` thresholds are the historical ``minimum_coverage``
+# values, ALIGNED to measured reality with a safety margin (§v19 Option A, the
+# honest-probe re-run over the full 2000-2026 window — see the metric block
+# above).  The metric split: every per-stock channel declares ``stock_coverage``;
+# the MARKET-WIDE broadcast channels (etf_flow / industry / market_env) declare
+# ``date_coverage`` — their value is the same for every stock per date, so stock
+# coverage is vacuous (1.0 whenever the file exists) and date coverage is the
+# meaningful metric.  dragon_tiger is deliberately absent from the map
+# (presence-only), preserving the convention that a required channel absent from
+# the contract map is presence-only.
+#
+# §T8 era_coverage is NOT contracted by any shipped channel — DEFERRED (no
+# storage-layer write-end for the provider-era fields exists yet, so no gold
+# asset manifest can be probed).  The former era-contracted sparse text channels
+# (guba / sentiment) are therefore gated on the DECIDABLE per-stock
+# ``stock_coverage``; an era_coverage contract can be re-introduced once a
+# write-end lands.
 #
 # §T5 market_env split: ``market_env`` stays required + ``date_coverage 0.95``
 # because the file it gates carries the VERIFIED price part (high/low breadth,
@@ -344,22 +357,18 @@ FEATURE_PROFILES: dict[str, FeatureProfile] = {
             "block_trade", "lockup", "dividend", "industry", "market_env",
         ),
         coverage_contracts={
-            "sentiment": CoverageContract(
-                "era_coverage", 0.90,
-                requires=("era_observable_stock_fraction", 0.90)),
-            "guba": CoverageContract(
-                "era_coverage", 0.90,
-                requires=("era_observable_stock_fraction", 0.90)),
+            "sentiment": CoverageContract("stock_coverage", 0.90),
+            "guba": CoverageContract("stock_coverage", 0.90),
             "comment": CoverageContract("stock_coverage", 0.90),
             "announcement": CoverageContract("stock_coverage", 0.70),
-            "margin": CoverageContract("stock_coverage", 0.95),
-            "northbound": CoverageContract("stock_coverage", 0.90),
+            "margin": CoverageContract("stock_coverage", 0.60),
+            "northbound": CoverageContract("stock_coverage", 0.60),
             "capital_flow": CoverageContract("stock_coverage", 0.90),
             "block_trade": CoverageContract("stock_coverage", 0.30),
             "lockup": CoverageContract("stock_coverage", 0.30),
             "dividend": CoverageContract("stock_coverage", 0.30),
-            "etf_flow": CoverageContract("date_coverage", 0.80),
-            "industry": CoverageContract("date_coverage", 0.95),
+            "etf_flow": CoverageContract("date_coverage", 0.40),
+            "industry": CoverageContract("date_coverage", 0.40),
             "market_env": CoverageContract("date_coverage", 0.95),
         },
         vintage_policy="revision-safe",

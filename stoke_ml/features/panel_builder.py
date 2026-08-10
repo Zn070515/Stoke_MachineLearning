@@ -671,7 +671,7 @@ def _build_panel_streaming(
         # rtol=1e-5/atol=1e-6 in tests/features/test_panel_builders.py for
         # past_known/past_observed ONLY.
         normalizer = DateWiseZScoreNormalizer(daily_membership)
-        normalizer.init_stats_accumulator()
+        normalizer.init_stats_accumulator(all_dates)
         for code in valid_codes:
             pkl_path = os.path.join(scratch, f"{code}.pkl")
             df = pd.read_pickle(pkl_path)

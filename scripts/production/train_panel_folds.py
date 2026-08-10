@@ -86,6 +86,8 @@ def _fold_eligible_stocks(panel_data: dict, train_end: int) -> np.ndarray:
 
 def _mask_stocks(data: dict, keep: np.ndarray) -> dict:
     """Drop ineligible stocks (axis 0) from every panel slice array."""
+    if keep.all():
+        return data
     out = {}
     for k, v in data.items():
         if isinstance(v, np.ndarray) and v.ndim >= 1:
@@ -226,7 +228,7 @@ def _apply_candidate_gates(
     gate = nd_mask[np.ix_(rows, cols)]
     if mem_mask is not None:
         gate = gate & mem_mask[np.ix_(rows, cols)]
-    dd["decision_eligible_mask"] &= gate
+    dd["decision_eligible_mask"] = dd["decision_eligible_mask"] & gate
 
 def _gate_inner_train_membership(
     inner_train: dict,
@@ -241,7 +243,9 @@ def _gate_inner_train_membership(
     back to original panel-stock rows and ``cols`` are the inner_train grid
     columns (both aligned by the fold's slicing order).
     """
-    inner_train["entry_eligible_mask"] &= mem_mask[np.ix_(rows, cols)]
+    inner_train["entry_eligible_mask"] = (
+        inner_train["entry_eligible_mask"] & mem_mask[np.ix_(rows, cols)]
+    )
 
 def _gate_descriptions(
     consumes_membership: bool, strict_index_training: bool,

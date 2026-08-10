@@ -68,12 +68,18 @@ def _constant_col_indices(arr: np.ndarray, obs: np.ndarray) -> np.ndarray:
     listed = obs.sum(axis=1) > 0
     hi = np.float32(1e30)
     const = np.zeros((n_stocks, n_feat), dtype=bool)
-    # Chunk over stocks so the two where() temporaries stay bounded.
-    for s0 in range(0, n_stocks, 512):
-        s1 = min(s0 + 512, n_stocks)
-        m = obs[s0:s1, :, None]
-        vmin = np.where(m, arr[s0:s1], hi).min(axis=1)   # (chunk, D)
-        vmax = np.where(m, arr[s0:s1], -hi).max(axis=1)  # (chunk, D)
+    # Chunk over stocks; one writable buffer is reused for min and max so the
+    # transient stays ~ (chunk, T, D) instead of two np.where copies.  The
+    # (chunk, T, 1) mask is broadcast via a stride-0 view (no extra buffer).
+    for s0 in range(0, n_stocks, 128):
+        s1 = min(s0 + 128, n_stocks)
+        m = np.broadcast_to(obs[s0:s1, :, None], (s1 - s0, _n_dates, n_feat))
+        nm = ~m
+        buf = arr[s0:s1].copy()
+        np.putmask(buf, nm, hi)
+        vmin = buf.min(axis=1)
+        np.putmask(buf, nm, -hi)
+        vmax = buf.max(axis=1)
         const[s0:s1] = vmin == vmax
     const[~listed] = True
     return const

@@ -251,16 +251,35 @@ class DateWiseZScoreNormalizer:
 
     # ── Streaming / two-pass methods (§T5) ────────────────────────────────
 
-    def init_stats_accumulator(self):
+    def init_stats_accumulator(self, all_dates: set):
         """Initialize per-date cross-sectional stats accumulators.
 
-        Called once before the streaming accumulate pass.  Resets internal
-        accumulators so the same normalizer instance can be reused.
+        Called once before the streaming accumulate pass.  *all_dates* is the
+        global date axis as a ``set`` of ``datetime.date`` objects (the union
+        of every chunk's dates); it fixes the row axis of the dense float64
+        accumulator arrays.  Resets internal state so the same normalizer
+        instance can be reused.
+
+        The dense arrays are allocated lazily on the first
+        :meth:`accumulate_stats_chunk` call because ``norm_cols`` (the column
+        axis) is only known there.  ``date -> row`` and ``col -> position``
+        maps anchor every scatter-add.
         """
-        # {(date, col): (finite_count, sum, sumsq)} — float64 sums
-        self._all_acc: dict[tuple, tuple[int, float, float]] = {}
-        self._member_acc: dict[tuple, tuple[int, float, float]] = {}
-        self._member_dates: set = set()
+        # Global date axis → dense row index.
+        self._all_dates_sorted: list = sorted(all_dates)
+        self._date_to_row: dict = {
+            d: i for i, d in enumerate(self._all_dates_sorted)
+        }
+        # Dense float64 accumulators, shape (n_dates, n_norm_cols) — allocated
+        # lazily by _ensure_arrays (norm_cols is unknown until the first chunk).
+        self._all_cnt: np.ndarray | None = None
+        self._all_sum: np.ndarray | None = None
+        self._all_sq: np.ndarray | None = None
+        self._member_cnt: np.ndarray | None = None
+        self._member_sum: np.ndarray | None = None
+        self._member_sq: np.ndarray | None = None
+        self._norm_cols: list | None = None
+        self._col_pos: dict = {}
         # Per-column source dtype (§T5): the dense path stores mean/std in the
         # concat frame's dtype (float64 if ANY engineered frame carries the col
         # as float64, else float32).  The streaming stats must cast to the SAME
@@ -268,6 +287,54 @@ class DateWiseZScoreNormalizer:
         # float32-vs-float64 mean rounding (~2.5e-6 at magnitude ~126) into a
         # ±10 z-score flip.  Track whether any accumulated chunk is float64.
         self._col_is_f64: dict[str, bool] = {}
+
+    def _ensure_arrays(self, norm_cols: list):
+        """Allocate the dense float64 accumulator arrays on first use.
+
+        ``norm_cols`` fixes the column axis (len = number of columns); the
+        date axis was fixed at :meth:`init_stats_accumulator` time.  The real
+        streaming caller passes the SAME ``norm_cols`` for every chunk, so a
+        later call with a different column count is rejected rather than
+        silently mis-accumulating.
+        """
+        if self._all_cnt is not None:
+            if list(norm_cols) != self._norm_cols:
+                raise RuntimeError(
+                    "DateWiseZScoreNormalizer: accumulate_stats_chunk called "
+                    f"with {len(norm_cols)} norm_cols after the dense arrays "
+                    f"were allocated for {len(self._norm_cols)} — the "
+                    "streaming build must use a single fixed norm_cols across "
+                    "chunks")
+            return
+        T = len(self._all_dates_sorted)
+        C = len(norm_cols)
+        self._norm_cols = list(norm_cols)
+        self._col_pos = {c: i for i, c in enumerate(norm_cols)}
+        self._all_cnt = np.zeros((T, C), dtype=np.float64)
+        self._all_sum = np.zeros((T, C), dtype=np.float64)
+        self._all_sq = np.zeros((T, C), dtype=np.float64)
+        if self.membership_active:
+            self._member_cnt = np.zeros((T, C), dtype=np.float64)
+            self._member_sum = np.zeros((T, C), dtype=np.float64)
+            self._member_sq = np.zeros((T, C), dtype=np.float64)
+
+    def _get_accum(self, date, col):
+        """Return ``(count, sum, sumsq)`` for one ``(date, col)`` from the
+        dense arrays.
+
+        Mirrors the old ``dict.get((date, col), (0, 0.0, 0.0))`` contract so
+        throwaway diagnostics that read raw accumulator values keep working
+        after the dict → dense-array change.
+        """
+        r = self._date_to_row.get(date)
+        cpos = self._col_pos.get(col)
+        if r is None or cpos is None or self._all_cnt is None:
+            return (0, 0.0, 0.0)
+        return (
+            float(self._all_cnt[r, cpos]),
+            float(self._all_sum[r, cpos]),
+            float(self._all_sq[r, cpos]),
+        )
 
     def accumulate_stats_chunk(
         self,
@@ -282,8 +349,21 @@ class DateWiseZScoreNormalizer:
         active) member-set aggregates into float64 running sums.
 
         Called once per stock in the streaming Pass 2stats.
+
+        Vectorized: a panel chunk carries ONE row per date, so the
+        accumulation adds exactly one float64 value per (date, col) per stock,
+        in stock order — the same order the old per-cell dict loop used.  The
+        dense arrays therefore reproduce the dict sums BIT-IDENTICALLY while
+        replacing ~12M per-cell Python/numpy extractions per stock (~120 s)
+        with a few whole-matrix numpy ops.
         """
+        if df is None or len(df) == 0:
+            return
         active_cols = [c for c in norm_cols if c in df.columns]
+        if not active_cols:
+            return
+        self._ensure_arrays(norm_cols)
+        active_cols = [c for c in active_cols if c in self._col_pos]
         if not active_cols:
             return
 
@@ -291,62 +371,94 @@ class DateWiseZScoreNormalizer:
             if not self._col_is_f64.get(col, False) and df[col].dtype == np.float64:
                 self._col_is_f64[col] = True
 
-        if self.membership_active:
-            is_member_series = _daily_member_flag(
-                df[["date", "stock_code"]], self.daily_membership,
+        # Map chunk rows onto the global date axis.  Panel chunks carry one
+        # row per date, all of which lie on the axis (builder's all_dates union
+        # + ZI-align).  A stray date would silently mis-accumulate under a
+        # dense layout, so fail loudly instead of guessing.
+        dates = pd.to_datetime(df["date"]).dt.date.to_numpy()
+        row_idx = np.fromiter(
+            (self._date_to_row.get(d, -1) for d in dates),
+            dtype=np.int64, count=len(dates),
+        )
+        if (row_idx == -1).any():
+            bad = [d for d in dates if d not in self._date_to_row]
+            raise ValueError(
+                "accumulate_stats_chunk: chunk dates not on the global date "
+                f"axis: {bad[:10]}{'...' if len(bad) > 10 else ''}"
             )
+
+        col_pos = np.array([self._col_pos[c] for c in active_cols],
+                           dtype=np.int64)
+
+        # Whole-matrix extraction: (n_rows, n_active_cols) float64.
+        mat = df[active_cols].to_numpy(dtype=np.float64)
+        finite = np.isfinite(mat)
+        clean = np.where(finite, mat, 0.0)
+
+        # Panel format gives unique dates per chunk; duplicate dates are
+        # defensively handled via np.add.at (the per-date float-add order then
+        # differs from the groupwise dict loop by ~ULP, but a well-formed
+        # panel chunk cannot produce them).
+        has_dup = (
+            len(set(dates)) != len(dates)
+            or np.unique(col_pos).size != col_pos.size
+        )
+
+        if not has_dup:
+            # Unique row indices → plain advanced-indexed += is exact.
+            self._all_cnt[np.ix_(row_idx, col_pos)] += finite.astype(np.float64)
+            self._all_sum[np.ix_(row_idx, col_pos)] += clean
+            self._all_sq[np.ix_(row_idx, col_pos)] += clean * clean
         else:
-            is_member_series = None
+            n, m = len(row_idx), len(col_pos)
+            flat_idx = (
+                np.repeat(row_idx, m) * self._all_cnt.shape[1]
+                + np.tile(col_pos, n)
+            )
+            f64 = finite.astype(np.float64).ravel()
+            cr = clean.ravel()
+            np.add.at(self._all_cnt.ravel(), flat_idx, f64)
+            np.add.at(self._all_sum.ravel(), flat_idx, cr)
+            np.add.at(self._all_sq.ravel(), flat_idx, cr * cr)
 
-        for date_val, group in df.groupby("date"):
-            date_key = pd.Timestamp(date_val).date()
-            group_idx = group.index
-
-            for col in active_cols:
-                vals = group[col].to_numpy(dtype=np.float64)
-                finite = np.isfinite(vals)
-                cnt = int(finite.sum())
-                if cnt == 0:
-                    continue
-                s = float(vals[finite].sum())
-                sq = float((vals[finite] ** 2).sum())
-
-                # All-set
-                prev_all = self._all_acc.get((date_key, col), (0, 0.0, 0.0))
-                self._all_acc[(date_key, col)] = (
-                    prev_all[0] + cnt, prev_all[1] + s, prev_all[2] + sq,
-                )
-
-                # Member-set
-                if is_member_series is not None:
-                    member_mask = is_member_series.loc[group_idx].to_numpy(
-                        dtype=bool,
-                    )
-                    member_finite = finite & member_mask
-                    mcnt = int(member_finite.sum())
-                    if mcnt > 0:
-                        ms = float(vals[member_finite].sum())
-                        msq = float((vals[member_finite] ** 2).sum())
-                        prev_m = self._member_acc.get(
-                            (date_key, col), (0, 0.0, 0.0),
-                        )
-                        self._member_acc[(date_key, col)] = (
-                            prev_m[0] + mcnt, prev_m[1] + ms, prev_m[2] + msq,
-                        )
-                        self._member_dates.add(date_key)
+        # Member-set: same scatter-add restricted to member rows.  Adding the
+        # zeroed rows when mcnt==0 is a no-op, exactly matching the old loop's
+        # ``if mcnt > 0`` guard.
+        if self.membership_active:
+            is_member = _daily_member_flag(
+                df[["date", "stock_code"]], self.daily_membership,
+            ).to_numpy(dtype=bool)
+            member_finite = finite & is_member[:, None]
+            member_clean = np.where(member_finite, mat, 0.0)
+            if not has_dup:
+                self._member_cnt[np.ix_(row_idx, col_pos)] += (
+                    member_finite.astype(np.float64))
+                self._member_sum[np.ix_(row_idx, col_pos)] += member_clean
+                self._member_sq[np.ix_(row_idx, col_pos)] += (
+                    member_clean * member_clean)
+            else:
+                mf = member_finite.astype(np.float64).ravel()
+                mcr = member_clean.ravel()
+                np.add.at(self._member_cnt.ravel(), flat_idx, mf)
+                np.add.at(self._member_sum.ravel(), flat_idx, mcr)
+                np.add.at(self._member_sq.ravel(), flat_idx, mcr * mcr)
 
     def _build_stats_df(
         self,
-        acc: dict,
+        arrays: tuple,
         dates_subset: set,
         norm_cols: list,
     ) -> dict[str, pd.DataFrame]:
-        """Build per-column ``(mean, std, count)`` DataFrames from an
-        accumulator for the given date subset.
+        """Build per-column ``(mean, std, count)`` DataFrames from dense
+        accumulator arrays for the given date subset.
 
-        Reproduces the expanding-moment sparse fallback from
-        :func:`_cross_section_stats` using the per-date aggregates.  The
-        sparse fallback is NOT bit-exact against the dense path: the dense
+        *arrays* is the ``(cnt, sum, sumsq)`` tuple of dense float64 arrays,
+        each shaped ``(n_dates_axis, n_norm_cols)``.  Reads the same
+        per-(date, col) aggregates the old dict accumulator held and
+        reproduces the expanding-moment sparse fallback from
+        :func:`_cross_section_stats` exactly as before.
+
+        The sparse fallback is NOT bit-exact against the dense path: the dense
         path cumsums individual rows in concat order while this path cumsums
         per-date sums (associative in exact arithmetic, but float rounding
         differs) — a controlled ~1e-13 float64 summation-order diff.
@@ -359,22 +471,33 @@ class DateWiseZScoreNormalizer:
         fixtures use seeded per-stock price noise to keep compared columns
         non-constant.
         """
+        cnt2d, sum2d, sq2d = arrays
         all_dates_sorted = sorted(dates_subset)
+        row_pos = np.array(
+            [self._date_to_row[d] for d in all_dates_sorted], dtype=np.int64,
+        )
         date_stats: dict[str, pd.DataFrame] = {}
 
         for col in norm_cols:
             # Match the dense path's stored dtype for this column (§T5).
             out_dtype = np.float64 if self._col_is_f64.get(col, False) else np.float32
-            rows: list[dict] = []
-            for d in all_dates_sorted:
-                cnt, s_sum, s_sq = acc.get((d, col), (0, 0.0, 0.0))
-                rows.append({
-                    "date": pd.Timestamp(d),
-                    "count": cnt,
-                    "sum": float(s_sum),
-                    "sumsq": float(s_sq),
-                })
-            stats_df = pd.DataFrame(rows)
+            if col in self._col_pos:
+                cpos = self._col_pos[col]
+                cnt_arr = cnt2d[row_pos, cpos]
+                sum_arr = sum2d[row_pos, cpos]
+                sq_arr = sq2d[row_pos, cpos]
+            else:
+                # A norm col never accumulated (no chunk carried it): all-zero
+                # rows, same as the old ``acc.get(..., (0, 0.0, 0.0))``.
+                cnt_arr = np.zeros(len(all_dates_sorted), dtype=np.float64)
+                sum_arr = np.zeros(len(all_dates_sorted), dtype=np.float64)
+                sq_arr = np.zeros(len(all_dates_sorted), dtype=np.float64)
+            stats_df = pd.DataFrame({
+                "date": [pd.Timestamp(d) for d in all_dates_sorted],
+                "count": cnt_arr,
+                "sum": sum_arr,
+                "sumsq": sq_arr,
+            })
             if stats_df.empty:
                 date_stats[col] = pd.DataFrame(
                     columns=["mean", "std", "count"],
@@ -382,9 +505,6 @@ class DateWiseZScoreNormalizer:
                 continue
 
             stats_df = stats_df.set_index("date")
-            cnt_arr = stats_df["count"].to_numpy(dtype=np.float64)
-            sum_arr = stats_df["sum"].to_numpy(dtype=np.float64)
-            sq_arr = stats_df["sumsq"].to_numpy(dtype=np.float64)
 
             # Per-date mean & sample std (ddof=1) via the sumsq identity.
             # Dates with no (or a single) observation divide by cnt=0/1 — the
@@ -438,17 +558,26 @@ class DateWiseZScoreNormalizer:
         :meth:`normalize` so the downstream ``apply_zscore`` loop is
         identical for both paths.
         """
+        self._ensure_arrays(norm_cols)
         if self.membership_active:
-            member_dates = self._member_dates
+            # §T6: a date is a member date iff it received >=1 member FINITE
+            # contribution — the old dict loop added a date exactly when some
+            # (date, col) had mcnt > 0, i.e. member_cnt.sum(axis=1) > 0.
+            member_mask = self._member_cnt.sum(axis=1) > 0
+            member_dates = {
+                d for d, m in zip(self._all_dates_sorted, member_mask) if m
+            }
             missing_dates = all_dates - member_dates
 
             member_stats = self._build_stats_df(
-                self._member_acc, member_dates, norm_cols,
+                (self._member_cnt, self._member_sum, self._member_sq),
+                member_dates, norm_cols,
             )
 
             if missing_dates:
                 all_stats = self._build_stats_df(
-                    self._all_acc, missing_dates, norm_cols,
+                    (self._all_cnt, self._all_sum, self._all_sq),
+                    missing_dates, norm_cols,
                 )
                 # Concat exactly as the dense path does.
                 date_stats: dict[str, pd.DataFrame] = {}
@@ -469,7 +598,8 @@ class DateWiseZScoreNormalizer:
                 return member_stats
         else:
             return self._build_stats_df(
-                self._all_acc, all_dates, norm_cols,
+                (self._all_cnt, self._all_sum, self._all_sq),
+                all_dates, norm_cols,
             )
 
     @staticmethod

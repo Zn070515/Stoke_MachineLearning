@@ -7,7 +7,8 @@ from omegaconf import OmegaConf
 from stoke_ml.config import load_config as _real_load_config
 from stoke_ml.features.pipeline import (
     FeaturePipeline, SENTIMENT_COLS, GUBA_COLS, _PIT_STATIC_COLS,
-    _min_vol_nobs, _not_long_suspended, fold_dead_feature_columns,
+    _constant_col_indices, _min_vol_nobs, _not_long_suspended,
+    fold_dead_feature_columns,
 )
 
 
@@ -1347,6 +1348,55 @@ class TestFoldDeadFeatureColumns:
         pk_idx, po_idx = fold_dead_feature_columns(self._train_data(pk, po, obs), cols, cols)
         assert pk_idx == [1]
         assert po_idx == [0, 1, 2]
+
+
+def _constant_col_indices_reference(arr, obs):
+    """Naive two-where reference (pre-bounded impl) for equivalence checks."""
+    n_stocks, _n, n_feat = arr.shape
+    listed = obs.sum(axis=1) > 0
+    hi = np.float32(1e30)
+    const = np.zeros((n_stocks, n_feat), dtype=bool)
+    for s0 in range(0, n_stocks, 512):
+        s1 = min(s0 + 512, n_stocks)
+        m = obs[s0:s1, :, None]
+        vmin = np.where(m, arr[s0:s1], hi).min(axis=1)
+        vmax = np.where(m, arr[s0:s1], -hi).max(axis=1)
+        const[s0:s1] = vmin == vmax
+    const[~listed] = True
+    return const
+
+
+def test_constant_col_indices_matches_naive_reference():
+    """Bounded putmask impl must produce identical per-stock constancy masks
+    to the old two-where implementation (behavioral parity)."""
+    rng = np.random.default_rng(0)
+    for shape in [(5, 40, 8), (17, 33, 21), (129, 50, 12)]:
+        n_stocks, n_dates, n_feat = shape
+        arr = rng.normal(size=shape).astype(np.float32)
+        obs = rng.random(size=(n_stocks, n_dates)) < 0.8
+        obs[1] = False  # one stock with zero observed days → all-const
+        got = _constant_col_indices(arr, obs)
+        exp = _constant_col_indices_reference(arr, obs)
+        assert got.dtype == bool
+        assert got.shape == exp.shape
+        assert np.array_equal(got, exp)
+    # NaN in an observed cell propagates through both impls identically.
+    arr = np.zeros((3, 6, 2), dtype=np.float32)
+    arr[0, 2, 0] = np.nan
+    obs = np.ones((3, 6), dtype=bool)
+    assert np.array_equal(
+        _constant_col_indices(arr, obs),
+        _constant_col_indices_reference(arr, obs))
+    # Hand-computed ground truth (guards against reference+impl sharing a bug).
+    arr = np.array([
+        [[1.0, 5.0], [1.0, 6.0], [1.0, 7.0]],   # stock 0: feat0 constant 1, feat1 varies
+        [[2.0, 5.0], [2.0, 5.0], [2.0, 5.0]],  # stock 1: all constant
+    ], dtype=np.float32)
+    obs = np.ones((2, 3), dtype=bool)
+    assert _constant_col_indices(arr, obs).tolist() == [
+        [True, False],
+        [True, True],
+    ]
 
 
 # ---------------------------------------------------------------------------

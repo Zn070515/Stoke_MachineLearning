@@ -926,3 +926,270 @@ class TestBuildPanelFeaturesMemmap:
             f"peak({N})={peak_n}, peak({2*N})={peak_2n}, "
             f"ratio={peak_2n/peak_n:.2f}"
         )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # §streaming-perf: vectorized accumulate_stats_chunk
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDateWiseZScoreNormalizerVectorized:
+    """The vectorized ``accumulate_stats_chunk`` must reproduce the old
+    per-cell dict loop BIT-IDENTICALLY: each panel chunk carries one row per
+    date, so the dense float64 arrays accumulate exactly one value per
+    (date, col) per stock in stock order — the same order the dict used.  The
+    perf win comes from replacing ~12M per-cell Python/numpy extractions with
+    whole-matrix numpy ops, NOT from changing the summation order."""
+
+    def _stocks(self):
+        dates = pd.to_datetime([
+            "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-08",
+        ])
+        return [
+            pd.DataFrame({
+                "date": dates,
+                "stock_code": "000001",
+                "a": [1.0, np.nan, 3.0, np.inf, 5.0],
+                "b": [10.0, np.nan, 30.0, np.inf, 50.0],
+                "c": np.array([1, 2, 3, 4, 5], dtype=np.float32),
+            }),
+            pd.DataFrame({
+                "date": dates,
+                "stock_code": "000002",
+                "a": [np.inf, 2.0, 4.0, 5.0, 6.0],
+                "b": [20.0, 22.0, -np.inf, 25.0, 26.0],
+                "c": np.array([1, 2, 3, 4, 5], dtype=np.float32) + 1.0,
+            }),
+            pd.DataFrame({
+                "date": dates,
+                "stock_code": "000003",
+                "a": [7.0, 8.0, -np.inf, 9.0, np.nan],
+                "b": [np.nan, 80.0, 90.0, 95.0, 100.0],
+                "c": np.array([1, 2, 3, 4, 5], dtype=np.float32) + 2.0,
+            }),
+            pd.DataFrame({
+                "date": dates,
+                "stock_code": "000004",
+                "a": [np.nan, 1.5, 2.5, 3.5, 4.5],
+                "b": [15.0, 16.5, np.nan, 18.5, 19.5],
+                "c": np.array([1, 2, 3, 4, 5], dtype=np.float32) + 3.0,
+            }),
+            pd.DataFrame({
+                "date": dates,
+                "stock_code": "000005",
+                "a": [2.0, 3.0, 4.0, np.nan, 6.0],
+                "b": [12.0, 13.0, 14.0, 15.0, 16.0],
+                "c": np.array([1, 2, 3, 4, 5], dtype=np.float32) + 4.0,
+            }),
+        ]
+
+    @staticmethod
+    def _reference_accumulate(stocks, norm_cols, daily_membership=None):
+        """The OLD per-cell dict loop — the reference the vectorized path
+        must match."""
+        from stoke_ml.features.panel_builders._normalizer import (
+            _daily_member_flag,
+        )
+        all_acc = {}
+        member_acc = {}
+        member_dates = set()
+        membership_active = (
+            daily_membership is not None and not daily_membership.empty)
+        for df in stocks:
+            active_cols = [c for c in norm_cols if c in df.columns]
+            if not active_cols:
+                continue
+            if membership_active:
+                is_member_series = _daily_member_flag(
+                    df[["date", "stock_code"]], daily_membership)
+            else:
+                is_member_series = None
+            for date_val, group in df.groupby("date"):
+                date_key = pd.Timestamp(date_val).date()
+                group_idx = group.index
+                for col in active_cols:
+                    vals = group[col].to_numpy(dtype=np.float64)
+                    finite = np.isfinite(vals)
+                    cnt = int(finite.sum())
+                    if cnt == 0:
+                        continue
+                    s = float(vals[finite].sum())
+                    sq = float((vals[finite] ** 2).sum())
+                    prev_all = all_acc.get((date_key, col), (0, 0.0, 0.0))
+                    all_acc[(date_key, col)] = (
+                        prev_all[0] + cnt, prev_all[1] + s, prev_all[2] + sq)
+                    if is_member_series is not None:
+                        member_mask = is_member_series.loc[
+                            group_idx].to_numpy(dtype=bool)
+                        member_finite = finite & member_mask
+                        mcnt = int(member_finite.sum())
+                        if mcnt > 0:
+                            ms = float(vals[member_finite].sum())
+                            msq = float((vals[member_finite] ** 2).sum())
+                            prev_m = member_acc.get(
+                                (date_key, col), (0, 0.0, 0.0))
+                            member_acc[(date_key, col)] = (
+                                prev_m[0] + mcnt,
+                                prev_m[1] + ms, prev_m[2] + msq)
+                            member_dates.add(date_key)
+        return all_acc, member_acc, member_dates
+
+    def _assert_arrays_match_dict(self, norm, acc_dict, member=False):
+        """Assert a reference dict accumulator equals the dense arrays
+        EXACTLY (bit-identical summation order)."""
+        if member:
+            cnt = norm._member_cnt
+            sm = norm._member_sum
+            sq = norm._member_sq
+        else:
+            cnt = norm._all_cnt
+            sm = norm._all_sum
+            sq = norm._all_sq
+        T, C = cnt.shape
+        covered = set(acc_dict.keys())
+        for (d, col), (c, s, ss) in acc_dict.items():
+            r = norm._date_to_row[d]
+            cpos = norm._col_pos[col]
+            assert cnt[r, cpos] == c, (d, col, "cnt")
+            assert sm[r, cpos] == s, (d, col, "sum")
+            assert sq[r, cpos] == ss, (d, col, "sumsq")
+        # Every cell the reference never touched must stay exactly zero.
+        for r in range(T):
+            for cpos in range(C):
+                key = (norm._all_dates_sorted[r], norm._norm_cols[cpos])
+                if key in covered:
+                    continue
+                assert cnt[r, cpos] == 0.0, key
+                assert sm[r, cpos] == 0.0, key
+                assert sq[r, cpos] == 0.0, key
+
+    def test_vectorized_matches_reference_loop(self):
+        from stoke_ml.features.panel_builders._normalizer import (
+            DateWiseZScoreNormalizer,
+        )
+        stocks = self._stocks()
+        norm_cols = ["a", "b", "c"]
+        all_dates = {
+            pd.Timestamp(d).date() for df in stocks for d in df["date"]
+        }
+        ref_all, _, _ = self._reference_accumulate(stocks, norm_cols)
+
+        norm = DateWiseZScoreNormalizer(None)
+        norm.init_stats_accumulator(all_dates)
+        for df in stocks:
+            norm.accumulate_stats_chunk(df, norm_cols)
+        self._assert_arrays_match_dict(norm, ref_all, member=False)
+
+        # float64 source cols tracked; the float32 col is absent (not f64).
+        assert norm._col_is_f64.get("a") is True
+        assert norm._col_is_f64.get("b") is True
+        assert norm._col_is_f64.get("c", False) is False
+
+    def test_vectorized_matches_reference_with_membership(self):
+        from stoke_ml.features.panel_builders._normalizer import (
+            DateWiseZScoreNormalizer,
+        )
+        stocks = self._stocks()
+        norm_cols = ["a", "b", "c"]
+        all_dates = {
+            pd.Timestamp(d).date() for df in stocks for d in df["date"]
+        }
+        # 000001/000002/000003 are members on dates[0:4]; dates[4] has ZERO
+        # members → it must be excluded from member_dates and fall back to the
+        # all-stock stats in finalize (the §T6 missing-date case).
+        dates = pd.to_datetime(stocks[0]["date"])
+        membership = pd.DataFrame({
+            "stock_code": ["000001", "000002", "000003"],
+            "in_date": [dates[0], dates[0], dates[0]],
+            "out_date": [dates[4], dates[4], dates[4]],
+        })
+        ref_all, ref_member, ref_member_dates = self._reference_accumulate(
+            stocks, norm_cols, daily_membership=membership)
+
+        norm = DateWiseZScoreNormalizer(membership)
+        norm.init_stats_accumulator(all_dates)
+        for df in stocks:
+            norm.accumulate_stats_chunk(df, norm_cols)
+        self._assert_arrays_match_dict(norm, ref_all, member=False)
+        self._assert_arrays_match_dict(norm, ref_member, member=True)
+
+        # member_dates is exactly dates[0:4] — the zero-member date is absent.
+        member_dates = {
+            d for d, m in zip(
+                norm._all_dates_sorted, norm._member_cnt.sum(axis=1) > 0)
+            if m}
+        assert member_dates == set(ref_member_dates)
+        assert pd.Timestamp("2024-01-08").date() not in member_dates
+
+        # finalize: the zero-member date still gets stats via the all-stock
+        # fallback, keeping the dense-path dict-of-DataFrame contract.
+        date_stats = norm.finalize_date_stats(norm_cols, all_dates)
+        assert set(date_stats.keys()) == set(norm_cols)
+        d4 = pd.Timestamp("2024-01-08")
+        for col in norm_cols:
+            df_out = date_stats[col]
+            assert d4 in df_out.index
+            assert df_out.loc[d4, "count"] > 0
+            assert list(df_out.columns) == ["mean", "std", "count"]
+
+    def test_duplicate_dates_fall_back_to_add_at(self):
+        from stoke_ml.features.panel_builders._normalizer import (
+            DateWiseZScoreNormalizer,
+        )
+        df = pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02", "2024-01-02", "2024-01-03"]),
+            "stock_code": "000009",
+            "a": [1.0, 2.0, 3.0],
+            "b": [np.nan, 4.0, 5.0],
+        })
+        norm_cols = ["a", "b"]
+        all_dates = {pd.Timestamp(d).date() for d in df["date"]}
+        ref_all, _, _ = self._reference_accumulate([df], norm_cols)
+
+        norm = DateWiseZScoreNormalizer(None)
+        norm.init_stats_accumulator(all_dates)
+        norm.accumulate_stats_chunk(df, norm_cols)
+        for (d, col), (c, s, ss) in ref_all.items():
+            r = norm._date_to_row[d]
+            cpos = norm._col_pos[col]
+            # Groupwise (old) vs scatter (np.add.at) float-add order can differ
+            # by ~ULP on the running sums — exact counts, tolerance on sums.
+            assert norm._all_cnt[r, cpos] == c
+            np.testing.assert_allclose(
+                norm._all_sum[r, cpos], s, rtol=1e-12, atol=0)
+            np.testing.assert_allclose(
+                norm._all_sq[r, cpos], ss, rtol=1e-12, atol=0)
+
+    def test_finalize_stats_format_unchanged(self):
+        from stoke_ml.features.panel_builders._normalizer import (
+            DateWiseZScoreNormalizer,
+        )
+        stocks = self._stocks()
+        norm_cols = ["a", "b", "c"]
+        all_dates = {
+            pd.Timestamp(d).date() for df in stocks for d in df["date"]
+        }
+        norm = DateWiseZScoreNormalizer(None)
+        norm.init_stats_accumulator(all_dates)
+        for df in stocks:
+            norm.accumulate_stats_chunk(df, norm_cols)
+
+        date_stats = norm.finalize_date_stats(norm_cols, all_dates)
+        assert isinstance(date_stats, dict)
+        assert set(date_stats.keys()) == set(norm_cols)
+        for col in norm_cols:
+            df_out = date_stats[col]
+            assert list(df_out.columns) == ["mean", "std", "count"]
+            assert isinstance(df_out.index, pd.DatetimeIndex)
+            assert len(df_out.index) == len(all_dates)
+
+        # Hand-check one column/date against the raw aggregates.  Use the
+        # all-finite float32 col "c": 5 finite values -> count=5, so the
+        # per-date cross-section (NOT the count<5 expanding fallback) applies.
+        d = pd.Timestamp("2024-01-03")
+        row_c = date_stats["c"].loc[d]
+        assert row_c["count"] == 5
+        # c on that date = {2, 3, 4, 5, 6} (5 stocks).
+        np.testing.assert_allclose(row_c["mean"], 4.0, rtol=1e-6)
+        sq = 2.0 ** 2 + 3.0 ** 2 + 4.0 ** 2 + 5.0 ** 2 + 6.0 ** 2  # 90
+        var = (sq - (20.0 ** 2) / 5.0) / 4.0  # sample var, ddof=1
+        np.testing.assert_allclose(row_c["std"], np.sqrt(var), rtol=1e-6)

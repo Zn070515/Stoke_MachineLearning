@@ -456,12 +456,13 @@ def _era_capable_channels() -> frozenset[str]:
     truth for which channels are gated on provider-era retrieval coverage —
     instead of a hard-coded list that must be kept in sync by hand.  The UNION
     is taken over ALL profiles, not just the run's active profile: the probe is
-    a data-capability read of the gold manifests, and it must not silently
-    collapse to an empty set when ``profile_name`` is None (the live default,
-    where no profile is active but sentiment/guba era contracts still gate
-    headline_v1 formal runs).  Read via the module attribute (not a captured
-    binding) so tests that mutate the profile registry are observed at call
-    time.
+    a data-capability read of the gold manifests and must not depend on which
+    profile is active.  §v19 Option A deferred era_coverage (no shipped profile
+    declares it), so the set is currently empty; the derivation stays so a
+    channel that gains an era_coverage contract in any profile is auto-probed
+    without a hand-maintained list.  Read via the module attribute (not a
+    captured binding) so tests that mutate the profile registry are observed at
+    call time.
     """
     channels = {
         ch
@@ -626,10 +627,20 @@ def _resolve_panel(
             strict_external_meta=strict)
         # §T4: a store built with the manifest persisted reads the ACCURATE
         # build-time coverage directly; a legacy store without it falls back to
-        # the has_* flag probe (which cannot cover flag-less channels).
+        # the has_* flag probe PLUS the flag-less disk probe for the required
+        # channels that carry no has_* flag (which the flag probe cannot cover).
         stored = panel_data.get("channel_coverage_manifest")
-        channel_manifest = (stored if stored is not None
-                            else _prebuilt_channel_coverage(panel_data))
+        if stored is not None:
+            # Persisted build-time coverage is the ACCURATE record; replay it.
+            channel_manifest = stored
+        else:
+            # Legacy store (no persisted manifest): probe has_* flags AND fill
+            # the REQUIRED flag-less channels from the aux files on disk so a
+            # formal run with a named profile does not abort (§T4).
+            channel_manifest = _prebuilt_channel_coverage(panel_data)
+            channel_manifest = _probe_flagless_channel_coverage(
+                channel_manifest, required_set, stock_list, data_dir,
+                args.start, args.end)
         # §T8: merge the provider-era coverage probe for the text channels.
         # force=False: a store built under §T8 already persisted build-time
         # era_coverage — replay it without re-probing the gold manifests on the
@@ -744,6 +755,13 @@ def _resolve_panel(
         # build the manifest is set into panel_data AFTER this block and read
         # back from the reloaded store below.)
         channel_manifest = _prebuilt_channel_coverage(panel_data)
+        # §T4: has_* flags cover only the flag channels — REQUIRED flag-less
+        # channels (block_trade / capital_flow / dividend / lockup / margin /
+        # northbound / etf_flow / industry / market_env) are probed from the
+        # aux files on disk, else the formal coverage gate aborts the build.
+        channel_manifest = _probe_flagless_channel_coverage(
+            channel_manifest, required_set, stock_list, data_dir,
+            args.start, args.end)
     # §T8: merge the provider-era coverage probe for the text channels BEFORE
     # any persist — the store BUILD persists build-time era_coverage (so a later
     # store-load replays it without re-probing the gold manifests), and the
@@ -2023,3 +2041,139 @@ def _prebuilt_channel_coverage(panel_data: dict) -> dict:
             "flag": flag,
         }
     return channels
+
+
+def _present_stock_codes(root: str) -> set[str]:
+    """Stock codes with >=1 parquet file under ``root`` (recursive).
+
+    A MarketWideStorage channel's prebuilt data lives as consolidated flat
+    ``{code}.parquet`` and/or legacy ``{year}/{month}/{code}.parquet``
+    partitions under the channel's source dir.  Asset-manifest sidecars
+    (``*.manifest.json`` / ``.manifests/``) are not parquet, so the ``.parquet``
+    suffix filter excludes them.  An absent root yields the empty set.
+    """
+    if not os.path.isdir(root):
+        return set()
+    codes: set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fname in filenames:
+            if fname.endswith(".parquet"):
+                codes.add(fname[: -len(".parquet")])
+    return codes
+
+
+def _probe_flagless_channel_coverage(
+    channel_manifest: dict,
+    required_set: set[str],
+    stock_list: list[str],
+    data_dir: str,
+    start_date: str,
+    end_date: str,
+) -> dict:
+    """Probe coverage for REQUIRED flag-less channels from the aux files on disk.
+
+    ``_prebuilt_channel_coverage`` can only probe the has_* flag channels — the
+    other headline_v1 required channels (block_trade / capital_flow / dividend /
+    lockup / margin / northbound / etf_flow / industry / market_env) carry no
+    presence flag in the panel arrays, so the prebuilt/store path could never
+    verify them and formal mode aborted (§T4).  This probes them from the SAME
+    aux files the prebuilt features were built from:
+
+    * per-stock MarketWideStorage channels: ``stock_coverage`` = the fraction of
+      ``stock_list`` with >=1 parquet under the channel's ``source_dir``;
+    * industry / market_env: ``date_coverage`` from the shared broadcast parquet
+      via ``_probe_broadcast_dates``, mirroring the live ``load_aux_data`` probe;
+    * etf_flow: ``date_coverage`` from the aggregated ``sector_*.parquet``
+      files, window-filtered exactly like the live path.
+
+    Only REQUIRED channels MISSING from ``channel_manifest`` are probed — a
+    channel already covered (has_* flag / live load / persisted store manifest)
+    is left untouched, and non-required flag-less channels are not added (the
+    coverage gate only gates the required set).  Missing CHANNEL_SOURCE entry or
+    unreadable files degrade to FAILED / MISSING with 0.0 coverage — never raise.
+    """
+    for ch in sorted(required_set):
+        if ch in channel_manifest:
+            continue
+        spec = CHANNEL_SOURCE.get(ch)
+        entry = _new_channel_entry(True, True)
+        channel_manifest[ch] = entry
+        if spec is None:
+            entry["coverage"] = 0.0
+            entry["stock_coverage"] = 0.0
+            entry["status"] = "FAILED"
+            entry["note"] = "no CHANNEL_SOURCE entry — unprobeable"
+            logger.warning("[%s] no CHANNEL_SOURCE entry — cannot probe "
+                           "coverage (formal gate will abort)", ch)
+            continue
+        if ch in ("industry", "market_env"):
+            fname = ("industry_returns.parquet" if ch == "industry"
+                     else "market_env_daily.parquet")
+            rel = os.path.join(*source_dir(spec).split("/"), fname)
+            path = os.path.join(data_dir, rel)
+            n_dates, status = _probe_broadcast_dates(
+                path, start_date, end_date, data_dir)
+            entry["loaded_stocks"] = None  # broadcast channel, not per-stock
+            if status == "OK":
+                entry["coverage"] = 1.0
+                entry["stock_coverage"] = 1.0
+                entry["date_coverage"] = _date_coverage_fraction(
+                    n_dates, data_dir, start_date, end_date)
+                entry["status"] = "OK"
+            else:
+                entry["coverage"] = 0.0
+                entry["stock_coverage"] = 0.0
+                entry["date_coverage"] = 0.0
+                entry["status"] = status
+                entry["note"] = f"broadcast parquet: {path}"
+            logger.info("[%s] (flagless probe) date coverage %.4f (%d dates "
+                        "in range)", ch, entry["date_coverage"], n_dates)
+        elif ch == "etf_flow":
+            etf_base = os.path.join(data_dir, *source_dir(spec).split("/"))
+            entry["loaded_stocks"] = len(stock_list)
+            try:
+                frames = []
+                if os.path.isdir(etf_base):
+                    for f in sorted(os.listdir(etf_base)):
+                        if f.startswith("sector_") and f.endswith(".parquet"):
+                            frames.append(pd.read_parquet(os.path.join(etf_base, f)))
+                if not frames:
+                    entry["coverage"] = 0.0
+                    entry["stock_coverage"] = 0.0
+                    entry["date_coverage"] = 0.0
+                    entry["status"] = "MISSING"
+                    logger.info("[etf_flow] (flagless probe) no sector files — "
+                                "MISSING")
+                    continue
+                etf_all = pd.concat(frames, ignore_index=True)
+                etf_all["date"] = pd.to_datetime(etf_all["date"], errors="coerce")
+                etf_all = etf_all.dropna(subset=["date"])
+                n_dates = int(_filter_dates_in_range(
+                    etf_all["date"], start_date, end_date).nunique())
+                entry["coverage"] = 1.0
+                entry["stock_coverage"] = 1.0
+                entry["date_coverage"] = _date_coverage_fraction(
+                    n_dates, data_dir, start_date, end_date)
+                entry["status"] = "OK"
+                logger.info("[etf_flow] (flagless probe) date coverage %.4f "
+                            "(%d dates in range)",
+                            entry["date_coverage"], n_dates)
+            except Exception as exc:
+                entry["coverage"] = 0.0
+                entry["stock_coverage"] = 0.0
+                entry["date_coverage"] = 0.0
+                entry["status"] = "FAILED"
+                entry["note"] = str(exc)
+                logger.warning("[etf_flow] (flagless probe) aggregation failed "
+                               "— %s", exc)
+        else:
+            root = os.path.join(data_dir, *source_dir(spec).split("/"))
+            present = len(_present_stock_codes(root) & set(stock_list))
+            entry["loaded_stocks"] = present
+            entry["coverage"] = (
+                round(present / len(stock_list), 4) if stock_list else 0.0)
+            entry["stock_coverage"] = entry["coverage"]
+            entry["status"] = "OK" if present else "MISSING"
+            logger.info("[%s] (flagless probe) %d/%d stocks present",
+                        ch, present, len(stock_list))
+    return channel_manifest
